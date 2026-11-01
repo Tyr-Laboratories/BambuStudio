@@ -571,6 +571,8 @@ void PrintObject::make_perimeters()
     }
 #endif
 
+    m_wall_painting = WallPainting::slice_paint(*this, [this] { m_print->throw_if_canceled(); });
+
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - start";
 #if 1
     tbb::parallel_for(
@@ -1524,6 +1526,7 @@ bool PrintObject::invalidate_state_by_config_options(
             steps.emplace_back(posSlice);
         } else if (
                opt_key == "wall_loops"
+            || opt_key == "painted_wall_loops"
             || opt_key == "top_one_wall_type"
             || opt_key == "top_area_threshold"
             || opt_key == "only_one_wall_first_layer"
@@ -2259,7 +2262,9 @@ void PrintObject::discover_vertical_shells()
                         polygons_append(cache.holes, to_polygons(layerm.fill_expolygons));
                     }
                     // For a multi-material print, simulate perimeter / infill split as if only a single extruder has been used for the whole print.
-                    if (perimeter_offset > 0.) {
+                    const bool painted_layer=idx_layer<m_wall_painting.size() &&
+                        std::any_of(m_wall_painting[idx_layer].begin(),m_wall_painting[idx_layer].end(),[](const auto &line){return line.painted;});
+                    if (perimeter_offset > 0. && !painted_layer) {
                         // The layer.lslices are forced to merge by expanding them first.
                         // 对于多材料，按照最大墙宽度，再算一次稀疏区域
                         polygons_append(cache.holes, offset2(layer.lslices, 0.3f * perimeter_min_spacing, -perimeter_offset - 0.3f * perimeter_min_spacing));

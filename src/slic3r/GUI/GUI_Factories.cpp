@@ -57,7 +57,7 @@ static SettingsFactory::Bundle FREQ_SETTINGS_BUNDLE_FFF =
 {
     //BBS
     { L("Quality"), { "layer_height" } },
-    { L("Shell"), { "wall_loops", "top_shell_layers", "bottom_shell_layers"} },
+    { L("Shell"), { "wall_loops", "painted_wall_loops", "top_shell_layers", "bottom_shell_layers"} },
     { L("Infill")               , { "sparse_infill_density", "sparse_infill_pattern", "conformal_infill", "conformal_stagger", "conformal_link_keep_layers", "conformal_link_flip_layers", "conformal_pole", "conformal_ray_count", "conformal_hub_radius" } },
     // BBS
     { L("Support")     , { "enable_support", "support_type", "support_threshold_angle",
@@ -103,7 +103,7 @@ std::map<std::string, std::vector<SimpleSettingData>>  SettingsFactory::OBJECT_C
 std::map<std::string, std::vector<SimpleSettingData>>  SettingsFactory::PART_CATEGORY_SETTINGS=
     {{L("Quality"), {{"ironing_type", "", 8}, {"ironing_flow", "", 9}, {"ironing_spacing", "", 10}, {"ironing_inset", "", 11}, {"ironing_speed", "", 12}, {"ironing_direction", "",13}
                     }},
-    { L("Strength"), {{"wall_loops", "",1},{"top_shell_layers", "",1},{"top_shell_thickness", "",1},
+    { L("Strength"), {{"wall_loops", "",1},{"painted_wall_loops", "",1},{"top_shell_layers", "",1},{"top_shell_thickness", "",1},
                     {"bottom_shell_layers", "",1}, {"bottom_shell_thickness", "",1}, {"sparse_infill_density", "",1},
                     {"sparse_infill_pattern", "",1},{"conformal_infill", "",1},{"conformal_stagger", "",1},{"conformal_link_keep_layers", "",1},{"conformal_link_flip_layers", "",1},{"conformal_pole", "",1},{"conformal_ray_count", "",1},{"conformal_hub_radius", "",1},{"sparse_infill_anchor", "",1},{"sparse_infill_anchor_max", "",1}, {"sparse_infill_lattice_angle_1", "",1},{"sparse_infill_lattice_angle_2", "",1},
                     {"top_surface_pattern", "",1},{"top_surface_density", "",1},{"monotonic_travel_into_wall", "",1},
@@ -142,7 +142,7 @@ std::vector<SimpleSettingData> SettingsFactory::get_visible_options(const std::s
         //Quality
         "wall_infill_order", "ironing_type", "inner_wall_line_width", "outer_wall_line_width", "top_surface_line_width",
         //Shell
-        "wall_loops", "top_shell_layers", "bottom_shell_layers", "top_shell_thickness", "bottom_shell_thickness",
+        "wall_loops", "painted_wall_loops", "top_shell_layers", "bottom_shell_layers", "top_shell_thickness", "bottom_shell_thickness",
         //Infill
         "sparse_infill_density", "sparse_infill_pattern", "conformal_infill", "conformal_stagger", "conformal_link_keep_layers", "conformal_link_flip_layers", "conformal_pole", "conformal_ray_count", "conformal_hub_radius", "top_surface_pattern", "bottom_surface_pattern", "infill_combination", "infill_direction", "infill_wall_overlap",
         //speed

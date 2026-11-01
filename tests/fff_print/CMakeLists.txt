@@ -18,7 +18,7 @@ add_executable(${_TEST_NAME}_tests
 	test_support_material_on_wipe_tower.cpp
 	test_trianglemesh.cpp
 	)
-target_link_libraries(${_TEST_NAME}_tests test_common libslic3r)
+target_link_libraries(${_TEST_NAME}_tests test_common libslic3r slicer_test_support)
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 
 if (WIN32)
@@ -62,3 +62,19 @@ endif()
 set_property(TARGET periodic_modifier_tests PROPERTY FOLDER "tests")
 add_test(periodic_modifier_tests periodic_modifier_tests ${CATCH_EXTRA_ARGS})
 
+
+add_executable(wall_painting_tests fff_print_tests.cpp test_wall_painting.cpp)
+target_link_libraries(wall_painting_tests test_common libslic3r slicer_test_support)
+set_property(TARGET wall_painting_tests PROPERTY FOLDER "tests")
+add_test(wall_painting_tests wall_painting_tests ${CATCH_EXTRA_ARGS})
+
+# Keep the relevant pre-existing model/3MF/slicing checks runnable even when
+# unrelated legacy G-code tests target APIs that have since been removed.
+add_executable(wall_painting_regression_tests
+    fff_print_tests.cpp test_data.cpp test_model.cpp test_trianglemesh.cpp
+    test_extrusion_entity.cpp test_flow.cpp test_printobject.cpp
+    ../libslic3r/test_3mf.cpp
+)
+target_link_libraries(wall_painting_regression_tests test_common libslic3r slicer_test_support)
+set_property(TARGET wall_painting_regression_tests PROPERTY FOLDER "tests")
+add_test(wall_painting_regression_tests wall_painting_regression_tests ${CATCH_EXTRA_ARGS})

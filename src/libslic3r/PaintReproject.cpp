@@ -1161,7 +1161,7 @@ private:
 };
 
 // Destination geometry expressed in the source frame. Built once per reprojection
-// and shared by all four annotation layers, which would otherwise each re-transform
+// and shared by all annotation layers, which would otherwise each re-transform
 // the whole vertex list.
 class DestinationInSourceFrame
 {
@@ -1169,6 +1169,7 @@ public:
     DestinationInSourceFrame(const TriangleMesh &dst_mesh, const Transform3d &dst_to_src)
         : m_dst_to_src(dst_to_src)
         , m_identity(dst_to_src.isApprox(Transform3d::Identity()))
+        , m_mirrored(dst_to_src.linear().determinant() < 0.)
     {
         if (!m_identity) {
             m_storage.reserve(dst_mesh.its.vertices.size());
@@ -1186,18 +1187,25 @@ public:
 
     std::array<Vec3f, 3> triangle(const Vec3i &face) const
     {
+        // Keep actual vertex order here: congruence checks use it to decide
+        // whether copying a serialized subdivision tree is safe.
         return {(*m_vertices)[face[0]], (*m_vertices)[face[1]], (*m_vertices)[face[2]]};
     }
 
     std::array<Vec3f, 3> to_source(const std::array<Vec3f, 3> &triangle_in_destination) const
     {
-        return m_identity ? triangle_in_destination
-                          : transform_triangle(triangle_in_destination, m_dst_to_src);
+        auto result = m_identity ? triangle_in_destination
+                                 : transform_triangle(triangle_in_destination, m_dst_to_src);
+        // Winding is repaired when a reflection is baked into the mesh. Undo
+        // it only for normal-sensitive geometric coverage in the source frame.
+        if (m_mirrored) std::swap(result[1], result[2]);
+        return result;
     }
 
 private:
     Transform3d               m_dst_to_src;
     bool                      m_identity { false };
+    bool                      m_mirrored { false };
     std::vector<Vec3f>        m_storage;
     const std::vector<Vec3f> *m_vertices { nullptr };
 };
@@ -1208,7 +1216,7 @@ static constexpr size_t RegionSeedTreeMinStates = 3;
 
 // Destination faces prepared for seeding the region walks: their bounding boxes in the source
 // frame and, once a layer carries enough states to amortize it, an AABB tree over the same
-// faces. Built once per reprojection and shared by all four annotation layers, which restrict
+// faces. Built once per reprojection and shared by all annotation layers, which restrict
 // the walk with the same mask - the cut path passes the fragment faces to every layer and the
 // repair path passes none, so rebuilding this per layer was a wasted full-mesh pass each time.
 class DestinationSeedIndex
@@ -1599,11 +1607,12 @@ bool reproject_paint(const ModelVolume &src_volume,
         const char             *name;    // internal log tag
         const char             *display; // user-facing progress label (English)
     };
-    const std::array<Layer, 4> layers {{
+    const std::array<Layer, 5> layers {{
         {src_volume.supported_facets,        dst_volume.supported_facets,        "support",    L("Restoring support painting")},
         {src_volume.seam_facets,             dst_volume.seam_facets,             "seam",       L("Restoring seam painting")},
         {src_volume.mmu_segmentation_facets, dst_volume.mmu_segmentation_facets, "mmu",        L("Restoring paint color")},
         {src_volume.fuzzy_skin_facets,       dst_volume.fuzzy_skin_facets,       "fuzzy skin", L("Restoring fuzzy skin")},
+        {src_volume.wall_painting_facets,       dst_volume.wall_painting_facets,       "wall painting", L("Restoring wall painting")},
     }};
     int active_layers = 0;
     for (const Layer &layer : layers)
@@ -1612,7 +1621,7 @@ bool reproject_paint(const ModelVolume &src_volume,
     if (active_layers == 0)
         return true;
 
-    // Geometry-only, so it is computed once and shared by all four layers.
+    // Geometry-only, so it is computed once and shared by all annotation layers.
     const DestinationInSourceFrame dst_in_source(dst_mesh, destination_to_source);
     const double                   src_diagonal = src_mesh.bounding_box().size().norm();
     const CutFaceClassification    classification =
@@ -1629,7 +1638,7 @@ bool reproject_paint(const ModelVolume &src_volume,
     // instance x volume, and add_cut_volume() only recenters it, so these vertices are
     // millimeters and the target applies as-is.
     const RegionEdgeLimit edge_limit(dst_mesh, nullptr);
-    // The mask is the same for all four layers, so this is geometry-only as well.
+    // The mask is the same for all annotation layers, so this is geometry-only as well.
     DestinationSeedIndex seed_index(dst_mesh, dst_in_source, &classification.fragment_faces);
 
     int layer_index = 0;
@@ -1720,12 +1729,14 @@ bool reproject_paint_geometric(const TriangleMesh     &src_mesh,
                                const FacetsAnnotation &src_seam,
                                const FacetsAnnotation &src_mmu,
                                const FacetsAnnotation &src_fuzzy,
+                               const FacetsAnnotation &src_walls,
                                const TriangleMesh     &dst_mesh,
                                const Transform3d      &dst_to_src,
                                FacetsAnnotation       &dst_supported,
                                FacetsAnnotation       &dst_seam,
                                FacetsAnnotation       &dst_mmu,
                                FacetsAnnotation       &dst_fuzzy,
+                               FacetsAnnotation       &dst_walls,
                                const PaintReprojectProgressCallback &progress,
                                const PaintReprojectCancelCallback   &cancel,
                                const Transform3d      *dst_world_matrix)
@@ -1743,6 +1754,7 @@ bool reproject_paint_geometric(const TriangleMesh     &src_mesh,
     dst_seam.reset();
     dst_mmu.reset();
     dst_fuzzy.reset();
+    dst_walls.reset();
     if (dst_mesh.its.indices.empty() || src_mesh.its.indices.empty())
         return true;
 
@@ -1754,11 +1766,12 @@ bool reproject_paint_geometric(const TriangleMesh     &src_mesh,
         const char             *name;    // internal log tag
         const char             *display; // user-facing progress label (English)
     };
-    const std::array<Layer, 4> layers {{
+    const std::array<Layer, 5> layers {{
         {src_supported, dst_supported, "support",    L("Restoring support painting")},
         {src_seam,      dst_seam,      "seam",       L("Restoring seam painting")},
         {src_mmu,       dst_mmu,       "mmu",        L("Restoring paint color")},
         {src_fuzzy,     dst_fuzzy,     "fuzzy skin", L("Restoring fuzzy skin")},
+        {src_walls,     dst_walls,     "wall painting", L("Restoring wall painting")},
     }};
     int active_layers = 0;
     for (const Layer &layer : layers)
@@ -1797,7 +1810,7 @@ bool reproject_paint_geometric(const TriangleMesh     &src_mesh,
     const RegionEdgeLimit edge_limit(dst_mesh, dst_world_matrix);
 
     const DestinationInSourceFrame dst_in_source(dst_mesh, dst_to_src);
-    // Repair paints the whole destination, so no mask; shared by all four layers.
+    // Repair paints the whole destination, so no mask; shared by all annotation layers.
     DestinationSeedIndex seed_index(dst_mesh, dst_in_source, nullptr);
 
     int layer_index = 0;
@@ -1862,6 +1875,30 @@ bool reproject_paint_geometric(const TriangleMesh     &src_mesh,
     if (progress)
         progress(100, L("Restoring painting"));
     return true;
+}
+
+bool reproject_paint_between_volumes(const ModelVolume &src, ModelVolume &dst)
+{
+    const Transform3d dst_to_src = src.get_matrix().inverse() * dst.get_matrix();
+    if (dst_to_src.isApprox(Transform3d::Identity()) &&
+        src.mesh().its.vertices == dst.mesh().its.vertices &&
+        src.mesh().its.indices == dst.mesh().its.indices) {
+        // An unchanged reload must retain the subdivision bit for bit.
+        dst.supported_facets.assign(src.supported_facets);
+        dst.seam_facets.assign(src.seam_facets);
+        dst.mmu_segmentation_facets.assign(src.mmu_segmentation_facets);
+        dst.fuzzy_skin_facets.assign(src.fuzzy_skin_facets);
+        dst.wall_painting_facets.assign(src.wall_painting_facets);
+        return true;
+    }
+    const ModelObject *object = dst.get_object();
+    const Transform3d world = (object && !object->instances.empty() ?
+        object->instances.front()->get_transformation().get_matrix_no_offset() : Transform3d::Identity()) * dst.get_matrix();
+    return reproject_paint_geometric(src.mesh(), src.supported_facets, src.seam_facets,
+        src.mmu_segmentation_facets, src.fuzzy_skin_facets, src.wall_painting_facets,
+        dst.mesh(), dst_to_src, dst.supported_facets, dst.seam_facets,
+        dst.mmu_segmentation_facets, dst.fuzzy_skin_facets, dst.wall_painting_facets,
+        nullptr, nullptr, &world);
 }
 
 } // namespace Slic3r

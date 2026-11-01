@@ -94,7 +94,7 @@ SCENARIO("2D convex hull of sinking object", "[3mf]") {
 
             // set instance's attitude so that it is rotated, scaled and sinking
             ModelInstance* instance = object->instances.front();
-            instance->set_rotation(X, -M_PI / 4.0);
+            instance->set_rotation(Vec3d(-M_PI / 4.0, 0., 0.));
             instance->set_offset(Vec3d::Zero());
             instance->set_scaling_factor({ 2.0, 2.0, 2.0 });
 

@@ -79,6 +79,8 @@ static inline void model_volume_list_copy_configs(ModelObject &model_object_dst,
         mv_dst.supported_facets.assign(mv_src.supported_facets);
         assert(mv_dst.fuzzy_skin_facets.id() == mv_src.fuzzy_skin_facets.id());
         mv_dst.fuzzy_skin_facets.assign(mv_src.fuzzy_skin_facets);
+        assert(mv_dst.wall_painting_facets.id() == mv_src.wall_painting_facets.id());
+        mv_dst.wall_painting_facets.assign(mv_src.wall_painting_facets);
         assert(mv_dst.seam_facets.id() == mv_src.seam_facets.id());
         mv_dst.seam_facets.assign(mv_src.seam_facets);
         assert(mv_dst.mmu_segmentation_facets.id() == mv_src.mmu_segmentation_facets.id());
@@ -1701,6 +1703,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             model_object.assign_copy(model_object_new);
         } else {
             model_object_status.print_object_regions_status = ModelObjectStatus::PrintObjectRegionsStatus::Valid;
+            if (model_custom_wall_painting_data_changed(model_object, model_object_new)) {
+                for (const PrintObjectStatus &status : print_objects_range)
+                    update_apply_status(status.print_object->invalidate_step(posPerimeters));
+            }
             if (supports_differ || model_custom_supports_data_changed(model_object, model_object_new)) {
                 // First stop background processing before shuffling or deleting the ModelVolumes in the ModelObject's list.
                 if (supports_differ) {

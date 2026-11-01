@@ -24,6 +24,7 @@
 #include "slic3r/GUI/Gizmos/GLGizmoSeam.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoMmuSegmentation.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoFuzzySkin.hpp"
+#include "slic3r/GUI/Gizmos/GLGizmoWallPainting.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSimplify.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoText.hpp"
 #include "slic3r/GUI/Gizmos/GLGizmoSVG.hpp"
@@ -116,6 +117,7 @@ bool GLGizmosManager::init()
     m_gizmos.emplace_back(new GLGizmoSeam(m_parent, EType::Seam));
     m_gizmos.emplace_back(new GLGizmoBrimEars(m_parent, EType::BrimEars));
     m_gizmos.emplace_back(new GLGizmoFuzzySkin(m_parent, EType::FuzzySkin));
+    m_gizmos.emplace_back(new GLGizmoWallPainting(m_parent, EType::WallPainting));
     m_gizmos.emplace_back(new GLGizmoMeasure(m_parent, EType::Measure));
     m_gizmos.emplace_back(new GLGizmoSimplify(m_parent, EType::Simplify));
 
@@ -700,6 +702,7 @@ bool GLGizmosManager::is_paint_gizmo() const
 {
     return m_current == EType::FdmSupports ||
            m_current == EType::FuzzySkin ||
+           m_current == EType::WallPainting ||
            m_current == EType::MmuSegmentation ||
            m_current == EType::Seam;
 }
@@ -1345,6 +1348,16 @@ bool GLGizmosManager::on_key(wxKeyEvent& evt)
                 wxGetApp().imgui()->set_requires_extra_frame();
             }
         }
+        else if (m_current == WallPainting) {
+            GLGizmoWallPainting *wall_painting = dynamic_cast<GLGizmoWallPainting *>(get_current());
+            if (wall_painting != nullptr && (keyCode == 'F' || keyCode == 'S' || keyCode == 'C' || keyCode == 'T' || keyCode == 'G')) {
+                processed = wall_painting->on_key_down_select_tool_type(keyCode);
+            }
+            if (processed) {
+                // force extra frame to automatically update window size
+                wxGetApp().imgui()->set_requires_extra_frame();
+            }
+        }
         else if (m_current == FdmSupports) {
             GLGizmoFdmSupports* fdm_support = dynamic_cast<GLGizmoFdmSupports*>(get_current());
             if (fdm_support != nullptr && (keyCode == 'F' || keyCode == 'S' || keyCode == 'C' || keyCode == 'G')) {
@@ -1505,6 +1518,8 @@ std::string GLGizmosManager::convert_gizmo_type_to_string(Slic3r::GUI::GLGizmosM
         return "Svg";
     case Slic3r::GUI::GLGizmosManager::EType::MmuSegmentation:
         return "Color Painting";
+    case Slic3r::GUI::GLGizmosManager::EType::WallPainting:
+        return "WallPainting";
     case Slic3r::GUI::GLGizmosManager::EType::FuzzySkin:
         return "FuzzySkin";
     case Slic3r::GUI::GLGizmosManager::EType::Measure:

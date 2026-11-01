@@ -73,6 +73,7 @@
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "Gizmos/GLGizmoAlignment.hpp"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/PaintReproject.hpp"
 #include "libslic3r/ModelArrange.hpp"
 #include "libslic3r/SLA/Hollowing.hpp"
 #include "libslic3r/SLA/SupportPoint.hpp"
@@ -8998,19 +8999,9 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 if (dlg.get_checkbox_state())
                                     wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
                             }
-                            else if ((validated == VALIDATE_PRESETS_PRINTER_NOT_FOUND) || (validated == VALIDATE_PRESETS_FILAMENTS_NOT_FOUND)) {
-                                std::string warning_message;
-                                warning_message += "\n";
-                                for (std::set<std::string>::iterator it=modified_gcodes.begin(); it!=modified_gcodes.end(); ++it)
-                                    warning_message += "-" + *it + "\n";
-                                warning_message += "\n";
-                                //show_info(q, _L("The 3mf has following customized filament or printer presets:") + warning_message + _L("Please confirm that the G-codes within these presets are safe to prevent any damage to the machine!"), _L("Customized Preset"));
-                                MessageDialog dlg(q, _L("The 3mf has following customized filament or printer presets:") + from_u8(warning_message)+ _L("Please confirm that the G-codes within these presets are safe to prevent any damage to the machine!"), _L("Customized Preset"));
-                                dlg.show_dsa_button();
-                                auto  res = dlg.ShowModal();
-                                if (dlg.get_checkbox_state())
-                                    wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
-                            }
+                            // A project-local preset need not exist in the installed
+                            // preset library. That alone does not establish that its
+                            // G-code changed, so it does not warrant a load-time dialog.
                         }
 
                         //always load config
@@ -11708,10 +11699,10 @@ bool Plater::priv::replace_volume_with_stl(int object_idx, int volume_idx, const
         new_volume->convert_from_imperial_units();
     else if (old_volume->source.is_converted_from_meters)
         new_volume->convert_from_meters();
-    new_volume->supported_facets.assign(old_volume->supported_facets);
-    new_volume->fuzzy_skin_facets.assign(old_volume->fuzzy_skin_facets);
-    new_volume->seam_facets.assign(old_volume->seam_facets);
-    new_volume->mmu_segmentation_facets.assign(old_volume->mmu_segmentation_facets);
+    if (!reproject_paint_between_volumes(*old_volume, *new_volume)) {
+        old_model_object->delete_volume(old_model_object->volumes.size() - 1);
+        return false;
+    }
     std::swap(old_model_object->volumes[volume_idx], old_model_object->volumes.back());
     old_model_object->delete_volume(old_model_object->volumes.size() - 1);
     if (!sinking)
@@ -12126,6 +12117,11 @@ void Plater::priv::reload_from_disk()
                     new_volume->convert_from_imperial_units();
                 else if (old_volume->source.is_converted_from_meters)
                     new_volume->convert_from_meters();
+                if (!reproject_paint_between_volumes(*old_volume, *new_volume)) {
+                    old_model_object->delete_volume(old_model_object->volumes.size() - 1);
+                    fail_list.push_back(from_u8(has_source ? old_volume->source.input_file : old_volume->name));
+                    continue;
+                }
                 std::swap(old_model_object->volumes[vol_idx], old_model_object->volumes.back());
                 old_model_object->delete_volume(old_model_object->volumes.size() - 1);
                 if (!sinking) old_model_object->ensure_on_bed();
@@ -12198,6 +12194,11 @@ void Plater::priv::reload_from_disk()
                     new_volume->convert_from_imperial_units();
                 else if (old_volume->source.is_converted_from_meters)
                     new_volume->convert_from_meters();
+                if (!reproject_paint_between_volumes(*old_volume, *new_volume)) {
+                    old_model_object->delete_volume(old_model_object->volumes.size() - 1);
+                    fail_list.push_back(from_u8(has_source ? old_volume->source.input_file : old_volume->name));
+                    continue;
+                }
                 std::swap(old_model_object->volumes[sel_v.volume_idx], old_model_object->volumes.back());
                 old_model_object->delete_volume(old_model_object->volumes.size() - 1);
                 if (!sinking)

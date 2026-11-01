@@ -285,6 +285,56 @@ static bool fuzzy_skin_allows_overhang_slowdown(const PerimeterGenerator &pg)
     return fs == FuzzySkinType::Disabled_fuzzy || (fs == FuzzySkinType::None && pg.perimeter_regions->empty());
 }
 
+// A clipped perimeter is open, but still has a stack depth for wall sequencing.
+class PartialPerimeterPath final : public ExtrusionMultiPath
+{
+public:
+    PartialPerimeterPath(ExtrusionPaths &&paths_in, ExtrusionLoopRole role) : loop_role(role)
+        { paths = std::move(paths_in); }
+    ExtrusionEntity *clone() const override { return new PartialPerimeterPath(*this); }
+    ExtrusionEntity *clone_move() override { return new PartialPerimeterPath(std::move(*this)); }
+    ExtrusionLoopRole loop_role;
+};
+
+// Preserve existing loop ordering, then represent a partially painted loop as
+// connected open paths. Never close an extra wall across the paint boundary.
+static void append_wall_loop(ExtrusionEntityCollection &out, ExtrusionLoop *loop, int depth,
+                             const WallPainting::BoundaryPolicy *policy)
+{
+    if (!policy) { out.entities.push_back(loop); return; }
+    ExtrusionPaths kept;
+    bool complete = true;
+    for (const ExtrusionPath &path : loop->paths) {
+        ExtrusionPath current(path);
+        current.polyline.points.clear();
+        auto flush = [&] {
+            if (current.polyline.points.size() > 1) kept.push_back(current);
+            current.polyline.points.clear();
+        };
+        for (size_t i=1; i<path.polyline.points.size(); ++i) {
+            for (const auto &span : policy->split(Line(path.polyline.points[i-1], path.polyline.points[i]))) {
+                if (depth >= span.second) { complete=false; flush(); continue; }
+                if (!current.polyline.points.empty() && current.polyline.points.back()!=span.first.a) flush();
+                if (current.polyline.points.empty()) current.polyline.points.push_back(span.first.a);
+                current.polyline.points.push_back(span.first.b);
+            }
+        }
+        flush();
+    }
+    if (complete) { out.entities.push_back(loop); return; }
+    const ExtrusionLoopRole loop_role = loop->loop_role();
+    delete loop;
+    ExtrusionPaths connected;
+    for (auto &path : kept) {
+        if (!connected.empty() && connected.back().last_point()!=path.first_point()) {
+            out.entities.push_back(new PartialPerimeterPath(std::move(connected), loop_role));
+            connected.clear();
+        }
+        connected.push_back(std::move(path));
+    }
+    if (!connected.empty()) out.entities.push_back(new PartialPerimeterPath(std::move(connected), loop_role));
+}
+
 static ExtrusionEntityCollection traverse_loops(const PerimeterGenerator &perimeter_generator, const PerimeterGeneratorLoops &loops, ThickPolylines &thin_walls)
 {
     // loops is an arrayref of ::Loop objects
@@ -462,6 +512,30 @@ static ExtrusionEntityCollection traverse_loops(const PerimeterGenerator &perime
                 corner_far = bbox.max;
             zero_point = corner_far;
         }
+        if (perimeter_generator.active_wall_policy) {
+            ThickPolylines limited;
+            for (const auto &thin : thin_walls) {
+                ThickPolyline current;
+                auto flush = [&] { if (current.points.size()>1) limited.push_back(std::move(current)); current=ThickPolyline(); };
+                for (size_t i=1; i<thin.points.size(); ++i) {
+                    const Line original(thin.points[i-1],thin.points[i]);
+                    const Vec2d delta=(original.b-original.a).cast<double>();
+                    const double len2=delta.squaredNorm();
+                    if (len2==0.) continue;
+                    for (const auto &span : perimeter_generator.active_wall_policy->split(original)) {
+                        if (span.second==0) { flush(); continue; }
+                        if (!current.points.empty() && current.points.back()!=span.first.a) flush();
+                        if (current.points.empty()) current.points.push_back(span.first.a);
+                        current.points.push_back(span.first.b);
+                        const double wa=thin.width[2*(i-1)], wb=thin.width[2*(i-1)+1];
+                        for (const Point &point : {span.first.a,span.first.b})
+                            current.width.push_back(wa+(wb-wa)*(point-original.a).cast<double>().dot(delta)/len2);
+                    }
+                }
+                flush();
+            }
+            thin_walls=std::move(limited);
+        }
         variable_width(thin_walls, erExternalPerimeter, perimeter_generator.ext_perimeter_flow, coll.entities);
         thin_walls.clear();
     }
@@ -488,10 +562,10 @@ static ExtrusionEntityCollection traverse_loops(const PerimeterGenerator &perime
             if (loop.is_contour) {
                 eloop->make_counter_clockwise();
                 out.append(std::move(children.entities));
-                out.entities.emplace_back(eloop);
+                append_wall_loop(out, eloop, loop.depth, perimeter_generator.active_wall_policy);
             } else {
                 eloop->make_clockwise();
-                out.entities.emplace_back(eloop);
+                append_wall_loop(out, eloop, loop.depth, perimeter_generator.active_wall_policy);
                 out.append(std::move(children.entities));
             }
         }
@@ -911,14 +985,33 @@ void PerimeterGenerator::process_classic()
     std::vector<size_t> surface_order = chain_expolygons(surface_exp);
     for (size_t order_idx = 0; order_idx < surface_order.size(); order_idx++) {
         const Surface &surface = all_surfaces[surface_order[order_idx]];
+        WallPainting::BoundaryPolicy wall_policy;
+        if (wall_painting && !wall_painting->empty()) {
+            const double tolerance = scaled<double>(0.03 + std::max(std::abs(object_config->xy_contour_compensation.value),
+                                                                     std::abs(object_config->xy_hole_compensation.value)) +
+                ((layer_id == 0 && object_config->raft_layers.value == 0) ?
+                    std::abs(object_config->elefant_foot_compensation.value) : 0.));
+            std::vector<WallPainting::CountRegion> count_regions;
+            for (const auto &region : *perimeter_regions)
+                if (region.region->config().painted_wall_loops != config->painted_wall_loops)
+                    count_regions.push_back({region.expolygons,region.region->config().painted_wall_loops.value});
+            wall_policy = WallPainting::BoundaryPolicy::bind(to_polygons(surface.expolygon), *wall_painting,
+                config->wall_loops.value, config->painted_wall_loops.value, tolerance, count_regions);
+        }
+        const int base_wall_loops = wall_policy.empty() ? config->wall_loops.value : wall_policy.maximum();
         // detect how many perimeters must be generated for this island
-        int        loop_number = this->config->wall_loops + surface.extra_perimeters - 1;  // 0-indexed loops
+        int        loop_number = base_wall_loops + surface.extra_perimeters - 1;  // 0-indexed loops
         if (this->config->alternate_extra_wall && this->layer_id % 2 == 1 && !m_spiral_vase)
             loop_number++;
         //BBS: set the topmost and bottom most layer to be one wall
         if (loop_number > 0 && ((this->object_config->top_one_wall_type != TopOneWallType::None && this->upper_slices == nullptr) || (this->object_config->only_one_wall_first_layer && layer_id == 0)))
             loop_number = 0;
 
+        const int extra_walls = surface.extra_perimeters + (config->alternate_extra_wall && layer_id % 2 == 1 && !m_spiral_vase ? 1 : 0);
+        const bool force_one_wall = (object_config->top_one_wall_type != TopOneWallType::None && upper_slices == nullptr) ||
+                                   (object_config->only_one_wall_first_layer && layer_id == 0);
+        wall_policy = wall_policy.adjusted(extra_walls, 0, force_one_wall);
+        active_wall_policy = !wall_policy.empty() && !wall_policy.uniform_count() ? &wall_policy : nullptr;
         bool counter_circle_compensation = surface.counter_circle_compensation;
         std::vector<Point> compensation_holes_centers;
         for (int i : surface.holes_circle_compensation) {
@@ -939,6 +1032,7 @@ void PerimeterGenerator::process_classic()
         ExPolygons last        = union_ex(surface.expolygon.simplify_p(surface_simplify_resolution));
         if (last.size() != 1)
             counter_circle_compensation = false;
+        Polygons painted_wall_coverage;
         ExPolygons gaps;
         ExPolygons top_fills;
         ExPolygons fill_clip;
@@ -1112,10 +1206,10 @@ void PerimeterGenerator::process_classic()
                 if (i == 0 && i != loop_number && this->object_config->top_one_wall_type == TopOneWallType::Alltop && this->upper_slices != NULL) {
                     //split the polygons with top/not_top
                     //get the offset from solid surface anchor
-                    coord_t offset_top_surface = scale_(1.5 * (config->wall_loops.value == 0 ? 0. : unscaled(double(ext_perimeter_width + perimeter_spacing * int(int(config->wall_loops.value) - int(1))))));
+                    coord_t offset_top_surface = scale_(1.5 * (base_wall_loops == 0 ? 0. : unscaled(double(ext_perimeter_width + perimeter_spacing * int(int(base_wall_loops) - int(1))))));
                     // if possible, try to not push the extra perimeters inside the sparse infill
-                    if (offset_top_surface > 0.9 * (config->wall_loops.value <= 1 ? 0. : (perimeter_spacing * (config->wall_loops.value - 1))))
-                        offset_top_surface -= coord_t(0.9 * (config->wall_loops.value <= 1 ? 0. : (perimeter_spacing * (config->wall_loops.value - 1))));
+                    if (offset_top_surface > 0.9 * (base_wall_loops <= 1 ? 0. : (perimeter_spacing * (base_wall_loops - 1))))
+                        offset_top_surface -= coord_t(0.9 * (base_wall_loops <= 1 ? 0. : (perimeter_spacing * (base_wall_loops - 1))));
                     else
                         offset_top_surface = 0;
                     //don't takes into account too thin areas
@@ -1257,8 +1351,12 @@ void PerimeterGenerator::process_classic()
                     ExtrusionEntitiesPtr      entities_reorder;
                     ExtrusionEntitiesPtr entities_second_wall;
                     for (int entity_idx = 0; entity_idx < entities.entities.size(); ++entity_idx) {
-                        ExtrusionLoop *eloop = static_cast<ExtrusionLoop *>(entities.entities[entity_idx]);
-                        if (eloop->loop_role() & elrSecondPerimeter) {
+                        const auto *entity = entities.entities[entity_idx];
+                        const auto *partial = dynamic_cast<const PartialPerimeterPath *>(entity);
+                        const ExtrusionLoopRole role = entity->is_loop() ?
+                            static_cast<const ExtrusionLoop *>(entity)->loop_role() :
+                            (partial ? partial->loop_role : elrDefault);
+                        if (role & elrSecondPerimeter) {
                             entities_second_wall.push_back(entities.entities[entity_idx]);
                         } else {
                             entities_reorder.push_back(entities.entities[entity_idx]);
@@ -1268,7 +1366,9 @@ void PerimeterGenerator::process_classic()
                             }
                         }
                     }
-                    entities.entities = std::move( entities_reorder);
+                    // A zero-count patch can remove the associated exterior span.
+                    entities_reorder.insert(entities_reorder.end(), entities_second_wall.begin(), entities_second_wall.end());
+                    entities.entities = std::move(entities_reorder);
                 }
 
             //BBS: add node for loops
@@ -1312,10 +1412,20 @@ void PerimeterGenerator::process_classic()
             }
 
 
+            if (active_wall_policy)
+                painted_wall_coverage = entities.polygons_covered_by_spacing(0.f);
+
             // append perimeters for this slice as a collection
             if (! entities.empty())
                 this->loops->append(entities);
         } // for each loop of an island
+
+        if (active_wall_policy) {
+            // The old uniform final offset removes too much infill behind a
+            // one-wall span. Rebuild the free space from the emitted walls.
+            last = diff_ex(surface.expolygon, union_(painted_wall_coverage));
+            gaps = intersection_ex(gaps, last);
+        }
 
         // fill gaps
         if (! gaps.empty()) {
@@ -1380,10 +1490,11 @@ void PerimeterGenerator::process_classic()
                 ext_perimeter_spacing / 2 :
                 // two or more loops?
                 perimeter_spacing / 2;
+        if (active_wall_policy) inset = 0; // last is already the wall footprint boundary.
         // only apply infill overlap if we actually have one perimeter
         coord_t infill_peri_overlap = 0;
-        if (inset > 0) {
-            infill_peri_overlap = coord_t(scale_(this->config->infill_wall_overlap.get_abs_value(unscale<double>(inset + solid_infill_spacing / 2))));
+        if (inset > 0 || (active_wall_policy && !painted_wall_coverage.empty())) {
+            infill_peri_overlap = coord_t(scale_(this->config->infill_wall_overlap.get_abs_value(unscale<double>((active_wall_policy ? perimeter_spacing / 2 : inset) + solid_infill_spacing / 2))));
             inset -= infill_peri_overlap;
         }
         // simplify infill contours according to resolution
@@ -1404,6 +1515,10 @@ void PerimeterGenerator::process_classic()
         if (!top_fills.empty()) {
             infill_exp = union_ex(infill_exp, offset_ex(top_infill_exp, double(infill_peri_overlap)));
         }
+        // At zero-wall spans the free area reaches the model boundary. Overlap
+        // may enter existing walls, but must not grow beyond printable material.
+        if (active_wall_policy)
+            infill_exp = intersection_ex(infill_exp, ExPolygons{surface.expolygon});
         this->fill_surfaces->append(infill_exp, stInternal);
 
         // BBS: get the no-overlap infill expolygons
@@ -1433,7 +1548,8 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
                                                          coord_t            perimeter_spacing,
                                                          coord_t            min_perimeter_infill_spacing,
                                                          coord_t            spacing,
-                                                         bool               is_inner_part)
+                                                         bool               is_inner_part,
+                                                         const ExPolygon   *material)
 {
     if( offset_ex(infill_contour, -float(spacing / 2.)).empty() )
     {
@@ -1454,7 +1570,10 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
     for (ExPolygon &ex : infill_contour)
         ex.simplify_p(m_scaled_resolution, &inner_pp);
 
-    this->fill_surfaces->append(offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.), float(insert + min_perimeter_infill_spacing / 2.)), stInternal);
+    ExPolygons fill = offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.), float(insert + min_perimeter_infill_spacing / 2.));
+    if (material != nullptr)
+        fill = intersection_ex(fill, ExPolygons{*material});
+    this->fill_surfaces->append(fill, stInternal);
 
     append(*this->fill_no_overlap, offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.), float(+min_perimeter_infill_spacing / 2.)));
 }
@@ -1499,11 +1618,30 @@ void PerimeterGenerator::process_arachne()
 
 	bool apply_precise_outer_wall = config->precise_outer_wall && config->wall_sequence == WallSequence::InnerOuter;
     for (const Surface& surface : all_surfaces) {
+        WallPainting::BoundaryPolicy wall_policy;
+        if (wall_painting && !wall_painting->empty()) {
+            const double tolerance = scaled<double>(0.03 + std::max(std::abs(object_config->xy_contour_compensation.value),
+                                                                     std::abs(object_config->xy_hole_compensation.value)) +
+                ((layer_id == 0 && object_config->raft_layers.value == 0) ?
+                    std::abs(object_config->elefant_foot_compensation.value) : 0.));
+            std::vector<WallPainting::CountRegion> count_regions;
+            for (const auto &region : *perimeter_regions)
+                if (region.region->config().painted_wall_loops != config->painted_wall_loops)
+                    count_regions.push_back({region.expolygons,region.region->config().painted_wall_loops.value});
+            wall_policy = WallPainting::BoundaryPolicy::bind(to_polygons(surface.expolygon), *wall_painting,
+                config->wall_loops.value, config->painted_wall_loops.value, tolerance, count_regions);
+        }
+        const int base_wall_loops = wall_policy.empty() ? config->wall_loops.value : wall_policy.maximum();
         // detect how many perimeters must be generated for this island
-        int loop_number = this->config->wall_loops + surface.extra_perimeters - 1; // 0-indexed loops
+        int loop_number = base_wall_loops + surface.extra_perimeters - 1; // 0-indexed loops
         if (this->config->alternate_extra_wall && this->layer_id % 2 == 1 && !m_spiral_vase)
             loop_number++;
 
+        const int extra_walls = surface.extra_perimeters + (config->alternate_extra_wall && layer_id % 2 == 1 && !m_spiral_vase ? 1 : 0);
+        const bool force_one_wall = (object_config->top_one_wall_type != TopOneWallType::None && upper_slices == nullptr) ||
+                                   (object_config->only_one_wall_first_layer && layer_id == 0);
+        wall_policy = wall_policy.adjusted(extra_walls, 0, force_one_wall);
+        active_wall_policy = !wall_policy.empty() && !wall_policy.uniform_count() ? &wall_policy : nullptr;
         bool apply_circle_compensation = true;
         // Orca: properly adjust offset for the outer wall if precise_outer_wall is enabled.
         ExPolygons last  = offset_ex(surface.expolygon.simplify_p(surface_simplify_resolution),
@@ -1559,9 +1697,11 @@ void PerimeterGenerator::process_arachne()
             if (apply_precise_outer_wall)
                 wall_0_inset = -coord_t(ext_perimeter_width / 2 - ext_perimeter_spacing / 2);
 
+            const auto first_wall_policy = wall_policy.adjusted(0, 0, true);
+            const auto remaining_wall_policy = wall_policy.adjusted(0, 1);
             // do detail check whether to enable one wall
             if (seperate_wall_generation) {
-                Arachne::WallToolPaths one_wall_paths(last_p, ext_perimeter_spacing, perimeter_spacing, 1, wall_0_inset, layer_height, input_params);
+                Arachne::WallToolPaths one_wall_paths(last_p, ext_perimeter_spacing, perimeter_spacing, 1, wall_0_inset, layer_height, input_params, active_wall_policy ? &first_wall_policy : nullptr);
                 if (apply_circle_compensation)
                     one_wall_paths.EnableHoleCompensation(true, circle_poly_indices);
 
@@ -1595,7 +1735,7 @@ void PerimeterGenerator::process_arachne()
                 if (loop_number > 0) {
                     last = diff_ex(infill_contour_by_one_wall, top_expolys_by_one_wall);
                     last_p = to_polygons(last); // disable contour compensation in remaining walls
-                    Arachne::WallToolPaths paths_new(last_p, perimeter_spacing, perimeter_spacing, loop_number, wall_0_inset, layer_height, input_params);
+                    Arachne::WallToolPaths paths_new(last_p, perimeter_spacing, perimeter_spacing, loop_number, wall_0_inset, layer_height, input_params, active_wall_policy ? &remaining_wall_policy : nullptr);
                     auto new_perimeters = paths_new.getToolPaths();
                     for (auto& perimeters : new_perimeters) {
                         if (!perimeters.empty()) {
@@ -1612,7 +1752,7 @@ void PerimeterGenerator::process_arachne()
             else {
                 if (is_one_wall) {
                     // plan wall width as one wall
-                    Arachne::WallToolPaths one_wall_paths(last_p, ext_perimeter_spacing, perimeter_spacing, 1, wall_0_inset, layer_height, input_params);
+                    Arachne::WallToolPaths one_wall_paths(last_p, ext_perimeter_spacing, perimeter_spacing, 1, wall_0_inset, layer_height, input_params, active_wall_policy ? &first_wall_policy : nullptr);
                     if (apply_circle_compensation)
                         one_wall_paths.EnableHoleCompensation(true, circle_poly_indices);
                     total_perimeters = one_wall_paths.getToolPaths();
@@ -1620,7 +1760,7 @@ void PerimeterGenerator::process_arachne()
                 }
                 else {
                     // plan wall width as noraml
-                    Arachne::WallToolPaths normal_paths(last_p, ext_perimeter_spacing, perimeter_spacing, loop_number + 1, wall_0_inset, layer_height, input_params);
+                    Arachne::WallToolPaths normal_paths(last_p, ext_perimeter_spacing, perimeter_spacing, loop_number + 1, wall_0_inset, layer_height, input_params, active_wall_policy);
                     if (apply_circle_compensation)
                         normal_paths.EnableHoleCompensation(true, circle_poly_indices);
                     total_perimeters = normal_paths.getToolPaths();
@@ -1795,7 +1935,8 @@ void PerimeterGenerator::process_arachne()
         // collapse too narrow infill areas
         const auto    min_perimeter_infill_spacing = coord_t(solid_infill_spacing * (1. - INSET_OVERLAP_TOLERANCE));
         // append infill areas to fill_surfaces
-        add_infill_contour_for_arachne(infill_contour, loop_number, ext_perimeter_spacing, perimeter_spacing, min_perimeter_infill_spacing, spacing, false);
+        add_infill_contour_for_arachne(infill_contour, loop_number, ext_perimeter_spacing, perimeter_spacing, min_perimeter_infill_spacing, spacing, false,
+            active_wall_policy ? &surface.expolygon : nullptr);
 
     }
 }
@@ -1870,6 +2011,7 @@ PerimeterRegion::PerimeterRegion(const LayerRegion &layer_region) : region(&laye
 bool PerimeterRegion::has_compatible_perimeter_regions(const PrintRegionConfig &config, const PrintRegionConfig &other_config)
 {
     return config.fuzzy_skin == other_config.fuzzy_skin && config.fuzzy_skin_thickness == other_config.fuzzy_skin_thickness
+           && config.painted_wall_loops == other_config.painted_wall_loops
            && config.fuzzy_skin_point_distance == other_config.fuzzy_skin_point_distance
            && config.fuzzy_skin_first_layer == other_config.fuzzy_skin_first_layer
            && config.fuzzy_skin_noise_type == other_config.fuzzy_skin_noise_type

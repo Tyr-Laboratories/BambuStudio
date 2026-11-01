@@ -75,6 +75,9 @@ set(lisbslic3r_sources
     CutUtils.hpp
     PaintReproject.cpp
     PaintReproject.hpp
+    WallPainting.hpp
+    WallPainting.cpp
+    WallPaintingSlice.cpp
     EdgeGrid.cpp
     EdgeGrid.hpp
     ElephantFootCompensation.cpp

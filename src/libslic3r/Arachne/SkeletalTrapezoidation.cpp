@@ -375,13 +375,14 @@ SkeletalTrapezoidation::SkeletalTrapezoidation(const Polygons& polys, const Bead
                                                double transitioning_angle, coord_t discretization_step_size,
                                                coord_t transition_filter_dist, coord_t allowed_filter_deviation,
                                                coord_t beading_propagation_transition_dist, bool enable_hole_compensation,
-                                               const std::vector<int>& hole_indices
+                                               const std::vector<int>& hole_indices, const WallPainting::BoundaryPolicy *wall_policy
     ): transitioning_angle(transitioning_angle),
     discretization_step_size(discretization_step_size),
     transition_filter_dist(transition_filter_dist),
     allowed_filter_deviation(allowed_filter_deviation),
     beading_propagation_transition_dist(beading_propagation_transition_dist),
     beading_strategy(beading_strategy),
+    wall_policy(wall_policy),
     enable_hole_compensation(enable_hole_compensation),
     hole_indices(hole_indices)
 {
@@ -699,13 +700,61 @@ void SkeletalTrapezoidation::filterOuterCentral()
     }
 }
 
+coord_t SkeletalTrapezoidation::boundaryBeadCount(node_t *node, coord_t thickness) const
+{
+    const coord_t optimal = beading_strategy.getOptimalBeadCount(thickness);
+    if (!wall_policy || optimal <= 0 || !node->incident_edge) return optimal;
+
+    // A shared width fit needs the combined budget of its boundary sides, not
+    // twice the larger side's budget. Keep side ownership in the boundary policy;
+    // this scalar only controls fitting/transitioning of their shared cross-section.
+    std::vector<std::pair<Line, int>> sources;
+    const edge_t *edge = node->incident_edge;
+    do {
+        const edge_t *first = edge, *last = edge;
+        while (first->prev) first = first->prev;
+        while (last->next) last = last->next;
+        const Line source(first->from->p, last->to->p);
+        const Vec2d direction = (source.b-source.a).cast<double>();
+        if (direction.squaredNorm() > 0.) {
+            auto known = std::find_if(sources.begin(), sources.end(), [&](const std::pair<Line, int> &entry) {
+                const Vec2d other = (entry.first.b-entry.first.a).cast<double>();
+                const Vec2d offset = (source.a-entry.first.a).cast<double>();
+                // Graph ribs subdivide one input edge into multiple domains.
+                // They still belong to one boundary side of this width fit.
+                return std::abs(direction.x()*other.y()-direction.y()*other.x()) <=
+                           1.e-8*direction.norm()*other.norm() &&
+                       std::abs(offset.x()*other.y()-offset.y()*other.x()) <= SCALED_EPSILON*other.norm();
+            });
+            int count = 0;
+            // Keep enough candidates for short painted patches even if no
+            // Voronoi node projects onto the patch itself.
+            for (const auto &span : wall_policy->split(source)) count = std::max(count, span.second);
+            if (known == sources.end()) sources.emplace_back(source, count);
+            else known->second = std::max(known->second, count);
+        }
+        edge = edge->twin->next;
+    } while (edge && edge != node->incident_edge);
+    if (sources.size() < 2) return optimal;
+    std::sort(sources.begin(), sources.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+    const coord_t budget = sources[0].second + sources[1].second;
+    // Match the native limiting strategy's final-bead width allowance. Wider
+    // sections retain their ordinary beading and an infill gap, rather than
+    // stretching a small wall budget over the whole section.
+    if (budget > 0 && budget < optimal &&
+        thickness < beading_strategy.getOptimalThickness(budget) +
+                    beading_strategy.getOptimalThickness(1) - scaled<coord_t>(0.01))
+        return budget;
+    return optimal;
+}
+
 void SkeletalTrapezoidation::updateBeadCount()
 {
     for (edge_t& edge : graph.edges)
     {
         if (edge.data.isCentral())
         {
-            edge.to->data.bead_count = beading_strategy.getOptimalBeadCount(edge.to->data.distance_to_boundary * 2);
+            edge.to->data.bead_count = boundaryBeadCount(edge.to, edge.to->data.distance_to_boundary * 2);
         }
     }
 
@@ -724,7 +773,7 @@ void SkeletalTrapezoidation::updateBeadCount()
                     node.data.distance_to_boundary = std::min(node.data.distance_to_boundary, edge->to->data.distance_to_boundary + coord_t((edge->from->p - edge->to->p).cast<int64_t>().norm()));
                 } while (edge = edge->twin->next, edge != node.incident_edge);
             }
-            coord_t bead_count = beading_strategy.getOptimalBeadCount(node.data.distance_to_boundary * 2);
+            coord_t bead_count = boundaryBeadCount(&node, node.data.distance_to_boundary * 2);
             node.data.bead_count = bead_count;
         }
     }
@@ -786,7 +835,7 @@ bool SkeletalTrapezoidation::filterNoncentralRegions(edge_t* to_edge, coord_t be
     {
         next_edge->data.setIsCentral(true);
         next_edge->twin->data.setIsCentral(true);
-        next_edge->to->data.bead_count = beading_strategy.getOptimalBeadCount(next_edge->to->data.distance_to_boundary * 2);
+        next_edge->to->data.bead_count = boundaryBeadCount(next_edge->to, next_edge->to->data.distance_to_boundary * 2);
         next_edge->to->data.transition_ratio = 0;
     }
     return dissolve; // Dissolving only depend on the one edge going upward. There cannot be multiple edges going upward.
@@ -1881,7 +1930,7 @@ std::shared_ptr<SkeletalTrapezoidationJoint::BeadingPropagation> SkeletalTrapezo
                 BOOST_LOG_TRIVIAL(error) << "Unknown beading for non-central node!";
             }
             assert(dist != std::numeric_limits<coord_t>::max());
-            node->data.bead_count = beading_strategy.getOptimalBeadCount(dist * 2);
+            node->data.bead_count = boundaryBeadCount(node, dist * 2);
         }
         assert(node->data.bead_count != -1);
         node_beadings.emplace_back(new BeadingPropagation(beading_strategy.compute(node->data.distance_to_boundary * 2, node->data.bead_count)));
@@ -2091,7 +2140,106 @@ void SkeletalTrapezoidation::connectJunctions(ptr_vector_t<LineJunctions>& edge_
                 bool to_is_3way = to_is_odd && quad_end->from->isMultiIntersection();
                 passed_odd_edges.emplace(quad_start->next);
 
-                addToolpathSegment(from, to, is_odd_segment, new_domain_start, from_is_3way, to_is_3way);
+                if (!wall_policy) {
+                    addToolpathSegment(from, to, is_odd_segment, new_domain_start, from_is_3way, to_is_3way);
+                } else if (from.w > 0 && to.w > 0) {
+                    // Limit this source side inside the native generator, before
+                    // connecting extrusion lines. The shared width fit remains
+                    // intact, so opposing walls cannot independently overfill.
+                    const Line source(quad_start->from->p, quad_end->to->p);
+                    Point source_from, source_to;
+                    source.distance_to_squared(from.p, &source_from);
+                    source.distance_to_squared(to.p, &source_to);
+                    const Line projected(source_from, source_to);
+                    auto fraction = [](const Line &line, const Point &p) {
+                        const Vec2d d=(line.b-line.a).cast<double>();
+                        return d.squaredNorm()==0. ? 0. : std::clamp((p-line.a).cast<double>().dot(d)/d.squaredNorm(),0.,1.);
+                    };
+                    auto at = [](const Line &line, double t) {
+                        return Point(line.a+((line.b-line.a).cast<double>()*t).cast<coord_t>());
+                    };
+                    std::vector<double> cuts{0.,1.};
+                    auto add_cuts = [&](const Line &line) {
+                        for (const auto &span : wall_policy->split(line)) {
+                            cuts.push_back(fraction(line,span.first.a));
+                            cuts.push_back(fraction(line,span.first.b));
+                        }
+                    };
+                    add_cuts(projected);
+                    Line opposite=projected;
+                    {
+                        // Retain the opposite boundary identity for asymmetric
+                        // stacks as well as for shared central beads.
+                        const edge_t *other=quad_start->next->twin;
+                        const edge_t *first=other, *last=other;
+                        while (first->prev) first=first->prev;
+                        while (last->next) last=last->next;
+                        const Line other_source(first->from->p,last->to->p);
+                        other_source.distance_to_squared(from.p,&opposite.a);
+                        other_source.distance_to_squared(to.p,&opposite.b);
+                        add_cuts(opposite);
+                    }
+                    std::sort(cuts.begin(),cuts.end());
+                    cuts.erase(std::unique(cuts.begin(),cuts.end(),[](double a,double b){return std::abs(a-b)<1.e-9;}),cuts.end());
+                    auto dense_bead_count = [](node_t *node) -> int {
+                        if (!node->data.hasBeading()) return 0;
+                        const auto &widths = node->data.getBeading()->beading.bead_widths;
+                        // Contour-marker beadings have an infill gap and cannot
+                        // be borrowed across that gap by the opposite stack.
+                        return std::all_of(widths.begin(), widths.end(), [](coord_t w) { return w > 0; }) ? int(widths.size()) : 0;
+                    };
+                    const int count_from = dense_bead_count(quad_start->to);
+                    const int count_to = dense_bead_count(quad_end->from);
+                    const int opposite_depth = count_from > 0 && count_from == count_to ?
+                        count_from - 1 - int(from.perimeter_index) : -1;
+                    auto owner = [&](double t) -> std::pair<int, bool> {
+                        const int own = wall_policy->count_at(at(projected,t));
+                        const int other = wall_policy->count_at(at(opposite,t));
+                        if (int(from.perimeter_index) < own) return {int(from.perimeter_index), false};
+                        if (is_odd_segment && int(from.perimeter_index) < other)
+                            return {int(from.perimeter_index), true};
+                        if (opposite_depth >= 0 && opposite_depth < other)
+                            return {opposite_depth, true};
+                        return {-1, false};
+                    };
+                    const double transition_length=std::max<coord_t>(0,beading_strategy.getTransitioningLength(2*from.perimeter_index));
+                    auto transition_distance = [&](double t, int depth, bool other) {
+                        double distance=wall_policy->transition_distance(at(other ? opposite : projected,t),depth,transition_length);
+                        if (is_odd_segment)
+                            distance=std::max(distance,wall_policy->transition_distance(at(other ? projected : opposite,t),depth,transition_length));
+                        return distance;
+                    };
+                    // Use Arachne's configured transition length, entirely on
+                    // the side requesting the additional bead. Preserve the
+                    // breakpoint where the bead reaches its ordinary width.
+                    const double projected_length=projected.length();
+                    if (transition_length>0. && projected_length>0.) {
+                        std::vector<double> transition_cuts=cuts;
+                        for (size_t c=1;c<cuts.size();++c) {
+                            const auto [depth, other] = owner((cuts[c-1]+cuts[c])/2.);
+                            if (depth < 0) continue;
+                            const double left=cuts[c-1]+(transition_length-transition_distance(cuts[c-1],depth,other))/projected_length;
+                            const double right=cuts[c]-(transition_length-transition_distance(cuts[c],depth,other))/projected_length;
+                            if (left>cuts[c-1] && left<cuts[c]) transition_cuts.push_back(left);
+                            if (right>cuts[c-1] && right<cuts[c]) transition_cuts.push_back(right);
+                        }
+                        std::sort(transition_cuts.begin(),transition_cuts.end());
+                        transition_cuts.erase(std::unique(transition_cuts.begin(),transition_cuts.end()),transition_cuts.end());
+                        cuts=std::move(transition_cuts);
+                    }
+                    auto junction = [&](double t, int depth, bool other) {
+                        const double factor=transition_length>0. ? transition_distance(t,depth,other)/transition_length : 1.;
+                        return ExtrusionJunction(at(Line(from.p,to.p),t),
+                            std::max(coord_t(SCALED_EPSILON),coord_t((from.w+(to.w-from.w)*t)*factor)),
+                            size_t(depth),from.hole_compensation_flag);
+                    };
+                    for (size_t c=1;c<cuts.size();++c) {
+                        const auto [depth, other] = owner((cuts[c-1]+cuts[c])/2.);
+                        if (depth < 0) continue;
+                        addToolpathSegment(junction(cuts[c-1],depth,other),junction(cuts[c],depth,other),is_odd_segment,
+                                           new_domain_start || cuts[c-1]>0.,from_is_3way && cuts[c-1]==0.,to_is_3way && cuts[c]==1.);
+                    }
+                }
             }
             new_domain_start = false;
         }
@@ -2113,6 +2261,7 @@ void SkeletalTrapezoidation::generateLocalMaximaSingleBeads()
         if (beading.bead_widths.size() % 2 == 1 && node.isLocalMaximum(true) && !node.isCentral())
         {
             const size_t inset_index = beading.bead_widths.size() / 2;
+            if (wall_policy && int(inset_index) >= wall_policy->count_at(node.p)) continue;
             constexpr bool is_odd = true;
             if (inset_index >= generated_toolpaths.size())
             {

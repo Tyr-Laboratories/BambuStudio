@@ -3367,6 +3367,7 @@ void ObjectList::merge(bool to_multipart_object)
                 new_volume->supported_facets.assign(std::move(volume->supported_facets));
                 new_volume->seam_facets.assign(std::move(volume->seam_facets));
                 new_volume->fuzzy_skin_facets.assign(std::move(volume->fuzzy_skin_facets));
+                new_volume->wall_painting_facets.assign(std::move(volume->wall_painting_facets));
             }
             new_object->sort_volumes(true);
 
@@ -6554,7 +6555,7 @@ void ObjectList::fix_through_netfabb()
     } else if (const ModelObject *o = object(obj_idxs.front())) {
         for (int vol_idx : vol_idxs) {
             const ModelVolume *v = o->volumes[vol_idx];
-            if (v && (v->is_mm_painted() || v->is_fuzzy_skin_facets_painted() ||
+            if (v && (v->is_mm_painted() || v->is_fuzzy_skin_facets_painted() || v->is_wall_painting_facets_painted() ||
                       v->is_fdm_support_painted() || v->is_seam_painted())) {
                 has_paint = true;
                 break;

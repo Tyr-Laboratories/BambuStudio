@@ -2,6 +2,7 @@
 #define slic3r_Print_hpp_
 
 #include "PrintBase.hpp"
+#include "WallPainting.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/FillLightning.hpp"
 
@@ -424,6 +425,7 @@ public:
     PrintInstances& instances() { return m_instances; }
 
     // Whoever will get a non-const pointer to PrintObject will be able to modify its layers.
+    const WallPainting::LayerPaint &wall_painting(size_t index) const { return m_wall_painting.at(index); }
     LayerPtrs&                   layers()               { return m_layers; }
     SupportLayerPtrs&            support_layers()       { return m_support_layers; }
 
@@ -669,6 +671,7 @@ private:
 
     SlicingParameters                       m_slicing_params;
     LayerPtrs                               m_layers;
+    std::vector<WallPainting::LayerPaint>      m_wall_painting;
     SupportLayerPtrs                        m_support_layers;
     SupportStageTimes                       m_support_stage_times;
     // BBS

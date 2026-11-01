@@ -4764,6 +4764,14 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->set_default_value(new ConfigOptionInt(2));
 
+    def = this->add("painted_wall_loops", coInt);
+    def->label = L("Painted wall loops");
+    def->category = L("Strength");
+    def->tooltip = L("Total wall count on surfaces marked with Wall Painting. Other wall rules still apply.");
+    def->min = 0;
+    def->max = 1000;
+    def->set_default_value(new ConfigOptionInt(2));
+
     def = this->add("embedding_wall_into_infill", coBool);
     def->label = L("Embedding the wall into the infill");
     def->category = L("Strength");

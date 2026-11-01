@@ -2,6 +2,8 @@
 # add_subirectory(<testcase>)
 
 set(TEST_DATA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/data)
+# Test runners are command-line executables even when the application is a bundle.
+set(CMAKE_MACOSX_BUNDLE OFF)
 file(TO_NATIVE_PATH "${TEST_DATA_DIR}" TEST_DATA_DIR)
 
 add_library(Catch2 INTERFACE)
@@ -26,6 +28,16 @@ if (APPLE)
 endif()
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
+# libslic3r's project loader and logging backend use these utility functions.
+# Link their production implementations into headless slicing tests as well.
+add_library(slicer_test_support STATIC
+    slicer_test_support.cpp
+    ${PROJECT_SOURCE_DIR}/src/slic3r/Utils/Http.cpp
+    ${PROJECT_SOURCE_DIR}/src/slic3r/Utils/BBLUtil.cpp
+)
+target_link_libraries(slicer_test_support PUBLIC libslic3r libcurl OpenSSL::SSL OpenSSL::Crypto)
+set_property(TARGET slicer_test_support PROPERTY FOLDER "tests")
 
 add_subdirectory(libnest2d)
 add_subdirectory(libslic3r)

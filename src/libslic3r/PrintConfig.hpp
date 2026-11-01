@@ -1165,6 +1165,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatsNullable, inner_wall_speed))
     // Total number of perimeters.
     ((ConfigOptionInt, wall_loops))
+    ((ConfigOptionInt, painted_wall_loops))
     // Modifier-only: apply this modifier for m layers, then skip it for n layers.
     ((ConfigOptionBool, periodic_modifier))
     ((ConfigOptionInt, periodic_modifier_skip_layers))

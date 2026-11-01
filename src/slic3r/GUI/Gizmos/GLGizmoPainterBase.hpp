@@ -23,6 +23,7 @@ struct Camera;
 enum class PainterGizmoType {
     FDM_SUPPORTS,
     FUZZY_SKIN,
+    WALL_PAINTING,
     SEAM,
     MMU_SEGMENTATION
 };

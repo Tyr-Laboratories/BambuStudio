@@ -8,6 +8,7 @@
 #include "BoundingBox.hpp"
 #include "SVG.hpp"
 #include "RegionExpansion.hpp"
+#include "AABBTreeLines.hpp"
 
 #include <string>
 #include <map>
@@ -172,6 +173,8 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const Perimet
     g.overhang_flow         = this->bridging_flow(frPerimeter, object_config.thick_bridges);
     g.solid_infill_flow     = this->flow(frSolidInfill);
     g.perimeter_regions     = &perimeter_regions;
+    if (!print_config.spiral_mode)
+        g.wall_painting = &this->layer()->object()->wall_painting(this->layer()->id() - this->layer()->object()->layers().front()->id());
 
     if (this->layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne && !spiral_mode)
         g.process_arachne();
@@ -536,6 +539,31 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
         // TODO: Maybe there is better solution when printing with zero perimeters, but this works reasonably well, given the situation
         shell_width   = float(SCALED_EPSILON);
         expansion_min = float(SCALED_EPSILON);;
+    }
+
+    const auto *object=this->layer()->object();
+    if (!object->print()->config().spiral_mode && object->model_object()->is_wall_painting_painted()) {
+        const auto &paint=object->wall_painting(this->layer()->id()-object->layers().front()->id());
+        if (std::any_of(paint.begin(),paint.end(),[](const auto &line){return line.painted;})) {
+            // This is a conservative expansion radius for solid surfaces, not
+            // an infill boundary. Derive it from the walls actually emitted;
+            // the generated fill surfaces still provide the local clipping.
+            Lines borders;
+            for (const auto *region:this->layer()->regions()) {
+                auto region_borders=to_lines(to_polygons(region->slices.surfaces));
+                borders.insert(borders.end(),region_borders.begin(),region_borders.end());
+            }
+            AABBTreeLines::LinesDistancer<Line> distance(borders);
+            shell_width=float(SCALED_EPSILON);
+            expansion_min=float(SCALED_EPSILON);
+            const auto paths=perimeters.flatten();
+            for (const auto *path:paths.entities) {
+                const float spacing=this->flow(frPerimeter).scaled_spacing();
+                expansion_min=spacing;
+                for (const Point &p:path->as_polyline().points)
+                    shell_width=std::max(shell_width,float(distance.distance_from_lines<false>(p))+spacing);
+            }
+        }
     }
 
     // Scaled expansions of the respective external surfaces.

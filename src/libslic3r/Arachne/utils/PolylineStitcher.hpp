@@ -50,7 +50,8 @@ public:
      * \param snap_distance Points closer than this distance are considered to
      * be the same point.
      */
-    static void stitch(const Paths& lines, Paths& result_lines, Paths& result_polygons, coord_t max_stitch_distance = scaled<coord_t>(0.1), coord_t snap_distance = scaled<coord_t>(0.01))
+    static void stitch(const Paths& lines, Paths& result_lines, Paths& result_polygons, coord_t max_stitch_distance = scaled<coord_t>(0.1), coord_t snap_distance = scaled<coord_t>(0.01),
+                       const std::function<bool(const Point &, const Point &)> &allow_connection = {})
     {
         if (lines.empty())
             return;
@@ -95,7 +96,7 @@ public:
                     coord_t closest_distance = std::numeric_limits<coord_t>::max();
                     grid.processNearby(from, max_stitch_distance,
                                        std::function<bool (const PathsPointIndex<Paths>&)> (
-                                           [from, &chain, &closest, &closest_is_closing_polygon, &closest_distance, &processed, &chain_length, go_in_reverse_direction, max_stitch_distance, snap_distance, should_close]
+                                           [from, &chain, &closest, &closest_is_closing_polygon, &closest_distance, &processed, &chain_length, &allow_connection, go_in_reverse_direction, max_stitch_distance, snap_distance, should_close]
                                            (const PathsPointIndex<Paths>& nearby)->bool
                                            {
                                                bool is_closing_segment = false;
@@ -104,6 +105,8 @@ public:
                                                {
                                                    return true; // keep looking
                                                }
+                                               if (allow_connection && !allow_connection(from, nearby.p()))
+                                                   return true;
                                                if ((nearby.p().template cast<int64_t>() - make_point(chain.front()).template cast<int64_t>()).squaredNorm() < snap_distance * snap_distance)
                                                {
                                                    if (chain_length + dist < 3 * max_stitch_distance // prevent closing of small poly, cause it might be able to continue making a larger polyline

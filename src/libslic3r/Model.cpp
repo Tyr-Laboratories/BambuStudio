@@ -1548,6 +1548,11 @@ bool ModelObject::is_fuzzy_skin_painted() const
     return std::any_of(this->volumes.cbegin(), this->volumes.cend(), [](const ModelVolume *mv) { return mv->is_fuzzy_skin_facets_painted(); });
 }
 
+bool ModelObject::is_wall_painting_painted() const
+{
+    return std::any_of(this->volumes.cbegin(), this->volumes.cend(), [](const ModelVolume *mv) { return mv->is_wall_painting_facets_painted(); });
+}
+
 void ModelObject::sort_volumes(bool full_sort)
 {
     // sort volumes inside the object to order "Model Part, Negative Volume, Modifier, Support Blocker and Support Enforcer. "
@@ -1982,6 +1987,7 @@ void ModelObject::convert_units(ModelObjectPtrs& new_objects, ConversionType con
 
             vol->supported_facets.assign(volume->supported_facets);
             vol->fuzzy_skin_facets.assign(volume->fuzzy_skin_facets);
+            vol->wall_painting_facets.assign(volume->wall_painting_facets);
             vol->seam_facets.assign(volume->seam_facets);
             vol->mmu_segmentation_facets.assign(volume->mmu_segmentation_facets);
 
@@ -2519,6 +2525,7 @@ ModelObjectPtrs ModelObject::cut(size_t instance, std::array<Vec3d, 4> plane_poi
 
         volume->supported_facets.reset();
         volume->fuzzy_skin_facets.reset();
+        volume->wall_painting_facets.reset();
         volume->seam_facets.reset();
         volume->mmu_segmentation_facets.reset();
 
@@ -2610,6 +2617,7 @@ ModelObjectPtrs ModelObject::segment(size_t instance, unsigned int max_extruders
 
         volume->supported_facets.reset();
         volume->fuzzy_skin_facets.reset();
+        volume->wall_painting_facets.reset();
         volume->seam_facets.reset();
 
         if (!volume->is_model_part()) {
@@ -2801,6 +2809,33 @@ void ModelObject::split(ModelObjectPtrs* new_objects)
 }
 
 
+// Baking a reflection flips each face's vertex order. Serialized subdivision
+// trees depend on that order, so remap all annotation layers before concatenation.
+static PaintKeepPrepared transformed_volume_paint(const ModelVolume &volume,
+                                                  const Transform3d &transform,
+                                                  bool fix_left_handed)
+{
+    PaintKeepPrepared result;
+    result.mesh = volume.mesh();
+    result.mesh.transform(transform, fix_left_handed);
+    if (fix_left_handed && transform.linear().determinant() < 0.) {
+        const Transform3d world = Transform3d::Identity();
+        const bool completed = reproject_paint_geometric(volume.mesh(), volume.supported_facets,
+            volume.seam_facets, volume.mmu_segmentation_facets, volume.fuzzy_skin_facets,
+            volume.wall_painting_facets, result.mesh, transform.inverse(), result.supported,
+            result.seam, result.mmu, result.fuzzy, result.walls, nullptr, nullptr, &world);
+        assert(completed); // No cancellation callback is supplied.
+        (void)completed;
+    } else {
+        result.supported.assign(volume.supported_facets);
+        result.seam.assign(volume.seam_facets);
+        result.mmu.assign(volume.mmu_segmentation_facets);
+        result.fuzzy.assign(volume.fuzzy_skin_facets);
+        result.walls.assign(volume.wall_painting_facets);
+    }
+    return result;
+}
+
 void ModelObject::merge()
 {
     if (this->volumes.size() == 1) {
@@ -2809,16 +2844,30 @@ void ModelObject::merge()
     }
 
     TriangleMesh mesh;
+    std::array<std::vector<std::string>, 5> masks;
 
     for (ModelVolume* volume : volumes)
-        if (!volume->mesh().empty())
-            mesh.merge(volume->mesh());
+        if (!volume->mesh().empty()) {
+            auto part = transformed_volume_paint(*volume, volume->get_matrix(), true);
+            const std::array<const FacetsAnnotation *, 5> annotations{
+                &part.supported, &part.seam, &part.mmu, &part.fuzzy, &part.walls};
+            for (size_t layer = 0; layer < masks.size(); ++layer)
+                for (size_t face = 0; face < part.mesh.its.indices.size(); ++face)
+                    masks[layer].push_back(annotations[layer]->get_triangle_as_string(int(face)));
+            mesh.merge(part.mesh);
+        }
 
     this->clear_volumes();
     ModelVolume* vol = this->add_volume(mesh);
 
     if (!vol)
         return;
+    const std::array<FacetsAnnotation *, 5> annotations{&vol->supported_facets, &vol->seam_facets,
+        &vol->mmu_segmentation_facets, &vol->fuzzy_skin_facets, &vol->wall_painting_facets};
+    for (size_t layer = 0; layer < masks.size(); ++layer)
+        for (size_t face = 0; face < masks[layer].size(); ++face)
+            if (!masks[layer][face].empty())
+                annotations[layer]->set_triangle_from_string(int(face), masks[layer][face]);
 }
 
 ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)
@@ -2844,23 +2893,21 @@ ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)
     // order (only vertex indices are offset), so face f of the merged mesh maps
     // exactly to the captured per-part triangles below. Capture before
     // reset_mesh() empties the source volumes.
-    std::vector<std::string> merged_supported, merged_seam, merged_mmu, merged_fuzzy;
+    std::vector<std::string> merged_supported, merged_seam, merged_mmu, merged_fuzzy, merged_walls;
     for (int i : vol_indeces) {
         auto volume = volumes[i];
         if (!volume->mesh().empty()) {
-            const size_t nf = volume->mesh().its.indices.size();
+            auto part = transformed_volume_paint(*volume, volume->get_matrix(), true);
+            const size_t nf = part.mesh.its.indices.size();
             for (size_t f = 0; f < nf; ++f) {
-                merged_supported.emplace_back(volume->supported_facets.get_triangle_as_string((int)f));
-                merged_seam.emplace_back(volume->seam_facets.get_triangle_as_string((int)f));
-                merged_mmu.emplace_back(volume->mmu_segmentation_facets.get_triangle_as_string((int)f));
-                merged_fuzzy.emplace_back(volume->fuzzy_skin_facets.get_triangle_as_string((int)f));
+                merged_supported.emplace_back(part.supported.get_triangle_as_string((int)f));
+                merged_seam.emplace_back(part.seam.get_triangle_as_string((int)f));
+                merged_mmu.emplace_back(part.mmu.get_triangle_as_string((int)f));
+                merged_fuzzy.emplace_back(part.fuzzy.get_triangle_as_string((int)f));
+                merged_walls.emplace_back(part.walls.get_triangle_as_string((int)f));
             }
-            const auto volume_matrix = volume->get_matrix();
-            TriangleMesh mesh_(volume->mesh());
-            mesh_.transform(volume_matrix, true);
             volume->reset_mesh();
-
-            mesh.merge(mesh_);
+            mesh.merge(part.mesh);
         }
     }
 #else
@@ -2880,6 +2927,7 @@ ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)
         if (!merged_seam[f].empty())      vol->seam_facets.set_triangle_from_string((int)f, merged_seam[f]);
         if (!merged_mmu[f].empty())       vol->mmu_segmentation_facets.set_triangle_from_string((int)f, merged_mmu[f]);
         if (!merged_fuzzy[f].empty())     vol->fuzzy_skin_facets.set_triangle_from_string((int)f, merged_fuzzy[f]);
+        if (!merged_walls[f].empty())     vol->wall_painting_facets.set_triangle_from_string((int)f, merged_walls[f]);
     }
     for (int i = 0; i < volumes.size();i++) {
         if (std::find(vol_indeces.begin(), vol_indeces.end(), i) != vol_indeces.end()) {
@@ -3218,6 +3266,7 @@ void ModelVolume::set_material_id(t_model_material_id material_id)
 void ModelVolume::reset_extra_facets() {
     this->supported_facets.reset();
     this->fuzzy_skin_facets.reset();
+    this->wall_painting_facets.reset();
     this->seam_facets.reset();
     this->mmu_segmentation_facets.reset();
 }
@@ -3229,7 +3278,7 @@ bool ModelVolume::reproject_paint_keep(const TriangleMesh &new_mesh,
                                        const std::function<bool()> &cancel) const
 {
     // Repair rebuilds the triangulation in place: the old and new meshes share the
-    // volume-local frame, so re-project the four painted annotation layers onto the
+    // volume-local frame, so re-project the painted annotation layers onto the
     // new mesh with area-error driven subdivision (nearest source face + nearest 3D
     // point sampling).
     //
@@ -3249,9 +3298,9 @@ bool ModelVolume::reproject_paint_keep(const TriangleMesh &new_mesh,
         this->get_matrix();
     return reproject_paint_geometric(
         old_mesh, this->supported_facets, this->seam_facets,
-        this->mmu_segmentation_facets, this->fuzzy_skin_facets,
+        this->mmu_segmentation_facets, this->fuzzy_skin_facets, this->wall_painting_facets,
         new_mesh, Transform3d::Identity(),
-        out.supported, out.seam, out.mmu, out.fuzzy,
+        out.supported, out.seam, out.mmu, out.fuzzy, out.walls,
         progress, cancel, &dst_world_matrix);
 }
 
@@ -3265,6 +3314,7 @@ void ModelVolume::commit_mesh_keep_paint(PaintKeepPrepared &&prepared)
     this->seam_facets.assign(std::move(prepared.seam));
     this->mmu_segmentation_facets.assign(std::move(prepared.mmu));
     this->fuzzy_skin_facets.assign(std::move(prepared.fuzzy));
+    this->wall_painting_facets.assign(std::move(prepared.walls));
 }
 
 bool ModelVolume::set_mesh_keep_paint(TriangleMesh &&mesh_in,
@@ -3671,17 +3721,19 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
     std::vector<std::string> tris_split_strs;
     // BBS: also carry support/seam/fuzzy-skin painting across the split (the
     // ships[] relationship maps each split face back to its source face).
-    std::vector<std::string> tris_sup_strs, tris_seam_strs, tris_fuzzy_strs;
+    std::vector<std::string> tris_sup_strs, tris_seam_strs, tris_fuzzy_strs, tris_walls_strs;
     auto face_count = m_mesh->its.indices.size();
     tris_split_strs.reserve(face_count);
     tris_sup_strs.reserve(face_count);
     tris_seam_strs.reserve(face_count);
     tris_fuzzy_strs.reserve(face_count);
+    tris_walls_strs.reserve(face_count);
     for (size_t i = 0; i < face_count; i++) {
         tris_split_strs.emplace_back(mmu_segmentation_facets.get_triangle_as_string(i));
         tris_sup_strs.emplace_back(supported_facets.get_triangle_as_string(i));
         tris_seam_strs.emplace_back(seam_facets.get_triangle_as_string(i));
         tris_fuzzy_strs.emplace_back(fuzzy_skin_facets.get_triangle_as_string(i));
+        tris_walls_strs.emplace_back(wall_painting_facets.get_triangle_as_string(i));
     }
     int last_all_mesh_face_count = 0;
     for (TriangleMesh &mesh : meshes) {
@@ -3704,6 +3756,7 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
             this->exterior_facets.reset();
             this->supported_facets.reset();
             this->fuzzy_skin_facets.reset();
+            this->wall_painting_facets.reset();
             this->seam_facets.reset();
             for (size_t i = 0; i < cur_face_count; i++) {
                 if (ships[idx].find(i) != ships[idx].end()) {
@@ -3716,6 +3769,8 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
                         seam_facets.set_triangle_from_string(i, tris_seam_strs[index]);
                     if (tris_fuzzy_strs[index].size() > 0)
                         fuzzy_skin_facets.set_triangle_from_string(i, tris_fuzzy_strs[index]);
+                    if (tris_walls_strs[index].size() > 0)
+                        wall_painting_facets.set_triangle_from_string(i, tris_walls_strs[index]);
                 }
             }
         } else {
@@ -3732,6 +3787,8 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
                         new_mv->seam_facets.set_triangle_from_string(i, tris_seam_strs[index]);
                     if (tris_fuzzy_strs[index].size() > 0)
                         new_mv->fuzzy_skin_facets.set_triangle_from_string(i, tris_fuzzy_strs[index]);
+                    if (tris_walls_strs[index].size() > 0)
+                        new_mv->wall_painting_facets.set_triangle_from_string(i, tris_walls_strs[index]);
                 }
             }
         }
@@ -3806,6 +3863,7 @@ void ModelVolume::assign_new_unique_ids_recursive()
     config.set_new_unique_id();
     supported_facets.set_new_unique_id();
     fuzzy_skin_facets.set_new_unique_id();
+    wall_painting_facets.set_new_unique_id();
     seam_facets.set_new_unique_id();
     mmu_segmentation_facets.set_new_unique_id();
 }
@@ -3852,9 +3910,8 @@ void ModelVolume::scale_geometry_after_creation(const Vec3f& versor)
 
 void ModelVolume::transform_this_mesh(const Transform3d &mesh_trafo, bool fix_left_handed)
 {
-	TriangleMesh mesh = this->mesh();
-	mesh.transform(mesh_trafo, fix_left_handed);
-	this->set_mesh(std::move(mesh));
+    auto prepared = transformed_volume_paint(*this, mesh_trafo, fix_left_handed);
+    this->commit_mesh_keep_paint(std::move(prepared));
     TriangleMesh convex_hull = this->get_convex_hull();
     convex_hull.transform(mesh_trafo, fix_left_handed);
     m_convex_hull = std::make_shared<TriangleMesh>(std::move(convex_hull));
@@ -3864,14 +3921,9 @@ void ModelVolume::transform_this_mesh(const Transform3d &mesh_trafo, bool fix_le
 
 void ModelVolume::transform_this_mesh(const Matrix3d &matrix, bool fix_left_handed)
 {
-	TriangleMesh mesh = this->mesh();
-	mesh.transform(matrix, fix_left_handed);
-	this->set_mesh(std::move(mesh));
-    TriangleMesh convex_hull = this->get_convex_hull();
-    convex_hull.transform(matrix, fix_left_handed);
-    m_convex_hull = std::make_shared<TriangleMesh>(std::move(convex_hull));
-    // Let the rest of the application know that the geometry changed, so the meshes have to be reloaded.
-    this->set_new_unique_id();
+    Transform3d transform = Transform3d::Identity();
+    transform.linear() = matrix;
+    this->transform_this_mesh(transform, fix_left_handed);
 }
 
 void ModelVolume::convert_from_imperial_units()
@@ -4663,6 +4715,9 @@ void FacetsAnnotation::set_triangle_from_string(int triangle_id, const std::stri
         for (int i=0; i<4; ++i)
             m_data.second.insert(m_data.second.end(), bool(dec & (1 << i)));
     }
+    // Imported / merged annotation payloads must participate in the same
+    // timestamp-based copies and undo invalidation as interactive strokes.
+    this->touch();
 }
 
 bool FacetsAnnotation::equals(const FacetsAnnotation &other) const
@@ -4782,6 +4837,13 @@ bool model_custom_fuzzy_skin_data_changed(const ModelObject &mo, const ModelObje
     return model_property_changed(
         mo, mo_new, [](const ModelVolumeType t) { return t == ModelVolumeType::MODEL_PART; },
         [](const ModelVolume &mv_old, const ModelVolume &mv_new) { return mv_old.fuzzy_skin_facets.timestamp_matches(mv_new.fuzzy_skin_facets); });
+}
+
+bool model_custom_wall_painting_data_changed(const ModelObject &mo, const ModelObject &mo_new)
+{
+    return model_property_changed(
+        mo, mo_new, [](const ModelVolumeType t) { return t == ModelVolumeType::MODEL_PART; },
+        [](const ModelVolume &mv_old, const ModelVolume &mv_new) { return mv_old.wall_painting_facets.timestamp_matches(mv_new.wall_painting_facets); });
 }
 
 bool model_custom_seam_data_changed(const ModelObject& mo, const ModelObject& mo_new)

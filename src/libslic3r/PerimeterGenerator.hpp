@@ -1,5 +1,6 @@
 #ifndef slic3r_PerimeterGenerator_hpp_
 #define slic3r_PerimeterGenerator_hpp_
+#include "WallPainting.hpp"
 
 #include "libslic3r.h"
 #include <vector>
@@ -46,6 +47,8 @@ public:
     const PrintObjectConfig     *object_config;
     const PrintConfig           *print_config;
     const PerimeterRegions      *perimeter_regions;
+    const WallPainting::LayerPaint *wall_painting = nullptr;
+    const WallPainting::BoundaryPolicy *active_wall_policy = nullptr;
     // Outputs:
     ExtrusionEntityCollection   *loops;
     ExtrusionEntityCollection   *gap_fill;
@@ -103,7 +106,7 @@ public:
     // to save memory, directly modify top
     bool        should_enable_top_one_wall(const ExPolygons& original_expolys, ExPolygons& top);
 
-    void        add_infill_contour_for_arachne( ExPolygons infill_contour, int loops, coord_t ext_perimeter_spacing, coord_t perimeter_spacing, coord_t min_perimeter_infill_spacing, coord_t spacing, bool is_inner_part );
+    void        add_infill_contour_for_arachne( ExPolygons infill_contour, int loops, coord_t ext_perimeter_spacing, coord_t perimeter_spacing, coord_t min_perimeter_infill_spacing, coord_t spacing, bool is_inner_part, const ExPolygon *material = nullptr );
 
     double      ext_mm3_per_mm()        const { return m_ext_mm3_per_mm; }
     double      mm3_per_mm()            const { return m_mm3_per_mm; }

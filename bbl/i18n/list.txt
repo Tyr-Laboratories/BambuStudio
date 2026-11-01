@@ -67,6 +67,8 @@ src/slic3r/GUI/Gizmos/GLGizmoFdmSupports.cpp
 src/slic3r/GUI/Gizmos/GLGizmoFlatten.cpp
 src/slic3r/GUI/Gizmos/GLGizmoMmuSegmentation.cpp
 src/slic3r/GUI/Gizmos/GLGizmoFuzzySkin.cpp
+src/slic3r/GUI/Gizmos/GLGizmoWallPainting.cpp
+src/slic3r/GUI/Gizmos/GLGizmoWallPainting.hpp
 src/slic3r/GUI/Gizmos/GLGizmoMove.cpp
 src/slic3r/GUI/Gizmos/GLGizmoRotate.cpp
 src/slic3r/GUI/Gizmos/GLGizmoScale.cpp

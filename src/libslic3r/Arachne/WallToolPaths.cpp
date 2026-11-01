@@ -24,7 +24,7 @@ namespace Slic3r::Arachne
 {
 
 WallToolPaths::WallToolPaths(const Polygons& outline, const coord_t bead_width_0, const coord_t bead_width_x,
-                             const size_t inset_count, const coord_t wall_0_inset, const coordf_t layer_height, const WallToolPathsParams &params)
+                             const size_t inset_count, const coord_t wall_0_inset, const coordf_t layer_height, const WallToolPathsParams &params, const WallPainting::BoundaryPolicy *wall_policy)
     : outline(outline)
     , bead_width_0(bead_width_0)
     , bead_width_x(bead_width_x)
@@ -38,6 +38,7 @@ WallToolPaths::WallToolPaths(const Polygons& outline, const coord_t bead_width_0
     , wall_transition_filter_deviation(scaled<coord_t>(params.wall_transition_filter_deviation))
     , toolpaths_generated(false)
     , m_params(params)
+    , m_wall_policy(wall_policy)
 {
 }
 
@@ -527,11 +528,12 @@ const std::vector<VariableWidthLines> &WallToolPaths::generate()
         allowed_filter_deviation,
         wall_transition_length,
         apply_hole_compensation,
-        hole_indices
+        hole_indices,
+        m_wall_policy
     );
     wall_maker.generateToolpaths(toolpaths);
 
-    stitchToolPaths(toolpaths, this->bead_width_x);
+    stitchToolPaths(toolpaths, this->bead_width_x, m_wall_policy);
 
     removeSmallLines(toolpaths);
 
@@ -540,6 +542,17 @@ const std::vector<VariableWidthLines> &WallToolPaths::generate()
     simplifyToolPaths(toolpaths);
 
     removeEmptyToolPaths(toolpaths);
+    if (m_wall_policy) {
+        Polygons covered;
+        for (const auto &depth : toolpaths)
+            for (const auto &path : depth)
+                for (size_t i=1; i<path.junctions.size(); ++i) {
+                    const auto &a=path.junctions[i-1], &b=path.junctions[i];
+                    WallPainting::append_coverage(covered, Line(a.p,b.p), a.w, b.w);
+                }
+        inner_contour = diff(prepared_outline, union_(covered));
+    }
+
     assert(std::is_sorted(toolpaths.cbegin(), toolpaths.cend(),
                           [](const VariableWidthLines& l, const VariableWidthLines& r)
                           {
@@ -549,7 +562,8 @@ const std::vector<VariableWidthLines> &WallToolPaths::generate()
     return toolpaths;
 }
 
-void WallToolPaths::stitchToolPaths(std::vector<VariableWidthLines> &toolpaths, const coord_t bead_width_x)
+void WallToolPaths::stitchToolPaths(std::vector<VariableWidthLines> &toolpaths, const coord_t bead_width_x,
+                                   const WallPainting::BoundaryPolicy *policy)
 {
     const coord_t stitch_distance = bead_width_x - 1; //In 0-width contours, junctions can cause up to 1-line-width gaps. Don't stitch more than 1 line width.
 
@@ -558,7 +572,19 @@ void WallToolPaths::stitchToolPaths(std::vector<VariableWidthLines> &toolpaths, 
 
         VariableWidthLines stitched_polylines;
         VariableWidthLines closed_polygons;
-        PolylineStitcher<VariableWidthLines, ExtrusionLine, ExtrusionJunction>::stitch(wall_lines, stitched_polylines, closed_polygons, stitch_distance);
+        std::function<bool(const Point &, const Point &)> allow_connection;
+        if (policy && !wall_lines.empty()) {
+            const size_t depth = wall_lines.front().inset_idx;
+            allow_connection = [policy, depth](const Point &a, const Point &b) {
+                if (a == b) return true;
+                const auto spans = policy->split(Line(a, b));
+                return std::all_of(spans.begin(), spans.end(), [depth](const auto &span) {
+                    return int(depth) < span.second;
+                });
+            };
+        }
+        PolylineStitcher<VariableWidthLines, ExtrusionLine, ExtrusionJunction>::stitch(wall_lines, stitched_polylines, closed_polygons, stitch_distance,
+                                                                                   scaled<coord_t>(0.01), allow_connection);
 #ifdef ARACHNE_STITCH_PATCH_DEBUG
         for (const ExtrusionLine& line : stitched_polylines) {
             if ( ! line.is_odd && line.polylineLength() > 3 * stitch_distance && line.size() > 3) {

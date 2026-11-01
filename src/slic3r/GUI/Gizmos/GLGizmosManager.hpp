@@ -83,6 +83,7 @@ public:
         Seam,
         BrimEars,
         FuzzySkin,
+        WallPainting,
         Measure,
         Simplify,
         SlaSupports,

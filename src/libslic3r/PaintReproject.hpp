@@ -17,6 +17,10 @@ using PaintReprojectProgressCallback = std::function<void(int percent, const cha
 // Returns true to request early termination of the (potentially long) reprojection.
 using PaintReprojectCancelCallback   = std::function<bool()>;
 
+// Reload/replacement within one object: preserve every independent annotation,
+// mapping destination vertices through the volumes' object-space transforms.
+[[nodiscard]] bool reproject_paint_between_volumes(const ModelVolume &src, ModelVolume &dst);
+
 // ---------------------------------------------------------------------------
 // Shared paint (facet-annotation) re-projection.
 //
@@ -77,12 +81,14 @@ using PaintReprojectCancelCallback   = std::function<bool()>;
                                              const FacetsAnnotation &src_seam,
                                              const FacetsAnnotation &src_mmu,
                                              const FacetsAnnotation &src_fuzzy,
+                                             const FacetsAnnotation &src_walls,
                                              const TriangleMesh     &dst_mesh,
                                              const Transform3d      &dst_to_src,
                                              FacetsAnnotation       &dst_supported,
                                              FacetsAnnotation       &dst_seam,
                                              FacetsAnnotation       &dst_mmu,
                                              FacetsAnnotation       &dst_fuzzy,
+                                             FacetsAnnotation       &dst_walls,
                                              const PaintReprojectProgressCallback &progress = nullptr,
                                              const PaintReprojectCancelCallback   &cancel   = nullptr,
                                              const Transform3d      *dst_world_matrix = nullptr);

@@ -20,6 +20,7 @@
 #include "libslic3r/Arachne/BeadingStrategy/BeadingStrategy.hpp"
 #include "SkeletalTrapezoidationGraph.hpp"
 #include "../Geometry/Voronoi.hpp"
+#include "../WallPainting.hpp"
 
 //#define ARACHNE_DEBUG
 //#define ARACHNE_DEBUG_VORONOI
@@ -79,6 +80,7 @@ class SkeletalTrapezoidation
      * lines.
      */
     const BeadingStrategy& beading_strategy;
+    const WallPainting::BoundaryPolicy *wall_policy;
 
 public:
     using Segment  = PolygonsSegmentIndex;
@@ -112,7 +114,8 @@ public:
     , coord_t allowed_filter_deviation
     , coord_t beading_propagation_transition_dist
     , bool enable_hole_compensation
-    , const std::vector<int>& hole_indices);
+    , const std::vector<int>& hole_indices
+    , const WallPainting::BoundaryPolicy *wall_policy = nullptr);
 
     /*!
      * A skeletal graph through the polygons that we need to fill with beads.
@@ -281,6 +284,7 @@ protected:
      * beading strategy.
      */
     void updateBeadCount();
+    coord_t boundaryBeadCount(node_t *node, coord_t thickness) const;
 
     /*!
      * Add central regions and set bead counts where there is an end of the

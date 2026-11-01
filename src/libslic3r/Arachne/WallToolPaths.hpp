@@ -10,6 +10,7 @@
 #include "BeadingStrategy/BeadingStrategyFactory.hpp"
 #include "utils/ExtrusionLine.hpp"
 #include "../Polygon.hpp"
+#include "../WallPainting.hpp"
 #include "../PrintConfig.hpp"
 
 namespace Slic3r::Arachne
@@ -42,7 +43,7 @@ public:
      * \param inset_count The maximum number of parallel extrusion lines that make up the wall
      * \param wall_0_inset How far to inset the outer wall, to make it adhere better to other walls.
      */
-    WallToolPaths(const Polygons& outline, coord_t bead_width_0, coord_t bead_width_x, size_t inset_count, coord_t wall_0_inset, coordf_t layer_height, const WallToolPathsParams &params);
+    WallToolPaths(const Polygons& outline, coord_t bead_width_0, coord_t bead_width_x, size_t inset_count, coord_t wall_0_inset, coordf_t layer_height, const WallToolPathsParams &params, const WallPainting::BoundaryPolicy *wall_policy = nullptr);
 
     void EnableHoleCompensation(bool enable, const std::vector<int>& hole_indices_);
     /*!
@@ -110,7 +111,8 @@ protected:
      *
      * Works on both toolpaths and inner contours simultaneously.
      */
-    static void stitchToolPaths(std::vector<VariableWidthLines> &toolpaths, coord_t bead_width_x);
+    static void stitchToolPaths(std::vector<VariableWidthLines> &toolpaths, coord_t bead_width_x,
+                                const WallPainting::BoundaryPolicy *policy = nullptr);
 
     /*!
      * Remove polylines shorter than half the smallest line width along that polyline.
@@ -142,6 +144,7 @@ private:
     Polygons inner_contour;  //<! The inner contour of the generated toolpaths
     Polygons first_wall_contour; //<! The contour of the first wall
     const WallToolPathsParams m_params;
+    const WallPainting::BoundaryPolicy *m_wall_policy;
 private:
     bool enable_hole_compensation{ false };
     std::vector<int> hole_indices;
