@@ -4,6 +4,7 @@ on:
     types: [ released ]
 jobs:
   publish:
+    if: github.repository == 'bambulab/BambuStudio'
     runs-on: windows-latest
     steps:
       - uses: vedantmgoyal9/winget-releaser@main

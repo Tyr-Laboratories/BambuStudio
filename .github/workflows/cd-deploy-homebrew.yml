@@ -20,6 +20,7 @@ concurrency:
 jobs:
   homebrew-update:
     name: Update Homebrew Cask
+    if: github.repository == 'bambulab/BambuStudio'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
