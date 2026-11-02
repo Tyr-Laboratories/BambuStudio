@@ -259,7 +259,14 @@ void SendJob::process()
         100  // PrintingStageFinished
     };
 
-    auto update_fn = [this, &msg, &curr_percent, &error_text, StagePercentPoint](int stage, int code, std::string info) {
+    // Keep diagnostic details on the same UI queue as error presentation.
+    auto update_error_info = [this](int code, std::string description, std::string extra) {
+        CallAfter([this, code, description = std::move(description), extra = std::move(extra)] {
+            m_plater->update_print_error_info(code, description, extra);
+        });
+    };
+
+    auto update_fn = [this, &msg, &curr_percent, &error_text, &update_error_info, StagePercentPoint](int stage, int code, std::string info) {
                         if (stage == SendingPrintJobStage::PrintingStageCreate) {
                             if (this->connection_type == "lan") {
                                 msg = _L("Sending gcode file over LAN");
@@ -304,16 +311,16 @@ void SendJob::process()
                         //get errors
                         if (code > 100 || code < 0 || stage == BBL::SendingPrintJobStage::PrintingStageERROR) {
                             if (code == BAMBU_NETWORK_ERR_PRINT_WR_FILE_OVER_SIZE || code == BAMBU_NETWORK_ERR_PRINT_SP_FILE_OVER_SIZE) {
-                                m_plater->update_print_error_info(code, DESC_FILE_TOO_LARGE.ToStdString(), info);
+                                update_error_info(code, DESC_FILE_TOO_LARGE.ToStdString(), info);
                             }
                             else if (code == BAMBU_NETWORK_ERR_PRINT_WR_FILE_NOT_EXIST || code == BAMBU_NETWORK_ERR_PRINT_SP_FILE_NOT_EXIST) {
-                                m_plater->update_print_error_info(code, DESC_FAIL_NOT_EXIST.ToStdString(), info);
+                                update_error_info(code, DESC_FAIL_NOT_EXIST.ToStdString(), info);
                             }
                             else if (code == BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED || code == BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED) {
-                                m_plater->update_print_error_info(code, DESC_UPLOAD_FTP_FAILED.ToStdString(), info);
+                                update_error_info(code, DESC_UPLOAD_FTP_FAILED.ToStdString(), info);
                             }
                             else {
-                                m_plater->update_print_error_info(code, DESC_NETWORK_ERROR.ToStdString(), info);
+                                update_error_info(code, DESC_NETWORK_ERROR.ToStdString(), info);
                             }
                         }
                         else {

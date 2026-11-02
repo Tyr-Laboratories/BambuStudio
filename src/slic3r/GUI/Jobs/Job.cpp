@@ -2,6 +2,7 @@
 #include <exception>
 
 #include "Job.hpp"
+#include <wx/utils.h>
 #include <libslic3r/Thread.hpp>
 #include <boost/log/trivial.hpp>
 
@@ -37,7 +38,13 @@ void GUI::Job::update_percent_finish()
 
 void GUI::Job::show_error_info(wxString msg, int code, wxString description, wxString extra)
 {
-    m_progress->show_error_info(msg, code, description, extra);
+    // Error presentation can resize the print dialog. Dispatch it on the same
+    // job-owned UI queue as status updates; pending work is discarded with the
+    // job. Keep late errors even if a previous 100% update finalized progress.
+    CallAfter([this, msg = std::move(msg), code,
+               description = std::move(description), extra = std::move(extra)] {
+        m_progress->show_error_info(msg, code, description, extra);
+    });
 }
 
 GUI::Job::Job(std::shared_ptr<ProgressIndicator> pri)

@@ -485,9 +485,17 @@ void PrintJob::process()
         cloud_error_snapshot.extra = info;
     };
 
-    auto restore_cloud_error_info = [this, &cloud_error_snapshot]() {
+    // These details are consumed by dialogs and the calibration UI. Queue them
+    // on this job before its error presentation, with no worker-owned references.
+    auto update_error_info = [this](int code, std::string description, std::string extra) {
+        CallAfter([this, code, description = std::move(description), extra = std::move(extra)] {
+            m_plater->update_print_error_info(code, description, extra);
+        });
+    };
+
+    auto restore_cloud_error_info = [&update_error_info, &cloud_error_snapshot]() {
         if (cloud_error_snapshot.valid) {
-            m_plater->update_print_error_info(cloud_error_snapshot.code, cloud_error_snapshot.desc, cloud_error_snapshot.extra);
+            update_error_info(cloud_error_snapshot.code, cloud_error_snapshot.desc, cloud_error_snapshot.extra);
         }
     };
 
@@ -504,6 +512,7 @@ void PrintJob::process()
         &get_route_status_msg,
         &map_route_progress,
         &error_desc_for_code,
+        &update_error_info,
         &remember_cloud_error
     ](int stage, int code, std::string info) {
                         wxString msg = get_route_status_msg();
@@ -551,13 +560,13 @@ void PrintJob::process()
                             if (use_cloud_error_snapshot) {
                                 if (attempt_route == SendAttemptRoute::Cloud) {
                                     remember_cloud_error(code, info);
-                                    m_plater->update_print_error_info(code, error_desc_for_code(code), info);
+                                    update_error_info(code, error_desc_for_code(code), info);
                                 } else {
                                     BOOST_LOG_TRIVIAL(warning) << "print_job: non-cloud attempt error, route=" << static_cast<int>(attempt_route)
                                         << ", code=" << code << ", info=" << info;
                                 }
                             } else {
-                                m_plater->update_print_error_info(code, error_desc_for_code(code), info);
+                                update_error_info(code, error_desc_for_code(code), info);
                             }
                         }
                         else {
