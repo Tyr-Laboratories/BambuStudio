@@ -1,4 +1,5 @@
 #include "Plater.hpp"
+#include "OfficialSender.hpp"
 #include "PerfTrace.hpp"
 #include <array>
 #include <boost/format/format_fwd.hpp>
@@ -7293,6 +7294,7 @@ public:
     void on_action_publish(wxCommandEvent &evt);
     bool confirm_send_only_gcode();
     void on_action_print_plate(SimpleEvent&);
+    bool handoff_to_official_sender(int plate_idx);
     void on_action_print_all(SimpleEvent&);
     void on_action_export_gcode(SimpleEvent&);
     void on_action_send_gcode(SimpleEvent&);
@@ -15944,12 +15946,51 @@ void Plater::priv::on_action_publish(wxCommandEvent &event)
     }
 }
 
+bool Plater::priv::handoff_to_official_sender(int plate_idx)
+{
+#ifdef __APPLE__
+    const OfficialSender::fs::path resources(Slic3r::resources_dir());
+    if (!OfficialSender::is_configured(resources) || q->only_gcode_mode() ||
+        !wxGetApp().preset_bundle->printers.get_edited_preset().is_bbl_vendor_preset(wxGetApp().preset_bundle))
+        return false;
+    try {
+        wxBusyCursor busy;
+        const auto app = OfficialSender::application_path(resources);
+        OfficialSender::verify_application(app);
+        // Flush the current selections before a first-time private snapshot.
+        wxGetApp().app_config->save();
+        const auto sender_data = OfficialSender::data_directory(Slic3r::data_dir());
+        OfficialSender::prepare_data(Slic3r::data_dir(), sender_data);
+        // An imported sliced archive may contain several valid plates. Opening
+        // that archive in the official app selects its first valid plate, so a
+        // single-plate handoff must export the requested plate's existing G-code
+        // rather than reuse the complete archive. This does not re-slice it.
+        const bool export_selected_plate = q->using_exported_file() && plate_idx >= 0;
+        const int result = q->send_gcode(plate_idx, [](int, int, int, bool &) {}, export_selected_plate);
+        if (result != 0 || m_print_job_data._3mf_path.empty())
+            throw std::runtime_error("Could not prepare the sliced plate for the official sender. Slice the plate and try again.");
+        const auto name = into_u8(q->get_export_gcode_filename("", true, plate_idx == PLATE_ALL_IDX));
+        const auto job = OfficialSender::stage_job(m_print_job_data._3mf_path.string(), sender_data, name);
+        OfficialSender::launch(app, sender_data, job);
+        notification_manager->push_notification(_u8L("The sliced file is opening in official Bambu Studio. Select your printer and confirm Print or Send there."));
+    } catch (const std::exception &error) {
+        MessageDialog dialog(q, from_u8(error.what()), _L("Official print sender"), wxOK | wxICON_ERROR);
+        dialog.ShowModal();
+    }
+    // Never retry through the unsigned process when the signed handoff fails.
+    return true;
+#else
+    return false;
+#endif
+}
+
 void Plater::priv::on_action_print_plate(SimpleEvent&)
 {
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print plate event\n" ;
     }
 
+    if (handoff_to_official_sender(partplate_list.get_curr_plate_index())) return;
     if (!wxGetApp().check_send_print_version_policy()) return;
 
     if (q->only_gcode_mode()) {
@@ -16066,6 +16107,7 @@ int Plater::priv::update_print_required_data(Slic3r::DynamicPrintConfig config, 
 
 void Plater::priv::on_action_send_to_printer(bool isall)
 {
+    if (handoff_to_official_sender(isall ? PLATE_ALL_IDX : partplate_list.get_curr_plate_index())) return;
     if (!wxGetApp().check_send_print_version_policy()) return;
 
 	if (!m_send_to_sdcard_dlg) m_send_to_sdcard_dlg = new SendToPrinterDialog(q);
@@ -16094,6 +16136,7 @@ void Plater::priv::on_action_print_all(SimpleEvent&)
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print all event\n" ;
     }
 
+    if (handoff_to_official_sender(PLATE_ALL_IDX)) return;
     if (!wxGetApp().check_send_print_version_policy()) return;
 
     if (q->only_gcode_mode()) {
@@ -24755,13 +24798,13 @@ void Plater::send_gcode_legacy(int plate_idx, Export3mfProgressFn proFn)
         }
     }
 }
-int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn)
+int Plater::send_gcode(int plate_idx, Export3mfProgressFn proFn, bool force_export)
 {
     int result = 0;
     /* generate 3mf */
     set_print_job_plate_idx(plate_idx);
 
-    if (using_exported_file() && !m_3mf_path.empty()) {
+    if (!force_export && using_exported_file() && !m_3mf_path.empty()) {
         try {
             if (boost::filesystem::exists(m_3mf_path)) {
                 p->m_print_job_data._3mf_path = fs::path(m_3mf_path);

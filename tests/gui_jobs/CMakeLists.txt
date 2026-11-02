@@ -16,3 +16,12 @@ target_compile_definitions(gui_job_tests PRIVATE ${_job_wx_definitions})
 target_link_libraries(gui_job_tests PRIVATE test_common boost_libs ${_job_wx_libraries})
 set_property(TARGET gui_job_tests PROPERTY FOLDER "tests")
 add_test(NAME gui_job_tests COMMAND gui_job_tests ${CATCH_EXTRA_ARGS})
+
+add_executable(official_sender_tests
+    test_official_sender.cpp
+    ${PROJECT_SOURCE_DIR}/src/slic3r/GUI/OfficialSender.cpp
+)
+target_include_directories(official_sender_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(official_sender_tests PRIVATE test_common)
+set_property(TARGET official_sender_tests PROPERTY FOLDER "tests")
+add_test(NAME official_sender_tests COMMAND official_sender_tests ${CATCH_EXTRA_ARGS})

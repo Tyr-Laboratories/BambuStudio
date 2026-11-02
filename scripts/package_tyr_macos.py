@@ -11,11 +11,127 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
+
+
+OFFICIAL_TEAM_ID = "T3UBR9Y3B2"
+OFFICIAL_BUNDLE_ID = "com.bambulab.bambu-studio"
+OFFICIAL_RELATIVE_PATH = Path("Contents/Helpers/BambuStudio.app")
 
 
 def run(*args):
     return subprocess.check_output([str(arg) for arg in args], text=True).strip()
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def official_bundle_digest(app):
+    """Hash contents, modes, and symlinks without following links outside the app."""
+    digest = hashlib.sha256()
+    for path in sorted(app.rglob("*")):
+        mode = path.lstat().st_mode
+        name = path.relative_to(app).as_posix()
+        if path.is_symlink():
+            try:
+                resolved = path.resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                raise RuntimeError(f"Invalid official app symlink: {name}") from error
+            if app.resolve() not in resolved.parents:
+                raise RuntimeError(f"Official app symlink escapes its bundle: {name}")
+            entry = [name, mode, "link", str(path.readlink())]
+        elif stat.S_ISDIR(mode):
+            entry = [name, mode, "directory"]
+        elif stat.S_ISREG(mode):
+            entry = [name, mode, "file", sha256_file(path)]
+        else:
+            raise RuntimeError(f"Unsupported file in official app bundle: {name}")
+        digest.update((json.dumps(entry, ensure_ascii=True) + "\n").encode("utf-8"))
+    return digest.hexdigest()
+
+
+def verify_vendor_signature(app):
+    """Require the genuine Bambu publisher, not merely any valid local signature."""
+    requirement = (f'=anchor apple generic and certificate leaf[subject.OU] = "{OFFICIAL_TEAM_ID}" '
+                   f'and identifier "{OFFICIAL_BUNDLE_ID}"')
+    try:
+        subprocess.check_output([
+            "codesign", "--verify", "--deep", "--strict", "--verbose=2",
+            "--test-requirement", requirement, str(app),
+        ], text=True, stderr=subprocess.STDOUT)
+        detail = subprocess.check_output([
+            "codesign", "--display", "--verbose=4", str(app),
+        ], text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"Official app signature verification failed: {error.output.strip()}") from error
+    team = re.search(r"^TeamIdentifier=(.+)$", detail, re.MULTILINE)
+    publisher = re.search(r"^Authority=(.+)$", detail, re.MULTILINE)
+    if not team or team[1] != OFFICIAL_TEAM_ID or not publisher:
+        raise RuntimeError("Official app is not signed by the expected Bambu publisher")
+    return {"team_identifier": team[1], "publisher": publisher[1]}
+
+
+def official_app_metadata(app):
+    if app.is_symlink():
+        raise RuntimeError("Official app bundle must not be a symlink")
+    if not app.is_dir():
+        raise RuntimeError(f"Missing official app bundle: {app}")
+    # Inspect all links before opening any bundle files so malformed inputs cannot
+    # cause reads of account data or other files outside this supplied release.
+    bundle_digest = official_bundle_digest(app)
+    info_path = app / "Contents/Info.plist"
+    if not info_path.is_file() or info_path.is_symlink():
+        raise RuntimeError("Official bundle is missing a regular Contents/Info.plist")
+    try:
+        info = plistlib.loads(info_path.read_bytes())
+    except (plistlib.InvalidFileException, ValueError) as error:
+        raise RuntimeError("Invalid official app bundle Info.plist") from error
+    if info.get("CFBundleIdentifier") != OFFICIAL_BUNDLE_ID:
+        raise RuntimeError("Unexpected official app bundle identifier")
+    if info.get("CFBundleExecutable") != "BambuStudio":
+        raise RuntimeError("Unexpected official app executable")
+    executable = app / "Contents/MacOS/BambuStudio"
+    if not executable.is_file() or executable.is_symlink():
+        raise RuntimeError("Official bundle is missing its regular BambuStudio executable")
+    version = info.get("CFBundleShortVersionString")
+    build = info.get("CFBundleVersion", "")
+    if not isinstance(version, str) or not version or not isinstance(build, str):
+        raise RuntimeError("Official app bundle has invalid version metadata")
+    return {
+        "bundle_path": OFFICIAL_RELATIVE_PATH.as_posix(),
+        "bundle_identifier": info["CFBundleIdentifier"],
+        "version": version,
+        "build": build,
+        "executable_sha256": sha256_file(executable),
+        "bundle_sha256": bundle_digest,
+        **verify_vendor_signature(app),
+    }
+
+
+def verify_official_app(app, expected):
+    if official_app_metadata(app) != expected:
+        raise RuntimeError(f"Official app changed; bundle must remain identical to vendor input: {app}")
+
+
+def stage_official_app(source, target):
+    source_resolved, target_resolved = source.resolve(), target.resolve()
+    if (target.exists() or target.is_symlink() or source_resolved == target_resolved
+            or source_resolved in target_resolved.parents or target_resolved in source_resolved.parents):
+        raise RuntimeError("Official app target exists or overlaps the source bundle")
+    metadata = official_app_metadata(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # ditto preserves bundle metadata, signatures, resource forks and symlinks.
+    # Do not use the enclosing fork's signature-stripping copy for the sender.
+    run("ditto", source, target)
+    verify_official_app(target, metadata)
+    return metadata
 
 
 def dependencies(binary):
@@ -55,6 +171,8 @@ def audit(binary, frameworks, minimum):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", required=True, type=Path)
+    parser.add_argument("--official-app", type=Path,
+                        help="Untouched vendor-signed Bambu Studio app to bundle as the print sender")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--zstd", required=True, type=Path)
     parser.add_argument("--imath", required=True, type=Path)
@@ -69,6 +187,8 @@ def main():
     revision = run("git", "-C", root, "rev-parse", "HEAD")
     if run("git", "-C", root, "status", "--porcelain", "--untracked-files=no"):
         parser.error("commit tracked changes before packaging so the source revision is exact")
+    if (args.app / OFFICIAL_RELATIVE_PATH).exists():
+        parser.error("input fork already contains a sender; use the build app and --official-app separately")
     for source in (args.app / "Contents/MacOS/BambuStudio", args.zstd, args.imath,
                    args.zstd_license, args.imath_license):
         if not source.is_file():
@@ -127,6 +247,8 @@ def main():
             "Imath": {"version": "3.2.3", "source": "https://github.com/AcademySoftwareFoundation/Imath/releases/tag/v3.2.3"},
         },
     }
+    if args.official_app:
+        manifest["official_sender"] = stage_official_app(args.official_app, app / OFFICIAL_RELATIVE_PATH)
     (notices / "release.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for binary in binaries:
         audit(binary, frameworks, args.minimum_macos)
@@ -136,9 +258,20 @@ def main():
         run("codesign", "--force", "--sign", "-", "--timestamp=none", binary)
     run("codesign", "--force", "--sign", "-", "--timestamp=none", app)
     run("codesign", "--verify", "--deep", "--strict", "--verbose=2", app)
+    if args.official_app:
+        # Signing the outer app must never re-sign or otherwise modify the inner
+        # vendor app. In particular, do not add --deep to the signing command.
+        verify_official_app(app / OFFICIAL_RELATIVE_PATH, manifest["official_sender"])
+        verify_official_app(args.official_app, manifest["official_sender"])
     archive = args.output / f"BambuStudio-Tyr-{args.release}-macOS-arm64.zip"
     run("ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, archive)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if args.official_app:
+        with tempfile.TemporaryDirectory(prefix="verify-sender-", dir=args.output) as unpacked:
+            run("ditto", "-x", "-k", archive, unpacked)
+            extracted = Path(unpacked) / app.name
+            run("codesign", "--verify", "--deep", "--strict", "--verbose=2", extracted)
+            verify_official_app(extracted / OFFICIAL_RELATIVE_PATH, manifest["official_sender"])
+    digest = sha256_file(archive)
     (args.output / "SHA256SUMS.txt").write_text(f"{digest}  {archive.name}\n")
     (args.output / "release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Validated application: {app}")

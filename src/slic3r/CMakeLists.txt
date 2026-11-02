@@ -731,6 +731,9 @@ endif ()
 
 if (APPLE)
     list(APPEND SLIC3R_GUI_SOURCES
+            GUI/OfficialSender.cpp
+            GUI/OfficialSender.hpp
+            GUI/OfficialSenderMac.mm
             Utils/RetinaHelperImpl.mm
             Utils/MacDarkMode.mm
             GUI/RemovableDriveManagerMM.mm
