@@ -62,6 +62,14 @@ The normal application build retains the Bambu Studio application identity and i
 
 This fork also suppresses the **Customized Preset** dialog when its only cause is that a project's printer or filament preset name is absent from the installed library. The warning for detected modified G-code remains in place. A same-project load without the missing-preset dialog was verified.
 
+## Sending prints
+
+Direct printing from this fork is currently blocked by the Bambu networking plugin's application-signature check in the verified macOS setup. After the print-error crash was fixed, a user retry displayed **Your software is not signed** (`BAMBU_NETWORK_SIGNED_ERROR`, `-26`). Account access and profile reuse do not establish permission to start a print. The fork's ad-hoc macOS signature does not provide Bambu's trusted publisher identity; Apple Developer ID signing alone is not an established solution.
+
+Bambu documents [Bambu Connect as its supported handoff for third-party slicers](https://blog.bambulab.com/firmware-update-introducing-new-authorization-control-system-2/). To use that route, slice with this fork, then choose **File > Export > Export plate sliced file** and open the resulting `.gcode.3mf` in the official Bambu Connect application. The exported file contains the generated wall toolpaths, so Connect does not need to understand the painting extension. Keep the editable project separately and do not re-slice it in an official Studio version that lacks wall painting.
+
+The handoff is a documented vendor workflow, not a verified successful print from this fork. Automatic Bambu Connect integration is not implemented. No printer mode or network configuration changes are required by the export step.
+
 ## Recorded validation
 
 The following results cover the wall-painting implementation and its macOS application build:
