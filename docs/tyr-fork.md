@@ -15,13 +15,15 @@ The source is based on upstream `master` commit `79df7ae309be398ed30c9f397c13c99
 | Control | Effect |
 | --- | --- |
 | Left mouse button | Mark the surface to use the painted wall count. |
-| Right mouse button | Mark the surface to use the normal wall count. |
+| Right mouse button | Erase the surface annotation, returning it to ordinary unpainted behavior. |
 | Shift + left mouse button | Erase the surface annotation, returning it to ordinary unpainted behavior. |
 | Erase all painting | Clear this object's wall-painting annotations. |
 | Undo | Undo painting edits. |
 | Section view | Clip the view to access interior surfaces without cutting the model. |
 
-Normal and erased surfaces both use the applicable normal wall count. The distinction is that right-click leaves an explicit normal annotation, while erase removes the annotation.
+Right-click and Shift + left-click both erase wall painting and restore the applicable normal wall count. Right-drag erases along the brush stroke; Fill uses the same erase behavior with the right mouse button.
+
+Older projects may contain red normal-wall annotations from earlier fork versions. The painter now loads those as unpainted surfaces, preserving their normal wall count and the remaining painted mask.
 
 ## Counts and inheritance
 
@@ -61,7 +63,7 @@ The following results cover the wall-painting implementation and its macOS appli
 
 - **Focused automated tests:** 26 cases and 1,366 assertions passed. Coverage includes both generators, partial and curved painted surfaces, holes, zero/high counts, narrow regions, transitions, infill clearance, transforms, variable layer heights, numeric modifiers, per-part settings, annotation lifecycle, and 3MF persistence. See [the focused test source](../tests/fff_print/test_wall_painting.cpp).
 - **Application build:** the macOS application compiled and linked successfully.
-- **Manual interaction:** user checks confirmed painting, right-click normal, Shift erase, undo, and section clipping.
+- **Manual interaction:** user checks of the original implementation confirmed painting, Shift erase, undo, and section clipping. See release notes for subsequent interaction changes and their verification.
 - **Project and output checks:** the GUI loaded, saved, and reopened painted 3MF projects. Preview showed one exterior wall and an additional wall at the painted center hole. An edited project exported G-code successfully and retained its painting after reopening.
 - **Broader regression coverage:** a selected existing regression target ran 18 cases, with 12 passing and 6 failing. The failures involved older arrangement fixtures, a removed setting, an exact floating-point comparison, and stale hull expectations. The broader existing FFF test target also encountered removed-API compilation failures. No clean upstream-baseline comparison established that all of these failures predate this fork, so this is not a claim that the full upstream suite passes.
 

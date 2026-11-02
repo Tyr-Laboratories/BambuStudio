@@ -56,7 +56,7 @@ std::string GLGizmoWallPainting::on_get_name() const
 }
 
 EnforcerBlockerType GLGizmoWallPainting::get_right_button_state_type() const {
-    return EnforcerBlockerType::BLOCKER;
+    return EnforcerBlockerType::NONE;
 }
 
 bool GLGizmoWallPainting::on_init()
@@ -73,7 +73,7 @@ bool GLGizmoWallPainting::on_init()
     m_desc["paint_walls_caption"] = _L("Left mouse button");
     m_desc["paint_walls"]         = _L("Use painted wall count");
     m_desc["remove_caption"]        =  _L("Right mouse button");
-    m_desc["remove"]                = _L("Use normal wall count");
+    m_desc["remove"]                = _L("Erase");
     m_desc["erase_caption"] = _L("Shift + Left mouse button");
     m_desc["erase"] = _L("Erase");
     m_desc["remove_all"]            = _L("Erase all painting");
@@ -524,7 +524,6 @@ void GLGizmoWallPainting::update_from_model_object(bool first_update)
     std::vector<std::array<float, 4>> ebt_colors;
     ebt_colors.push_back(GLVolume::NEUTRAL_COLOR);
     ebt_colors.push_back(TriangleSelectorGUI::enforcers_color);
-    ebt_colors.push_back(TriangleSelectorGUI::blockers_color);
     for (const ModelVolume* mv : mo->volumes) {
         if (! mv->is_model_part())
             continue;
@@ -535,7 +534,10 @@ void GLGizmoWallPainting::update_from_model_object(bool first_update)
         const TriangleMesh* mesh = &mv->mesh();
         m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(*mesh, ebt_colors));
         // Reset of TriangleSelector is done inside TriangleSelectorGUI's constructor, so we don't need it to perform it again in deserialize().
-        m_triangle_selectors.back()->deserialize(mv->wall_painting_facets.get_data(), false);
+        // Earlier versions stored right-clicks as blockers. They have the same
+        // wall count as unpainted facets, so load them as erased surfaces.
+        m_triangle_selectors.back()->deserialize(mv->wall_painting_facets.get_data(), false,
+            EnforcerBlockerType::ENFORCER, EnforcerBlockerType::BLOCKER, EnforcerBlockerType::NONE);
         m_triangle_selectors.back()->request_update_render_data();
         m_triangle_selectors.back()->set_wireframe_needed(true);
         //BBS: add timestamp logic
@@ -550,17 +552,8 @@ PainterGizmoType GLGizmoWallPainting::get_painter_type() const
 
 wxString GLGizmoWallPainting::handle_snapshot_action_name(bool shift_down, GLGizmoPainterBase::Button button_down) const
 {
-    // BBS remove _L()
-    wxString action_name;
-    if (shift_down)
-        action_name = ("Unselect all");
-    else {
-        if (button_down == Button::Left)
-            action_name = ("Use painted wall count");
-        else
-            action_name = ("Use normal wall count");
-    }
-    return action_name;
+    return shift_down || button_down == Button::Right
+        ? "Erase wall painting" : "Use painted wall count";
 }
 
 } // namespace Slic3r::GUI
