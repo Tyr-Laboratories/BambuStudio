@@ -835,7 +835,9 @@ public:
     bool            is_compatibility_version();
     bool            check_networking_version();
     void            cancel_networking_install();
-    void            restart_networking();
+    // False means activation is deferred until a full application restart;
+    // true means the existing in-process activation path has run.
+    bool            restart_networking();
     void            check_config_updates_from_updater();
     void            check_config_updates_from_menu();
 

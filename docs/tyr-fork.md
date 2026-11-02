@@ -78,6 +78,8 @@ To install, quit Bambu Studio, extract the ZIP, and replace `BambuStudio.app` in
 
 No account data, printer credentials, profiles from a developer's machine, or optional networking plugin binaries are included in the release. The optional Bambu networking plugin retains its normal download and user-data storage workflow.
 
+On macOS, installing or updating the networking plugin requires quitting and reopening Bambu Studio before the new plugin is activated. The installation dialog will explain this. Save any open project before quitting. The fork avoids loading a replacement plugin into the same process: macOS can retain the previous plugin after it is unloaded, and the upgrade path produced a guarded-file-descriptor crash during discovery. An ordinary startup with an already-compatible plugin does not require an extra restart.
+
 The fork retains the upstream [GNU Affero General Public License, version 3](../LICENSE), credits, and notices. See the [upstream README content](../README.md#license) for attribution and the separate status of the optional networking plugin.
 
 ## Maintaining the fork and release

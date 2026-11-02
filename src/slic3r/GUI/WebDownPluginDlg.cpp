@@ -6,6 +6,7 @@
 #include "libslic3r/AppConfig.hpp"
 #include "slic3r/GUI/wxExtensions.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "MsgDialog.hpp"
 #include "libslic3r_version.h"
 
 #include <wx/sizer.h>
@@ -215,7 +216,12 @@ void DownPluginFrame::OnScriptMessage(wxWebViewEvent &evt)
             wxGetApp().CallAfter([this] { InstallPlugin(); });
         }
         else if (strCmd == "restart_studio") {
-            wxGetApp().restart_networking();
+            if (!wxGetApp().restart_networking()) {
+                MessageDialog dialog(this,
+                    _L("Networking plug-in installed. Quit and reopen Bambu Studio to activate it."),
+                    _L("Restart required"), wxOK | wxICON_INFORMATION);
+                dialog.ShowModal();
+            }
             this->EndModal(wxID_OK);
             this->Close();
         }

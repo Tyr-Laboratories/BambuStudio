@@ -217,6 +217,30 @@ void DownloadProgressDialog::update_release_note(std::string release_note, std::
 
 std::shared_ptr<UpgradeNetworkJob> DownloadProgressDialog::make_job(std::shared_ptr<ProgressIndicator> pri) { return std::make_shared<UpgradeNetworkJob>(pri); }
 
-void DownloadProgressDialog::on_finish() { wxGetApp().restart_networking(); }
+void DownloadProgressDialog::on_finish()
+{
+    if (!wxGetApp().restart_networking()) {
+        // The success handler checks this after on_finish(); logging in cannot
+        // use the newly installed plugin until the user reopens the app.
+        m_post_login = false;
+
+        // Keep the terminal notice separate from the worker's status label:
+        // queued progress events can still update that label after success.
+        auto* panel = new wxPanel(m_simplebook_status);
+        auto* sizer = new wxBoxSizer(wxVERTICAL);
+        auto* message = new wxStaticText(panel, wxID_ANY,
+            _L("Networking plug-in installed. Quit and reopen Bambu Studio to activate it."));
+        message->Wrap(FromDIP(360));
+        sizer->Add(message, 0, wxEXPAND | wxBOTTOM, FromDIP(15));
+        auto* button = new Button(panel, _L("OK"));
+        button->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { Close(); });
+        sizer->Add(button, 0, wxALIGN_RIGHT);
+        panel->SetSizer(sizer);
+        m_simplebook_status->AddPage(panel, wxEmptyString, true);
+        wxGetApp().UpdateDlgDarkUI(this);
+        Layout();
+        Fit();
+    }
+}
 
 }} // namespace Slic3r::GUI

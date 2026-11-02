@@ -2012,8 +2012,15 @@ int GUI_App::install_plugin(std::string name, std::string package_name, InstallP
     return 0;
 }
 
-void GUI_App::restart_networking()
+bool GUI_App::restart_networking()
 {
+#ifdef __APPLE__
+    // macOS retains dylibs with thread-local state after dlclose(). Loading an
+    // installed replacement here can leave two plugin generations in one
+    // process. Activate it on the next launch, keeping the current session open.
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": networking plugin activation requires an application restart";
+    return false;
+#else
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(" enter, mainframe %1%")%mainframe;
     on_init_network(true);
     StaticBambuLib::reset();
@@ -2055,6 +2062,8 @@ void GUI_App::restart_networking()
         }
     }
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(" exit, m_agent=%1%")%m_agent;
+    return true;
+#endif
 }
 
 void GUI_App::remove_old_networking_plugins()
