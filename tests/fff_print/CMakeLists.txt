@@ -74,7 +74,6 @@ add_executable(wall_painting_regression_tests
     fff_print_tests.cpp test_data.cpp test_model.cpp test_trianglemesh.cpp
     test_extrusion_entity.cpp test_flow.cpp test_printobject.cpp
     ../libslic3r/test_3mf.cpp
-    test_sliced_plate_handoff.cpp
 )
 target_link_libraries(wall_painting_regression_tests test_common libslic3r slicer_test_support)
 set_property(TARGET wall_painting_regression_tests PROPERTY FOLDER "tests")

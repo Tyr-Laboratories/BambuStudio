@@ -1,0 +1,33 @@
+{
+  "repository": "https://github.com/FULU-Foundation/OrcaSlicer-bambulab",
+  "revision": "1b556d73f80e69f512881eab3331e6e9f70e5bf5",
+  "license": "AGPL-3.0",
+  "network_abi": "02.05.02.58",
+  "original_sha256": {
+    "shared/BambuBridge/Auth/BridgeAuthPayload.hpp": "e110cad1d57689eb6dcccc24b7b0aa9633731145742850fb347c68b0cfc462b9",
+    "shared/pjarczak_linux_plugin_bridge_core/BridgeAuthPayload.hpp": "0ae6804ce77d633b0317aa126c469f31934f5a36d6bca22b859ba0fefd790a69",
+    "shared/pjarczak_linux_plugin_bridge_core/BridgeCoreJson.hpp": "71cfc6ee95e2d2fa3debb82ee77f2bc7733e569cbc998e1e498bb59a58da6da8",
+    "src/slic3r/GUI/Printer/BambuTunnel.h": "11fc1e118219087501b235f34c5a5997dd3d83db5840d041932fccb857a5fc0a",
+    "src/slic3r/Utils/PJarczakLinuxBridge/PJarczakLinuxBridgeCompat.hpp": "96fa3fc4359b5760a1e262eb6d342a6eb61f40c9942a9963f01b2b852eddc79a",
+    "src/slic3r/Utils/PJarczakLinuxBridge/PJarczakLinuxBridgeConfig.cpp": "e5dd4a8d13bf0072442363c7e0f027864ff4d3ed12527a98845f0ec536eb4481",
+    "src/slic3r/Utils/PJarczakLinuxBridge/PJarczakLinuxBridgeConfig.hpp": "083ec1d86157922e0598c8a76def93a669e6e001043fccac366e967cd75ed792",
+    "src/slic3r/Utils/PJarczakLinuxBridge/PJarczakLinuxSoBridgeRpcProtocol.cpp": "b81474223f9ec6e9e480d94f451aca1ac8f2555dc1e744ee48d3a108002c3a49",
+    "src/slic3r/Utils/PJarczakLinuxBridge/PJarczakLinuxSoBridgeRpcProtocol.hpp": "c118df7cb292cab3aae65b877d66f8fd665fee43b6088d67c9c6d5b8366e5578",
+    "src/slic3r/Utils/bambu_networking.hpp": "5a163c88ef372e2d1016add3915ab2c41a36c811f721199c748b39563dc0966c",
+    "tools/pjarczak_bambu_linux_host/LinuxPluginHost.cpp": "4243e0de49bb93fb1e7ba6aac804546eeb888172201eb3ac19b0880b6ded8571",
+    "tools/pjarczak_bambu_linux_host/LinuxPluginHost.hpp": "eea5d77fc3c03c9a113cfbe41ec6c0aff9eac84a02ff4f14610a271bdd51742a",
+    "tools/pjarczak_bambu_linux_host/main.cpp": "9f5a631c30b96c2a40f5f6772763dc4c7b630950139ad9d46c0035cd1d7a665e"
+  },
+  "farm_fixes": {
+    "repository": "https://github.com/Tyr-Laboratories/tyr-print-farm",
+    "revision": "4446108fddfe663ab2b10806dad296b239da7e60",
+    "path": "runtime/patch_host.py",
+    "sha256": "b2118296a74a4dfb8aff033947516b0b7828162a5d6e2a50d86e70dae3ac6e88"
+  },
+  "redistributed_asset_sha256": {
+    "LICENSE.upstream": "57c8ff33c9c0cfc3ef00e650a1cc910d7ee479a8bc509f6c9209a7c2a11399d6",
+    "resources/cert/slicer_base64.cer": "f504dc1c37bc9741b7a95198914e67f3f6f1d917b1e45eaa14b9e84eb7b51ec8",
+    "resources/cert/ca-certificates.crt": "4183a28770cc0a1f820c6386cb13b5e354cb2271bae3ce3c1a065505cc868c80",
+    "resources/cert/printer.cer": "36f2bcee347ec7adce719b5fd350099591a4d3d0ec4e039c7019890d78e152a0"
+  }
+}

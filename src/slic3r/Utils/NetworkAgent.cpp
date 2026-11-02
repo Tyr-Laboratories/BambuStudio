@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdexcept>
 #if defined(_MSC_VER) || defined(_WIN32)
 #include <Windows.h>
 #else
@@ -10,6 +11,9 @@
 #include "libslic3r/Utils.hpp"
 #include "slic3r/Utils/BBLUtil.hpp"
 #include "NetworkAgent.hpp"
+#if defined(__APPLE__)
+#include "TyrCloudSendHelper.hpp"
+#endif
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/CertificateVerify.hpp"
@@ -667,6 +671,7 @@ int NetworkAgent::set_cert_file(std::string folder, std::string filename)
 
 int NetworkAgent::set_country_code(std::string country_code)
 {
+    m_cloud_sender_country = country_code;
     int ret = 0;
     if (network_agent && set_country_code_ptr) {
         ret = set_country_code_ptr(network_agent, country_code);
@@ -1167,8 +1172,33 @@ int NetworkAgent::set_user_selected_machine(std::string dev_id)
     return ret;
 }
 
+bool NetworkAgent::uses_cloud_send_helper()
+{
+#if defined(__APPLE__)
+    return true;
+#else
+    return false;
+#endif
+}
+
 int NetworkAgent::start_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, OnWaitFn wait_fn)
 {
+#if defined(__APPLE__)
+    if (params.connection_type != "lan") {
+        try {
+            if (!is_user_login())
+                throw std::runtime_error("Sign in to Bambu Studio before sending a print.");
+            return TyrCloudSendHelper::send(params, data_dir() + "/BambuNetworkEngine.conf", get_user_id(),
+                m_cloud_sender_country, resources_dir(), data_dir(), update_fn, cancel_fn, wait_fn);
+        } catch (const std::exception& error) {
+            // Helper exceptions contain user-facing diagnostics, never SDK
+            // payloads or credentials. Do not let failures escape task threads.
+            if (update_fn)
+                update_fn(PrintingStageERROR, cloud_send_helper_error, error.what());
+            return cloud_send_helper_error;
+        }
+    }
+#endif
     int ret = 0;
     if (network_agent && start_print_ptr) {
         ret = start_print_ptr(network_agent, params, update_fn, cancel_fn, wait_fn);

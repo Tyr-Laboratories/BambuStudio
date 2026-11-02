@@ -138,6 +138,10 @@ public:
     static void* get_bambu_source_entry();
 #endif
     static std::string get_version();
+    // Cloud submissions use a private background sender on the Tyr macOS build.
+    // The native agent continues to own login, discovery and live monitoring.
+    static bool uses_cloud_send_helper();
+    static constexpr int cloud_send_helper_error = -9000;
     static void* get_network_function(const char* name);
     NetworkAgent(std::string log_dir);
     ~NetworkAgent();
@@ -256,6 +260,7 @@ public:
     void *get_network_agent() { return network_agent; }
 
 private:
+    std::string m_cloud_sender_country = "US";
     bool enable_track = false;
     void*                   network_agent { nullptr };
 

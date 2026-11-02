@@ -209,7 +209,7 @@ void PrintJob::process()
         this->task_bed_type = bed_type_to_gcode_string(plate_data.is_valid ? plate_data.bed_type : curr_plate->get_bed_type(true));
     }
 
-    BBL::PrintParams params;
+    BBL::PrintParams params{};
 
     // local print access
     params.dev_ip = m_dev_ip;
@@ -434,6 +434,7 @@ void PrintJob::process()
     bool is_try_lan_mode = false;
     bool is_try_lan_mode_failed = false;
     bool use_cloud_error_snapshot = false;
+    bool helper_is_only_route = false;
     SendAttemptRoute attempt_route = SendAttemptRoute::Default;
     PrintErrorSnapshot cloud_error_snapshot;
 
@@ -451,12 +452,14 @@ void PrintJob::process()
         }
     };
 
-    auto map_route_progress = [&attempt_route](int percent) -> int {
+    auto map_route_progress = [&attempt_route, &helper_is_only_route](int percent) -> int {
         percent = std::max(0, std::min(100, percent));
         switch (attempt_route) {
         case SendAttemptRoute::LanWithRecord:
             return 10 + percent * 45 / 100;
         case SendAttemptRoute::Cloud:
+            if (helper_is_only_route)
+                return percent;
             return 55 + percent * 25 / 100;
         case SendAttemptRoute::LanDirect:
             return 85 + percent * 12 / 100;
@@ -557,6 +560,8 @@ void PrintJob::process()
 
                         //get errors
                         if (code > 100 || code < 0 || stage == BBL::SendingPrintJobStage::PrintingStageERROR) {
+                            if (code == NetworkAgent::cloud_send_helper_error)
+                                error_str = wxString::FromUTF8(info);
                             if (use_cloud_error_snapshot) {
                                 if (attempt_route == SendAttemptRoute::Cloud) {
                                     remember_cloud_error(code, info);
@@ -750,6 +755,16 @@ void PrintJob::process()
         attempt_route = SendAttemptRoute::Default;
         this->update_status(curr_percent, _L("Sending print job through cloud service"));
         result = m_agent->start_sdcard_print(params, update_fn, cancel_fn);
+    } else if (params.connection_type != "lan" && NetworkAgent::uses_cloud_send_helper()
+               && wxGetApp().app_config->get("lan_mode_only") != "1") {
+        // Choose the cloud helper before any native LAN acceleration attempt.
+        // A failed or uncertain helper submission must never be retried through
+        // another transport automatically, which could start the same job twice.
+        use_cloud_error_snapshot = true;
+        helper_is_only_route = true;
+        attempt_route = SendAttemptRoute::Cloud;
+        this->update_status(map_route_progress(curr_percent), get_route_status_msg());
+        result = m_agent->start_print(params, update_fn, cancel_fn, wait_fn);
     } else if (params.connection_type != "lan") {
         if (params.dev_ip.empty())
             params.comments = "no_ip";
@@ -881,6 +896,8 @@ void PrintJob::process()
         } else if (result == BAMBU_NETWORK_ERR_CANCELED) {
             msg_text = PRINT_CANCELED_STR;
             this->update_status(0, msg_text);
+        } else if (result == NetworkAgent::cloud_send_helper_error && !error_str.empty()) {
+            msg_text = error_str;
         } else if (result == BAMBU_NETWORK_SIGNED_ERROR) {
             msg_text = PRINT_SIGNED_STR;
         } else {

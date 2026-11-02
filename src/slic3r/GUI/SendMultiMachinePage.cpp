@@ -449,7 +449,7 @@ void SendMultiMachinePage::refresh_user_device()
 
 BBL::PrintParams SendMultiMachinePage::request_params(MachineObject* obj)
 {
-    BBL::PrintParams params;
+    BBL::PrintParams params{};
 
     //get all setting
     bool bed_leveling = app_config->get("print", "bed_leveling") == "1" ? true : false;

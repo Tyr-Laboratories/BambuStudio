@@ -731,9 +731,9 @@ endif ()
 
 if (APPLE)
     list(APPEND SLIC3R_GUI_SOURCES
-            GUI/OfficialSender.cpp
-            GUI/OfficialSender.hpp
-            GUI/OfficialSenderMac.mm
+            Utils/TyrCloudSendHelper.cpp
+            Utils/TyrCloudSendHelper.hpp
+            Utils/TyrCloudSendRecovery.hpp
             Utils/RetinaHelperImpl.mm
             Utils/MacDarkMode.mm
             GUI/RemovableDriveManagerMM.mm
