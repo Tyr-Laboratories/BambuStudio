@@ -78,6 +78,8 @@ set(lisbslic3r_sources
     WallPainting.hpp
     WallPainting.cpp
     WallPaintingSlice.cpp
+    RoundHoleDetection.hpp
+    RoundHoleDetection.cpp
     EdgeGrid.cpp
     EdgeGrid.hpp
     ElephantFootCompensation.cpp

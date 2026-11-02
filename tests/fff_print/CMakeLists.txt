@@ -63,7 +63,7 @@ set_property(TARGET periodic_modifier_tests PROPERTY FOLDER "tests")
 add_test(periodic_modifier_tests periodic_modifier_tests ${CATCH_EXTRA_ARGS})
 
 
-add_executable(wall_painting_tests fff_print_tests.cpp test_wall_painting.cpp)
+add_executable(wall_painting_tests fff_print_tests.cpp test_wall_painting.cpp test_round_hole_detection.cpp)
 target_link_libraries(wall_painting_tests test_common libslic3r slicer_test_support)
 set_property(TARGET wall_painting_tests PROPERTY FOLDER "tests")
 add_test(wall_painting_tests wall_painting_tests ${CATCH_EXTRA_ARGS})

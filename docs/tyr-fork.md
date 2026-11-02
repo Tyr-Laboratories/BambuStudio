@@ -17,11 +17,16 @@ The source is based on upstream `master` commit `79df7ae309be398ed30c9f397c13c99
 | Left mouse button | Mark the surface to use the painted wall count. |
 | Right mouse button | Erase the surface annotation, returning it to ordinary unpainted behavior. |
 | Shift + left mouse button | Erase the surface annotation, returning it to ordinary unpainted behavior. |
+| Fill all round internal holes | Find circular bore walls on the selected object and paint them in one undoable action. |
 | Erase all painting | Clear this object's wall-painting annotations. |
 | Undo | Undo painting edits. |
 | Section view | Clip the view to access interior surfaces without cutting the model. |
 
 Right-click and Shift + left-click both erase wall painting and restore the applicable normal wall count. Right-drag erases along the brush stroke; Fill uses the same erase behavior with the right mouse button.
+
+**Fill all round internal holes** searches the selected object's model parts, including surfaces hidden by Section view. It adds the same surface mask as manual painting and uses the existing **Painted wall loops** setting. Existing painting elsewhere is preserved; you can erase individual results or undo the whole action. Canceling detection leaves painting unchanged. Save the project as 3MF to retain the result.
+
+The detector looks for inward-facing cylindrical walls that surround a complete circular bore, in any orientation and at the selected instance's scale. It includes the cylindrical sides of through and blind holes. Exterior cylinders, coarse polygonal or elliptical openings, open channels, tapered surfaces, and flat blind-hole bottoms are not automatic targets. Stepped holes are considered as separate cylindrical sections. Very coarse or damaged meshes, interrupted bores, and very short bores blended smoothly into surrounding curved surfaces may need manual painting. Review the highlighted surfaces and sliced Preview before printing.
 
 Older projects may contain red normal-wall annotations from earlier fork versions. The painter now loads those as unpainted surfaces, preserving their normal wall count and the remaining painted mask.
 
@@ -61,7 +66,8 @@ This fork also suppresses the **Customized Preset** dialog when its only cause i
 
 The following results cover the wall-painting implementation and its macOS application build:
 
-- **Focused automated tests:** 26 cases and 1,366 assertions passed. Coverage includes both generators, partial and curved painted surfaces, holes, zero/high counts, narrow regions, transitions, infill clearance, transforms, variable layer heights, numeric modifiers, per-part settings, annotation lifecycle, and 3MF persistence. See [the focused test source](../tests/fff_print/test_wall_painting.cpp).
+- **Focused automated tests:** 39 cases and 19,524 assertions passed. Coverage includes both generators, partial and curved painted surfaces, holes, zero/high counts, narrow regions, transitions, infill clearance, transforms, variable layer heights, numeric modifiers, per-part settings, annotation lifecycle, and 3MF persistence. Automatic-hole cases cover circular bores, arbitrary orientation and mirroring, circular and elliptical scaling, dense tessellation, chamfers, oblique rims, incomplete channels, spherical cavities, cancellation, and preservation of manual painting through 3MF serialization. See [wall-painting tests](../tests/fff_print/test_wall_painting.cpp) and [round-hole tests](../tests/fff_print/test_round_hole_detection.cpp).
+- **Automatic-hole project checks:** all 54 independently identified complete reference bores were detected across 18 aircraft parts containing 8.84 million triangles. The pass found 262 cylindrical sections, including surfaces missed by partial manual selections; independent radius and inward-normal checks found no false positives in those results. The largest 1.93-million-triangle part took about 4.5 seconds to scan, with about 265 MiB peak memory for the standalone validation process including the mesh. These samples do not establish exhaustive recognition of every possible hole.
 - **Application build:** the macOS application compiled and linked successfully.
 - **Manual interaction:** user checks of the original implementation confirmed painting, Shift erase, undo, and section clipping. See release notes for subsequent interaction changes and their verification.
 - **Project and output checks:** the GUI loaded, saved, and reopened painted 3MF projects. Preview showed one exterior wall and an additional wall at the painted center hole. An edited project exported G-code successfully and retained its painting after reopening.

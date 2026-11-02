@@ -1,6 +1,7 @@
 #include "GLGizmoWallPainting.hpp"
 
 #include "libslic3r/Model.hpp"
+#include "libslic3r/RoundHoleDetection.hpp"
 //BBS
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Thread.hpp"
@@ -13,12 +14,16 @@
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/Widgets/ProgressDialog.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 
 
 #include <GL/glew.h>
 
 #include <boost/log/trivial.hpp>
+#include <atomic>
+#include <chrono>
+#include <future>
 
 namespace Slic3r::GUI {
 
@@ -30,11 +35,15 @@ GLGizmoWallPainting::GLGizmoWallPainting(GLCanvas3D& parent, unsigned int sprite
 }
 
 void GLGizmoWallPainting::data_changed(bool is_serializing) {
+    if (is_serializing || !m_c || !m_c->selection_info() || !m_c->selection_info()->model_object() ||
+        m_c->selection_info()->model_object()->id() != m_round_hole_status_object_id)
+        m_round_hole_fill_status.clear();
     set_painter_gizmo_data(m_parent.get_selection());
 }
 
 void GLGizmoWallPainting::on_shutdown()
 {
+    m_round_hole_fill_status.clear();
     m_parent.toggle_model_objects_visibility(true);
 }
 
@@ -77,6 +86,7 @@ bool GLGizmoWallPainting::on_init()
     m_desc["erase_caption"] = _L("Shift + Left mouse button");
     m_desc["erase"] = _L("Erase");
     m_desc["remove_all"]            = _L("Erase all painting");
+    m_desc["fill_round_holes"] = _L("Fill all round internal holes");
     m_desc["perform"]               = _L("Perform");
     m_desc["gap_area"] = _L("Gap area");
     m_desc["tool_type"]             = _L("Tool type");
@@ -312,6 +322,26 @@ void GLGizmoWallPainting::on_render_input_window(float x, float y, float bottom_
     if (m_current_tool != old_tool)
         this->tool_changed(old_tool, m_current_tool);
 
+    ImGui::Separator();
+    m_imgui->disabled_begin(m_round_hole_fill_pending);
+    if (m_imgui->button(m_desc.at("fill_round_holes"))) {
+        m_round_hole_fill_pending = true;
+        const ObjectID object_id = p_model_object->id();
+        // A progress dialog yields UI events. Start outside this ImGui frame.
+        wxGetApp().CallAfter([this, object_id]() {
+            ScopeGuard reset_pending([this]() { m_round_hole_fill_pending = false; });
+            if (get_state() == On && m_c && m_c->selection_info() && m_c->selection_info()->model_object() &&
+                m_c->selection_info()->model_object()->id() == object_id)
+                fill_round_internal_holes();
+            m_parent.set_as_dirty();
+        });
+    }
+    m_imgui->disabled_end();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Paint circular bore walls on this object, including hidden surfaces. Existing painting is preserved. Undo reverses the fill."), max_tooltip_width);
+    if (!m_round_hole_fill_status.empty())
+        m_imgui->text_wrapped(m_round_hole_fill_status, ImGui::GetFontSize() * 22.f);
+
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetFontSize() * 0.1));
 
     if (m_current_tool == ImGui::CircleButtonIcon) {
@@ -432,6 +462,129 @@ void GLGizmoWallPainting::on_render_input_window(float x, float y, float bottom_
 
     // BBS
     ImGuiWrapper::pop_toolbar_style();
+}
+
+void GLGizmoWallPainting::fill_round_internal_holes()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    const int instance_idx = m_parent.get_selection().get_instance_idx();
+    if (!object || instance_idx < 0 || size_t(instance_idx) >= object->instances.size())
+        return;
+    const ObjectID object_id = object->id();
+
+    struct Input {
+        std::shared_ptr<const TriangleMesh> mesh;
+        Transform3d transform;
+    };
+    std::vector<Input> inputs;
+    size_t total_facets = 0;
+    // Classify the geometry at its actual scale, independent of section clipping
+    // and the assembled-view display/explosion offsets.
+    const Transform3d instance_transform = object->instances[instance_idx]->get_matrix();
+    for (const ModelVolume *volume : object->volumes) {
+        if (!volume->is_model_part())
+            continue;
+        inputs.push_back({volume->get_mesh_shared_ptr(), instance_transform * volume->get_matrix()});
+        total_facets += volume->mesh().its.indices.size();
+    }
+    if (inputs.size() != m_triangle_selectors.size() || total_facets == 0)
+        return;
+    m_round_hole_status_object_id = object->id();
+
+    struct Canceled {};
+    std::atomic<bool> canceled {false};
+    std::atomic<int> progress {0};
+    std::vector<std::vector<WallPainting::RoundHole>> results;
+    m_round_hole_fill_status.clear();
+    {
+        ProgressDialog dialog(_L("Fill all round internal holes"), _L("Finding round internal holes..."),
+                              100, find_toplevel_parent(wxGetApp().plater()),
+                              wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT);
+        dialog.EnableYield(true);
+        auto work = std::async(std::launch::async, [&]() {
+            std::vector<std::vector<WallPainting::RoundHole>> detected;
+            size_t completed_facets = 0;
+            for (const Input &input : inputs) {
+                const size_t facet_count = input.mesh->its.indices.size();
+                detected.push_back(WallPainting::detect_round_internal_holes(input.mesh->its, input.transform,
+                    [&](float fraction) {
+                        if (canceled.load()) throw Canceled{};
+                        progress.store(std::min(99, int(100. * (completed_facets + fraction * facet_count) / total_facets)));
+                    }));
+                completed_facets += facet_count;
+            }
+            return detected;
+        });
+        while (work.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready) {
+            if (!dialog.Update(progress.load()))
+                canceled.store(true);
+        }
+        try {
+            results = work.get();
+            if (canceled.load() || dialog.WasCancelled()) {
+                m_round_hole_fill_status = _L("Canceled. Painting was not changed.");
+                return;
+            }
+        } catch (const Canceled &) {
+            m_round_hole_fill_status = _L("Canceled. Painting was not changed.");
+            return;
+        } catch (const std::exception &error) {
+            BOOST_LOG_TRIVIAL(error) << "Round hole detection failed: " << error.what();
+            m_round_hole_fill_status = _L("Could not detect round holes. Painting was not changed.");
+            return;
+        }
+        // Update yields pending UI input, including a last-moment Cancel click.
+        if (!dialog.Update(100) || dialog.WasCancelled()) {
+            m_round_hole_fill_status = _L("Canceled. Painting was not changed.");
+            return;
+        }
+    }
+
+    // Closing the dialog yields UI events. Only commit to the object and meshes
+    // that were inspected, even if selection changed while it was closing.
+    if (get_state() != On || !m_c || !m_c->selection_info() ||
+        !m_c->selection_info()->model_object() ||
+        m_c->selection_info()->model_object()->id() != object_id ||
+        m_triangle_selectors.size() != inputs.size())
+        return;
+    size_t mesh_index = 0;
+    for (const ModelVolume *volume : m_c->selection_info()->model_object()->volumes) {
+        if (volume->is_model_part()) {
+            if (mesh_index >= inputs.size() || volume->mesh_ptr() != inputs[mesh_index++].mesh.get())
+                return;
+        }
+    }
+    if (mesh_index != inputs.size())
+        return;
+
+    size_t hole_count = 0;
+    bool changed = false;
+    for (size_t index = 0; index < results.size(); ++index) {
+        const auto &triangles = m_triangle_selectors[index]->get_triangles();
+        hole_count += results[index].size();
+        for (const auto &hole : results[index])
+            for (int facet : hole.facets)
+                changed |= triangles[facet].is_split() || triangles[facet].get_state() != EnforcerBlockerType::ENFORCER;
+    }
+    if (!changed) {
+        m_round_hole_fill_status = hole_count == 0 ? _L("No round internal holes found.") :
+                                                   _L("Round internal holes are already painted.");
+        return;
+    }
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Fill all round internal holes"), UndoRedo::SnapshotType::GizmoAction);
+    for (size_t index = 0; index < results.size(); ++index) {
+        auto &selector = m_triangle_selectors[index];
+        for (const auto &hole : results[index])
+            for (int facet : hole.facets)
+                selector->set_facet(facet, EnforcerBlockerType::ENFORCER);
+        selector->seed_fill_unselect_all_triangles();
+        selector->request_update_render_data(true);
+    }
+    m_seed_fill_last_mesh_id = -1;
+    update_model_object();
+    m_round_hole_fill_status = format_wxstr(_L("Painted %1% round internal holes."), hole_count);
+    m_parent.set_as_dirty();
 }
 
 void GLGizmoWallPainting::tool_changed(wchar_t old_tool, wchar_t new_tool)

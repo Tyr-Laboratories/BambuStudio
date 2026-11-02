@@ -49,11 +49,15 @@ private:
     //BBS: add logic to distinguish the first_time_update and later_update
     void update_from_model_object(bool first_update) override;
     void tool_changed(wchar_t old_tool, wchar_t new_tool);
+    void fill_round_internal_holes();
     void on_opening() override {}
     void on_shutdown() override;
     PainterGizmoType get_painter_type() const override;
 
     std::vector<ObjectBase::Timestamp> m_volume_timestamps;
+    bool m_round_hole_fill_pending = false;
+    wxString m_round_hole_fill_status;
+    ObjectID m_round_hole_status_object_id;
 
     // This map holds all translated description texts, so they can be easily referenced during layout calculations
     // etc. When language changes, GUI is recreated and this class constructed again, so the change takes effect.
