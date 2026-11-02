@@ -226,51 +226,6 @@ void GLGizmoWallPainting::on_render_input_window(float x, float y, float bottom_
     ImGuiWrapper::push_toolbar_style(m_parent.get_scale());
     GizmoImguiBegin(get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar);
 
-    const auto &process = wxGetApp().preset_bundle->prints.get_edited_preset().config;
-    int wall_count = p_model_object->config.has("painted_wall_loops")
-        ? p_model_object->config.opt_int("painted_wall_loops") : process.opt_int("painted_wall_loops");
-    auto count_changed = [&] {
-        wxGetApp().obj_list()->update_and_show_object_settings_item();
-        wxGetApp().plater()->changed_object(*p_model_object);
-        m_parent.set_as_dirty();
-    };
-    ImGui::SetNextItemWidth(m_imgui->scaled(7.f));
-    if (ImGui::InputInt(_u8L("Painted wall loops (this object)").c_str(), &wall_count)) {
-        wall_count = std::clamp(wall_count, 0, 1000);
-        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Change painted wall count", UndoRedo::SnapshotType::GizmoAction);
-        p_model_object->config.set("painted_wall_loops", wall_count);
-        count_changed();
-    }
-    m_imgui->text(_L("Total walls on painted surfaces"));
-    if (p_model_object->config.has("painted_wall_loops")) {
-        if (m_imgui->button(_L("Use global value"))) {
-            Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Reset painted wall count", UndoRedo::SnapshotType::GizmoAction);
-            p_model_object->config.erase("painted_wall_loops");
-            count_changed();
-        }
-    } else {
-        m_imgui->text(_L("Inherited from global settings"));
-    }
-    for (size_t i = 0; i < p_model_object->volumes.size(); ++i) {
-        ModelVolume *volume = p_model_object->volumes[i];
-        if (!volume->is_model_part() || !volume->config.has("painted_wall_loops"))
-            continue;
-        int part_count = volume->config.opt_int("painted_wall_loops");
-        ImGui::PushID(int(i));
-        ImGui::SetNextItemWidth(m_imgui->scaled(7.f));
-        if (ImGui::InputInt(volume->name.c_str(), &part_count)) {
-            Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Change painted wall count", UndoRedo::SnapshotType::GizmoAction);
-            volume->config.set("painted_wall_loops", std::clamp(part_count, 0, 1000));
-            count_changed();
-        }
-        if (m_imgui->button(_L("Use object value"))) {
-            Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Reset painted wall count", UndoRedo::SnapshotType::GizmoAction);
-            volume->config.erase("painted_wall_loops");
-            count_changed();
-        }
-        ImGui::PopID();
-    }
-
     // First calculate width of all the texts that are could possibly be shown. We will decide set the dialog width based on that:
     const float space_size = m_imgui->get_style_scaling() * 8;
     const float clipping_slider_left    = m_imgui->calc_text_size(m_desc.at("clipping_of_view")).x + m_imgui->scaled(1.5f);

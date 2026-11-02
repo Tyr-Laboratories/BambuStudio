@@ -27,11 +27,13 @@ Normal and erased surfaces both use the applicable normal wall count. The distin
 
 **Painted wall loops** (`painted_wall_loops`) is the **total** requested wall count on painted surfaces, not an extra number added to **Wall loops** (`wall_loops`). Both settings accept integers from **0 to 1000** and have a definition default of **2**; a selected preset can supply another value. A painted count can be higher or lower than the normal count.
 
-The setting follows the existing process, object, and part hierarchy:
+Set wall counts through the standard settings panels. The setting follows the existing process, object, and part hierarchy:
 
 - **Global process:** set the inherited painted count in **Strength > Walls**.
-- **Object:** the painter's **Painted wall loops (this object)** field creates or edits an object override. **Use global value** removes it; the panel shows **Inherited from global settings** when there is no object override.
-- **Part:** set a part override through the existing object/part settings. Existing part overrides also appear in the painter, where **Use object value** removes a part override.
+- **Object:** select the object and set **Painted wall loops** in its normal object settings to override the global value. Remove the override there to inherit the global value again.
+- **Part:** select the part and set **Painted wall loops** in its normal part settings to override the object's value. Remove the override there to inherit the object/global value again.
+
+The painting panel contains surface-painting tools only. Numeric wall counts and their inheritance controls remain in the standard global, object, and part settings.
 
 Painting records a surface mask separately from the numeric count. Changing the applicable count updates surfaces already painted when you slice again; repainting is unnecessary. A part override takes precedence over the object or global value, so changing the global value will not change a part with its own override.
 
@@ -59,7 +61,7 @@ The following results cover the wall-painting implementation and its macOS appli
 
 - **Focused automated tests:** 26 cases and 1,366 assertions passed. Coverage includes both generators, partial and curved painted surfaces, holes, zero/high counts, narrow regions, transitions, infill clearance, transforms, variable layer heights, numeric modifiers, per-part settings, annotation lifecycle, and 3MF persistence. See [the focused test source](../tests/fff_print/test_wall_painting.cpp).
 - **Application build:** the macOS application compiled and linked successfully.
-- **Manual interaction:** user checks confirmed painting, right-click normal, Shift erase, undo, and section clipping. The object-count label and inheritance text were observed; the reset-to-global/object buttons were not directly exercised in those checks.
+- **Manual interaction:** user checks confirmed painting, right-click normal, Shift erase, undo, and section clipping.
 - **Project and output checks:** the GUI loaded, saved, and reopened painted 3MF projects. Preview showed one exterior wall and an additional wall at the painted center hole. An edited project exported G-code successfully and retained its painting after reopening.
 - **Broader regression coverage:** a selected existing regression target ran 18 cases, with 12 passing and 6 failing. The failures involved older arrangement fixtures, a removed setting, an exact floating-point comparison, and stale hull expectations. The broader existing FFF test target also encountered removed-API compilation failures. No clean upstream-baseline comparison established that all of these failures predate this fork, so this is not a claim that the full upstream suite passes.
 
