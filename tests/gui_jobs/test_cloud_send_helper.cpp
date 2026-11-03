@@ -189,7 +189,7 @@ int fake_docker(int argc, char **argv)
                 }
                 if (++runtime_mounts == 2) mark("staged-runtime");
             }
-            if (a.find("dst=/job") != std::string::npos && mode != "verify" && mode != "verify-rejected" && mode != "verify-printer") {
+            if (a.find("dst=/job") != std::string::npos && !fs::is_empty(source)) {
                 if (read_file(source / "plate.gcode.3mf") != "exact sliced job bytes" || read_file(source / "config.3mf") != "exact config bytes") return 97;
                 struct stat st{};
                 stat((source / "plate.gcode.3mf").c_str(), &st);
@@ -283,7 +283,18 @@ int fake_docker(int argc, char **argv)
         if (m == "net.change_user") return 95; // Native auth import uses the opaque session, never a fabricated login payload.
         if (m == "net.is_user_login") r["value"] = true;
         if (m == "net.get_user_id") r["value"] = mode == "wrong-user" ? "wrong-user" : "user-test";
+        if (m == "net.get_camera_url") {
+            if (!printer_reported || p.at("dev_id") != "printer-test|01.02|\"tutk\",\"agora\"") return 116;
+            write_file(root / "camera-requested", "yes");
+            if(mode=="camera-wait") continue;
+            r["result"] = mode == "camera-denied" ? "[1:403]" :
+                          mode == "camera-local" ? "bambu:///local/192.0.2.1?passwd=SECRET_TOKEN" :
+                          mode == "camera-wrong-protocol" ? "bambu:///tutk-invalid?token=SECRET_TOKEN" :
+                          mode == "camera-agora" ? "bambu:///camera/agora?token=SECRET_TOKEN" :
+                          "bambu:///tutk?uid=private-camera-uid&authkey=SECRET_TOKEN";
+        }
         if (m == "net.start_print") {
+            if (!fs::exists(root/"staged-bytes-private")) return 97;
             mark("submitted");
             write_file(root / "submission-count", std::to_string(++submissions));
             if (json::parse(read_file(workspace / "owner.json")).at("phase") != "submitting") return 114;
@@ -372,6 +383,9 @@ int fake_docker(int argc, char **argv)
         }
         if (m == "bridge.job_cancel") {
             mark("cancelled");
+            // Allow the waiting completion callback to return before the
+            // cancellation RPC finishes. A terminal job needs no wait reply.
+            if (mode == "wait-cancel") std::this_thread::sleep_for(std::chrono::milliseconds(100));
             respond(pending, {{"ok", true}, {"value", BAMBU_NETWORK_ERR_CANCELED}});
             pending = 0;
         }
@@ -422,6 +436,69 @@ TEST_CASE("Cloud helper refuses changed resources before invoking any runtime", 
     write_file(f.root / "resources/cloud-helper/image.tar", "tampered");
     REQUIRE_THROWS_AS(f.send(), std::runtime_error);
     REQUIRE_FALSE(f.marked("docker-called"));
+}
+TEST_CASE("Camera authorization prepares the target without submitting or replacing send timing", "[cloud-helper][camera]")
+{
+    Fixture f;
+    const auto timing=f.root/"data/cloud-send-latest-timing.json";
+    write_file(timing,"last real print attempt");
+    const auto url=helper::camera_url((f.root/"BambuNetworkEngine.conf").string(),"user-test","US",
+        (f.root/"resources").string(),(f.root/"data").string(),"printer-test|01.02|\"tutk\",\"agora\"");
+    REQUIRE(url=="bambu:///tutk?uid=private-camera-uid&authkey=SECRET_TOKEN");
+    REQUIRE(f.marked("printer-report-delivered"));
+    REQUIRE(f.marked("camera-requested"));
+    REQUIRE_FALSE(f.marked("submitted"));
+    REQUIRE(jobs_empty(f.root/"data/cloud-send-jobs"));
+    REQUIRE(read_file(timing)=="last real print attempt");
+}
+TEST_CASE("Camera authorization rejects refused or non-cloud sessions without exposing their values", "[cloud-helper][camera]")
+{
+    for(const char* mode:{"camera-denied","camera-local","camera-wrong-protocol"}) {
+        Fixture f(mode);
+        std::string error;
+        try { (void)helper::camera_url((f.root/"BambuNetworkEngine.conf").string(),"user-test","US",
+            (f.root/"resources").string(),(f.root/"data").string(),"printer-test|01.02|\"tutk\",\"agora\""); }
+        catch(const std::exception& e){error=e.what();}
+        REQUIRE(f.marked("camera-requested"));
+        REQUIRE(error.find("supported camera connection")!=std::string::npos);
+        REQUIRE(error.find("SECRET_TOKEN")==std::string::npos);
+        REQUIRE(error.find("192.0.2.1")==std::string::npos);
+        REQUIRE_FALSE(f.marked("submitted"));
+        REQUIRE(jobs_empty(f.root/"data/cloud-send-jobs"));
+    }
+}
+TEST_CASE("Camera requests cancel and stop before requesting a session", "[cloud-helper][camera]")
+{
+    Fixture f("cancel-printer");
+    REQUIRE_THROWS(helper::camera_url((f.root/"BambuNetworkEngine.conf").string(),"user-test","US",
+        (f.root/"resources").string(),(f.root/"data").string(),"printer-test|01.02|\"tutk\",\"agora\"",
+        [&]{return f.marked("printer-polled");}));
+    REQUIRE(f.marked("printer-polled"));
+    REQUIRE_FALSE(f.marked("camera-requested"));
+    REQUIRE_FALSE(f.marked("submitted"));
+    REQUIRE(jobs_empty(f.root/"data/cloud-send-jobs"));
+}
+TEST_CASE("Camera requests can cancel during the SDK authorization callback", "[cloud-helper][camera]")
+{
+    Fixture f("camera-wait");
+    const auto started=std::chrono::steady_clock::now();
+    REQUIRE_THROWS_WITH(helper::camera_url((f.root/"BambuNetworkEngine.conf").string(),"user-test","US",
+        (f.root/"resources").string(),(f.root/"data").string(),"printer-test|01.02|\"tutk\",\"agora\"",
+        [&]{return f.marked("camera-requested");}),Catch::Matchers::Contains("canceled"));
+    REQUIRE(std::chrono::steady_clock::now()-started<std::chrono::seconds(2));
+    REQUIRE_FALSE(f.marked("submitted"));
+    REQUIRE(jobs_empty(f.root/"data/cloud-send-jobs"));
+}
+TEST_CASE("Camera authorization accepts the cloud Agora path and refuses invalid requests early", "[cloud-helper][camera]")
+{
+    Fixture f("camera-agora");
+    REQUIRE(helper::camera_url((f.root/"BambuNetworkEngine.conf").string(),"user-test","US",
+        (f.root/"resources").string(),(f.root/"data").string(),"printer-test|01.02|\"tutk\",\"agora\"") == "bambu:///camera/agora?token=SECRET_TOKEN");
+    REQUIRE_FALSE(f.marked("submitted"));
+    for(const char* request:{"","|firmware","printer-test","printer-test|bad\ninput"}) {
+        REQUIRE_THROWS_WITH(helper::camera_url((f.root/"BambuNetworkEngine.conf").string(),"user-test","US",
+            (f.root/"resources").string(),(f.root/"data").string(),request),Catch::Matchers::Contains("invalid"));
+    }
 }
 TEST_CASE("Cloud helper prepares the selected printer before its single submission", "[cloud-helper][printer-preparation]")
 {

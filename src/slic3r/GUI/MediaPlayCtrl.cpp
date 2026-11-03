@@ -10,6 +10,7 @@
 
 #include "slic3r/Utils/BBLUtil.hpp"
 #include "slic3r/Utils/FileTransferObject.hpp"
+#include "slic3r/Utils/TyrCloudCameraRequests.hpp"
 #include "Printer/LiveViewTrackContext.h"
 #include "Printer/BambuTunnel.h"
 
@@ -404,6 +405,15 @@ void refresh_agora_url(char const* device, char const* dev_ver, char const* chan
     });
 }
 
+static void refresh_live_camera_url(char const* device, char const* dev_ver, char const* channel,
+                                    void* context, void (*callback)(void*, char const*))
+{
+    const std::string request = std::string(device) + "|" + dev_ver + "|\"agora\"|" + channel;
+    wxGetApp().getAgent()->get_live_camera_url(request, [context, callback](std::string url, TyrCloudCameraGuard guard) {
+        guard.deliver([&] { callback(context, url.c_str()); });
+    });
+}
+
 void MediaPlayCtrl::Play()
 {
     if (!m_next_retry.IsValid() || wxDateTime::Now() < m_next_retry)
@@ -453,7 +463,7 @@ void MediaPlayCtrl::Play()
         url += "&cli_ver=" + std::string(SLIC3R_VERSION);
 
 #if !BBL_RELEASE_TO_PUBLIC
-        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl: " << hide_passwd(hide_id_middle_string(url, url.find(m_lan_ip), m_lan_ip.length()), {m_lan_passwd});
+        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl: local camera connection prepared";
 #endif
 
         m_url = url;
@@ -494,8 +504,8 @@ void MediaPlayCtrl::Play()
 
     if (agent) {
         std::string protocols[] = {"", "\"tutk\"", "\"agora\"", "\"tutk\",\"agora\""};
-        agent->get_camera_url(m_machine + "|" + m_dev_ver + "|" + protocols[m_remote_proto],
-                [this, m = m_machine, v = agent_version, dv = m_dev_ver, token = std::weak_ptr(m_token)](std::string url) {
+        const int request_result = agent->get_live_camera_url(m_machine + "|" + m_dev_ver + "|" + protocols[m_remote_proto],
+                [this, m = m_machine, v = agent_version, dv = m_dev_ver, token = std::weak_ptr(m_token)](std::string url, TyrCloudCameraGuard guard) {
             if (token.expired()) {
                 BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": token has been expired";
                 return;
@@ -505,41 +515,46 @@ void MediaPlayCtrl::Play()
                 url += "&device=" + into_u8(m);
                 url += "&net_ver=" + v;
                 url += "&dev_ver=" + dv;
-                url += "&refresh_url=" + boost::lexical_cast<std::string>(&refresh_agora_url);
+                url += "&refresh_url=" + boost::lexical_cast<std::string>(&refresh_live_camera_url);
                 url += "&cli_id=" + wxGetApp().app_config->get("slicer_uuid");
                 url += "&cli_ver=" + std::string(SLIC3R_VERSION);
             }
 
 #if !BBL_RELEASE_TO_PUBLIC
-            BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl: " << hide_passwd(url, {"?uid=", "channel=", "authkey=", "passwd=", "license=", "token="});
+            BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl: cloud camera request completed";
 #endif
 
-            CallAfter([this, m, url] {
-                if (m != m_machine) {
-                    BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl drop late ttcode for machine: " << BBLCrossTalk::Crosstalk_DevId(m);
-                    return;
-                }
-                if (m_last_state == MEDIASTATE_INITIALIZING) {
-                    if (url.empty() || !boost::algorithm::starts_with(url, "bambu:///")) {
-                        m_failed_code = 3;
-                        if (boost::ends_with(url, "]")) {
-                            size_t n = url.find_last_of('[');
-                            if (n != std::string::npos)
-                                m_failed_code = std::atoi(url.substr(n + 1, url.length() - n - 2).c_str());
-                        }
-                        Stop(_L("Connection Failed. Please check the network and try again"), from_u8(url));
-                    } else {
-                        m_url = url;
-                        if (m_media_ctrl) {
-                            m_media_ctrl->SetTrackChannel(parse_track_channel_from_url(url));
-                        }
-                        load();
+            CallAfter([this, m, url, token, guard] {
+                if (token.expired()) return;
+                guard.deliver([&] {
+                    if (m != m_machine) {
+                        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl drop late ttcode for machine: " << BBLCrossTalk::Crosstalk_DevId(m);
+                        return;
                     }
-                } else {
-                    BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl drop late ttcode for state: " << m_last_state;
-                }
+                    if (m_last_state == MEDIASTATE_INITIALIZING) {
+                        if (url.empty() || !boost::algorithm::starts_with(url, "bambu:///")) {
+                            m_failed_code = 3;
+                            if (boost::ends_with(url, "]")) {
+                                size_t n = url.find_last_of('[');
+                                if (n != std::string::npos)
+                                    m_failed_code = std::atoi(url.substr(n + 1, url.length() - n - 2).c_str());
+                            }
+                            Stop(_L("Connection Failed. Please check the network and try again"), from_u8(url));
+                        } else {
+                            m_url = url;
+                            if (m_media_ctrl) {
+                                m_media_ctrl->SetTrackChannel(parse_track_channel_from_url(url));
+                            }
+                            load();
+                        }
+                    } else {
+                        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl drop late ttcode for state: " << m_last_state;
+                    }
+                });
             });
         });
+        if (request_result != 0)
+            Stop(_L("Connection Failed. Please check the network and try again"));
     }
 }
 
@@ -748,7 +763,7 @@ void MediaPlayCtrl::ToggleStream()
         url += "&dev_ver=" + m_dev_ver;
 
 #if !BBL_RELEASE_TO_PUBLIC
-        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::ToggleStream: " << hide_passwd(hide_id_middle_string(url, url.find(m_lan_ip), m_lan_ip.length()), {m_lan_passwd});
+        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::ToggleStream: local camera connection prepared";
 #endif
 
         std::string             file_url = data_dir() + "/cameratools/url.txt";
@@ -776,7 +791,7 @@ void MediaPlayCtrl::ToggleStream()
         }
 
 #if !BBL_RELEASE_TO_PUBLIC
-        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::ToggleStream: " << hide_passwd(url,{"?uid=", "authkey=", "passwd=", "license=", "token="});
+        BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::ToggleStream: cloud camera request completed";
 #endif
 
         CallAfter([this, m, url] {
@@ -1216,7 +1231,7 @@ void MediaPlayCtrl::media_proc()
         if (m_tasks.size() >= 2 && !url.IsEmpty() && url[0] != '<' && m_tasks[1] == "<stop>") {
 
 #if !BBL_RELEASE_TO_PUBLIC
-            BOOST_LOG_TRIVIAL(trace) << "MediaPlayCtrl: busy skip url: " << url;
+            BOOST_LOG_TRIVIAL(trace) << "MediaPlayCtrl: skipped camera load after Stop";
 #endif
             m_tasks.pop_front();
             m_tasks.pop_front();

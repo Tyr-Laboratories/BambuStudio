@@ -3,10 +3,13 @@
 
 #include "bambu_networking.hpp"
 #include "libslic3r/ProjectTask.hpp"
+#include <memory>
 
 using namespace BBL;
 
 namespace Slic3r {
+class TyrCloudCameraRequests;
+class TyrCloudCameraGuard;
 typedef bool (*func_check_debug_consistent)(bool is_debug);
 typedef std::string (*func_get_version)(void);
 typedef void* (*func_create_agent)(std::string log_dir);
@@ -228,6 +231,7 @@ public:
     int query_bind_status(std::vector<std::string> query_list, unsigned int* http_code, std::string* http_body);
     int modify_printer_name(std::string dev_id, std::string dev_name);
     int get_camera_url(std::string dev_id, std::function<void(std::string)> callback);
+    int get_live_camera_url(std::string dev_id, std::function<void(std::string, TyrCloudCameraGuard)> callback);
     int get_camera_url_for_golive(std::string dev_id, std::string sdev_id, std::function<void(std::string)> callback);
     int get_design_staffpick(int offset, int limit, std::function<void(std::string)> callback);
     int start_publish(PublishParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn, std::string* out);
@@ -260,6 +264,9 @@ public:
     void *get_network_agent() { return network_agent; }
 
 private:
+#if defined(__APPLE__)
+    std::unique_ptr<TyrCloudCameraRequests> m_cloud_camera_requests;
+#endif
     std::string m_cloud_sender_country = "US";
     bool enable_track = false;
     void*                   network_agent { nullptr };

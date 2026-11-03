@@ -22,6 +22,7 @@ if (APPLE)
     target_sources(gui_job_tests PRIVATE test_webview_mac.cpp)
     add_executable(cloud_send_helper_tests
         test_cloud_send_helper.cpp
+        test_camera_requests.cpp
         test_cloud_send_recovery.cpp
         ${PROJECT_SOURCE_DIR}/src/slic3r/Utils/TyrCloudSendHelper.cpp
     )

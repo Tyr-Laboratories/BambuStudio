@@ -14,6 +14,7 @@
 #if defined(__APPLE__)
 #include "TyrCloudSendHelper.hpp"
 #endif
+#include "TyrCloudCameraRequests.hpp"
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/CertificateVerify.hpp"
@@ -150,6 +151,9 @@ func_post_device_region             NetworkAgent::post_device_region_ptr       =
 
 NetworkAgent::NetworkAgent(std::string log_dir)
 {
+#if defined(__APPLE__)
+    m_cloud_camera_requests=std::make_unique<TyrCloudCameraRequests>();
+#endif
     if (create_agent_ptr) {
         network_agent = create_agent_ptr(log_dir);
     }
@@ -158,6 +162,10 @@ NetworkAgent::NetworkAgent(std::string log_dir)
 
 NetworkAgent::~NetworkAgent()
 {
+#if defined(__APPLE__)
+    // Stop read-only helper requests before their native callback owners leave.
+    m_cloud_camera_requests.reset();
+#endif
     int ret = 0;
     if (network_agent && destroy_agent_ptr) {
         ret = destroy_agent_ptr(network_agent);
@@ -983,13 +991,20 @@ bool NetworkAgent::start_discovery(bool start, bool sending)
 
 int  NetworkAgent::change_user(std::string user_info)
 {
-    int ret = 0;
-    if (network_agent && change_user_ptr) {
-        ret = change_user_ptr(network_agent, user_info);
-        if (ret)
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") %network_agent %ret ;
-    }
-    return ret;
+    auto mutate = [&] {
+        int ret = 0;
+        if (network_agent && change_user_ptr) {
+            ret = change_user_ptr(network_agent, user_info);
+            if (ret)
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") %network_agent %ret ;
+        }
+        return ret;
+    };
+#if defined(__APPLE__)
+    return m_cloud_camera_requests->account_change(mutate);
+#else
+    return mutate();
+#endif
 }
 
 bool NetworkAgent::is_user_login()
@@ -1003,13 +1018,20 @@ bool NetworkAgent::is_user_login()
 
 int  NetworkAgent::user_logout(bool request)
 {
-    int ret = 0;
-    if (network_agent && user_logout_ptr) {
-        ret = user_logout_ptr(network_agent, request);
-        if (ret)
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") %network_agent %ret;
-    }
-    return ret;
+    auto mutate = [&] {
+        int ret = 0;
+        if (network_agent && user_logout_ptr) {
+            ret = user_logout_ptr(network_agent, request);
+            if (ret)
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(" error: network_agent=%1%, ret=%2%") %network_agent %ret;
+        }
+        return ret;
+    };
+#if defined(__APPLE__)
+    return m_cloud_camera_requests->account_change(mutate);
+#else
+    return mutate();
+#endif
 }
 
 std::string NetworkAgent::get_user_id()
@@ -1520,6 +1542,26 @@ int NetworkAgent::modify_printer_name(std::string dev_id, std::string dev_name)
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" : network_agent=%1%, ret=%2%, dev_id=%3%, dev_name=%4%") %network_agent %ret %BBLCrossTalk::Crosstalk_DevId(dev_id) %dev_name;
     }
     return ret;
+}
+
+int NetworkAgent::get_live_camera_url(std::string dev_id, std::function<void(std::string, TyrCloudCameraGuard)> callback)
+{
+#if defined(__APPLE__)
+    return m_cloud_camera_requests->submit_factory([this, request = std::move(dev_id)]() -> TyrCloudCameraRequests::Work {
+        if (!is_user_login()) return {};
+        const auto data = data_dir();
+        const auto resources = resources_dir();
+        const auto identity = get_user_id();
+        const auto country = m_cloud_sender_country;
+        return [data, resources, identity, country, request](TyrCloudCameraRequests::Cancelled cancelled) {
+            return TyrCloudSendHelper::camera_url(data + "/BambuNetworkEngine.conf", identity, country, resources, data, request, std::move(cancelled));
+        };
+    }, std::move(callback)) ? 0 : cloud_send_helper_error;
+#else
+    return get_camera_url(std::move(dev_id), [callback = std::move(callback)](std::string url) {
+        callback(std::move(url), TyrCloudCameraGuard::unrestricted());
+    });
+#endif
 }
 
 int NetworkAgent::get_camera_url(std::string dev_id, std::function<void(std::string)> callback)

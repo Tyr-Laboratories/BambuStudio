@@ -751,7 +751,17 @@ void prepare_printer(Rpc &rpc, const Json &agent, const std::string &target, con
     }
     if (was_cancelled(cancelled)) throw PreparationCancelled{};
 }
-enum class RunMode { Send, VerifyAccount, VerifyPrinter };
+bool cloud_camera_session(const std::string &url)
+{
+    if(url.size()>16384 || url.rfind("bambu:///",0)!=0 ||
+       std::any_of(url.begin(),url.end(),[](unsigned char c){return c<32 || c==127;})) return false;
+    const auto query=url.find('?');
+    if(query==std::string::npos) return false;
+    auto path=url.substr(9,query-9);
+    if(!path.empty() && path.back()=='/') path.pop_back();
+    return path=="tutk" || path=="agora" || path=="camera/tutk" || path=="camera/agora";
+}
+enum class RunMode { Send, VerifyAccount, VerifyPrinter, Camera };
 int run_send(const BBL::PrintParams &params,
              const std::string      &session_file,
              const std::string      &expected_user_id,
@@ -762,7 +772,9 @@ int run_send(const BBL::PrintParams &params,
              BBL::WasCancelledFn     cancelled,
              BBL::OnWaitFn           wait,
              RunMode                 mode   = RunMode::Send,
-             SendTiming             *timing = nullptr)
+             SendTiming             *timing = nullptr,
+             const std::string      *camera_request = nullptr,
+             std::string            *camera_result = nullptr)
 {
     const bool verify_only = mode != RunMode::Send;
     const auto mark        = [&](const char *phase) {
@@ -847,6 +859,17 @@ int run_send(const BBL::PrintParams &params,
         }
         prepare_printer(rpc, agent, params.dev_id, cancelled);
         mark("printer_ready");
+        if(mode==RunMode::Camera) {
+            if(!camera_request || !camera_result) fail("The camera request is invalid.");
+            const auto result=rpc.call("net.get_camera_url",{{"agent",agent},{"dev_id",*camera_request}},Seconds(25));
+            if(result.value("value",-1)!=0) fail("The cloud camera session could not be obtained. Try again.");
+            const auto url=result.value("result",std::string());
+            if(!cloud_camera_session(url)) fail("The cloud service did not provide a supported camera connection. Try again.");
+            if(was_cancelled(cancelled)) throw PreparationCancelled{};
+            *camera_result=url;
+            job.finish();
+            return 0;
+        }
         if (mode == RunMode::VerifyPrinter) {
             job.finish();
             return 0;
@@ -894,7 +917,10 @@ int run_send(const BBL::PrintParams &params,
             }
             if (Clock::now() > job_deadline || Clock::now() > cancel_deadline) fail(transport_error);
             poll_events();
-            if (waiting.valid() && waiting.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            // Cancellation (or an early SDK return) may have completed the job
+            // during either RPC above. Its completion callback is still joined
+            // below, but no reply belongs to an already terminal request.
+            if (!rpc.has(request) && waiting.valid() && waiting.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
                 const bool reply = waiting.get();
                 mark("completion_wait_finished");
                 rpc.call("bridge.job_wait_reply", {{"job_id", job_id}, {"request_id", wait_request}, {"reply", !cancel_sent && reply}});
@@ -924,6 +950,27 @@ bool available(const std::string &resources_dir)
 {
     std::error_code error;
     return fs::is_regular_file(fs::path(resources_dir) / "cloud-helper/manifest.json", error);
+}
+std::string camera_url(const std::string &session_file, const std::string &expected_user_id,
+                       const std::string &country, const std::string &resources_dir,
+                       const std::string &data_dir, const std::string &camera_request,
+                       BBL::WasCancelledFn cancelled)
+{
+    const auto separator=camera_request.find('|');
+    if(separator==0 || separator==std::string::npos || separator>128 || camera_request.size()>2048 ||
+       std::any_of(camera_request.begin(),camera_request.end(),[](unsigned char c){return c<32 || c==127;}))
+        fail("The camera request is invalid.");
+    BBL::PrintParams params{};
+    params.dev_id=camera_request.substr(0,separator);
+    std::string result;
+    try {
+        const int code=run_send(params,session_file,expected_user_id,country,resources_dir,data_dir,{},std::move(cancelled),{},
+            RunMode::Camera,nullptr,&camera_request,&result);
+        if(code!=0) fail("Camera connection request canceled.");
+        return result;
+    } catch(const PreparationCancelled&) { fail("Camera connection request canceled."); }
+      catch(const Json::exception&) { fail("The camera helper returned an incompatible response."); }
+      catch(const fs::filesystem_error&) { fail("The camera helper could not access its private files."); }
 }
 int send(const BBL::PrintParams &params,
          const std::string      &session_file,
