@@ -2,6 +2,7 @@
 #include "catch2/catch.hpp"
 #include "slic3r/Utils/TyrCloudSendHelper.hpp"
 #include "slic3r/Utils/TyrCloudSendRecovery.hpp"
+#include "slic3r/Utils/TyrCloudCameraRequests.hpp"
 #include "nlohmann/json.hpp"
 #include <openssl/sha.h>
 #include <filesystem>
@@ -15,6 +16,9 @@
 #include <future>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <spawn.h>
+extern char **environ;
 using json       = nlohmann::json;
 namespace fs     = std::filesystem;
 namespace helper = Slic3r::TyrCloudSendHelper;
@@ -450,6 +454,29 @@ TEST_CASE("Camera authorization prepares the target without submitting or replac
     REQUIRE_FALSE(f.marked("submitted"));
     REQUIRE(jobs_empty(f.root/"data/cloud-send-jobs"));
     REQUIRE(read_file(timing)=="last real print attempt");
+}
+TEST_CASE("Camera authorization checks chunked files on the native worker stack", "[cloud-helper][camera][worker-stack]")
+{
+    Fixture f;
+    const std::string contents(2 * 1024 * 1024 + 17, 'x');
+    write_file(f.root / "resources/cloud-helper/image.tar", contents);
+    const auto manifest_path = f.root / "resources/cloud-helper/manifest.json";
+    auto manifest = json::parse(read_file(manifest_path));
+    manifest["hashes"]["image.tar"] = digest(contents);
+    write_file(manifest_path, manifest.dump());
+
+    // A child process contains a possible stack fault so Catch can report the
+    // regression. Inside it, use the production worker's normal macOS stack.
+    std::string option = "--camera-worker-stack-probe";
+    char *args[] = {exe.data(), option.data(), nullptr};
+    pid_t child = -1;
+    REQUIRE(posix_spawn(&child, exe.c_str(), nullptr, nullptr, args, environ) == 0);
+    int status = 0;
+    REQUIRE(waitpid(child, &status, 0) == child);
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == 0);
+    CHECK(jobs_empty(f.root / "data/cloud-send-jobs"));
+    CHECK_FALSE(f.marked("submitted"));
 }
 TEST_CASE("Camera authorization rejects refused or non-cloud sessions without exposing their values", "[cloud-helper][camera]")
 {
@@ -949,5 +976,18 @@ int main(int argc, char **argv)
 {
     if (fs::path(argv[0]).filename() == "docker") return fake_docker(argc, argv);
     exe = fs::canonical(argv[0]).string();
+    if (argc == 2 && std::string(argv[1]) == "--camera-worker-stack-probe") {
+        const fs::path root = getenv("TYR_TEST_ROOT");
+        std::promise<std::string> answer;
+        auto result = answer.get_future();
+        Slic3r::TyrCloudCameraRequests requests;
+        if (!requests.submit([root](Slic3r::TyrCloudCameraRequests::Cancelled cancelled) {
+            return helper::camera_url((root / "BambuNetworkEngine.conf").string(), "user-test", "US",
+                (root / "resources").string(), (root / "data").string(),
+                "printer-test|01.02|\"tutk\",\"agora\"", std::move(cancelled));
+        }, [&](std::string url, Slic3r::TyrCloudCameraGuard) { answer.set_value(std::move(url)); })) return 2;
+        if (result.wait_for(std::chrono::seconds(20)) != std::future_status::ready) return 3;
+        return result.get() == "bambu:///tutk?uid=private-camera-uid&authkey=SECRET_TOKEN" ? 0 : 4;
+    }
     return Catch::Session().run(argc, argv);
 }

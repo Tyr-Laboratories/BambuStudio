@@ -16,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -161,7 +162,9 @@ std::string sha256(const fs::path &path)
     if (!file) fail("A bundled print helper file could not be read. Reinstall this build.");
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(), EVP_MD_CTX_free);
     if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1) fail("Print helper integrity checking failed.");
-    std::array<char, 1024 * 1024> buffer;
+    // macOS worker threads normally have a 512 KiB stack. Keep the streaming
+    // buffer on the heap; its 1 MiB chunk must not consume that thread stack.
+    std::vector<char> buffer(1024 * 1024);
     while (file) {
         file.read(buffer.data(), buffer.size());
         if (EVP_DigestUpdate(context.get(), buffer.data(), size_t(file.gcount())) != 1) fail("Print helper integrity checking failed.");
