@@ -530,6 +530,128 @@ Json print_parameters(const BBL::PrintParams &p)
     j["config_filename"] = p.config_filename.empty() ? "" : "/job/config.3mf";
     return j;
 }
+void prepare_printer(Rpc &rpc, const Json &agent, const std::string &target, const BBL::WasCancelledFn &cancelled)
+{
+    if (target.empty()) fail("Select a printer before sending.");
+    auto net = [&](const char *method, Json payload = Json::object()) {
+        payload["agent"] = agent;
+        return rpc.call(std::string("net.") + method, payload);
+    };
+    auto check = [&](const char *method, Json payload = Json::object()) {
+        if (net(method, payload).value("value", -1) != 0)
+            fail("The print helper could not prepare the selected printer. No print was submitted. Check the connection and try again.");
+    };
+    auto is_target_topic = [&](const std::string &topic) {
+        // SDK callbacks use either the device ID or an MQTT/tunnel topic.
+        // Match a complete component, never another printer's ID prefix.
+        std::istringstream parts(topic);
+        for (std::string part; std::getline(parts, part, '/');)
+            if (part == target) return true;
+        return false;
+    };
+    bool     cloud_connected = false, target_started = false, report_received = false;
+    unsigned certificate_calls   = 0;
+    auto     install_certificate = [&] {
+        if (certificate_calls < 3) {
+            check("install_device_cert", {{"dev_id", target}, {"lan_only", false}});
+            ++certificate_calls;
+        }
+    };
+    auto poll = [&] {
+        if (was_cancelled(cancelled)) throw PreparationCancelled{};
+        bool       refresh_certificate = false;
+        const auto events              = rpc.call("bridge.poll_events", {{"limit", 256}}).value("events", Json::array());
+        for (const auto &event : events) {
+            if (event.value("agent", Json()) != agent) continue;
+            const auto name    = event.value("name", "");
+            const auto payload = event.value("payload", Json::object());
+            if (name == "on_user_login" && !payload.value("login", false))
+                fail("The Bambu account session expired while preparing the printer. Sign in again; no print was submitted.");
+            if (name == "on_http_error" && (payload.value("http_code", 0) == 401 || payload.value("http_code", 0) == 403))
+                fail("The cloud service rejected the account session. Sign in again; no print was submitted.");
+            if (name == "on_server_connected") {
+                if (payload.value("return_code", -1) != 0) fail("The cloud connection was rejected while preparing the printer. No print was submitted.");
+                cloud_connected = true;
+            }
+            if (target_started && name == "on_subscribe_failure" && is_target_topic(payload.value("topic", "")))
+                fail("The selected printer's status subscription failed. No print was submitted. Check the printer connection and try again.");
+            if (target_started && name == "on_printer_connected" && is_target_topic(payload.value("topic_str", ""))) refresh_certificate = true;
+            if (target_started && name == "on_message") {
+                const auto device  = payload.value("dev_id", "");
+                const auto message = payload.value("msg", "");
+                if ((device.empty() || device == target) && message == "wait_info") refresh_certificate = true;
+                if (device != target) continue;
+                const auto parsed = Json::parse(message, nullptr, false);
+                if (!parsed.is_object() || !parsed.contains("print") || !parsed["print"].is_object()) continue;
+                const auto &print = parsed["print"];
+                if (print.value("command", Json()) == "push_status" && print.contains("gcode_state") && print["gcode_state"].is_string() &&
+                    !print["gcode_state"].get_ref<const std::string &>().empty())
+                    report_received = true;
+            }
+        }
+        if (refresh_certificate) install_certificate();
+    };
+
+    check("set_user_selected_machine", {{"dev_id", ""}});
+    check("connect_server");
+    const auto cloud_deadline = Clock::now() + Seconds(15);
+    while (!cloud_connected) {
+        poll();
+        if (!cloud_connected) cloud_connected = net("is_server_connected").value("value", false);
+        if (cloud_connected) break;
+        if (Clock::now() >= cloud_deadline) fail("The cloud connection did not become ready. No print was submitted. Check the connection and try again.");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    const auto account = net("get_user_print_info");
+    const auto http    = account.value("http_code", 0);
+    if (account.value("value", -1) != 0 || http < 200 || http >= 300)
+        fail("The cloud service did not accept the current account session. Sign in again; no print was submitted.");
+    const auto inventory = Json::parse(account.value("http_body", ""), nullptr, false);
+    if (!inventory.is_object() || !inventory.contains("devices") || !inventory["devices"].is_array())
+        fail("The cloud service returned invalid printer information. No print was submitted.");
+    bool found = false;
+    for (const auto &device : inventory["devices"]) {
+        if (!device.is_object() || device.value("dev_id", Json()) != target) continue;
+        found = true;
+        if (device.value("dev_online", Json()) != true) fail("The selected printer is offline. No print was submitted. Reconnect the printer and try again.");
+    }
+    if (!found) fail("The selected printer is not available in this account. No print was submitted.");
+    check("enable_multi_machine", {{"enable", true}});
+    check("start_subscribe", {{"module", "tunnel"}});
+    target_started = true;
+    check("add_subscribe", {{"devs", Json::array({target})}});
+    check("set_user_selected_machine", {{"dev_id", target}});
+    install_certificate();
+
+    unsigned   status_requests     = 0;
+    bool       status_requested    = false;
+    unsigned   sequence            = 20000;
+    auto       next_status_request = Clock::now();
+    const auto printer_deadline    = Clock::now() + Seconds(30);
+    while (!report_received) {
+        if (was_cancelled(cancelled)) throw PreparationCancelled{};
+        if (status_requests < 3 && Clock::now() >= next_status_request) {
+            // Fixed read-only status request. Never send print/control commands
+            // during preparation or a verify_printer probe.
+            const Json query = {{"pushing", {{"sequence_id", std::to_string(++sequence)}, {"command", "pushall"}, {"version", 1}, {"push_target", 1}}}};
+            // Selection/subscription is asynchronous. A read-only query may
+            // be rejected until the route is ready; keep the bounded refreshes
+            // while authentication and subscription errors still fail in poll.
+            status_requested = net("send_message", {{"dev_id", target}, {"qos", 0}, {"flag", 0}, {"msg", query.dump()}}).value("value", -1) == 0 || status_requested;
+            ++status_requests;
+            next_status_request = Clock::now() + Seconds(5);
+        }
+        poll();
+        if (report_received) break;
+        if (Clock::now() >= printer_deadline) {
+            if (!status_requested) fail("The selected printer status request could not be sent. No print was submitted. Check the printer connection and try again.");
+            fail("The selected printer information did not become ready. No print was submitted. Check the printer connection and try again.");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (was_cancelled(cancelled)) throw PreparationCancelled{};
+}
+enum class RunMode { Send, VerifyAccount, VerifyPrinter };
 int run_send(const BBL::PrintParams &params,
              const std::string      &session_file,
              const std::string      &expected_user_id,
@@ -539,8 +661,9 @@ int run_send(const BBL::PrintParams &params,
              BBL::OnUpdateStatusFn   update,
              BBL::WasCancelledFn     cancelled,
              BBL::OnWaitFn           wait,
-             bool                    verify_only = false)
+             RunMode                 mode = RunMode::Send)
 {
+    const bool verify_only = mode != RunMode::Send;
     if (was_cancelled(cancelled)) return BAMBU_NETWORK_ERR_CANCELED;
     if (expected_user_id.empty()) fail("Sign in before sending a cloud print.");
     if ((params.task_record_timelapse && params.task_timelapse_use_internal) || !params.queue_plate_id.empty())
@@ -599,16 +722,23 @@ int run_send(const BBL::PrintParams &params,
                                           {"X-BBL-OS-Type", "linux"},
                                           {"X-BBL-Language", "en"},
                                           {"X-BBL-Device-ID", job.name}}}});
-        for (const char *method : {"set_queue_on_main_fn", "set_on_user_login_fn", "set_on_server_connected_fn", "set_on_http_error_fn"}) check(method);
+        for (const char *method : {"set_queue_on_main_fn", "set_on_user_login_fn", "set_on_server_connected_fn", "set_on_http_error_fn", "set_on_message_fn",
+                                   "set_on_printer_connected_fn", "set_on_subscribe_failure_fn"})
+            check(method);
         check("set_country_code", {{"country_code", country}});
         check("start");
         if (!net("is_user_login").value("value", false) || net("get_user_id").value("value", "") != expected_user_id)
             fail("The print helper account does not match Bambu Studio. Sign out and sign in again before sending.");
-        check("connect_server");
-        if (verify_only) {
+        if (mode == RunMode::VerifyAccount) {
+            check("connect_server");
             const auto account = net("get_user_print_info");
             const int  http    = account.value("http_code", 0);
             if (account.value("value", -1) != 0 || http < 200 || http >= 300) fail("The cloud service did not accept the current account session. Sign in again before sending.");
+            job.finish();
+            return 0;
+        }
+        prepare_printer(rpc, agent, params.dev_id, cancelled);
+        if (mode == RunMode::VerifyPrinter) {
             job.finish();
             return 0;
         }
@@ -696,11 +826,28 @@ int send(const BBL::PrintParams &params,
 void verify_account(const std::string &session_file, const std::string &expected_user_id, const std::string &country, const std::string &resources_dir, const std::string &data_dir)
 {
     try {
-        (void) run_send(BBL::PrintParams{}, session_file, expected_user_id, country, resources_dir, data_dir, {}, {}, {}, true);
+        (void) run_send(BBL::PrintParams{}, session_file, expected_user_id, country, resources_dir, data_dir, {}, {}, {}, RunMode::VerifyAccount);
     } catch (const Json::exception &) {
         fail("The print helper returned an incompatible account response.");
     } catch (const fs::filesystem_error &) {
         fail("The print helper could not access its private account files.");
+    }
+}
+void verify_printer(const std::string &session_file,
+                    const std::string &expected_user_id,
+                    const std::string &country,
+                    const std::string &resources_dir,
+                    const std::string &data_dir,
+                    const std::string &printer_id)
+{
+    BBL::PrintParams params{};
+    params.dev_id = printer_id;
+    try {
+        (void) run_send(params, session_file, expected_user_id, country, resources_dir, data_dir, {}, {}, {}, RunMode::VerifyPrinter);
+    } catch (const Json::exception &) {
+        fail("The print helper returned incompatible printer information. No print was submitted.");
+    } catch (const fs::filesystem_error &) {
+        fail("The print helper could not access its private account files. No print was submitted.");
     }
 }
 } // namespace Slic3r::TyrCloudSendHelper

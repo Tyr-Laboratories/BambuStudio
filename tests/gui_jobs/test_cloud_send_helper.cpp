@@ -189,7 +189,7 @@ int fake_docker(int argc, char **argv)
                 }
                 if (++runtime_mounts == 2) mark("staged-runtime");
             }
-            if (a.find("dst=/job") != std::string::npos && mode != "verify" && mode != "verify-rejected") {
+            if (a.find("dst=/job") != std::string::npos && mode != "verify" && mode != "verify-rejected" && mode != "verify-printer") {
                 if (read_file(source / "plate.gcode.3mf") != "exact sliced job bytes" || read_file(source / "config.3mf") != "exact config bytes") return 97;
                 struct stat st{};
                 stat((source / "plate.gcode.3mf").c_str(), &st);
@@ -208,9 +208,13 @@ int fake_docker(int argc, char **argv)
                 mark("private-auth");
             }
         }
-    uint32_t pending = 0;
-    bool     sent    = false;
-    int64_t  job     = 0;
+    uint32_t pending   = 0;
+    bool     sent      = false;
+    int64_t  job       = 0;
+    bool     connected = false, server_reported = false, selected = false, printer_reported = false;
+    bool     message_callback = false, printer_callback = false, subscribe_callback = false;
+    bool     selection_cleared = false, inventory_checked = false, tunnel_started = false, subscribed = false, multi_machine = false;
+    unsigned preparation_polls = 0, certificate_calls = 0, submissions = 0, status_requests = 0;
     for (;;) {
         uint32_t h[4];
         if (!std::cin.read(reinterpret_cast<char *>(h), 16)) return 0;
@@ -221,6 +225,9 @@ int fake_docker(int argc, char **argv)
         auto        p   = req.at("payload");
         std::string m   = req.at("method");
         json        r   = {{"ok", true}, {"value", 0}};
+        if (m == "net.set_on_message_fn") message_callback = true;
+        if (m == "net.set_on_printer_connected_fn") printer_callback = true;
+        if (m == "net.set_on_subscribe_failure_fn") subscribe_callback = true;
         if (m == "bridge.handshake")
             r = {{"ok", true},
                  {"protocol_version", 1},
@@ -233,14 +240,57 @@ int fake_docker(int argc, char **argv)
         }
         if (m == "net.get_user_print_info") {
             r["http_code"] = mode == "verify-rejected" ? 401 : 200;
-            r["http_body"] = "private inventory";
+            r["http_body"] =
+                json({{"devices", json::array({{{"dev_id", mode == "missing-printer" ? "another-printer" : "printer-test"}, {"dev_online", mode != "offline-printer"}}})}}).dump();
+            inventory_checked = true;
             mark("account-checked");
+        }
+        if (m == "net.set_user_selected_machine") {
+            if (p.at("dev_id") == "")
+                selection_cleared = !connected;
+            else {
+                if (p.at("dev_id") != "printer-test" || !inventory_checked || !subscribed || !multi_machine) return 108;
+                selected = true;
+                mark("printer-selected");
+            }
+        }
+        if (m == "net.connect_server") connected = true;
+        if (m == "net.is_server_connected") r["value"] = server_reported;
+        if (m == "net.enable_multi_machine") multi_machine = p.at("enable") == true;
+        if (m == "net.start_subscribe") {
+            if (p.at("module") != "tunnel") return 109;
+            tunnel_started = true;
+        }
+        if (m == "net.add_subscribe") {
+            if (p.at("devs") != json::array({"printer-test"}) || !tunnel_started) return 110;
+            subscribed = true;
+        }
+        if (m == "net.install_device_cert") {
+            if (p.at("dev_id") != "printer-test" || p.at("lan_only") != false) return 111;
+            write_file(root / "certificate-calls", std::to_string(++certificate_calls));
+        }
+        if (m == "net.send_message") {
+            const auto query    = json::parse(p.at("msg").get<std::string>());
+            const auto sequence = std::stoll(query.at("pushing").at("sequence_id").get<std::string>());
+            if (sequence < 20000 || sequence > 29999) return 115;
+            if (p.at("dev_id") != "printer-test" || p.at("qos") != 0 || p.at("flag") != 0 || !selected || !certificate_calls || query.size() != 1 ||
+                query.at("pushing").at("command") != "pushall" || query.at("pushing").at("version") != 1 || query.at("pushing").at("push_target") != 1)
+                return 112;
+            if (json::parse(read_file(workspace / "owner.json")).at("phase") != "running") return 113;
+            write_file(root / "status-request-count", std::to_string(++status_requests));
+            if (mode == "query-delayed" && status_requests == 1) r["value"] = -2;
         }
         if (m == "net.change_user") return 95; // Native auth import uses the opaque session, never a fabricated login payload.
         if (m == "net.is_user_login") r["value"] = true;
         if (m == "net.get_user_id") r["value"] = mode == "wrong-user" ? "wrong-user" : "user-test";
         if (m == "net.start_print") {
             mark("submitted");
+            write_file(root / "submission-count", std::to_string(++submissions));
+            if (json::parse(read_file(workspace / "owner.json")).at("phase") != "submitting") return 114;
+            if (!printer_reported || !selection_cleared || !message_callback || !printer_callback || !subscribe_callback) {
+                respond(h[2], {{"ok", true}, {"value", BAMBU_NETOWRK_ERR_PRINT_SP_ENC_FLAG_NOT_READY}});
+                continue;
+            }
             pending = h[2];
             job     = p.at("client_job_id");
             write_file(root / "print-params", p.at("params").dump());
@@ -255,6 +305,48 @@ int fake_docker(int argc, char **argv)
         }
         if (m == "bridge.poll_events") {
             r["events"] = json::array();
+            if (!pending && connected && !server_reported) {
+                if (mode != "connection-timeout") {
+                    server_reported = true;
+                    r["events"].push_back({{"agent", 1}, {"name", "on_server_connected"}, {"payload", {{"return_code", 0}, {"reason_code", 0}}}});
+                }
+                mark("cloud-polled");
+            }
+            if (!pending && selected && certificate_calls && status_requests && !printer_reported) {
+                ++preparation_polls;
+                mark("printer-polled");
+                if (mode == "expired-login")
+                    r["events"].push_back({{"agent", 1}, {"name", "on_user_login"}, {"payload", {{"login", false}, {"online_login", 0}}}});
+                else if (mode == "auth-rejected")
+                    r["events"].push_back({{"agent", 1}, {"name", "on_http_error"}, {"payload", {{"http_code", 401}}}});
+                else if (mode == "subscription-failed")
+                    r["events"].push_back({{"agent", 1}, {"name", "on_subscribe_failure"}, {"payload", {{"topic", "device/printer-test/report"}}}});
+                else if (mode == "certificate-refresh" && preparation_polls < 5) {
+                    for (unsigned i = 0; i < 20; ++i) {
+                        r["events"].push_back({{"agent", 1}, {"name", "on_message"}, {"payload", {{"dev_id", ""}, {"msg", "wait_info"}}}});
+                        r["events"].push_back({{"agent", 1}, {"name", "on_printer_connected"}, {"payload", {{"topic_str", "tunnel/printer-test"}}}});
+                    }
+                } else if (mode != "no-report" && mode != "cancel-printer" && (mode != "late-report" || preparation_polls >= 4) &&
+                           (mode != "query-delayed" || status_requests >= 2)) {
+                    const std::string target = mode == "wrong-printer" ? "another-printer" : "printer-test";
+                    const std::string report = mode == "invalid-report"     ? "not JSON" :
+                                               mode == "heartbeat"          ? "{}" :
+                                               mode == "empty-print-report" ? R"({"print":{}})" :
+                                               mode == "non-printer-report" ? R"({"info":{"command":"get_version"}})" :
+                                                                              R"({"print":{"gcode_state":"IDLE","command":"push_status"}})";
+                    r["events"].push_back({{"agent", mode == "wrong-agent" ? 99 : 1}, {"name", "on_message"}, {"payload", {{"dev_id", target}, {"msg", report}}}});
+                    if (mode == "wrong-printer" || mode == "wrong-agent" || mode == "invalid-report" || mode == "non-printer-report" || mode == "heartbeat" ||
+                        mode == "empty-print-report") {
+                        // Let the client consume the first invalid report. If
+                        // it accepts that report it will submit before this
+                        // second poll gives the test permission to cancel.
+                        if (preparation_polls >= 2) mark("invalid-report-delivered");
+                    } else {
+                        printer_reported = true;
+                        mark("printer-report-delivered");
+                    }
+                }
+            }
             if (pending && !sent) {
                 sent = true;
                 r["events"].push_back({{"name", "job.update_status"}, {"payload", {{"job_id", job}, {"status", 2}, {"code", 35}, {"msg", "Uploading"}}}});
@@ -316,6 +408,90 @@ TEST_CASE("Cloud helper refuses changed resources before invoking any runtime", 
     write_file(f.root / "resources/cloud-helper/image.tar", "tampered");
     REQUIRE_THROWS_AS(f.send(), std::runtime_error);
     REQUIRE_FALSE(f.marked("docker-called"));
+}
+TEST_CASE("Cloud helper prepares the selected printer before its single submission", "[cloud-helper][printer-preparation]")
+{
+    Fixture f("late-report");
+    REQUIRE(f.send({}, {}, [](int, std::string) { return true; }) == 0);
+    REQUIRE(f.marked("account-checked"));
+    REQUIRE(f.marked("printer-report-delivered"));
+    REQUIRE(read_file(f.root / "submission-count") == "1");
+    REQUIRE(jobs_empty(f.root / "data/cloud-send-jobs"));
+}
+TEST_CASE("Cloud helper never submits to a missing or offline account printer", "[cloud-helper][printer-preparation]")
+{
+    for (const char *mode : {"missing-printer", "offline-printer"}) {
+        Fixture f(mode);
+        REQUIRE_THROWS_AS(f.send(), std::runtime_error);
+        REQUIRE_FALSE(f.marked("submitted"));
+        REQUIRE(f.marked("cleaned"));
+    }
+}
+TEST_CASE("Cloud helper never submits after preparation authentication or subscription failure", "[cloud-helper][printer-preparation]")
+{
+    for (const char *mode : {"expired-login", "auth-rejected", "subscription-failed"}) {
+        Fixture f(mode);
+        REQUIRE_THROWS_AS(f.send(), std::runtime_error);
+        REQUIRE_FALSE(f.marked("submitted"));
+        REQUIRE(f.marked("cleaned"));
+    }
+}
+TEST_CASE("Cloud helper cannot treat unrelated messages as printer readiness", "[cloud-helper][printer-preparation]")
+{
+    for (const char *mode : {"wrong-printer", "wrong-agent", "invalid-report", "non-printer-report", "heartbeat", "empty-print-report"}) {
+        Fixture f(mode);
+        REQUIRE(f.send({}, [&] { return f.marked("invalid-report-delivered"); }) == BAMBU_NETWORK_ERR_CANCELED);
+        REQUIRE_FALSE(f.marked("submitted"));
+        REQUIRE(f.marked("cleaned"));
+    }
+}
+TEST_CASE("Cloud helper cancellation stops cloud and printer preparation", "[cloud-helper][printer-preparation]")
+{
+    for (const char *mode : {"connection-timeout", "cancel-printer"}) {
+        Fixture    f(mode);
+        const auto started = std::chrono::steady_clock::now();
+        REQUIRE(f.send({}, [&] { return f.marked("cloud-polled") && (std::string(mode) == "connection-timeout" || f.marked("printer-polled")); }) == BAMBU_NETWORK_ERR_CANCELED);
+        REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+        REQUIRE_FALSE(f.marked("submitted"));
+        REQUIRE(f.marked("cleaned"));
+    }
+}
+TEST_CASE("Cloud helper bounds missing printer reports without submitting", "[cloud-helper][printer-preparation]")
+{
+    Fixture    f("no-report");
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE_THROWS_WITH(f.send(), Catch::Matchers::Contains("printer information"));
+    REQUIRE(std::chrono::steady_clock::now() - started < std::chrono::seconds(40));
+    REQUIRE_FALSE(f.marked("submitted"));
+    REQUIRE(f.marked("cleaned"));
+    REQUIRE(read_file(f.root / "status-request-count") == "3");
+}
+TEST_CASE("Cloud helper printer preflight uses status preparation without submitting", "[cloud-helper][printer-preparation]")
+{
+    Fixture f("verify-printer");
+    REQUIRE_NOTHROW(
+        helper::verify_printer((f.root / "BambuNetworkEngine.conf").string(), "user-test", "US", (f.root / "resources").string(), (f.root / "data").string(), "printer-test"));
+    REQUIRE(f.marked("account-checked"));
+    REQUIRE(f.marked("printer-report-delivered"));
+    REQUIRE_FALSE(f.marked("submitted"));
+    REQUIRE(read_file(f.root / "status-request-count") == "1");
+    REQUIRE(jobs_empty(f.root / "data/cloud-send-jobs"));
+}
+TEST_CASE("Cloud helper bounds certificate refresh without treating it as readiness", "[cloud-helper][printer-preparation]")
+{
+    Fixture f("certificate-refresh");
+    REQUIRE(f.send({}, {}, [](int, std::string) { return true; }) == 0);
+    REQUIRE(f.marked("printer-report-delivered"));
+    REQUIRE(read_file(f.root / "certificate-calls") == "3");
+    REQUIRE(read_file(f.root / "submission-count") == "1");
+}
+TEST_CASE("Cloud helper retries a status request while its printer route becomes ready", "[cloud-helper][printer-preparation]")
+{
+    Fixture f("query-delayed");
+    REQUIRE(f.send({}, {}, [](int, std::string) { return true; }) == 0);
+    REQUIRE(f.marked("printer-report-delivered"));
+    REQUIRE(read_file(f.root / "status-request-count") == "2");
+    REQUIRE(read_file(f.root / "submission-count") == "1");
 }
 TEST_CASE("Cloud helper stages verified runtime assets inside the private job workspace", "[cloud-helper]")
 {

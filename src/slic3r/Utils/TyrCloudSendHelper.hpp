@@ -17,4 +17,12 @@ int send(const BBL::PrintParams &params,
 // Read-only cloud authentication check; never submits a job or controls a printer.
 void verify_account(
     const std::string &session_file, const std::string &expected_user_id, const std::string &country, const std::string &resources_dir, const std::string &data_dir);
+// Exercises the same target preparation as send, including read-only printer
+// status requests. Never submits a job or sends printer control commands.
+void verify_printer(const std::string &session_file,
+                    const std::string &expected_user_id,
+                    const std::string &country,
+                    const std::string &resources_dir,
+                    const std::string &data_dir,
+                    const std::string &printer_id);
 } // namespace Slic3r::TyrCloudSendHelper
