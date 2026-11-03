@@ -11,6 +11,7 @@
 #include <future>
 #include <iomanip>
 #include <map>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -36,6 +37,105 @@ constexpr size_t   max_frame   = 16 * 1024 * 1024;
 struct PreparationCancelled
 {};
 constexpr const char *transport_error = "The print helper stopped responding. Print sending could not be confirmed; check the printer before retrying.";
+
+// Only allowlisted phases and numeric SDK values enter this report. Keeping
+// markers in a fixed array also makes diagnostic collection allocation-free.
+class SendTiming
+{
+    struct Marker
+    {
+        const char *phase      = nullptr;
+        int64_t     elapsed_ms = 0;
+        int         stage      = 0;
+        int         code       = 0;
+    };
+    const std::string     &data_dir;
+    Clock::time_point      started = Clock::now();
+    std::array<Marker, 64> markers{};
+    size_t                 count      = 0;
+    unsigned               omitted    = 0;
+    int                    last_stage = 0;
+    bool                   has_stage  = false;
+    bool                   has_result = false;
+    int                    sdk_result = 0;
+    const char            *outcome    = "interrupted";
+    int64_t                elapsed() const noexcept { return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count(); }
+    void                   append(const char *phase, int stage = 0, int code = 0) noexcept
+    {
+        if (count < markers.size())
+            markers[count++] = {phase, elapsed(), stage, code};
+        else if (omitted < std::numeric_limits<unsigned>::max())
+            ++omitted;
+    }
+    void write() const noexcept
+    {
+        int         fd = -1;
+        std::string temporary;
+        try {
+            Json events = Json::array();
+            for (size_t i = 0; i < count; ++i) {
+                const auto &marker = markers[i];
+                Json        event  = {{"phase", marker.phase}, {"elapsed_ms", marker.elapsed_ms}};
+                if (std::strcmp(marker.phase, "sdk_stage") == 0) {
+                    event["stage"] = marker.stage;
+                    event["code"]  = marker.code;
+                }
+                events.push_back(std::move(event));
+            }
+            const auto body = Json({{"schema_version", 1},
+                                    {"outcome", outcome},
+                                    {"elapsed_ms", elapsed()},
+                                    {"sdk_result", has_result ? Json(sdk_result) : Json(nullptr)},
+                                    {"markers", std::move(events)},
+                                    {"omitted_markers", omitted}})
+                                  .dump(2) +
+                              "\n";
+            const fs::path parent(data_dir);
+            fs::create_directories(parent);
+            temporary = (parent / ".cloud-send-timing-XXXXXX").string();
+            fd        = ::mkstemp(temporary.data());
+            if (fd < 0) return;
+            if (::fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 || ::fchmod(fd, 0600) != 0) throw std::runtime_error("timing file");
+            for (size_t offset = 0; offset < body.size();) {
+                const auto written = ::write(fd, body.data() + offset, body.size() - offset);
+                if (written < 0 && errno == EINTR) continue;
+                if (written <= 0) throw std::runtime_error("timing write");
+                offset += size_t(written);
+            }
+            if (::fsync(fd) != 0) throw std::runtime_error("timing flush");
+            const int close_result = ::close(fd);
+            fd                     = -1;
+            if (close_result != 0) throw std::runtime_error("timing close");
+            fs::rename(temporary, parent / "cloud-send-latest-timing.json");
+            temporary.clear();
+        } catch (...) {
+            // Diagnostics must never change submission, cancellation or cleanup.
+        }
+        if (fd >= 0) ::close(fd);
+        if (!temporary.empty()) ::unlink(temporary.c_str());
+    }
+
+public:
+    explicit SendTiming(const std::string &data) noexcept : data_dir(data) { mark("started"); }
+    ~SendTiming() noexcept { write(); }
+    void mark(const char *phase) noexcept { append(phase); }
+    void stage(int status, int code) noexcept
+    {
+        if (!has_stage || last_stage != status) append("sdk_stage", status, code);
+        has_stage  = true;
+        last_stage = status;
+    }
+    void result(int value) noexcept
+    {
+        has_result = true;
+        sdk_result = value;
+    }
+    void complete(int value) noexcept
+    {
+        result(value);
+        outcome = value == 0 ? "succeeded" : value == BAMBU_NETWORK_ERR_CANCELED ? "cancelled" : "failed";
+    }
+};
 
 [[noreturn]] void fail(const char *message) { throw std::runtime_error(message); }
 bool              was_cancelled(const BBL::WasCancelledFn &fn) { return fn && fn(); }
@@ -661,16 +761,21 @@ int run_send(const BBL::PrintParams &params,
              BBL::OnUpdateStatusFn   update,
              BBL::WasCancelledFn     cancelled,
              BBL::OnWaitFn           wait,
-             RunMode                 mode = RunMode::Send)
+             RunMode                 mode   = RunMode::Send,
+             SendTiming             *timing = nullptr)
 {
     const bool verify_only = mode != RunMode::Send;
+    const auto mark        = [&](const char *phase) {
+        if (timing) timing->mark(phase);
+    };
     if (was_cancelled(cancelled)) return BAMBU_NETWORK_ERR_CANCELED;
     if (expected_user_id.empty()) fail("Sign in before sending a cloud print.");
     if ((params.task_record_timelapse && params.task_timelapse_use_internal) || !params.queue_plate_id.empty())
         fail("This cloud helper does not support internal-storage timelapse or queued print jobs. Disable that option for this print.");
     if (!fs::is_regular_file(session_file)) fail("The saved Bambu account session is missing. Sign in again before sending.");
-    const Runtime     runtime = verified_runtime(resources);
-    const std::string docker  = docker_executable();
+    const Runtime runtime = verified_runtime(resources);
+    mark("runtime_verified");
+    const std::string docker = docker_executable();
     verify_local_context(docker, cancelled);
     if (!verify_only) {
         const auto parent = fs::absolute(fs::path(data) / "cloud-send-jobs");
@@ -679,6 +784,7 @@ int run_send(const BBL::PrintParams &params,
             fail("A previous interrupted send may already have reached its printer. Check the previous printer before retrying this print.");
     }
     ensure_image(docker, runtime, cancelled);
+    mark("runtime_ready");
     if (was_cancelled(cancelled)) return BAMBU_NETWORK_ERR_CANCELED;
     Job job(data, docker, params.dev_id);
     job.stage_runtime(runtime);
@@ -688,6 +794,7 @@ int run_send(const BBL::PrintParams &params,
         job.stage(params.filename, "plate.gcode.3mf");
         if (!params.config_filename.empty()) job.stage(params.config_filename, "config.3mf");
     }
+    mark("files_staged");
     // Keep the callback future outside the try: an exception must stop the
     // container before joining a callback that still observes native telemetry.
     std::future<bool> waiting;
@@ -729,6 +836,7 @@ int run_send(const BBL::PrintParams &params,
         check("start");
         if (!net("is_user_login").value("value", false) || net("get_user_id").value("value", "") != expected_user_id)
             fail("The print helper account does not match Bambu Studio. Sign out and sign in again before sending.");
+        mark("account_ready");
         if (mode == RunMode::VerifyAccount) {
             check("connect_server");
             const auto account = net("get_user_print_info");
@@ -738,6 +846,7 @@ int run_send(const BBL::PrintParams &params,
             return 0;
         }
         prepare_printer(rpc, agent, params.dev_id, cancelled);
+        mark("printer_ready");
         if (mode == RunMode::VerifyPrinter) {
             job.finish();
             return 0;
@@ -748,6 +857,7 @@ int run_send(const BBL::PrintParams &params,
         }
         rpc.preparation_finished();
         job.submitting();
+        mark("submission_started");
         constexpr int64_t job_id          = 1;
         const auto        request         = rpc.request("net.start_print", {{"agent", agent}, {"client_job_id", job_id}, {"params", print}});
         bool              cancel_sent     = false;
@@ -760,13 +870,17 @@ int run_send(const BBL::PrintParams &params,
                 const auto p = e.value("payload", Json::object());
                 if (p.value("job_id", int64_t(0)) != job_id) continue;
                 const std::string name = e.value("name", "");
-                if (name == "job.update_status" && update)
-                    update(p.at("status").get<int>(), p.at("code").get<int>(), p.value("msg", ""));
-                else if (name == "job.wait") {
+                if (name == "job.update_status") {
+                    const int status = p.at("status").get<int>();
+                    const int code   = p.at("code").get<int>();
+                    if (timing) timing->stage(status, code);
+                    if (update) update(status, code, p.value("msg", ""));
+                } else if (name == "job.wait") {
                     if (waiting.valid()) fail("The print helper requested overlapping completion checks.");
                     wait_request             = p.at("request_id").get<int64_t>();
                     const int         status = p.at("status").get<int>();
                     const std::string info   = p.value("job_info", "");
+                    mark("completion_wait_started");
                     waiting = std::async(std::launch::async, [wait, status, info, cancel_sent] { return !cancel_sent && wait && wait(status, info); });
                 }
             }
@@ -782,18 +896,26 @@ int run_send(const BBL::PrintParams &params,
             poll_events();
             if (waiting.valid() && waiting.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
                 const bool reply = waiting.get();
+                mark("completion_wait_finished");
                 rpc.call("bridge.job_wait_reply", {{"job_id", job_id}, {"request_id", wait_request}, {"reply", !cancel_sent && reply}});
             }
             if (!rpc.has(request)) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         const int result = rpc.take(request).at("value").get<int>();
+        if (timing) timing->result(result);
+        mark("sdk_returned");
         // SDK callbacks precede its return, but may still be queued in the host.
         for (unsigned i = 0; i < 32 && poll_events() == 256; ++i) {}
-        if (waiting.valid()) (void) waiting.get();
+        if (waiting.valid()) {
+            (void) waiting.get();
+            mark("completion_wait_finished");
+        }
         job.finish();
+        mark("cleanup_finished");
         return result;
     } catch (...) {
         job.finish();
+        mark("cleanup_finished");
         throw;
     }
 }
@@ -813,9 +935,14 @@ int send(const BBL::PrintParams &params,
          BBL::WasCancelledFn     cancelled,
          BBL::OnWaitFn           wait)
 {
+    SendTiming timing(data_dir);
     try {
-        return run_send(params, session_file, expected_user_id, country, resources_dir, data_dir, std::move(update), std::move(cancelled), std::move(wait));
+        const int result = run_send(params, session_file, expected_user_id, country, resources_dir, data_dir, std::move(update), std::move(cancelled), std::move(wait),
+                                    RunMode::Send, &timing);
+        timing.complete(result);
+        return result;
     } catch (const PreparationCancelled &) {
+        timing.complete(BAMBU_NETWORK_ERR_CANCELED);
         return BAMBU_NETWORK_ERR_CANCELED;
     } catch (const Json::exception &) {
         fail("The print helper returned an incompatible response. Check the printer before retrying.");

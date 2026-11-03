@@ -1051,7 +1051,7 @@ wxWebView *WebView::CreateWebView(wxWindow *parent, wxString const &url, wxStrin
     if (has_backend_attempt) {
         auto addScriptMessageHandler = [] (wxWebView *webView) {
             Slic3r::GUI::wxGetApp().set_adding_script_handler(true);
-            if (!webView->AddScriptMessageHandler("wx"))
+            if (!RegisterScriptMessageHandler(webView))
                 log_webview(Slic3r::GUI::WebViewTraceLogger::Stage::L0_BACKEND, webView->GetName(),
                             "script_message_handler_failed", {},
                             Slic3r::GUI::WebViewTraceLogger::Severity::Warning);

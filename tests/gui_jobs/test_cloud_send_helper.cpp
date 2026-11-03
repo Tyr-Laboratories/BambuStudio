@@ -350,6 +350,16 @@ int fake_docker(int argc, char **argv)
             if (pending && !sent) {
                 sent = true;
                 r["events"].push_back({{"name", "job.update_status"}, {"payload", {{"job_id", job}, {"status", 2}, {"code", 35}, {"msg", "Uploading"}}}});
+                if (mode == "timing" || mode == "timing-storm") {
+                    const unsigned count = mode == "timing-storm" ? 100 : 8;
+                    for (unsigned i = 0; i < count; ++i)
+                        r["events"].push_back({{"name", "job.update_status"},
+                                               {"payload",
+                                                {{"job_id", job},
+                                                 {"status", mode == "timing-storm" ? int(i % 2 + 2) : 2},
+                                                 {"code", int(i)},
+                                                 {"msg", "PRIVATE SDK MESSAGE SECRET_TOKEN printer-test"}}}});
+                }
                 if (mode != "cancel") r["events"].push_back({{"name", "job.wait"}, {"payload", {{"job_id", job}, {"request_id", 8}, {"status", 7}, {"job_info", "{}"}}}});
             }
         }
@@ -366,6 +376,10 @@ int fake_docker(int argc, char **argv)
             pending = 0;
         }
         respond(h[2], r);
+        if (mode == "early-result" && pending && sent) {
+            respond(pending, {{"ok", true}, {"value", 0}});
+            pending = 0;
+        }
         if (mode == "crash-wait" && m == "bridge.poll_events" && sent) return 44;
     }
 }
@@ -757,6 +771,102 @@ TEST_CASE("Cloud helper never calls a submitted job unsent when cleanup is busy"
     REQUIRE(failure.find("Check the printer") != std::string::npos);
     REQUIRE(failure.find("No new print was submitted") == std::string::npos);
     REQUIRE_FALSE(jobs_empty(f.root / "data/cloud-send-jobs"));
+}
+TEST_CASE("Cloud helper records private bounded phase timing without SDK messages", "[cloud-helper][timing]")
+{
+    for (const char *mode : {"timing", "timing-storm"}) {
+        Fixture f(mode);
+        REQUIRE(f.send({}, {}, [](int, std::string) { return true; }) == 0);
+        const auto path = f.root / "data/cloud-send-latest-timing.json";
+        REQUIRE(fs::is_regular_file(path));
+        struct stat st{};
+        REQUIRE(stat(path.c_str(), &st) == 0);
+        REQUIRE((st.st_mode & 0777) == 0600);
+        const auto raw = read_file(path);
+        for (const auto &private_value : {"SECRET_TOKEN", "printer-test", "user-test", "PRIVATE SDK MESSAGE", "source.3mf", f.root.c_str()})
+            REQUIRE(raw.find(private_value) == std::string::npos);
+        const auto report = json::parse(raw);
+        REQUIRE(report.at("schema_version") == 1);
+        REQUIRE(report.at("outcome") == "succeeded");
+        REQUIRE(report.at("sdk_result") == 0);
+        REQUIRE(report.at("markers").size() <= 64);
+        int64_t                  previous = -1;
+        std::vector<std::string> phases;
+        unsigned                 stages = 0;
+        for (const auto &marker : report.at("markers")) {
+            const auto elapsed = marker.at("elapsed_ms").get<int64_t>();
+            REQUIRE(elapsed >= previous);
+            REQUIRE(elapsed <= report.at("elapsed_ms").get<int64_t>());
+            previous = elapsed;
+            phases.push_back(marker.at("phase").get<std::string>());
+            if (phases.back() == "sdk_stage") ++stages;
+        }
+        if (std::string(mode) == "timing") {
+            REQUIRE(stages == 1);
+            REQUIRE(phases == std::vector<std::string>{"started", "runtime_verified", "runtime_ready", "files_staged", "account_ready", "printer_ready", "submission_started",
+                                                       "sdk_stage", "completion_wait_started", "completion_wait_finished", "sdk_returned", "cleanup_finished"});
+        } else {
+            REQUIRE(report.at("omitted_markers").get<unsigned>() > 0);
+        }
+    }
+}
+TEST_CASE("Cloud helper records failed interrupted and cancelled attempts without changing their result", "[cloud-helper][timing]")
+{
+    for (const char *mode : {"sdk-error", "wrong-user", "cancel"}) {
+        Fixture f(mode);
+        if (std::string(mode) == "wrong-user")
+            REQUIRE_THROWS(f.send());
+        else
+            REQUIRE(f.send(
+                        {}, [&] { return std::string(mode) == "cancel" && f.marked("submitted"); }, [](int, std::string) { return true; }) ==
+                    (std::string(mode) == "cancel" ? BAMBU_NETWORK_ERR_CANCELED : -42));
+        const auto path = f.root / "data/cloud-send-latest-timing.json";
+        REQUIRE(fs::is_regular_file(path));
+        const auto report = json::parse(read_file(path));
+        REQUIRE(report.at("outcome") == (std::string(mode) == "cancel" ? "cancelled" : std::string(mode) == "wrong-user" ? "interrupted" : "failed"));
+        if (std::string(mode) == "wrong-user")
+            REQUIRE(report.at("sdk_result").is_null());
+        else
+            REQUIRE(report.at("sdk_result") == (std::string(mode) == "cancel" ? BAMBU_NETWORK_ERR_CANCELED : -42));
+    }
+}
+TEST_CASE("Cloud helper timing separates SDK return from a late completion callback", "[cloud-helper][timing]")
+{
+    Fixture f("early-result");
+    REQUIRE(f.send({}, {}, [](int, std::string) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        return true;
+    }) == 0);
+    const auto               report = json::parse(read_file(f.root / "data/cloud-send-latest-timing.json"));
+    std::vector<std::string> phases;
+    for (const auto &marker : report.at("markers")) phases.push_back(marker.at("phase").get<std::string>());
+    const auto sdk  = std::find(phases.begin(), phases.end(), "sdk_returned");
+    const auto wait = std::find(phases.begin(), phases.end(), "completion_wait_finished");
+    REQUIRE(sdk != phases.end());
+    REQUIRE(wait != phases.end());
+    REQUIRE(sdk < wait);
+}
+TEST_CASE("Cloud helper verification probes preserve the last actual send timing", "[cloud-helper][timing]")
+{
+    for (const char *mode : {"verify", "verify-printer"}) {
+        Fixture    f(mode);
+        const auto path = f.root / "data/cloud-send-latest-timing.json";
+        write_file(path, "previous actual send");
+        if (std::string(mode) == "verify")
+            helper::verify_account((f.root / "BambuNetworkEngine.conf").string(), "user-test", "US", (f.root / "resources").string(), (f.root / "data").string());
+        else
+            helper::verify_printer((f.root / "BambuNetworkEngine.conf").string(), "user-test", "US", (f.root / "resources").string(), (f.root / "data").string(), "printer-test");
+        REQUIRE(read_file(path) == "previous actual send");
+    }
+}
+TEST_CASE("Cloud helper timing write failure cannot fail a successful send", "[cloud-helper][timing]")
+{
+    Fixture    f;
+    const auto path = f.root / "data/cloud-send-latest-timing.json";
+    fs::create_directories(path);
+    REQUIRE(f.send({}, {}, [](int, std::string) { return true; }) == 0);
+    REQUIRE(fs::is_directory(path));
+    for (const auto &entry : fs::directory_iterator(f.root / "data")) REQUIRE(entry.path().filename().string().find(".cloud-send-timing-") != 0);
 }
 int main(int argc, char **argv)
 {

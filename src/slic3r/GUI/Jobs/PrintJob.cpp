@@ -1,4 +1,5 @@
 #include "PrintJob.hpp"
+#include "PrintJobCompletion.hpp"
 #include <regex>
 #include <algorithm>
 #include <chrono>
@@ -590,22 +591,12 @@ void PrintJob::process()
     auto wait_fn = [this, curr_percent, &obj](int state, std::string job_info) {
             BOOST_LOG_TRIVIAL(info) << "print_job: get_job_info = " << job_info;
 
-            if (!obj->is_support_wait_sending_finish) {
+            if (!obj || !obj->is_support_wait_sending_finish) {
                 return true;
             }
 
-            std::string curr_job_id;
-            json job_info_j;
-            try {
-                job_info_j.parse(job_info);
-                if (job_info_j.contains("job_id")) {
-                    curr_job_id = DevJsonValParser::get_longlong_val(job_info_j["job_id"]);
-                }
-                BOOST_LOG_TRIVIAL(trace) << "print_job: curr_obj_id=" << curr_job_id;
-
-            } catch(...) {
-                ;
-            }
+            const std::string curr_job_id = print_job_id_from_reply(job_info);
+            BOOST_LOG_TRIVIAL(trace) << "print_job: curr_obj_id=" << curr_job_id;
 
             if (obj) {
                 int time_out = 0;

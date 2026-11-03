@@ -37,6 +37,16 @@ public:
     static void ClearBambulabTokenCookies();
 
     // Backend setup.
+    static bool RegisterScriptMessageHandler(wxWebView *webView)
+    {
+#ifdef __WXOSX__
+        // Hidden WebKit views may suspend JavaScript. Register the native
+        // bridge immediately and inject its alias without a nested wait loop.
+        return webView->AddScriptMessageHandler("wx", false);
+#else
+        return webView->AddScriptMessageHandler("wx");
+#endif
+    }
     static wxString BuildEdgeUserDataPath();
 };
 
