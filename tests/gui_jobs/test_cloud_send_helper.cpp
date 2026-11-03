@@ -126,6 +126,7 @@ int fake_docker(int argc, char **argv)
     }
     if (args.size() > 1 && args[0] == "image" && args[1] == "inspect") {
         if ((mode == "import" || mode == "cancel-import") && !fs::exists(root / "loaded")) return 1;
+        if (mode == "tamper-copy") write_file(root / "resources/cloud-helper/plugin/libbambu_networking.so", "changed after verification");
         if (mode == "creation-race") {
             mark("image-inspected");
             const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -157,11 +158,37 @@ int fake_docker(int argc, char **argv)
     }
     if (args[0] != "run") return 92;
     mark("run");
+    fs::path workspace;
+    int      runtime_mounts = 0;
     for (size_t i = 0; i + 1 < args.size(); ++i)
         if (args[i] == "--mount") {
             const auto &a     = args[i + 1];
             auto        begin = a.find("src=") + 4, end = a.find(",dst=");
             fs::path    source = a.substr(begin, end - begin);
+            if (a.find("dst=/job") != std::string::npos) workspace = source.parent_path();
+            // Model Docker Desktop's restricted host filesystem: all mounts
+            // must come from the private user-data workspace, never the app.
+            const auto relative = source.lexically_relative(workspace);
+            if (workspace.empty() || relative.empty() || *relative.begin() == "..") return 125;
+            if (a.find("dst=/plugin") != std::string::npos || a.find("dst=/certs") != std::string::npos) {
+                if (a.find(",readonly") == std::string::npos) return 103;
+                struct stat st{};
+                stat(source.c_str(), &st);
+                if ((st.st_mode & 0777) != 0700) return 104;
+                const bool                     plugin   = a.find("dst=/plugin") != std::string::npos;
+                const std::vector<std::string> expected = plugin ? std::vector<std::string>{"libbambu_networking.so", "libBambuSource.so", "liblive555.so",
+                                                                                            "linux_payload_manifest.json"} :
+                                                                   std::vector<std::string>{"slicer_base64.cer"};
+                size_t                         count    = 0;
+                for (const auto &entry : fs::directory_iterator(source)) ++count;
+                if (count != expected.size()) return 105;
+                for (const auto &filename : expected) {
+                    if (read_file(source / filename) != "fixture") return 106;
+                    stat((source / filename).c_str(), &st);
+                    if ((st.st_mode & 0777) != 0600) return 107;
+                }
+                if (++runtime_mounts == 2) mark("staged-runtime");
+            }
             if (a.find("dst=/job") != std::string::npos && mode != "verify" && mode != "verify-rejected") {
                 if (read_file(source / "plate.gcode.3mf") != "exact sliced job bytes" || read_file(source / "config.3mf") != "exact config bytes") return 97;
                 struct stat st{};
@@ -289,6 +316,22 @@ TEST_CASE("Cloud helper refuses changed resources before invoking any runtime", 
     write_file(f.root / "resources/cloud-helper/image.tar", "tampered");
     REQUIRE_THROWS_AS(f.send(), std::runtime_error);
     REQUIRE_FALSE(f.marked("docker-called"));
+}
+TEST_CASE("Cloud helper stages verified runtime assets inside the private job workspace", "[cloud-helper]")
+{
+    Fixture f;
+    REQUIRE(f.send({}, {}, [](int, std::string) { return true; }) == 0);
+    REQUIRE(f.marked("staged-runtime"));
+    const auto hashes = json::parse(read_file(f.root / "resources/cloud-helper/manifest.json")).at("hashes");
+    for (auto it = hashes.begin(); it != hashes.end(); ++it) REQUIRE(digest(read_file(f.root / "resources/cloud-helper" / it.key())) == it.value().get<std::string>());
+    REQUIRE(jobs_empty(f.root / "data/cloud-send-jobs"));
+}
+TEST_CASE("Cloud helper rechecks copied runtime assets before launching", "[cloud-helper]")
+{
+    Fixture f("tamper-copy");
+    REQUIRE_THROWS_WITH(f.send(), Catch::Matchers::Contains("integrity check"));
+    REQUIRE_FALSE(f.marked("run"));
+    REQUIRE(jobs_empty(f.root / "data/cloud-send-jobs"));
 }
 TEST_CASE("Cloud helper verifies account identity before submitting", "[cloud-helper]")
 {

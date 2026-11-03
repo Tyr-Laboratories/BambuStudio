@@ -76,9 +76,10 @@ std::string sha256(const fs::path &path)
 }
 struct Runtime
 {
-    fs::path    root;
-    std::string image;
-    fs::path    archive;
+    fs::path                        root;
+    std::string                     image;
+    fs::path                        archive;
+    std::map<fs::path, std::string> mount_hashes;
 };
 Runtime verified_runtime(const std::string &resources)
 {
@@ -106,6 +107,7 @@ Runtime verified_runtime(const std::string &resources)
         }
         const auto digest = it.value().get<std::string>();
         if (!hex_digest(digest) || !fs::is_regular_file(full) || sha256(full) != digest) fail("The bundled print helper failed its integrity check. Reinstall this build.");
+        if (*relative.begin() == "plugin" || *relative.begin() == "certs") r.mount_hashes.emplace(relative, digest);
     }
     // The SDK loads files by name from these directories; reject unhashed extras.
     for (const char *directory : {"plugin", "certs"})
@@ -398,6 +400,24 @@ public:
         fs::copy_file(original, root / "payload" / filename, fs::copy_options::none);
         fs::permissions(root / "payload" / filename, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
     }
+    void stage_runtime(const Runtime &runtime)
+    {
+        // Docker Desktop may not share /Applications with its VM. Stage only
+        // verified SDK assets beside the job, where the account and payload
+        // mounts already reside, without changing the user's shared folders.
+        private_directory(root / "runtime");
+        for (const auto &[relative, digest] : runtime.mount_hashes) {
+            auto directory = root / "runtime";
+            for (const auto &component : relative.parent_path()) {
+                directory /= component;
+                private_directory(directory);
+            }
+            const auto destination = root / "runtime" / relative;
+            fs::copy_file(runtime.root / relative, destination, fs::copy_options::none);
+            fs::permissions(destination, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+            if (sha256(destination) != digest) fail("The staged print helper failed its integrity check. Reinstall this build.");
+        }
+    }
     void                     submitting() { recovery->set_phase("submitting"); }
     std::vector<std::string> arguments(const Runtime &r)
     {
@@ -426,9 +446,9 @@ public:
                 "--mount",
                 mount(root / "session", "/session", false),
                 "--mount",
-                mount(r.root / "plugin", "/plugin", true),
+                mount(root / "runtime/plugin", "/plugin", true),
                 "--mount",
-                mount(r.root / "certs", "/certs", true),
+                mount(root / "runtime/certs", "/certs", true),
                 r.image};
     }
     void finish()
@@ -538,6 +558,7 @@ int run_send(const BBL::PrintParams &params,
     ensure_image(docker, runtime, cancelled);
     if (was_cancelled(cancelled)) return BAMBU_NETWORK_ERR_CANCELED;
     Job job(data, docker, params.dev_id);
+    job.stage_runtime(runtime);
     fs::copy_file(session_file, job.root / "session/BambuNetworkEngine.conf", fs::copy_options::none);
     fs::permissions(job.root / "session/BambuNetworkEngine.conf", fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
     if (!verify_only) {
