@@ -438,9 +438,22 @@ std::string Preset::remove_suffix_modified(const std::string &name)
         name;
 }
 
+static void normalize_bridge_acceleration(DynamicPrintConfig &config)
+{
+    // Existing system profiles predate this option and inherit its one-value
+    // default. Early Tyr projects can also contain a single edited value with
+    // several nozzle variants. Expand that shared value before variant restore;
+    // leave explicit per-variant values and the variant identities unchanged.
+    auto *acceleration = config.option<ConfigOptionFloatsNullable>("bridge_acceleration");
+    const auto *variants = config.option<ConfigOptionStrings>("print_extruder_variant");
+    if (acceleration && variants && acceleration->size() == 1 && variants->size() > 1)
+        acceleration->resize(variants->size());
+}
+
 // Update new extruder fields at the printer profile.
 void Preset::normalize(DynamicPrintConfig &config)
 {
+    normalize_bridge_acceleration(config);
     // BBS
     auto* filament_diameter = dynamic_cast<const ConfigOptionFloats*>(config.option("filament_diameter"));
     //not use any more
@@ -2252,6 +2265,7 @@ std::pair<Preset*, bool> PresetCollection::load_external_preset(
 
     const auto        &keys = cfg.keys();
     cfg.apply_only(combined_config, keys, true);
+    normalize_bridge_acceleration(cfg);
     std::string                 &inherits = Preset::inherits(cfg);
 
     //BBS: add different settings check logic, replace the old system preset's default value with new system preset's default values

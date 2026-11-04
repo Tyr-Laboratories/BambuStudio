@@ -60,7 +60,9 @@ The default is **0**, which uses **Normal printing** acceleration and preserves 
 
 The value is saved with process presets and 3MF project settings, supports the process's nozzle variants, and takes effect on the next G-code export after a settings change. It works with both Classic and Arachne wall generation.
 
-The focused `bridge_acceleration_tests` target passed 3 cases and 53 assertions. It slices fixtures with external and internal bridge surfaces and checks acceleration on actual exported extrusion moves, ordinary wall/top/first-layer behavior, configuration persistence, and re-export after changing the setting.
+The focused `bridge_acceleration_tests` target passed 4 cases and 68 assertions. It slices fixtures with external and internal bridge surfaces and checks acceleration on actual exported extrusion moves, ordinary wall/top/first-layer behavior, configuration persistence, and re-export after changing the setting. It also loads the bundled H2S system profile and restores project overrides across its three nozzle variants.
+
+Existing system profiles and early Tyr projects may store a single Bridge value even when the process lists several nozzle variants. The loader now expands that shared value before restoring the process profile, avoiding the `invalid restore_index size` project-loading error. Explicit per-variant values retain their nozzle association, and projects without this setting retain the normal-acceleration default. Existing project files do not need manual conversion.
 
 ## Projects, profiles, and accounts
 

@@ -2,6 +2,7 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Preset.hpp"
+#include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 
@@ -135,6 +136,38 @@ TEST_CASE("Bridge acceleration persists in process profiles and Bambu projects",
                         &is_bambu, &version, nullptr, LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
     for (auto *plate : plates) delete plate;
     REQUIRE(reopened_config.option("bridge_acceleration")->serialize() == "800,1200");
+}
+
+TEST_CASE("H2S project restores bridge acceleration against its system profile", "[BridgeAcceleration][Config][ProfileRestore]")
+{
+    Workspace workspace;
+    PresetBundle bundle;
+    const auto profiles = boost::filesystem::path(TEST_DATA_DIR).parent_path().parent_path() / "resources" / "profiles";
+    bundle.load_vendor_configs_from_json(profiles.string(), "BBL", PresetBundle::LoadSystem,
+                                         ForwardCompatibilitySubstitutionRule::Disable);
+    const std::string base_name = "0.20mm Standard @BBL H2S";
+    const auto *base = bundle.prints.find_preset(base_name, false);
+    REQUIRE(base != nullptr);
+    REQUIRE(base->config.option<ConfigOptionStrings>("print_extruder_variant")->size() == 3);
+    auto saved = base->config;
+    saved.set_deserialize_strict({{"inherits", base_name}, {"bridge_acceleration", "2500"}});
+    std::string expected = "2500,2500,2500";
+    SECTION("single value from an existing Tyr project") {}
+    SECTION("explicit variant values retain their nozzle association") {
+        saved.set_deserialize_strict({
+            {"print_extruder_variant", "Direct Drive E3D High Flow;Direct Drive Standard;Direct Drive High Flow"},
+            {"bridge_acceleration", "700,2500,1200"}});
+        expected = "2500,1200,700";
+    }
+    SECTION("unset setting in an older project uses normal acceleration") {
+        saved.erase("bridge_acceleration");
+        expected = "0,0,0";
+    }
+    auto result = bundle.prints.load_external_preset("test.3mf", "Saved project.3mf", "Custom H2S process", saved,
+        {"bridge_acceleration"}, PresetCollection::LoadAndSelect::Always, Semver());
+    REQUIRE(result.first != nullptr);
+    REQUIRE(bundle.prints.get_edited_preset().config.option("bridge_acceleration")->serialize() == expected);
+    REQUIRE(bundle.prints.find_preset(base_name, false)->config.option("bridge_acceleration")->serialize() == "0,0,0");
 }
 
 TEST_CASE("Regular and internal bridge extrusion uses its dedicated acceleration", "[BridgeAcceleration][GCode]")
