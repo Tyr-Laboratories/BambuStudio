@@ -3419,6 +3419,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("inner_wall_acceleration", "", 0);
         optgroup->append_single_option_line("top_surface_acceleration", "", 0);
         optgroup->append_single_option_line("sparse_infill_acceleration", "", 0);
+        optgroup->append_single_option_line("bridge_acceleration", "", 0);
         optgroup->append_single_option_line("accel_to_decel_enable", "");
         optgroup->append_single_option_line("accel_to_decel_factor", "");
 

@@ -52,6 +52,16 @@ The count is still subject to the slicer's other wall rules and available space.
 
 Wall Painting requires one selected object and is unavailable in spiral vase mode. Painting is stored on the model's surfaces, so inspect it after operations that change the mesh. Supported copy, split, merge, transform, reload, and replacement paths have regression coverage; that coverage is not a guarantee for every possible mesh edit.
 
+## Bridge acceleration
+
+In **Speed > Acceleration**, enable Advanced settings and set **Bridge** (`bridge_acceleration`) in **mm/s²**. This controls bridge infill across open gaps and internal bridge infill over sparse infill. It applies to bridge extrusion paths, not every path on a layer that contains a bridge. Overhanging walls retain their existing wall acceleration.
+
+The default is **0**, which uses **Normal printing** acceleration and preserves existing project behavior. Initial-layer acceleration takes precedence, and height-based slowdown and applicable machine acceleration limits still apply. Like the other acceleration fields, Bridge is enabled only when Normal printing acceleration is greater than zero.
+
+The value is saved with process presets and 3MF project settings, supports the process's nozzle variants, and takes effect on the next G-code export after a settings change. It works with both Classic and Arachne wall generation.
+
+The focused `bridge_acceleration_tests` target passed 3 cases and 53 assertions. It slices fixtures with external and internal bridge surfaces and checks acceleration on actual exported extrusion moves, ordinary wall/top/first-layer behavior, configuration persistence, and re-export after changing the setting.
+
 ## Projects, profiles, and accounts
 
 This fork saves the wall mask and numeric settings in Bambu 3MF projects. Application save/reopen checks confirmed that edited painting remained present and affected the sliced preview. Exported G-code contains the resulting toolpaths; use the 3MF project to retain editable painting.

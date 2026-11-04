@@ -7182,9 +7182,11 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 #if 0
         } else if (this->object_layer_over_raft() && m_config.first_layer_acceleration_over_raft.value > 0) {
             acceleration = m_config.first_layer_acceleration_over_raft.value;
-        } else if (m_config.bridge_acceleration.value > 0 && is_bridge(path.role())) {
-            acceleration = m_config.bridge_acceleration.value;
 #endif
+        } else if (NOZZLE_CONFIG(bridge_acceleration) > 0 && path.role() == erBridgeInfill) {
+            // Both external and internal bridge surfaces produce bridge infill.
+            // Overhanging walls retain their existing wall acceleration.
+            acceleration = NOZZLE_CONFIG(bridge_acceleration);
         } else if (NOZZLE_CONFIG(outer_wall_acceleration) > 0
             //BBS: FIXME, in fact,we only need to set acceleration for outer wall. But we don't know
             //whether the overhang perimeter is outer or not. So using specific acceleration together.

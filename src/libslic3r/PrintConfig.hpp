@@ -1514,6 +1514,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionFloatsNullable,     travel_short_distance_acceleration))
     ((ConfigOptionFloatsNullable,     initial_layer_travel_acceleration))
     ((ConfigOptionFloatsNullable,     inner_wall_acceleration))
+    ((ConfigOptionFloatsNullable,     bridge_acceleration))
     ((ConfigOptionFloatsOrPercentsNullable,   sparse_infill_acceleration))
     ((ConfigOptionBools,              activate_air_filtration))
     ((ConfigOptionInts,               during_print_exhaust_fan_speed))

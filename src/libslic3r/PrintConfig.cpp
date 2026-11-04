@@ -3356,6 +3356,15 @@ void PrintConfigDef::init_fff_params()
     def->nullable = true;
     def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(100, true)});
 
+    def = this->add("bridge_acceleration", coFloats);
+    def->label = L("Bridge");
+    def->tooltip = L("Acceleration of bridge infill, including internal bridges over sparse infill. 0 means using normal printing acceleration. Initial layer acceleration takes precedence.");
+    def->sidetext = "mm/s²";
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsNullable{0});
+
     def = this->add("initial_layer_acceleration", coFloats);
     def->label = L("Initial layer");
     def->tooltip = L("Acceleration of initial layer. Using a lower value can improve build plate adhensive");
@@ -7662,6 +7671,7 @@ std::set<std::string> print_options_with_variant = {
     "outer_wall_acceleration",
     "inner_wall_acceleration",
     "sparse_infill_acceleration", //coFloatsOrPercents
+    "bridge_acceleration",
     "top_surface_acceleration",
     "print_extruder_id", //coInts
     "print_extruder_variant", //coStrings

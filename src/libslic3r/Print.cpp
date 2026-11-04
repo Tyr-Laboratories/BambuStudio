@@ -141,6 +141,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "initial_layer_acceleration",
         "outer_wall_acceleration",
         "top_surface_acceleration",
+        "bridge_acceleration",
         "accel_to_decel_enable",
         "accel_to_decel_factor",
         // BBS

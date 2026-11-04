@@ -2,6 +2,8 @@
 
 This Tyr Laboratories fork adds **Wall Painting**: choose a different total wall count for painted surfaces while retaining the normal wall count elsewhere, using the native Classic and Arachne wall generators. It is based on upstream Bambu Studio `master` at `79df7ae309be398ed30c9f397c13c9911c2edc57`.
 
+The fork also adds a dedicated **Bridge acceleration** setting for regular and internal bridge infill under **Speed > Acceleration**.
+
 See the [Tyr fork guide](docs/tyr-fork.md) for painting controls, settings, project compatibility, and validation limits. This is a Tyr Laboratories build; the upstream releases linked below do not include this fork's changes. The upstream project description, credits, and license notices follow.
 
 ---

@@ -68,6 +68,11 @@ target_link_libraries(wall_painting_tests test_common libslic3r slicer_test_supp
 set_property(TARGET wall_painting_tests PROPERTY FOLDER "tests")
 add_test(wall_painting_tests wall_painting_tests ${CATCH_EXTRA_ARGS})
 
+add_executable(bridge_acceleration_tests fff_print_tests.cpp test_bridge_acceleration.cpp)
+target_link_libraries(bridge_acceleration_tests test_common libslic3r slicer_test_support)
+set_property(TARGET bridge_acceleration_tests PROPERTY FOLDER "tests")
+add_test(bridge_acceleration_tests bridge_acceleration_tests ${CATCH_EXTRA_ARGS})
+
 # Keep the relevant pre-existing model/3MF/slicing checks runnable even when
 # unrelated legacy G-code tests target APIs that have since been removed.
 add_executable(wall_painting_regression_tests
