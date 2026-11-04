@@ -866,6 +866,14 @@ int NetworkAgent::refresh_connection()
 
 int NetworkAgent::start_subscribe(std::string module)
 {
+#if defined(__APPLE__)
+    // Keep the Mac agent's default app subscription active for its lifetime.
+    // Resuming it after GUI inactivity can deadlock inside the native plugin's
+    // MQTT locks and block the main event loop. Do not pause it in the first
+    // place (see stop_subscribe); printer selection and other modules still
+    // use their normal subscription APIs.
+    if (module == "app") return 0;
+#endif
     int ret = 0;
     if (network_agent && start_subscribe_ptr) {
         ret = start_subscribe_ptr(network_agent, module);
@@ -877,6 +885,11 @@ int NetworkAgent::start_subscribe(std::string module)
 
 int NetworkAgent::stop_subscribe(std::string module)
 {
+#if defined(__APPLE__)
+    // Paired with start_subscribe: inactivity must never pause the Mac app
+    // subscription, otherwise a later return to Device needs the unsafe resume.
+    if (module == "app") return 0;
+#endif
     int ret = 0;
     if (network_agent && stop_subscribe_ptr) {
         ret = stop_subscribe_ptr(network_agent, module);

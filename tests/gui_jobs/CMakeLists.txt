@@ -19,6 +19,22 @@ set_property(TARGET gui_job_tests PROPERTY FOLDER "tests")
 add_test(NAME gui_job_tests COMMAND gui_job_tests ${CATCH_EXTRA_ARGS})
 
 if (APPLE)
+    # Exercise the real NetworkAgent adapter against an isolated plugin ABI.
+    # This target never loads the installed plugin or the user's account data.
+    add_library(fake_idle_network MODULE fake_idle_network.cpp)
+    target_include_directories(fake_idle_network PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    set_target_properties(fake_idle_network PROPERTIES PREFIX "" SUFFIX ".dylib")
+    add_executable(network_subscription_tests test_network_subscription.cpp)
+    target_include_directories(network_subscription_tests PRIVATE ${PROJECT_SOURCE_DIR}/src ${_job_wx_includes})
+    target_compile_definitions(network_subscription_tests PRIVATE
+        ${_job_wx_definitions} FAKE_IDLE_NETWORK_PATH="$<TARGET_FILE:fake_idle_network>")
+    target_link_libraries(network_subscription_tests PRIVATE test_common libslic3r_gui
+        "-framework AVFoundation" "-framework AVKit" "-framework CoreMedia" "-framework VideoToolbox")
+    add_dependencies(network_subscription_tests fake_idle_network)
+    add_test(NAME network_subscription_tests COMMAND network_subscription_tests ${CATCH_EXTRA_ARGS})
+    set_tests_properties(network_subscription_tests PROPERTIES TIMEOUT 30)
+    set_property(TARGET fake_idle_network network_subscription_tests PROPERTY FOLDER "tests")
+
     target_sources(gui_job_tests PRIVATE test_webview_mac.cpp)
     add_executable(cloud_send_helper_tests
         test_cloud_send_helper.cpp

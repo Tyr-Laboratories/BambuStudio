@@ -3701,18 +3701,23 @@ bool GUI_App::on_init_inner()
         bool curr_studio_active = this->is_studio_active();
         if (m_studio_active != curr_studio_active) {
             if (curr_studio_active) {
-                BOOST_LOG_TRIVIAL(info) << "studio is active, start to subscribe";
+                BOOST_LOG_TRIVIAL(info) << "studio is active";
                 if (m_agent) {
-                    json j = json::object();
                     m_agent->start_subscribe("app");
+#ifndef __APPLE__
+                    // Mac keeps its app subscription active while idle.
+                    json j = json::object();
                     m_agent->track_event("mqtt_active", j.dump());
+#endif
                 }
             } else {
-                BOOST_LOG_TRIVIAL(info) << "studio is inactive, stop to subscribe";
+                BOOST_LOG_TRIVIAL(info) << "studio is inactive";
                 if (m_agent) {
-                    json j = json::object();
                     m_agent->stop_subscribe("app");
+#ifndef __APPLE__
+                    json j = json::object();
                     m_agent->track_event("mqtt_inactive", j.dump());
+#endif
                 }
             }
             m_studio_active = curr_studio_active;

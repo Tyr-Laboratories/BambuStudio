@@ -96,6 +96,27 @@ A user confirmed successful sending through the normal Print plate dialog in **t
 
 ## Recorded validation
 
+On macOS, the native printer-status subscription now stays active when Studio
+is idle. Previously Studio paused it after 15 minutes and resumed it when
+activity returned. Repeated samples of an overnight freeze found the main
+event loop blocked inside the native plugin's resume call, with networking
+workers also waiting on mutexes. The Mac adapter now skips both automatic
+`app` pause/resume calls; explicit printer subscriptions and other modules keep
+their existing behavior. This retains background status traffic while idle.
+It avoids the captured entrypoint without claiming to repair the closed
+plugin's internal locks or every possible network hang.
+
+The `network_subscription_tests` target loads an isolated fake plugin through
+the production adapter. Its 3 cases and 2,016 assertions cover 1,000 idle/wake
+cycles without native pause/resume calls, continued callback delivery and
+printer switching at the adapter boundary, and error propagation for other
+modules. The old code fails the two idle cases. The macOS application build
+and the five focused subscription, GUI, helper, bridge and wall-painting test
+targets passed. Actual cloud reconnection, sleep/wake and an overnight run of
+the installed update remain separate acceptance checks. The frozen process's
+31.2 GB footprint was recorded, but a growing memory leak has not been
+established; this change is not a claim to fix that memory usage.
+
 The following results cover the wall-painting implementation and its macOS application build:
 
 - **Focused automated tests:** 39 cases and 19,524 assertions passed. Coverage includes both generators, partial and curved painted surfaces, holes, zero/high counts, narrow regions, transitions, infill clearance, transforms, variable layer heights, numeric modifiers, per-part settings, annotation lifecycle, and 3MF persistence. Automatic-hole cases cover circular bores, arbitrary orientation and mirroring, circular and elliptical scaling, dense tessellation, chamfers, oblique rims, incomplete channels, spherical cavities, cancellation, and preservation of manual painting through 3MF serialization. See [wall-painting tests](../tests/fff_print/test_wall_painting.cpp) and [round-hole tests](../tests/fff_print/test_round_hole_detection.cpp).
@@ -139,7 +160,7 @@ Keep upstream merges on `master`, review conflicts in painting and perimeter cod
 
 Build the application with the upstream [macOS build script](../BuildMac.sh), using Apple silicon and a deployment target of 14.0, with public-release configuration (`BBL_RELEASE_TO_PUBLIC=1`, `BBL_INTERNAL_TESTING=0`). Enable `SLIC3R_BUILD_TESTS` to build and run `wall_painting_tests`. An application build directory alone is not a distributable app: its resource link and machine-local library dependencies must be packaged.
 
-With `SLIC3R_GUI` also enabled, build and run `gui_job_tests` to check print/send error dispatch. This target uses wxWidgets and requires a graphical session, but no account, networking plugin, or printer. On macOS, `cloud_send_helper_tests` checks the real native adapter against an isolated fake Docker process, including parameter transfer, cancellation, errors, and recovery. Run `python3 -m unittest discover -s tests/packaging -v` for runtime inventory and release packaging checks.
+With `SLIC3R_GUI` also enabled, build and run `gui_job_tests` to check print/send error dispatch. This target uses wxWidgets and requires a graphical session, but no account, networking plugin, or printer. On macOS, `cloud_send_helper_tests` checks the real native adapter against an isolated fake Docker process, including parameter transfer, cancellation, errors, and recovery. `network_subscription_tests` checks the native subscription adapter against a test-only plugin and temporary data directory; it never loads the installed plugin or user session. Run `python3 -m unittest discover -s tests/packaging -v` for runtime inventory and release packaging checks.
 
 The release tooling performs that separate step:
 
