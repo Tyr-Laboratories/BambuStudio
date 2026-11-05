@@ -10,7 +10,10 @@ std::vector<LayerPaint> slice_paint(const PrintObject &object, const std::functi
 {
     const auto layers=object.layers();
     std::vector<LayerPaint> result(layers.size());
-    if (!object.model_object()->is_wall_painting_painted() || object.print()->config().spiral_mode) return result;
+    bool slope_walls=false;
+    for (const auto &region:object.all_regions())
+        slope_walls |= region.get().config().extra_wall_slope_angle.value>0.;
+    if ((!object.model_object()->is_wall_painting_painted() && !slope_walls) || object.print()->config().spiral_mode) return result;
     std::vector<float> heights;
     heights.reserve(layers.size());
     for (const Layer *layer : layers) heights.push_back(float(layer->slice_z));
@@ -51,6 +54,7 @@ std::vector<LayerPaint> slice_paint(const PrintObject &object, const std::functi
                 Vec3d normal=(v[1]-v[0]).cross(v[2]-v[0]);
                 if (mirrored) normal=-normal;
                 if (volume->is_negative_volume()) normal=-normal;
+                const double slope_angle=std::atan2(std::abs(normal.z()),normal.head<2>().norm())*180./PI;
                 const double low=std::min({v[0].z(),v[1].z(),v[2].z()});
                 const double high=std::max({v[0].z(),v[1].z(),v[2].z()});
                 if (high-low<EPSILON) continue; // Horizontal faces don't define perimeter boundaries.
@@ -71,7 +75,7 @@ std::vector<LayerPaint> slice_paint(const PrintObject &object, const std::functi
                     if (a==b) continue;
                     const Vec2d tangent(-normal.y(),normal.x());
                     if ((b-a).cast<double>().dot(tangent)<0.) std::swap(a,b);
-                    result[size_t(layer-layers.begin())].push_back({Line(a,b),size_t(volume->id().id),state==EnforcerBlockerType::ENFORCER,-1});
+                    result[size_t(layer-layers.begin())].push_back({Line(a,b),size_t(volume->id().id),state==EnforcerBlockerType::ENFORCER,-1,slope_angle});
                 }
             }
         }
@@ -83,7 +87,7 @@ std::vector<LayerPaint> slice_paint(const PrintObject &object, const std::functi
         LayerPaint labels;
         labels.reserve(policy.spans().size());
         for (const auto &span:policy.spans())
-            labels.push_back({span.line,span.source,span.painted,-1});
+            labels.push_back({span.line,span.source,span.painted,-1,span.slope_angle});
         result[i]=std::move(labels);
     }
     return result;

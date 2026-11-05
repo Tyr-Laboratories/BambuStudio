@@ -73,7 +73,7 @@ BoundaryPolicy BoundaryPolicy::bind(const Polygons &outline, const LayerPaint &p
     // These regions only label the surviving outline; they never create walls.
     std::vector<CountRegion> regions;
     for (const auto &region:count_regions)
-        regions.push_back({offset_ex(region.area,2.*ClipperSafetyOffset),region.painted_count});
+        regions.push_back({offset_ex(region.area,2.*ClipperSafetyOffset),region.painted_count,region.slope_threshold});
     for (const Polygon &polygon : outline) {
         for (size_t i=0; i<polygon.size(); ++i) {
             const Line boundary(polygon.points[i], polygon.points[(i+1)%polygon.size()]);
@@ -95,7 +95,7 @@ BoundaryPolicy BoundaryPolicy::bind(const Polygons &outline, const LayerPaint &p
                 if (d.dot(s) < 0.5*std::sqrt(d.squaredNorm()*s.squaredNorm())) continue;
                 if (std::min({distance_sq(boundary, source.line.a), distance_sq(boundary, source.line.b),
                               distance_sq(source.line, boundary.a), distance_sq(source.line, boundary.b)}) > tolerance_sq) continue;
-                nearby.push_back({source.line, source.painted ? painted_count : normal_count, source.volume_id,source.painted});
+                nearby.push_back({source.line, source.painted ? painted_count : normal_count, source.volume_id,source.painted,source.slope_angle});
             }
             auto cuts = endpoints(boundary, nearby);
             for (const auto &region:regions) for (const auto &polygon:to_polygons(region.area))
@@ -114,16 +114,21 @@ BoundaryPolicy BoundaryPolicy::bind(const Polygons &outline, const LayerPaint &p
                 int count = normal_count;
                 size_t id = 0;
                 bool painted=false;
+                double slope_angle=0., slope_threshold=-1.;
                 for (size_t j=0; j<nearby.size(); ++j) {
                     const double dist = distance_sq(nearby[j].line, mid);
-                    if (dist < best) { best=dist; count=nearby[j].count; id=nearby[j].source; painted=nearby[j].painted; }
+                    if (dist < best) {
+                        best=dist; count=nearby[j].count; id=nearby[j].source; painted=nearby[j].painted;
+                        slope_angle=nearby[j].slope_angle;
+                    }
                 }
-                if (painted)
-                    for (const auto &region:regions)
-                        if (std::any_of(region.area.begin(),region.area.end(),[&](const ExPolygon &area){return area.contains(mid);}))
-                            count=region.painted_count;
+                for (const auto &region:regions)
+                    if (std::any_of(region.area.begin(),region.area.end(),[&](const ExPolygon &area){return area.contains(mid);})) {
+                        if (painted) count=region.painted_count;
+                        slope_threshold=region.slope_threshold;
+                    }
                 const Line span(along(boundary,cuts[c-1]),along(boundary,cuts[c]));
-                if (span.a != span.b) result.push_back({span,count,id,painted});
+                if (span.a != span.b) result.push_back({span,count,id,painted,slope_angle,slope_threshold});
             }
         }
     }
@@ -166,6 +171,20 @@ BoundaryPolicy BoundaryPolicy::adjusted(int extra, int consumed, bool one_wall) 
         span.count=std::max(0,span.count-consumed);
     }
     return adjusted;
+}
+
+BoundaryPolicy BoundaryPolicy::reinforce_slopes(double threshold, bool one_wall) const
+{
+    auto reinforced=*this;
+    for (auto &span:reinforced.m_spans) {
+        const double local_threshold=span.slope_threshold < 0. ? threshold : span.slope_threshold;
+        // Eligibility is the requested count, before the top/first-layer cap.
+        // A region requesting two or more walls keeps the existing cap behavior.
+        span.slope_reinforced=span.count==1 && local_threshold>0. && span.slope_angle>local_threshold+1.e-7;
+        if (one_wall) span.count=std::min(1,span.count);
+        if (span.slope_reinforced) span.count=2;
+    }
+    return reinforced;
 }
 
 double BoundaryPolicy::transition_distance(const Point &point, size_t depth, double limit) const

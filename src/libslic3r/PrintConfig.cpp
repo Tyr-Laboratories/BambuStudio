@@ -4781,6 +4781,16 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->set_default_value(new ConfigOptionInt(2));
 
+    def = this->add("extra_wall_slope_angle", coFloat);
+    def->label = L("Extra wall slope angle");
+    def->category = L("Strength");
+    def->tooltip = L("Add an inner wall where a surface requesting one wall slopes more than this angle from vertical, in either direction. 0 disables this feature. 90 degrees is horizontal. Regions requesting zero or at least two walls retain their existing behavior. Qualifying one-wall slopes take precedence over single-wall top and first-layer rules. Spiral vase mode is excluded.");
+    def->sidetext = L("°");
+    def->min = 0;
+    def->max = 90;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.));
+
     def = this->add("embedding_wall_into_infill", coBool);
     def->label = L("Embedding the wall into the infill");
     def->category = L("Strength");

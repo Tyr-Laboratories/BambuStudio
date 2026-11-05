@@ -7,8 +7,57 @@
 #include <cmath>
 #include <numeric>
 #include <optional>
+#include <unordered_set>
 
 namespace Slic3r::WallPainting {
+namespace {
+void append_round_hole_caps(const indexed_triangle_set &mesh, const Transform3d &transform,
+    std::vector<RoundHole> &holes, double normal_z_limit, const std::function<void(float)> &progress);
+}
+
+std::vector<RoundHole> detect_round_internal_hole_overhangs(
+    const indexed_triangle_set &mesh, const Transform3d &transform, double angle_deg,
+    const std::function<void(float)> &progress)
+{
+    auto report = [&](float value) { if (progress) progress(value); };
+    report(0.f);
+    if (!std::isfinite(angle_deg) || angle_deg <= 0.) {
+        report(1.f);
+        return {};
+    }
+    auto holes = detect_round_internal_holes(mesh, transform, [&](float p) { report(0.8f * p); });
+    if (holes.empty()) {
+        report(1.f);
+        return holes;
+    }
+
+    const Matrix3d normal_matrix = transform.linear().inverse().transpose();
+    const double limit = -std::cos(std::min(angle_deg, 90.) * M_PI / 180.);
+    append_round_hole_caps(mesh, transform, holes, limit, [&](float p) { report(0.8f + 0.15f * p); });
+    size_t total = 0, completed = 0;
+    for (const auto &hole : holes)
+        total += hole.facets.size();
+    for (auto &hole : holes) {
+        auto end = std::remove_if(hole.facets.begin(), hole.facets.end(), [&](int facet) {
+            const auto &face = mesh.indices[facet];
+            const Vec3d a = mesh.vertices[face[0]].cast<double>();
+            const Vec3d normal = normal_matrix *
+                (mesh.vertices[face[1]].cast<double>() - a).cross(mesh.vertices[face[2]].cast<double>() - a);
+            if ((++completed & 1023) == 0)
+                report(float(0.95 + 0.05 * completed / total));
+            // Reject vertical walls even when round-off leaves a tiny negative
+            // Z component at the 90-degree limit.
+            return !normal.allFinite() || normal.norm() == 0. || normal.normalized().z() >= limit - 1e-8;
+        });
+        hole.facets.erase(end, hole.facets.end());
+    }
+    holes.erase(std::remove_if(holes.begin(), holes.end(), [](const RoundHole &hole) {
+        return hole.facets.empty();
+    }), holes.end());
+    report(1.f);
+    return holes;
+}
+
 namespace {
 constexpr double max_turn_cos = 0.8660254037844386; // 30 degrees
 constexpr double axis_growth_tolerance = 0.03;
@@ -19,6 +68,135 @@ struct Edge {
     int halfedge;
     bool operator<(const Edge &other) const { return key < other.key; }
 };
+
+// A cap is accepted only when a connected inward-facing planar patch is fully
+// contained by the bore and its complete boundary is exactly one bore rim.
+// This is support-only: ordinary wall painting still targets cylindrical walls.
+void append_round_hole_caps(const indexed_triangle_set &mesh, const Transform3d &transform,
+    std::vector<RoundHole> &holes, double normal_z_limit, const std::function<void(float)> &progress)
+{
+    if (std::none_of(holes.begin(), holes.end(), [&](const RoundHole &hole) {
+        return -std::abs(hole.axis.z()) < normal_z_limit - 1e-8;
+    })) {
+        progress(1.f);
+        return;
+    }
+    auto edge_key = [](int a, int b) {
+        return (uint64_t(uint32_t(std::min(a, b))) << 32) | uint32_t(std::max(a, b));
+    };
+    std::vector<Edge> edges;
+    edges.reserve(3 * mesh.indices.size());
+    for (size_t i = 0; i < mesh.indices.size(); ++i) {
+        const auto &face = mesh.indices[i];
+        if ((face.array() >= 0).all() && (face.array() < int(mesh.vertices.size())).all())
+            for (int j = 0; j < 3; ++j)
+                edges.push_back({edge_key(face[j], face[(j + 1) % 3]), int(3 * i + j)});
+        if ((i & 4095) == 0)
+            progress(float(0.4 * i / mesh.indices.size()));
+    }
+    std::sort(edges.begin(), edges.end());
+    progress(0.4f);
+    auto neighbor = [&](uint64_t key, int face) {
+        const auto first = std::lower_bound(edges.begin(), edges.end(), Edge{key, 0});
+        if (first == edges.end() || first->key != key || first + 1 == edges.end() || (first + 1)->key != key ||
+            (first + 2 != edges.end() && (first + 2)->key == key))
+            return -1;
+        const int a = first->halfedge, b = (first + 1)->halfedge;
+        if (mesh.indices[a / 3][a % 3] == mesh.indices[b / 3][b % 3])
+            return -1; // Nonmanifold or inconsistent winding cannot enclose a cap.
+        return a / 3 == face ? b / 3 : (b / 3 == face ? a / 3 : -1);
+    };
+    const Matrix3d normal_matrix = transform.linear().inverse().transpose();
+    for (size_t i = 0; i < holes.size(); ++i) {
+        RoundHole &hole = holes[i];
+        auto check_cancel = [&] { progress(float(0.4 + 0.6 * i / holes.size())); };
+        check_cancel();
+        if (-std::abs(hole.axis.z()) >= normal_z_limit - 1e-8)
+            continue;
+        const auto bore_facets = hole.facets;
+        std::vector<Edge> bore_edges;
+        double lower = std::numeric_limits<double>::max(), upper = -lower;
+        for (int facet : bore_facets) {
+            const auto &face = mesh.indices[facet];
+            for (int j = 0; j < 3; ++j) {
+                bore_edges.push_back({edge_key(face[j], face[(j + 1) % 3]), 3 * facet + j});
+                const double z = (transform * mesh.vertices[face[j]].cast<double>() - hole.center).dot(hole.axis);
+                lower = std::min(lower, z); upper = std::max(upper, z);
+            }
+            if ((bore_edges.size() & 4095) < 3) check_cancel();
+        }
+        std::sort(bore_edges.begin(), bore_edges.end());
+        const double tolerance = std::max(0.0025, hole.radius * 0.0015);
+        for (int side : {0, 1}) {
+            const double end_position = side == 0 ? lower : upper;
+            const Vec3d inward = side == 0 ? hole.axis : -hole.axis;
+            if (inward.z() >= normal_z_limit - 1e-8) continue;
+            std::vector<uint64_t> rim;
+            int seed = -1;
+            for (size_t j = 0; j < bore_edges.size();) {
+                size_t end = j + 1;
+                while (end < bore_edges.size() && bore_edges[end].key == bore_edges[j].key) ++end;
+                if (end == j + 1) {
+                    const int halfedge = bore_edges[j].halfedge;
+                    const auto &face = mesh.indices[halfedge / 3];
+                    const Vec3d a = transform * mesh.vertices[face[halfedge % 3]].cast<double>() - hole.center;
+                    const Vec3d b = transform * mesh.vertices[face[(halfedge + 1) % 3]].cast<double>() - hole.center;
+                    if (std::abs(a.dot(hole.axis) - end_position) <= tolerance &&
+                        std::abs(b.dot(hole.axis) - end_position) <= tolerance) {
+                        rim.push_back(bore_edges[j].key);
+                        seed = neighbor(bore_edges[j].key, halfedge / 3);
+                    }
+                }
+                j = end;
+                if ((j & 4095) < 3) check_cancel();
+            }
+            if (rim.empty() || seed < 0) continue;
+            auto contained = [&](int facet) {
+                const auto &face = mesh.indices[facet];
+                const Vec3d a = mesh.vertices[face[0]].cast<double>();
+                const Vec3d normal = normal_matrix *
+                    (mesh.vertices[face[1]].cast<double>() - a).cross(mesh.vertices[face[2]].cast<double>() - a);
+                if (!normal.allFinite() || normal.norm() == 0. || normal.normalized().dot(inward) < 1. - 1e-6)
+                    return false;
+                for (int vertex : {face[0], face[1], face[2]}) {
+                    const Vec3d point = transform * mesh.vertices[vertex].cast<double>() - hole.center;
+                    const double z = point.dot(hole.axis);
+                    if (std::abs(z - end_position) > tolerance || (point - z * hole.axis).norm() > hole.radius + tolerance)
+                        return false;
+                }
+                return true;
+            };
+            std::vector<int> cap {seed};
+            std::unordered_set<int> visited {seed};
+            std::vector<uint64_t> boundary;
+            bool enclosed = true;
+            for (size_t head = 0; head < cap.size() && enclosed; ++head) {
+                if ((head & 1023) == 0) check_cancel();
+                const int facet = cap[head];
+                if (!contained(facet)) { enclosed = false; break; }
+                const auto &face = mesh.indices[facet];
+                for (int j = 0; j < 3; ++j) {
+                    const uint64_t key = edge_key(face[j], face[(j + 1) % 3]);
+                    const int other = neighbor(key, facet);
+                    if (other < 0) { enclosed = false; break; }
+                    if (std::binary_search(rim.begin(), rim.end(), key)) {
+                        if (!std::binary_search(bore_facets.begin(), bore_facets.end(), other)) {
+                            enclosed = false; break;
+                        }
+                        boundary.push_back(key);
+                    } else if (visited.insert(other).second) {
+                        cap.push_back(other);
+                    }
+                }
+            }
+            std::sort(boundary.begin(), boundary.end());
+            if (enclosed && boundary == rim)
+                hole.facets.insert(hole.facets.end(), cap.begin(), cap.end());
+        }
+        std::sort(hole.facets.begin(), hole.facets.end());
+    }
+    progress(1.f);
+}
 
 // Angular coordinates can be lifted continuously on an open cylindrical strip,
 // but not on a patch which wraps all the way around its axis. A contradictory

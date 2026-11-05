@@ -205,6 +205,8 @@ void Layer::make_perimeters()
     BOOST_LOG_TRIVIAL(trace) << "Generating perimeters for layer " << this->id();
     // keep track of regions whose perimeters we have already generated
     std::vector<unsigned char> done(m_regions.size(), false);
+    for (auto *region:m_regions)
+        region->has_slope_wall_reinforcement=false;
 
     for (LayerRegionPtrs::iterator layerm = m_regions.begin(); layerm != m_regions.end(); ++ layerm)
     	if ((*layerm)->slices.empty()) {

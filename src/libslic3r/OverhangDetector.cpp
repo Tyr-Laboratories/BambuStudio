@@ -3,6 +3,8 @@
 #include "AABBTreeLines.hpp"
 #include "Arachne/utils/ExtrusionLine.hpp"
 
+#include <algorithm>
+
 namespace Slic3r {
 
     Polylines ZPath_to_polylines(const ZPaths& paths)
@@ -46,9 +48,15 @@ namespace Slic3r {
                     // Interpolate extrusion line width.
                     assert(start.z() > 0 && end.z() > 0);
 
-                    double length_sqr = (end - start).cast<double>().squaredNorm();
-                    double dist_sqr = (pt - start).cast<double>().squaredNorm();
-                    double t = std::sqrt(dist_sqr / length_sqr);
+                    // Z carries bead spacing, not a spatial coordinate. Using
+                    // the 3D distance (with the new point's Z still zero) can
+                    // extrapolate widths far beyond either endpoint, especially
+                    // on short curved wall segments at an overhang boundary.
+                    const Vec2d direction = (end.head<2>() - start.head<2>()).cast<double>();
+                    const double length_sqr = direction.squaredNorm();
+                    const double t = length_sqr > 0. ? std::clamp(
+                        (pt.head<2>() - start.head<2>()).cast<double>().dot(direction) / length_sqr,
+                        0., 1.) : 0.;
 
                     pt.z() = start.z() + coord_t((end.z() - start.z()) * t);
                 }

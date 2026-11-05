@@ -3309,6 +3309,7 @@ void TabPrint::build()
         optgroup = page->new_optgroup(L("Walls"), L"param_wall");
         optgroup->append_single_option_line("wall_loops","wall-generator");
         optgroup->append_single_option_line("painted_wall_loops");
+        optgroup->append_single_option_line("extra_wall_slope_angle");
         optgroup->append_single_option_line("alternate_extra_wall");
         optgroup->append_single_option_line("embedding_wall_into_infill");
 
@@ -3745,6 +3746,7 @@ void TabPrintModel::build()
             optgroup->append_single_option_line("sparse_infill_density");
             optgroup->append_single_option_line("wall_loops");
             optgroup->append_single_option_line("painted_wall_loops");
+            optgroup->append_single_option_line("extra_wall_slope_angle");
             optgroup->append_single_option_line("enable_support", "support");
     m_pages.pop_back();
     m_pages.insert(m_pages.begin(), page);

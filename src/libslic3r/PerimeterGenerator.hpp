@@ -49,6 +49,7 @@ public:
     const PerimeterRegions      *perimeter_regions;
     const WallPainting::LayerPaint *wall_painting = nullptr;
     const WallPainting::BoundaryPolicy *active_wall_policy = nullptr;
+    bool                        has_slope_wall_reinforcement = false;
     // Outputs:
     ExtrusionEntityCollection   *loops;
     ExtrusionEntityCollection   *gap_fill;

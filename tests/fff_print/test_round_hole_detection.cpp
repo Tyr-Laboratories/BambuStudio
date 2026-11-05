@@ -318,3 +318,189 @@ TEST_CASE("Round-hole fill reports progress and propagates cancellation", "[Wall
         if(progress>=0.4f) throw std::runtime_error("canceled during detection");
     }),std::runtime_error);
 }
+
+TEST_CASE("Round-hole support blocking selects only the ceiling of horizontal bores", "[RoundHoles][RoundHoleSupport]")
+{
+    const auto mesh = bore();
+    Transform3d transform = Transform3d::Identity();
+    transform.rotate(Eigen::AngleAxisd(M_PI / 2., Vec3d::UnitX()));
+    const auto holes = detect_round_internal_hole_overhangs(mesh, transform, 45.);
+    REQUIRE(holes.size() == 1);
+    REQUIRE(holes.front().facets.size() == 32);
+    for (int facet : holes.front().facets) {
+        // A 45-degree ceiling is the middle quarter of the upper semicircle.
+        CHECK(facet >= 16);
+        CHECK(facet < 48);
+    }
+    const auto all_downward = detect_round_internal_hole_overhangs(mesh, transform, 90.);
+    REQUIRE(all_downward.size() == 1);
+    CHECK(all_downward.front().facets.size() == 64);
+    CHECK(detect_round_internal_hole_overhangs(mesh, transform, 0.).empty());
+    CHECK(detect_round_internal_hole_overhangs(mesh, Transform3d::Identity(), 90.).empty());
+}
+
+TEST_CASE("Round-hole support blocking follows transformed geometry", "[RoundHoles][RoundHoleSupport]")
+{
+    const double mirror = GENERATE(-1., 1.);
+    const double axis_angle = GENERATE(M_PI / 2., M_PI / 3.);
+    const double source_x_scale = GENERATE(1., 2.);
+    auto mesh = bore();
+    for (auto &vertex : mesh.vertices)
+        vertex.x() *= source_x_scale;
+    Transform3d transform = Transform3d::Identity();
+    transform.translate(Vec3d(100., -70., 50.));
+    transform.rotate(Eigen::AngleAxisd(axis_angle, Vec3d::UnitX()));
+    // An elliptical source becomes circular after scaling. Unlike uniform
+    // radial scaling, this distinguishes an inverse-transpose normal transform
+    // from applying the vertex transform directly to a normal.
+    transform.scale(Vec3d(2. / source_x_scale, mirror * 2., 0.6));
+    const auto holes = detect_round_internal_hole_overhangs(mesh, transform, 60.);
+    REQUIRE(holes.size() == 1);
+    std::vector<int> expected;
+    // Independent reference: outward bore normals point from the surface to
+    // the centerline. This also catches an inverted normal after mirroring.
+    const Vec3d origin = transform * Vec3d::Zero();
+    const Vec3d axis = (transform.linear() * Vec3d::UnitZ()).normalized();
+    for (int facet = 0; facet < 128; ++facet) {
+        const double angle = 2. * M_PI * (facet / 2 + 0.5) / 64.;
+        const Vec3d center = transform * Vec3d(source_x_scale * 2. * cos(angle), 2. * sin(angle), 5.);
+        const Vec3d radial = center - origin - axis * axis.dot(center - origin);
+        if (-radial.normalized().z() < -0.5)
+            expected.push_back(facet);
+    }
+    CHECK(holes.front().facets == expected);
+}
+
+TEST_CASE("Round-hole support blocking rejects non-bores and propagates cancellation", "[RoundHoles][RoundHoleSupport]")
+{
+    Transform3d transform = Transform3d::Identity();
+    transform.rotate(Eigen::AngleAxisd(M_PI / 2., Vec3d::UnitX()));
+    CHECK(detect_round_internal_hole_overhangs(bore(64, 11. * M_PI / 6.), transform, 90.).empty());
+    CHECK(detect_round_internal_hole_overhangs(its_make_cylinder(2., 10., M_PI / 32.), transform, 90.).empty());
+    CHECK(detect_round_internal_hole_overhangs(bore(), transform, std::numeric_limits<double>::quiet_NaN()).empty());
+    float previous = -1.f;
+    REQUIRE_FALSE(detect_round_internal_hole_overhangs(bore(), transform, 45., [&](float p) {
+        CHECK(p >= previous); CHECK(p <= 1.f); previous = p;
+    }).empty());
+    CHECK(previous == 1.f);
+    REQUIRE_THROWS_AS(detect_round_internal_hole_overhangs(bore(), transform, 45., [](float p) {
+        if (p >= 0.95f) throw std::runtime_error("canceled while selecting overhangs");
+    }), std::runtime_error);
+}
+
+TEST_CASE("Round-hole support blocking includes enclosed downward-facing blind caps", "[RoundHoles][RoundHoleSupport]")
+{
+    const double mirror = GENERATE(-1., 1.);
+    const double angle = GENERATE(M_PI, 0.8 * M_PI);
+    Transform3d transform = Transform3d::Identity();
+    transform.translate(Vec3d(30., 60., 80.));
+    transform.rotate(Eigen::AngleAxisd(angle, Vec3d::UnitX()));
+    transform.scale(Vec3d(mirror * 2., 2., 0.7));
+    const auto holes = detect_round_internal_hole_overhangs(bore(64, 2. * M_PI, 2., true), transform, 45.);
+    REQUIRE(holes.size() == 1);
+    REQUIRE(holes.front().facets.size() == 64);
+    for (int facet = 384; facet < 448; ++facet)
+        CHECK(std::binary_search(holes.front().facets.begin(), holes.front().facets.end(), facet));
+}
+
+TEST_CASE("Round-hole support blocking does not leak onto bore ends or exterior flanges", "[RoundHoles][RoundHoleSupport]")
+{
+    Transform3d inverted = Transform3d::Identity();
+    inverted.rotate(Eigen::AngleAxisd(M_PI, Vec3d::UnitX()));
+    CHECK(detect_round_internal_hole_overhangs(bore(64, 2. * M_PI, 2., true), Transform3d::Identity(), 90.).empty());
+    CHECK(detect_round_internal_hole_overhangs(bore(), inverted, 90.).empty());
+    auto protruding_cap = bore(64, 2. * M_PI, 2., true);
+    protruding_cap.vertices[256].x() = 3.f; // Fan center outside the 2mm bore.
+    CHECK(detect_round_internal_hole_overhangs(protruding_cap, inverted, 45.).empty());
+    auto sloped_cap = bore(64, 2. * M_PI, 2., true);
+    sloped_cap.vertices[256].z() = 1.f; // A tapered recess, not a planar end cap.
+    CHECK(detect_round_internal_hole_overhangs(sloped_cap, inverted, 45.).empty());
+
+    auto incomplete_cap = bore(64, 2. * M_PI, 2., true);
+    incomplete_cap.indices.erase(incomplete_cap.indices.begin() + 384, incomplete_cap.indices.begin() + 448);
+    const int inner = int(incomplete_cap.vertices.size());
+    for (int i = 0; i < 64; ++i) {
+        const double angle = 2. * M_PI * i / 64.;
+        incomplete_cap.vertices.emplace_back(cos(angle), sin(angle), 0.);
+    }
+    for (int i = 0; i < 64; ++i) {
+        const int j = (i + 1) % 64;
+        incomplete_cap.indices.emplace_back(i, j, inner + j);
+        incomplete_cap.indices.emplace_back(i, inner + j, inner + i);
+    }
+    // Every cap vertex is inside the bore and coplanar, but an interior opening
+    // means its boundary is not the complete disk bounded by the bore rim.
+    REQUIRE(detect_round_internal_holes(incomplete_cap, inverted).size() == 1);
+    CHECK(detect_round_internal_hole_overhangs(incomplete_cap, inverted, 45.).empty());
+}
+
+TEST_CASE("Round-hole support blockers preserve manual paint and survive project reopening", "[RoundHoles][RoundHoleSupport]")
+{
+    TriangleMesh mesh(bore());
+    Transform3d transform = Transform3d::Identity();
+    transform.rotate(Eigen::AngleAxisd(M_PI / 2., Vec3d::UnitX()));
+    mesh.transform(transform);
+    TriangleSelector selector(mesh);
+    const int outer_face = 128;
+    selector.set_facet(outer_face, EnforcerBlockerType::ENFORCER);
+    selector.set_facet(100, EnforcerBlockerType::BLOCKER);
+    // Retain a manually subdivided patch outside the hole, not only whole faces.
+    const auto &face = mesh.its.indices[outer_face];
+    const Vec3f center = (mesh.its.vertices[face[0]] + mesh.its.vertices[face[1]] + mesh.its.vertices[face[2]]) / 3.f;
+    selector.select_patch(outer_face, TriangleSelector::SinglePointCursor::cursor_factory(center, center + Vec3f(0, 0, 20), 0.5f,
+        TriangleSelector::CursorType::SPHERE, Transform3d::Identity(), TriangleSelector::ClippingPlane()),
+        EnforcerBlockerType::NONE, Transform3d::Identity(), true);
+    Model model;
+    auto *object = model.add_object();
+    auto *volume = object->add_volume(mesh);
+    object->add_instance();
+    volume->supported_facets.set(selector);
+    REQUIRE(volume->supported_facets.get_triangle_as_string(outer_face).size() > 1);
+    std::vector<std::string> before;
+    for (int i = 0; i < int(mesh.its.indices.size()); ++i)
+        before.push_back(volume->supported_facets.get_triangle_as_string(i));
+    TriangleSelector wall_selector(mesh);
+    wall_selector.set_facet(0, EnforcerBlockerType::ENFORCER);
+    volume->wall_painting_facets.set(wall_selector);
+    const auto wall_before = volume->wall_painting_facets.get_data();
+
+    const auto holes = detect_round_internal_hole_overhangs(mesh.its, Transform3d::Identity(), 45.);
+    REQUIRE(holes.size() == 1);
+    REQUIRE(holes.front().facets.size() == 32);
+    for (int facet : holes.front().facets)
+        selector.set_facet(facet, EnforcerBlockerType::BLOCKER);
+    CHECK(volume->supported_facets.set(selector));
+    for (int i = 0; i < int(mesh.its.indices.size()); ++i) {
+        if (std::binary_search(holes.front().facets.begin(), holes.front().facets.end(), i))
+            CHECK(selector.get_triangles()[i].get_state() == EnforcerBlockerType::BLOCKER);
+        else
+            CHECK(volume->supported_facets.get_triangle_as_string(i) == before[i]);
+    }
+    CHECK(volume->wall_painting_facets.get_data() == wall_before);
+    CHECK_FALSE(volume->supported_facets.set(selector)); // A repeat operation makes no annotation change.
+
+    const auto workspace = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("round-hole-support-%%%%-%%%%");
+    boost::filesystem::create_directories(workspace);
+    const std::string original_data = data_dir(), original_temp = temporary_dir();
+    set_data_dir(workspace.string()); set_temporary_dir(workspace.string());
+    struct Cleanup {
+        boost::filesystem::path path; std::string data, temp;
+        ~Cleanup() { set_data_dir(data); set_temporary_dir(temp); boost::system::error_code ec; boost::filesystem::remove_all(path, ec); }
+    } cleanup{workspace, original_data, original_temp};
+    const std::string filename = (workspace / "blocked-holes.3mf").string();
+    DynamicPrintConfig config;
+    StoreParams params; params.path = filename.c_str(); params.model = &model; params.config = &config;
+    REQUIRE(store_bbs_3mf(params));
+    Model loaded; DynamicPrintConfig loaded_config;
+    ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Disable);
+    bool is_bambu = false; Semver version; PlateDataPtrs plates; std::vector<Preset *> presets;
+    REQUIRE(load_bbs_3mf(filename.c_str(), &loaded_config, &substitutions, &loaded, &plates, &presets, &is_bambu, &version,
+        nullptr, LoadStrategy::LoadModel | LoadStrategy::LoadConfig));
+    REQUIRE(loaded.objects.size() == 1);
+    REQUIRE(loaded.objects.front()->volumes.size() == 1);
+    const auto *reopened = loaded.objects.front()->volumes.front();
+    CHECK(reopened->supported_facets.equals(volume->supported_facets));
+    CHECK(reopened->wall_painting_facets.equals(volume->wall_painting_facets));
+    CHECK(reopened->supported_facets.get_facets_strict(*reopened, EnforcerBlockerType::BLOCKER).indices.size() == 33);
+    for (auto *plate : plates) delete plate;
+}

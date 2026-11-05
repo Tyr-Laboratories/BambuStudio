@@ -1527,6 +1527,7 @@ bool PrintObject::invalidate_state_by_config_options(
         } else if (
                opt_key == "wall_loops"
             || opt_key == "painted_wall_loops"
+            || opt_key == "extra_wall_slope_angle"
             || opt_key == "top_one_wall_type"
             || opt_key == "top_area_threshold"
             || opt_key == "only_one_wall_first_layer"
@@ -1535,6 +1536,12 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "infill_wall_overlap"
             || opt_key == "apply_scarf_seam_on_circles") {
             steps.emplace_back(posPerimeters);
+            if (opt_key == "extra_wall_slope_angle") {
+                // Support trimming and lift avoidance consume the emitted
+                // walls / bridge areas, which this local wall policy changes.
+                steps.emplace_back(posSupportMaterial);
+                steps.emplace_back(posDetectOverhangsForLift);
+            }
         } else if (opt_key == "gap_infill_speed" || opt_key == "filter_out_gap_fill") {
             // Return true if gap-fill speed has changed from zero value to non-zero or from non-zero value to zero.
             auto is_gap_fill_changed_state_due_to_speed = [&opt_key, &old_config, &new_config]() -> bool {
@@ -2264,7 +2271,10 @@ void PrintObject::discover_vertical_shells()
                     // For a multi-material print, simulate perimeter / infill split as if only a single extruder has been used for the whole print.
                     const bool painted_layer=idx_layer<m_wall_painting.size() &&
                         std::any_of(m_wall_painting[idx_layer].begin(),m_wall_painting[idx_layer].end(),[](const auto &line){return line.painted;});
-                    if (perimeter_offset > 0. && !painted_layer) {
+                    const bool slope_walls=std::any_of(layer.regions().begin(),layer.regions().end(),[](const LayerRegion *region) {
+                        return region->has_slope_wall_reinforcement;
+                    });
+                    if (perimeter_offset > 0. && !painted_layer && !slope_walls) {
                         // The layer.lslices are forced to merge by expanding them first.
                         // 对于多材料，按照最大墙宽度，再算一次稀疏区域
                         polygons_append(cache.holes, offset2(layer.lslices, 0.3f * perimeter_min_spacing, -perimeter_offset - 0.3f * perimeter_min_spacing));

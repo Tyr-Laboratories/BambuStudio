@@ -61,6 +61,10 @@ private:
     PainterGizmoType get_painter_type() const override;
 
     void select_facets_by_angle(float threshold, bool block);
+    void block_round_internal_hole_overhangs();
+    bool m_round_hole_fill_pending = false;
+    wxString m_round_hole_fill_status;
+    ObjectID m_round_hole_status_object_id;
     // BBS
     int get_selection_support_threshold_angle();
 

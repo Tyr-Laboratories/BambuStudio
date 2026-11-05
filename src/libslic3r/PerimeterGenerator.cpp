@@ -282,7 +282,25 @@ static bool is_enable_overhang_speed(const PerimeterGenerator& perimeter_generat
 static bool fuzzy_skin_allows_overhang_slowdown(const PerimeterGenerator &pg)
 {
     const FuzzySkinType fs = pg.config->fuzzy_skin.value;
-    return fs == FuzzySkinType::Disabled_fuzzy || (fs == FuzzySkinType::None && pg.perimeter_regions->empty());
+    if (fs == FuzzySkinType::Disabled_fuzzy) return true;
+    if (fs != FuzzySkinType::None) return false;
+    // Local wall-count and slope policies share this collection with fuzzy
+    // regions. Only an actual fuzzy-skin setting suppresses overhang slowdown.
+    return std::none_of(pg.perimeter_regions->begin(), pg.perimeter_regions->end(), [](const PerimeterRegion &region) {
+        const auto mode = region.region->config().fuzzy_skin.value;
+        return mode != FuzzySkinType::None && mode != FuzzySkinType::Disabled_fuzzy;
+    });
+}
+
+// Keep the candidate inner wall available where slope reinforcement overrides
+// the one-wall top-surface mask. The policy still clips its exact boundary span.
+static ExPolygons slope_wall_region(const WallPainting::BoundaryPolicy &policy, const ExPolygon &material, coord_t radius)
+{
+    Polygons coverage;
+    for (const auto &span:policy.spans())
+        if (span.slope_reinforced)
+            WallPainting::append_coverage(coverage,span.line,2*radius,2*radius);
+    return coverage.empty() ? ExPolygons{} : intersection_ex(coverage,ExPolygons{material});
 }
 
 // A clipped perimeter is open, but still has a stack depth for wall sequencing.
@@ -993,8 +1011,10 @@ void PerimeterGenerator::process_classic()
                     std::abs(object_config->elefant_foot_compensation.value) : 0.));
             std::vector<WallPainting::CountRegion> count_regions;
             for (const auto &region : *perimeter_regions)
-                if (region.region->config().painted_wall_loops != config->painted_wall_loops)
-                    count_regions.push_back({region.expolygons,region.region->config().painted_wall_loops.value});
+                if (region.region->config().painted_wall_loops != config->painted_wall_loops ||
+                    region.region->config().extra_wall_slope_angle != config->extra_wall_slope_angle)
+                    count_regions.push_back({region.expolygons,region.region->config().painted_wall_loops.value,
+                                             region.region->config().extra_wall_slope_angle.value});
             wall_policy = WallPainting::BoundaryPolicy::bind(to_polygons(surface.expolygon), *wall_painting,
                 config->wall_loops.value, config->painted_wall_loops.value, tolerance, count_regions);
         }
@@ -1010,8 +1030,11 @@ void PerimeterGenerator::process_classic()
         const int extra_walls = surface.extra_perimeters + (config->alternate_extra_wall && layer_id % 2 == 1 && !m_spiral_vase ? 1 : 0);
         const bool force_one_wall = (object_config->top_one_wall_type != TopOneWallType::None && upper_slices == nullptr) ||
                                    (object_config->only_one_wall_first_layer && layer_id == 0);
-        wall_policy = wall_policy.adjusted(extra_walls, 0, force_one_wall);
+        wall_policy = wall_policy.adjusted(extra_walls).reinforce_slopes(config->extra_wall_slope_angle.value,force_one_wall);
+        if (!wall_policy.empty()) loop_number = wall_policy.maximum()-1;
         active_wall_policy = !wall_policy.empty() && !wall_policy.uniform_count() ? &wall_policy : nullptr;
+        const ExPolygons slope_walls = slope_wall_region(wall_policy,surface.expolygon,ext_perimeter_width+perimeter_spacing);
+        has_slope_wall_reinforcement |= !slope_walls.empty();
         bool counter_circle_compensation = surface.counter_circle_compensation;
         std::vector<Point> compensation_holes_centers;
         for (int i : surface.holes_circle_compensation) {
@@ -1247,6 +1270,10 @@ void PerimeterGenerator::process_classic()
                         if (!bridge_checker.empty() && !intersection_ex(bridge_checker, inner_polygons).empty())
                             inner_polygons = union_ex(inner_polygons, bridge_checker);
                     }
+                    // Slope reinforcement wins locally over the one-wall top rule.
+                    // Exclude this same area from top_fills so infill cannot be
+                    // restored underneath the additional wall afterwards.
+                    if (!slope_walls.empty()) inner_polygons = union_ex(inner_polygons,slope_walls);
                     // get the enlarged top surface, by using inner_polygons instead of upper_slices, and clip it for it to be exactly the polygons to fill.
                     top_polygons = diff_ex(fill_clip, inner_polygons, ApplySafetyOffset::Yes);
                     // increase by half peri the inner space to fill the frontier between last and stored.
@@ -1626,8 +1653,10 @@ void PerimeterGenerator::process_arachne()
                     std::abs(object_config->elefant_foot_compensation.value) : 0.));
             std::vector<WallPainting::CountRegion> count_regions;
             for (const auto &region : *perimeter_regions)
-                if (region.region->config().painted_wall_loops != config->painted_wall_loops)
-                    count_regions.push_back({region.expolygons,region.region->config().painted_wall_loops.value});
+                if (region.region->config().painted_wall_loops != config->painted_wall_loops ||
+                    region.region->config().extra_wall_slope_angle != config->extra_wall_slope_angle)
+                    count_regions.push_back({region.expolygons,region.region->config().painted_wall_loops.value,
+                                             region.region->config().extra_wall_slope_angle.value});
             wall_policy = WallPainting::BoundaryPolicy::bind(to_polygons(surface.expolygon), *wall_painting,
                 config->wall_loops.value, config->painted_wall_loops.value, tolerance, count_regions);
         }
@@ -1640,8 +1669,11 @@ void PerimeterGenerator::process_arachne()
         const int extra_walls = surface.extra_perimeters + (config->alternate_extra_wall && layer_id % 2 == 1 && !m_spiral_vase ? 1 : 0);
         const bool force_one_wall = (object_config->top_one_wall_type != TopOneWallType::None && upper_slices == nullptr) ||
                                    (object_config->only_one_wall_first_layer && layer_id == 0);
-        wall_policy = wall_policy.adjusted(extra_walls, 0, force_one_wall);
+        wall_policy = wall_policy.adjusted(extra_walls).reinforce_slopes(config->extra_wall_slope_angle.value,force_one_wall);
+        if (!wall_policy.empty()) loop_number = wall_policy.maximum()-1;
         active_wall_policy = !wall_policy.empty() && !wall_policy.uniform_count() ? &wall_policy : nullptr;
+        const ExPolygons slope_walls = slope_wall_region(wall_policy,surface.expolygon,ext_perimeter_width+perimeter_spacing);
+        has_slope_wall_reinforcement |= !slope_walls.empty();
         bool apply_circle_compensation = true;
         // Orca: properly adjust offset for the outer wall if precise_outer_wall is enabled.
         ExPolygons last  = offset_ex(surface.expolygon.simplify_p(surface_simplify_resolution),
@@ -1665,7 +1697,8 @@ void PerimeterGenerator::process_arachne()
             bool generate_one_wall_by_top_most = this->object_config->top_one_wall_type != TopOneWallType::None && this->upper_slices == nullptr;
             bool generate_one_wall_by_top = this->object_config->top_one_wall_type == TopOneWallType::Alltop && this->upper_slices != nullptr;
 
-            bool is_one_wall = loop_number == 0 || generate_one_wall_by_first_layer || generate_one_wall_by_top_most;
+            bool is_one_wall = loop_number == 0 ||
+                (slope_walls.empty() && (generate_one_wall_by_first_layer || generate_one_wall_by_top_most));
             // whether to seperate the generatation of wall into two parts,first generate outer wall,then generate the remaining wall
             bool seperate_wall_generation = !is_one_wall && generate_one_wall_by_top;
 
@@ -1723,6 +1756,8 @@ void PerimeterGenerator::process_arachne()
 
                 top_expolys_by_one_wall = diff_ex(top_expolys_by_one_wall, bottom_expolys);
                 seperate_wall_generation = should_enable_top_one_wall(last, top_expolys_by_one_wall);
+                if (seperate_wall_generation && !slope_walls.empty())
+                    top_expolys_by_one_wall = diff_ex(top_expolys_by_one_wall,slope_walls);
             }
 
 
@@ -2012,6 +2047,7 @@ bool PerimeterRegion::has_compatible_perimeter_regions(const PrintRegionConfig &
 {
     return config.fuzzy_skin == other_config.fuzzy_skin && config.fuzzy_skin_thickness == other_config.fuzzy_skin_thickness
            && config.painted_wall_loops == other_config.painted_wall_loops
+           && config.extra_wall_slope_angle == other_config.extra_wall_slope_angle
            && config.fuzzy_skin_point_distance == other_config.fuzzy_skin_point_distance
            && config.fuzzy_skin_first_layer == other_config.fuzzy_skin_first_layer
            && config.fuzzy_skin_noise_type == other_config.fuzzy_skin_noise_type

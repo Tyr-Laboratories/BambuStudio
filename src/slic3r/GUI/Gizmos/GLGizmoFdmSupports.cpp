@@ -1,6 +1,7 @@
 #include "GLGizmoFdmSupports.hpp"
 
 #include "libslic3r/Model.hpp"
+#include "libslic3r/RoundHoleDetection.hpp"
 //BBS
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Thread.hpp"
@@ -13,12 +14,16 @@
 #include "slic3r/GUI/GUI_ObjectList.hpp"
 #include "slic3r/GUI/format.hpp"
 #include "slic3r/GUI/GUI.hpp"
+#include "slic3r/GUI/Widgets/ProgressDialog.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 
 
 #include <GL/glew.h>
 
 #include <boost/log/trivial.hpp>
+#include <atomic>
+#include <chrono>
+#include <future>
 
 namespace Slic3r::GUI {
 
@@ -30,11 +35,15 @@ GLGizmoFdmSupports::GLGizmoFdmSupports(GLCanvas3D& parent, unsigned int sprite_i
 }
 
 void GLGizmoFdmSupports::data_changed(bool is_serializing) {
+    if (is_serializing || !m_c || !m_c->selection_info() || !m_c->selection_info()->model_object() ||
+        m_c->selection_info()->model_object()->id() != m_round_hole_status_object_id)
+        m_round_hole_fill_status.clear();
     set_painter_gizmo_data(m_parent.get_selection());
 }
 
 void GLGizmoFdmSupports::on_shutdown()
 {
+    m_round_hole_fill_status.clear();
     //BBS
     //wait the thread
     if (m_thread.joinable()) {
@@ -110,6 +119,7 @@ bool GLGizmoFdmSupports::on_init()
     m_desc["smart_fill_angle_caption"] = ctrl + _L("Mouse wheel");
     m_desc["smart_fill_angle"]      = _L("Smart fill angle");
     m_desc["on_overhangs_only"] = _L("On overhangs only");
+    m_desc["block_round_holes"] = _L("Block supports in round holes");
 
     memset(&m_print_instance, 0, sizeof(m_print_instance));
     return true;
@@ -448,6 +458,28 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     ImGui::PushItemWidth(1.5 * slider_icon_width);
     ImGui::BBLDragFloat("##angle_threshold_deg_input", &m_highlight_by_angle_threshold_deg, 0.05f, 0.0f, 0.0f, "%.2f");
 
+    m_imgui->disabled_begin(m_round_hole_fill_pending);
+    if (m_imgui->button(m_desc.at("block_round_holes"))) {
+        m_round_hole_fill_pending = true;
+        const ObjectID object_id = p_model_object->id();
+        const int instance_idx = m_parent.get_selection().get_instance_idx();
+        // The modal progress dialog yields UI events; open it outside this
+        // ImGui frame so nested rendering cannot corrupt the painter window.
+        wxGetApp().CallAfter([this, object_id, instance_idx]() {
+            ScopeGuard reset_pending([this]() { m_round_hole_fill_pending = false; });
+            if (get_state() == On && m_c && m_c->selection_info() && m_c->selection_info()->model_object() &&
+                m_c->selection_info()->model_object()->id() == object_id &&
+                m_parent.get_selection().get_instance_idx() == instance_idx)
+                block_round_internal_hole_overhangs();
+            m_parent.set_as_dirty();
+        });
+    }
+    m_imgui->disabled_end();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(_L("Paint support blockers on circular bore walls and enclosed flat ends selected by Highlight overhang areas, including hidden surfaces. Other painting is preserved. Undo reverses the fill."), max_tooltip_width);
+    if (!m_round_hole_fill_status.empty())
+        m_imgui->text_wrapped(m_round_hole_fill_status, ImGui::GetFontSize() * 22.f);
+
     if (m_current_tool != ImGui::GapFillIcon) {
         ImGui::Separator();
         if (m_c->object_clipper()->get_position() == 0.f) {
@@ -527,6 +559,141 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
 
     // BBS
     ImGuiWrapper::pop_toolbar_style();
+}
+
+void GLGizmoFdmSupports::block_round_internal_hole_overhangs()
+{
+    ModelObject *object = m_c->selection_info()->model_object();
+    const int instance_idx = m_parent.get_selection().get_instance_idx();
+    if (!object || instance_idx < 0 || size_t(instance_idx) >= object->instances.size())
+        return;
+    const ObjectID object_id = object->id();
+    const ObjectID instance_id = object->instances[instance_idx]->id();
+    m_round_hole_status_object_id = object_id;
+    const double angle = std::clamp(double(m_highlight_by_angle_threshold_deg), 0., 90.);
+    if (angle == 0.) {
+        m_round_hole_fill_status = _L("Increase Highlight overhang areas to select hole ceilings.");
+        return;
+    }
+
+    struct Input {
+        std::shared_ptr<const TriangleMesh> mesh;
+        Transform3d transform;
+        ObjectID volume_id;
+    };
+    std::vector<Input> inputs;
+    size_t total_facets = 0;
+    const Transform3d instance_transform = object->instances[instance_idx]->get_matrix();
+    for (const ModelVolume *volume : object->volumes) {
+        if (!volume->is_model_part())
+            continue;
+        inputs.push_back({volume->get_mesh_shared_ptr(), instance_transform * volume->get_matrix(), volume->id()});
+        total_facets += volume->mesh().its.indices.size();
+    }
+    if (inputs.size() != m_triangle_selectors.size() || total_facets == 0)
+        return;
+
+    struct Canceled {};
+    std::atomic<bool> canceled {false};
+    std::atomic<int> progress {0};
+    std::vector<std::vector<WallPainting::RoundHole>> results;
+    m_round_hole_fill_status.clear();
+    {
+        ProgressDialog dialog(_L("Block supports in round holes"), _L("Finding round internal hole overhangs..."),
+                              100, find_toplevel_parent(wxGetApp().plater()),
+                              wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT);
+        dialog.EnableYield(true);
+        auto work = std::async(std::launch::async, [&]() {
+            std::vector<std::vector<WallPainting::RoundHole>> detected;
+            size_t completed_facets = 0;
+            for (const Input &input : inputs) {
+                const size_t facet_count = input.mesh->its.indices.size();
+                detected.push_back(WallPainting::detect_round_internal_hole_overhangs(input.mesh->its, input.transform, angle,
+                    [&](float fraction) {
+                        if (canceled.load()) throw Canceled{};
+                        progress.store(std::min(99, int(100. * (completed_facets + fraction * facet_count) / total_facets)));
+                    }));
+                completed_facets += facet_count;
+            }
+            return detected;
+        });
+        while (work.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready) {
+            if (!dialog.Update(progress.load()))
+                canceled.store(true);
+        }
+        try {
+            results = work.get();
+            if (canceled.load() || dialog.WasCancelled()) {
+                m_round_hole_fill_status = _L("Canceled. Painting was not changed.");
+                return;
+            }
+        } catch (const Canceled &) {
+            m_round_hole_fill_status = _L("Canceled. Painting was not changed.");
+            return;
+        } catch (const std::exception &error) {
+            BOOST_LOG_TRIVIAL(error) << "Round hole support blocking failed: " << error.what();
+            m_round_hole_fill_status = _L("Could not detect round holes. Painting was not changed.");
+            return;
+        }
+        if (!dialog.Update(100) || dialog.WasCancelled()) {
+            m_round_hole_fill_status = _L("Canceled. Painting was not changed.");
+            return;
+        }
+    }
+
+    // A yielded event may have changed the selection or transforms. Commit
+    // only to the exact geometry and print orientation that were inspected.
+    if (get_state() != On || !m_c || !m_c->selection_info() ||
+        !m_c->selection_info()->model_object() ||
+        m_c->selection_info()->model_object()->id() != object_id ||
+        m_parent.get_selection().get_instance_idx() != instance_idx ||
+        m_triangle_selectors.size() != inputs.size())
+        return;
+    object = m_c->selection_info()->model_object();
+    if (size_t(instance_idx) >= object->instances.size() || object->instances[instance_idx]->id() != instance_id ||
+        !object->instances[instance_idx]->get_matrix().isApprox(instance_transform))
+        return;
+    size_t mesh_index = 0;
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume->is_model_part()) {
+            if (mesh_index >= inputs.size()) return;
+            const Input &input = inputs[mesh_index++];
+            if (volume->id() != input.volume_id || volume->mesh_ptr() != input.mesh.get() ||
+                !(instance_transform * volume->get_matrix()).isApprox(input.transform))
+                return;
+        }
+    }
+    if (mesh_index != inputs.size())
+        return;
+
+    size_t hole_count = 0;
+    bool changed = false;
+    for (size_t index = 0; index < results.size(); ++index) {
+        const auto &triangles = m_triangle_selectors[index]->get_triangles();
+        hole_count += results[index].size();
+        for (const auto &hole : results[index])
+            for (int facet : hole.facets)
+                changed |= triangles[facet].is_split() || triangles[facet].get_state() != EnforcerBlockerType::BLOCKER;
+    }
+    if (!changed) {
+        m_round_hole_fill_status = hole_count == 0 ? _L("No round internal hole overhangs found at this angle.") :
+                                                   _L("Round internal hole overhangs are already blocked.");
+        return;
+    }
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Block supports in round holes"), UndoRedo::SnapshotType::GizmoAction);
+    for (size_t index = 0; index < results.size(); ++index) {
+        auto &selector = m_triangle_selectors[index];
+        for (const auto &hole : results[index])
+            for (int facet : hole.facets)
+                selector->set_facet(facet, EnforcerBlockerType::BLOCKER);
+        selector->seed_fill_unselect_all_triangles();
+        selector->request_update_render_data(true);
+    }
+    m_seed_fill_last_mesh_id = -1;
+    update_model_object();
+    m_round_hole_fill_status = format_wxstr(_L("Blocked supports in %1% round internal holes."), hole_count);
+    m_parent.set_as_dirty();
 }
 
 void GLGizmoFdmSupports::tool_changed(wchar_t old_tool, wchar_t new_tool)

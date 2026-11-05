@@ -675,7 +675,11 @@ void WallToolPaths::stitchToolPaths(std::vector<VariableWidthLines> &toolpaths, 
 
 template<typename T> bool shorterThan(const T &shape, const coord_t check_length)
 {
-    const auto *p0     = &shape.back();
+    if (shape.empty())
+        return check_length > 0;
+    // These are open odd walls. Counting a closing edge from back to front
+    // overstates their extrusion length and keeps fragments below the limit.
+    const auto *p0     = &shape.front();
     int64_t     length = 0;
     for (const auto &p1 : shape) {
         length += (*p0 - p1).template cast<int64_t>().norm();

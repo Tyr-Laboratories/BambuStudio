@@ -225,9 +225,14 @@ std::optional<LineRegionRange> create_line_region_range(ClipperLib_Z::Path &&int
                 // There may be repeated intersections on different line segments
                 int max_point_idx = subject.size() - 1;
                 bool is_valid_order = prev_z.point_index <= curr_z.point_index;
-                if ((curr_z.point_index == max_point_idx) && (prev_z.point_index == 0))
+                // Only a closed subject wraps from its last vertex to its
+                // first. For an open two-point wall those indices are its
+                // ordinary endpoints; reversing them duplicates the entire
+                // wall when the uncovered ranges are filled below.
+                const bool closed = make_point(subject.front()) == make_point(subject.back());
+                if (closed && (curr_z.point_index == max_point_idx) && (prev_z.point_index == 0))
                     is_valid_order = false;
-                if ((curr_z.point_index == 0) && (prev_z.point_index == max_point_idx))
+                if (closed && (curr_z.point_index == 0) && (prev_z.point_index == max_point_idx))
                     is_valid_order = true;
                 if (!is_valid_order && (pre_pos != cur_pos)) {
                     return true;

@@ -180,6 +180,7 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const Perimet
         g.process_arachne();
     else
         g.process_classic();
+    has_slope_wall_reinforcement=g.has_slope_wall_reinforcement;
 }
 
 
@@ -542,9 +543,12 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
     }
 
     const auto *object=this->layer()->object();
-    if (!object->print()->config().spiral_mode && object->model_object()->is_wall_painting_painted()) {
+    const bool slope_walls=std::any_of(this->layer()->regions().begin(),this->layer()->regions().end(),[](const LayerRegion *region) {
+        return region->has_slope_wall_reinforcement;
+    });
+    if (!object->print()->config().spiral_mode && (object->model_object()->is_wall_painting_painted() || slope_walls)) {
         const auto &paint=object->wall_painting(this->layer()->id()-object->layers().front()->id());
-        if (std::any_of(paint.begin(),paint.end(),[](const auto &line){return line.painted;})) {
+        if (slope_walls || std::any_of(paint.begin(),paint.end(),[](const auto &line){return line.painted;})) {
             // This is a conservative expansion radius for solid surfaces, not
             // an infill boundary. Derive it from the walls actually emitted;
             // the generated fill surfaces still provide the local clipping.
@@ -556,13 +560,22 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
             AABBTreeLines::LinesDistancer<Line> distance(borders);
             shell_width=float(SCALED_EPSILON);
             expansion_min=float(SCALED_EPSILON);
-            const auto paths=perimeters.flatten();
-            for (const auto *path:paths.entities) {
-                const float spacing=this->flow(frPerimeter).scaled_spacing();
-                expansion_min=spacing;
-                for (const Point &p:path->as_polyline().points)
-                    shell_width=std::max(shell_width,float(distance.distance_from_lines<false>(p))+spacing);
-            }
+            // Compatible regions share their emitted perimeter collection on
+            // one owner. A modifier can enable slope walls while that owner's
+            // own threshold is disabled, so examine the merged layer geometry.
+            auto measure_walls=[&](const LayerRegion *region) {
+                const auto paths=region->perimeters.flatten();
+                for (const auto *path:paths.entities) {
+                    const float spacing=region->flow(frPerimeter).scaled_spacing();
+                    expansion_min=std::max(expansion_min,spacing);
+                    for (const Point &p:path->as_polyline().points)
+                        shell_width=std::max(shell_width,float(distance.distance_from_lines<false>(p))+spacing);
+                }
+            };
+            if (slope_walls)
+                for (const auto *region:this->layer()->regions()) measure_walls(region);
+            else
+                measure_walls(this);
         }
     }
 

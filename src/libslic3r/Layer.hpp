@@ -74,6 +74,7 @@ public:
     // ordered collection of extrusion paths/loops to build all perimeters
     // (this collection contains only ExtrusionEntityCollection objects)
     ExtrusionEntityCollection   perimeters;
+    bool                       has_slope_wall_reinforcement = false;
 
     // ordered collection of extrusion paths to fill surfaces
     // (this collection contains only ExtrusionEntityCollection objects)
