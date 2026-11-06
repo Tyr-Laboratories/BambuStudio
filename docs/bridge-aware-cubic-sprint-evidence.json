@@ -1,0 +1,199 @@
+{
+  "as_of": "2026-11-06",
+  "disposition": "development paused; release held",
+  "release_tracker": "https://github.com/Tyr-Laboratories/BambuStudio/issues/1",
+  "timed_source_commit": "67a1cf7552798c8cc2734508445317ce86a72c63",
+  "diagnostic_source_commit": "467ea713bf6b0e6ebe0d78395c5267959c1de311",
+  "experimental_emitter_commit": "f9aaafd0677d3a8e94bd6da9d5970aeb9234e683",
+  "benchmark": {
+    "official_version": "2.9.1.70",
+    "official_pattern": "Cubic",
+    "candidate_pattern": "Bridge aware cubic",
+    "mode": "development",
+    "warmup_pairs_per_fixture": 0,
+    "measured_pairs_per_fixture": 1,
+    "release_gate_passed": false,
+    "primary_metric": "result.json.sliced_plates[0].times.sliced_time (milliseconds)",
+    "original_report_sha256": "85d84a500c2da36afaa88cb1941b2b3bb7f3fa7ba2a3b27276ffa4ecf317e5c3",
+    "executables_sha256": {
+      "fork": "423e4e2111092314249f556438d15197ba59c7bff0748b1e8bbe17601a5efb60",
+      "official": "af6e6342d5972a24e7f16bb66722cab92f0cc514cd311b4b6b0dd9a311ebe9de"
+    },
+    "test_executable_sha256": "c059b9a76c23b2e5a85b1fc73221b6694d96b1a482d20401b29639db61205211",
+    "fixtures": {
+      "small": {
+        "density_percent": 5.0,
+        "gap_mm": 5.0,
+        "dimensions_mm": [
+          32.0,
+          28.0,
+          18.0
+        ],
+        "layers": 90,
+        "official_ms": 305,
+        "feature_ms": 9076,
+        "feature_prepare_infill_ms": 8515,
+        "ratio": 29.757377049180327,
+        "input_3mf_sha256": {
+          "official": "34eabc932f9330e746a6261d4367d6f28756854c16724808ee62295d6b57aaa8",
+          "feature": "088843a4c83b0ab0b3d183ae474f0a36039e7d9e65dfa8f8632708cc632b0341"
+        },
+        "gcode_sha256": {
+          "official": "29eed0caf0d546a0bb79c2bd5557f54322c62d056c0cbb1571e03e809517df28",
+          "fork": "0e929a778f759f1310dd4ce8705c26db15bf2eda1407d60afe738bc05a4260a0"
+        },
+        "executable_commands_matching_previous_feature_build": 16650
+      },
+      "large": {
+        "density_percent": 5.0,
+        "gap_mm": 5.0,
+        "dimensions_mm": [
+          64.0,
+          56.0,
+          18.0
+        ],
+        "layers": 90,
+        "official_ms": 270,
+        "feature_ms": 130962,
+        "feature_prepare_infill_ms": 128895,
+        "ratio": 485.0444444444444,
+        "input_3mf_sha256": {
+          "official": "ac94f19e98ce681c31bbffa733fae6fa0a4c5fae634f40baf7bb853fb53a824f",
+          "feature": "4f50e275c859567d0774eadd03eecc2d99f12e16c5248fcbbb3e3f81ea300363"
+        },
+        "gcode_sha256": {
+          "official": "4ecaf0a523b72092e4aaab65b87656a30b45f69ef91cf62e9f7e76d7f22d72dc",
+          "fork": "b3a2fe4c94499073b3090d81a395b747acfbdfa8e26117df7e640d9bc646188d"
+        },
+        "executable_commands_matching_previous_feature_build": 48014
+      },
+      "rib": {
+        "density_percent": 12.0,
+        "gap_mm": 5.0,
+        "dimensions_mm": [
+          32.0,
+          26.0,
+          15.0
+        ],
+        "layers": 75,
+        "official_ms": 278,
+        "feature_ms": 31888,
+        "feature_prepare_infill_ms": 31300,
+        "ratio": 114.70503597122303,
+        "input_3mf_sha256": {
+          "official": "435b5e9d42508b7c331ba028fd4bd80c1ca0f706cdab1f0170585cecc45a1bb9",
+          "feature": "8ff5ed58af77fb9bddc3497614abce4edd215e99f764e4ddb7cb1ad9ae48212d"
+        },
+        "gcode_sha256": {
+          "official": "34b43ba1268623b11d49a5d7afb94308c067ae19316abd0b4c0c7315abcd86d6",
+          "fork": "ee637f5c0bcdb2e53d878324795fe7b8e00690ebfdfc452abbc5eef734e2cf9f"
+        },
+        "executable_commands_matching_previous_feature_build": 16633
+      },
+      "modifier": {
+        "density_percent": 5.0,
+        "gap_mm": 8.0,
+        "dimensions_mm": [
+          48.0,
+          28.0,
+          18.0
+        ],
+        "layers": 90,
+        "official_ms": 260,
+        "feature_ms": 122716,
+        "feature_prepare_infill_ms": 121688,
+        "ratio": 471.9846153846154,
+        "input_3mf_sha256": {
+          "official": "5277bb86317485a3b49c821b56b515250b39f8562b65f5fb8919618eeb826676",
+          "feature": "08a7fffe44f67a5fe9492bdf59595993ef3665e45a775023771b423446e16b4a"
+        },
+        "gcode_sha256": {
+          "official": "c16446e0a5b60307b914e517d090da0e96eab047169bd7de7a79a6391e96e873",
+          "fork": "c8a656cdd9d5c23661a068c7486e6904e39bb6c11edfb98130eb19eced6cce59"
+        },
+        "executable_commands_matching_previous_feature_build": 36666
+      }
+    }
+  },
+  "full_correctness_run": {
+    "unique_default_cases": 438,
+    "default_case_executions": 440,
+    "qualified_hidden_cases": 3,
+    "total_case_executions": 443,
+    "assertions": 426060,
+    "passed": true
+  },
+  "additional_passing_checks": {
+    "legacy_ctest_targets": 17,
+    "packaging_tests": 44,
+    "benchmark_tool_tests": 70,
+    "fixture_writer_assertions": 260
+  },
+  "paired_first_roofs": {
+    "small-sample-01-official": {
+      "z_mm": 17.6,
+      "max_gap_mm": 21.027,
+      "max_cell_mm": 24.2797,
+      "gaps": 256,
+      "cells": 12
+    },
+    "small-sample-01-fork": {
+      "z_mm": 17.6,
+      "max_gap_mm": 4.10085,
+      "max_cell_mm": 4.9765,
+      "gaps": 795,
+      "cells": 140
+    },
+    "large-sample-01-official": {
+      "z_mm": 17.6,
+      "max_gap_mm": 21.0271,
+      "max_cell_mm": 24.2799,
+      "gaps": 777,
+      "cells": 31
+    },
+    "large-sample-01-fork": {
+      "z_mm": 17.6,
+      "max_gap_mm": 4.17647,
+      "max_cell_mm": 4.92492,
+      "gaps": 3371,
+      "cells": 561
+    }
+  },
+  "canonical_reference_first_roofs": {
+    "small": {
+      "width": 32,
+      "depth": 28,
+      "selected_gaps": 794,
+      "selected_cells": 140,
+      "max_gap_mm": 4.10072,
+      "max_cell_mm": 4.97705
+    },
+    "large": {
+      "width": 64,
+      "depth": 56,
+      "selected_gaps": 3371,
+      "selected_cells": 561,
+      "max_gap_mm": 4.17648,
+      "max_cell_mm": 4.92398
+    }
+  },
+  "first_sweep_diagnostic": {
+    "small": {
+      "trials": 103,
+      "single_layer_generations": 21,
+      "independently_proven_diagonal_rejections": 0,
+      "staged_native_path_failures": 19,
+      "matching_full_failure_events": 19,
+      "staged_failures_accepted_by_full_trial": 0
+    },
+    "large": {
+      "trials": 340,
+      "single_layer_generations": 48,
+      "independently_proven_diagonal_rejections": 0,
+      "staged_native_path_failures": 41,
+      "matching_full_failure_events": 41,
+      "staged_failures_accepted_by_full_trial": 0
+    }
+  },
+  "physical_print_qualification": "pending"
+}

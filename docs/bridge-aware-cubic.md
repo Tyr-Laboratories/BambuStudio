@@ -5,7 +5,7 @@ Bridge aware cubic adds a sparse infill pattern with two controls:
 - **Sparse infill density** sets the ordinary Cubic lattice away from support demand.
 - **Unsupported gap size**, in millimeters, sets the requested maximum opening beneath upcoming extrusions. Its initial default is 5 mm; this is not a qualified bridge distance for a particular filament.
 
-The source implementation is on `codex/bridge-aware-cubic`. The automated correctness checkpoint below passes, but the feature is not ready for release: the required end-to-end slicing limit of twice stock official Bambu Studio with regular Cubic has not been met. Performance optimization and fresh verification remain required before merging or delivery.
+**Sprint closed on 6 November 2026.** Development is paused on `codex/bridge-aware-cubic`. The measured cube roofs meet the configured gap, and slicing time exceeds the release limit on all four fixtures. The next sprint begins with an exact one-layer rejection check. [Sprint retrospective and next steps](bridge-aware-cubic-sprint-retrospective.md) · [Release tracker #1](https://github.com/Tyr-Laboratories/BambuStudio/issues/1)
 
 Each recursive child independently intersects the actual finite-width extrusion demand. A child that does not need further subdivision remains coarse. Complete added partition faces grow from their natural beginnings and retain their inherited walls. The transition can extend well below a roof, and a thin part may need refinement through its entire available sparse depth. Average infill can therefore exceed the selected bulk percentage.
 
@@ -71,7 +71,7 @@ The [official slicing benchmark procedure](bridge-aware-cubic-benchmark.md) docu
 
 ## Correctness checkpoint and outstanding performance gate
 
-The full geometry suite passed 443 executions and 426,060 assertions. The build also passed 17 legacy CTest targets, 44 packaging tests, 70 benchmark-tool tests and the 260-assertion fixture writer. **All four fixtures exceed the 2× slicing-time limit.** The table gives one matched development pair per fixture against official 2.9.1.70, without a warm-up. All eight CLI runs passed the input, exported settings and G-code checks.
+At the last fully tested and timed source, `67a1cf755`, the geometry suite passed 443 executions and 426,060 assertions. The build also passed 17 legacy CTest targets, 44 packaging tests, 70 benchmark-tool tests and the 260-assertion fixture writer. **All four fixtures exceed the 2× slicing-time limit.** The table gives one matched development pair per fixture against official 2.9.1.70, without a warm-up. All eight CLI runs passed the input, exported settings and G-code checks.
 
 | Fixture | Official regular Cubic | Bridge aware cubic | Ratio |
 | --- | ---: | ---: | ---: |

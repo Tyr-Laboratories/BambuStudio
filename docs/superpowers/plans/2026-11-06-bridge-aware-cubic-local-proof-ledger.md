@@ -1,5 +1,7 @@
 # Bridge aware cubic local proof ledger implementation plan
 
+**Sprint closed on 6 November 2026.** Development is paused. Use the [sprint retrospective](../../bridge-aware-cubic-sprint-retrospective.md) for measured outcomes, experiment boundaries and restart order. The [release tracker](https://github.com/Tyr-Laboratories/BambuStudio/issues/1) records the open gates and next-sprint issues.
+
 **Goal:** Reduce repeated slicing work enough to pursue the required end-to-end limit of no more than 2× official Bambu Studio regular Cubic on the qualification fixtures, while retaining the approved geometry and irreducibility requirements.
 
 **Architecture:** Retain the provenance of final emitted strands and the exact inputs of their support checks. Use physically preserved material cycles to bound complete affected voids, and revisit collapse candidates when their actual dependencies change. Existing exhaustive verification remains the fallback and final authority.
