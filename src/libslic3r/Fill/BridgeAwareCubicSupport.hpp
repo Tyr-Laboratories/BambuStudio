@@ -7,6 +7,7 @@
 #include <optional>
 #include <set>
 #include <functional>
+#include <string>
 
 namespace Slic3r {
 class Layer;
@@ -16,9 +17,25 @@ namespace BridgeAwareCubic {
 struct SerializedXY;
 struct LayerAttachment;
 
+// Reset generation-local provenance before any previous fill entity is freed.
+// Optional capture is bounded across the object and never changes deposition.
+void begin_layer_emissions(Layer &layer);
+
 // Apply immutable, once-per-layer closure deposition and saved model-path
 // attachments after the ordinary fill groups have finished generating.
 void apply_layer_paths(Layer &layer);
+
+// Diagnostic comparison against the established construction classifier on
+// the same final geometry. This performs both collections and is deliberately
+// separate from slicing timings. Exceptions and cancellation propagate.
+struct EmissionCollectionAudit {
+    bool equal = false;
+    // Counts on the optimized traversal only; reference_emitters excludes
+    // the audit's mandatory second, independent reference traversal.
+    size_t ledger_emitters = 0, reference_emitters = 0, ledger_construction_paths = 0;
+    std::string mismatch;
+};
+EmissionCollectionAudit audit_construction_collection(const PrintObject &object);
 
 // Choose only automatic bridge orientations from regenerated candidate paths
 // before BAC plans and model-support demands are frozen. The callback rebuilds

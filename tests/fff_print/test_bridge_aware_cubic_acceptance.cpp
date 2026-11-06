@@ -610,6 +610,9 @@ TEST_CASE("Bridge aware cubic supports ribs whose walls begin inside a sparse bo
     REQUIRE(first_rib_layer != rib_layers.end());
     REQUIRE(first_rib_layer != rib_layers.begin());
     REQUIRE((*first_rib_layer)->lslices.size() == 2);
+    const auto emission_audit = BridgeAwareCubic::audit_construction_collection(*print.get_object(size_t(0)));
+    INFO(emission_audit.mismatch);
+    REQUIRE(emission_audit.equal);
     double rib_area = 0., body_area = 0.;
     for (const ExPolygon &shape : (*first_rib_layer)->lslices) rib_area += shape.area() * SCALING_FACTOR * SCALING_FACTOR;
     for (const ExPolygon &shape : (*std::prev(first_rib_layer))->lslices) body_area += shape.area() * SCALING_FACTOR * SCALING_FACTOR;

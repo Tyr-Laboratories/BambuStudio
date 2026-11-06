@@ -8,6 +8,7 @@
 #include "ExtrusionEntityCollection.hpp"
 #include "RegionExpansion.hpp"
 #include <libslic3r/Print.hpp>
+#include <memory>
 
 namespace Slic3r {
 
@@ -29,6 +30,12 @@ namespace FillAdaptive {
 namespace FillLightning {
     class Generator;
 };
+
+namespace BridgeAwareCubic {
+    class EmissionLedgerBuilder;
+    class EmissionLedger;
+}
+namespace BridgeAwareCubicValidation { struct WorkBudget; }
 
 class LayerRegion
 {
@@ -153,6 +160,12 @@ public:
     coordf_t            print_z;       // Z used for printing in unscaled coordinates
     coordf_t            height;        // layer height in unscaled coordinates
     coordf_t            bottom_z() const { return this->print_z - this->height; }
+
+    // Generation-local optional provenance, indexed by emitting region. Reset
+    // before old fill entities are destroyed; sealed ledgers own exact values.
+    std::vector<std::shared_ptr<BridgeAwareCubic::EmissionLedgerBuilder>> bridge_aware_emission_builders;
+    std::vector<std::shared_ptr<const BridgeAwareCubic::EmissionLedger>> bridge_aware_emission_ledgers;
+    std::shared_ptr<BridgeAwareCubicValidation::WorkBudget> bridge_aware_emission_budget;
 
     // BBS
     mutable ExPolygons          sharp_tails;

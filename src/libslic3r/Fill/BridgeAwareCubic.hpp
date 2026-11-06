@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+namespace Slic3r { namespace BridgeAwareCubicValidation { struct WorkBudget; }}
+
 namespace Slic3r { namespace BridgeAwareCubic {
 
 // Stable only within one lattice's bounds/origin, spacing, density and angle.
@@ -96,6 +98,46 @@ struct LeafSection {
     bool solid = false;
 };
 
+struct ProducerInterval {
+    CellId owner;
+    // Finite [first,last] parameters on the original merged source axis,
+    // before domain clipping or XY serialization. A touching owner is not
+    // necessarily an alternative producer of the complete emitted path.
+    double first = 0., last = 0.;
+};
+
+struct LineSource {
+    enum class Kind { Bulk, Partition };
+    Kind kind = Kind::Bulk;
+    Point canonical_a, canonical_b;
+    std::vector<ProducerInterval> producers;
+};
+
+struct TaggedLineBatch {
+    Polylines paths;
+    std::vector<size_t> source_for_path;
+    std::vector<LineSource> sources;
+    // Complete requires exact source IDs for every output plus ALL original
+    // merged refinement sources at this Z, including those wholly clipped out
+    // of this domain. Source kind is generation provenance, not legacy added-
+    // mask classification or a deposited-material support certificate.
+    bool complete = false;
+};
+
+struct ReferenceLineBatch {
+    std::shared_ptr<const void> plan_identity;
+    double z = 0.;
+    BoundingBox bounds;
+    // Exact broad-reference refinement output and original source attribution.
+    // The complete raw source table includes rows clipped out of these bounds.
+    Polylines paths;
+    std::vector<size_t> source_for_path;
+    std::vector<LineSource> sources;
+    // Independently grouped finite fragments, identical to partition_lines().
+    std::vector<std::pair<CellId, Polylines>> partitions;
+    bool complete = false;
+};
+
 // Geometric construction, not a certificate of deposited-material support.
 // Builds once from current demand; no historical/provisional branches survive.
 class Plan {
@@ -112,6 +154,27 @@ public:
     // No same-layer anchoring order is promised. The deposition verifier must
     // establish previous-layer support or impose its own dependency ordering.
     Polylines lines(double z, const ExPolygon &domain) const;
+    // Optional provenance for the identical lines() geometry and order.
+    // Metadata admission is bounded by capacity_units (at most 200000,
+    // measured in sizeof(Point) storage units) and 20000 records. Whole vector
+    // capacities and temporary relocation storage count toward admission;
+    // failure returns ordinary geometry with complete=false
+    // and empty metadata, retaining any shared work already spent. Active
+    // solid/closure layers are ineligible in this initial implementation.
+    // Canonical refinement axes and finite owner ranges remain in the source
+    // frame: form finite fragment endpoints BEFORE pointwise serialization.
+    TaggedLineBatch tagged_lines(double z, const ExPolygon &domain, size_t capacity_units = 200000,
+                                BridgeAwareCubicValidation::WorkBudget *budget = nullptr) const;
+    // Optional-only broad reference for classification/ownership. Uses the
+    // same rectangle, clipping batch and finite-owner arithmetic as the legacy
+    // refinement_lines()/partition_lines() queries. All generated buffers are
+    // admitted before allocation. The quota covers those explicit buffers,
+    // not Clipper's internal allocator or total process RSS; native clipping
+    // retains its existing finite input/work/coordinate limits and runs
+    // sequentially with ordinary fill clipping. Failure returns an empty
+    // incomplete batch; spent shared work remains charged, cancellation propagates.
+    ReferenceLineBatch reference_lines(double z, const BoundingBox &bounds, size_t capacity_units = 200000,
+                                      BridgeAwareCubicValidation::WorkBudget *budget = nullptr) const;
     Polylines refinement_lines(double z, const ExPolygon &domain) const;
     Polylines partition_lines(const CellId &owner, double z, const ExPolygon &domain) const;
     // Compute the complete emitted batch once before assigning its surviving
@@ -119,7 +182,11 @@ public:
     std::vector<std::pair<CellId, Polylines>> partition_lines(double z, const ExPolygon &domain) const;
     Polylines closure_lines(double z) const;
     std::vector<LayerClosure> closures(double z) const;
+    bool has_closures(double z) const;
     std::vector<LayerAttachment> attachments(double z) const;
+    // Borrow matching records in their exact storage order without allocating
+    // a copy. False means the callback requested an early stop.
+    bool visit_attachments(double z, const std::function<bool(const LayerAttachment &)> &visitor) const;
     // Complete selected-parent sections while their added midplanes exist.
     // Callers add any preceding-layer scaffold required by contact validation.
     ExPolygons refinement_area(double z) const;
@@ -131,9 +198,10 @@ public:
     const std::vector<size_t>& active_demands() const;
     // Exact immutable trial copy, including accepted collapses.
     Plan clone() const;
-    // Retains this exact immutable implementation after the Plan is destroyed.
-    // Clones share the token; every rebuild receives a new identity. A token
-    // identifies construction geometry, not a deposited-material certificate.
+    // Retains an opaque lifetime-owned nonce after the Plan is destroyed,
+    // without retaining its geometry or callback captures. Clones share the
+    // token; every rebuild receives a new identity. A token identifies exact
+    // construction geometry, not a deposited-material certificate.
     std::shared_ptr<const void> immutable_identity() const noexcept;
     // Rebuild after external dependency filtering while preserving accepted
     // collapses and all unreplaced payloads. These remain uncertified trials.

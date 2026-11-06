@@ -689,6 +689,7 @@ void Layer::set_outlook_range(LockRegionParam &lock_param){
 // friend to Layer
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
 {
+    BridgeAwareCubic::begin_layer_emissions(*this);
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
 
@@ -721,6 +722,9 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
             cubic->plan = this->object()->bridge_aware_cubic_plan(surface_fill.region_id);
             cubic->material_domain = &this->lslices;
             cubic->extrusion_width = surface_fill.params.flow.width();
+            if (surface_fill.region_id < bridge_aware_emission_builders.size())
+                cubic->emission_builder = bridge_aware_emission_builders[surface_fill.region_id].get();
+            cubic->emission_budget = bridge_aware_emission_budget.get();
         }
         if (surface_fill.params.pattern == ipZigZag) {
             if (f->layer_id % 2 == 0)

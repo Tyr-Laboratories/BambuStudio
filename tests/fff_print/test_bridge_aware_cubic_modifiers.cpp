@@ -553,6 +553,9 @@ TEST_CASE("Bridge aware cubic modifier plans retain local density angle and gap 
     Print print;
     REQUIRE_NOTHROW(slice(print, model, config));
     const auto *object = print.get_object(size_t(0));
+    const auto emission_audit = BridgeAwareCubic::audit_construction_collection(*object);
+    INFO(emission_audit.mismatch);
+    REQUIRE(emission_audit.equal);
     std::set<const BridgeAwareCubic::Plan *> plans;
     std::set<double> gaps;
     for (size_t i = 0; i < object->num_printing_regions(); ++i) {

@@ -1,5 +1,6 @@
 #include "BridgeAwareCubic.hpp"
 #include "BridgeAwareCubicClipMask.hpp"
+#include "BridgeAwareCubicValidation.hpp"
 
 #include "../ClipperUtils.hpp"
 #include "../Geometry/ConvexHull.hpp"
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -85,9 +87,85 @@ bool bounds_overlap(const BoundingBox &a, const BoundingBox &b)
            a.min.y() <= b.max.y() && a.max.y() >= b.min.y();
 }
 
+struct TaggingUnavailable {};
+struct TaggingCanceled { std::exception_ptr exception; };
+
+// Optional metadata has its own bounded admission in addition to the Plan's
+// ordinary output bounds. Count whole vector capacities and conservatively
+// keep retired temporary allocations charged for this one request. Thus the
+// admitted total bounds peak metadata storage, including reserve relocation.
+class TaggingWork {
+public:
+    TaggingWork(size_t capacity, BridgeAwareCubicValidation::WorkBudget *budget,
+                const std::function<void()> &cancel, bool owned_geometry = false)
+        : m_capacity(std::min(capacity, size_t(200000))),
+          m_budget(budget == nullptr ? &m_local : budget), m_cancel(cancel), m_owned_geometry(owned_geometry) {}
+    bool owns_geometry() const noexcept { return m_owned_geometry; }
+    void poll() const
+    {
+        if (m_cancel) {
+            try { m_cancel(); }
+            catch (...) { throw TaggingCanceled{std::current_exception()}; }
+        }
+    }
+    void charge(size_t count = 1)
+    {
+        if (count > m_remaining || count > m_budget->remaining_work) throw TaggingUnavailable{};
+        m_remaining -= count;
+        m_budget->remaining_work -= count;
+        m_budget->charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)] += count;
+        m_since_poll += count;
+        if (m_since_poll >= 256) { m_since_poll = 0; poll(); }
+    }
+    void admit(size_t units, size_t records)
+    {
+        charge();
+        if (units > m_capacity - m_units || records > 20000 - m_records) throw TaggingUnavailable{};
+        m_units += units;
+        m_records += records;
+    }
+    template<class T> static constexpr size_t units_for()
+    {
+        return (sizeof(T) + sizeof(Point) - 1) / sizeof(Point);
+    }
+    template<class T> void reserve(std::vector<T> &items, size_t capacity)
+    {
+        if (capacity <= items.capacity()) return;
+        if (capacity > 20000) throw TaggingUnavailable{};
+        // The old buffer may coexist with the new allocation while moving.
+        admit(capacity * units_for<T>(), capacity);
+        charge(capacity);
+        items.reserve(capacity);
+        if (items.capacity() > capacity)
+            admit((items.capacity() - capacity) * units_for<T>(), items.capacity() - capacity);
+    }
+    template<class T> void grow(std::vector<T> &items)
+    {
+        if (items.size() == items.capacity())
+            reserve(items, std::min(size_t(20000), std::max(size_t(1), items.capacity() * 2)));
+        if (items.size() == items.capacity()) throw TaggingUnavailable{};
+    }
+    void lookup(size_t items)
+    {
+        charge();
+        for (; items != 0; items >>= 1) charge(2);
+    }
+private:
+    size_t m_capacity, m_units = 0, m_records = 0, m_remaining = 50000000, m_since_poll = 0;
+    BridgeAwareCubicValidation::WorkBudget m_local;
+    BridgeAwareCubicValidation::WorkBudget *m_budget;
+    const std::function<void()> &m_cancel;
+    bool m_owned_geometry;
+};
+
 } // namespace
 
 struct Plan::Impl {
+    // Identity consumers retain only this nonempty nonce, never the Plan's
+    // geometry or callback captures. Each constructor below initializes a
+    // fresh token; exact clones share the immutable Impl and its token.
+    struct Identity { unsigned char nonce = 0; };
+    const std::shared_ptr<const Identity> identity = std::make_shared<const Identity>();
     Parameters parameters;
     std::vector<Demand> demands;
     Statistics statistics;
@@ -103,6 +181,8 @@ struct Plan::Impl {
     std::set<CellId> active_owners;
     std::vector<Refinement> refinements;
     std::vector<size_t> active_demands;
+
+    Impl(const Impl &) = delete;
 
     Impl(Parameters input_parameters, std::vector<Demand> input_demands,
          std::vector<LayerClosure> input_closures = {}, std::vector<LayerAttachment> input_attachments = {},
@@ -565,13 +645,15 @@ struct Plan::Impl {
     // Complete midplane intersections, from their inherited-edge birth to
     // their inherited-edge death. The footprint never clips these intervals.
     PlaneIntervals refinement_intervals(double z, const CellId *owner = nullptr,
-                                        const PlaneIntervals *selected_planes = nullptr) const
+                                        const PlaneIntervals *selected_planes = nullptr,
+                                        TaggingWork *tag_work = nullptr) const
     {
         PlaneIntervals result;
         size_t visited = 0;
         for (const Cell &cell : cells) {
+            if (tag_work != nullptr) tag_work->charge();
             if ((++visited & 255) == 0)
-                cancel();
+                tag_work != nullptr ? tag_work->poll() : cancel();
             if (!cell.split || (owner != nullptr && !(cell.id() == *owner)))
                 continue;
             const double size = edge(cell);
@@ -586,8 +668,19 @@ struct Plan::Impl {
                 const unsigned a = (axis + 1) % 3;
                 const double first = lo[a] + std::max(0., t - size);
                 const double last = lo[a] + std::min(size, t);
-                if (last > first)
-                    result[key].emplace_back(first, last);
+                if (last > first) {
+                    if (tag_work != nullptr && tag_work->owns_geometry()) {
+                        tag_work->lookup(result.size());
+                        auto found = result.find(key);
+                        if (found == result.end()) {
+                            tag_work->admit(TaggingWork::units_for<PlaneIntervals::value_type>() +
+                                            4 * TaggingWork::units_for<void *>(), 1);
+                            found = result.emplace(key, std::vector<Interval>{}).first;
+                        }
+                        tag_work->grow(found->second);
+                        found->second.emplace_back(first, last);
+                    } else result[key].emplace_back(first, last);
+                }
             }
         }
         return result;
@@ -596,18 +689,18 @@ struct Plan::Impl {
     using Partitions = std::vector<std::pair<CellId, Polylines>>;
 
     Polylines refinement(double z, const ExPolygon &domain, const ExPolygons *solid = nullptr,
-                         Partitions *partitions = nullptr) const
+                         Partitions *partitions = nullptr, TaggedLineBatch *tagged = nullptr,
+                         TaggingWork *tag_work = nullptr) const
     {
-        struct ProducerInterval { CellId id; double first, last; };
-        struct RawLine {
-            Point first, last;
-            std::vector<ProducerInterval> producers;
-        };
-        std::map<PlaneKey, std::vector<ProducerInterval>> producers;
-        if (partitions != nullptr) {
+        struct RawProducer { CellId id; double first, last; };
+        std::map<PlaneKey, std::vector<RawProducer>> producers;
+        const bool retain_sources = partitions != nullptr || tagged != nullptr;
+        const auto check_cancel = [&] { tag_work != nullptr ? tag_work->poll() : cancel(); };
+        if (retain_sources) {
             for (const Cell &cell : cells) {
+                if (tag_work != nullptr) tag_work->charge();
                 if (!cell.split) continue;
-                cancel();
+                check_cancel();
                 const double size = edge(cell);
                 const Vec3d lo = lower(cell);
                 const double t = z * sqrt_three - lo.sum() - .5 * size;
@@ -616,25 +709,45 @@ struct Plan::Impl {
                     const unsigned a = (axis + 1) % 3;
                     const double first = lo[a] + std::max(0., t - size);
                     const double last = lo[a] + std::min(size, t);
-                    if (last > first)
-                        producers[{axis, cell.depth + 1, cell.address[axis] * 2 + 1}].push_back({cell.id(), first, last});
+                    if (last > first) {
+                        const PlaneKey key{axis, cell.depth + 1, cell.address[axis] * 2 + 1};
+                        if (tag_work != nullptr) tag_work->lookup(producers.size());
+                        auto found = producers.find(key);
+                        if (found == producers.end()) {
+                            if (tag_work != nullptr) {
+                                // Include the map value and its tree links.
+                                tag_work->admit(TaggingWork::units_for<decltype(producers)::value_type>() +
+                                                4 * TaggingWork::units_for<void *>(), 1);
+                                tag_work->lookup(producers.size());
+                            }
+                            found = producers.emplace(key, std::vector<RawProducer>{}).first;
+                        }
+                        if (tag_work != nullptr) tag_work->grow(found->second);
+                        found->second.push_back({cell.id(), first, last});
+                    }
                 }
             }
         }
         Polylines raw;
-        std::vector<RawLine> original;
+        std::vector<LineSource> original;
         size_t work = 0;
         const auto visit = [&] {
-            if (++work > parameters.max_nodes * size_t(64))
+            if (tag_work != nullptr) tag_work->charge();
+            if (++work > parameters.max_nodes * size_t(64)) {
+                if (tag_work != nullptr) throw TaggingUnavailable{};
                 throw std::runtime_error("Bridge aware cubic exceeds the partition ownership work limit");
-            if ((work & 255) == 0) cancel();
+            }
+            if ((work & 255) == 0) check_cancel();
         };
-        PlaneIntervals planes = refinement_intervals(z);
+        PlaneIntervals planes = refinement_intervals(z, nullptr, nullptr, tag_work);
         for (auto &entry : planes) {
-            cancel();
+            check_cancel();
             const PlaneKey &plane = entry.first;
             auto &intervals = entry.second;
-            std::sort(intervals.begin(), intervals.end());
+            std::sort(intervals.begin(), intervals.end(), [&](const Interval &a, const Interval &b) {
+                if (tag_work != nullptr && tag_work->owns_geometry()) tag_work->charge();
+                return a < b;
+            });
             const double fixed = std::ldexp(bulk_edge * double(plane.numerator), -int(plane.level));
             const unsigned a = (plane.axis + 1) % 3;
             const unsigned b = (plane.axis + 2) % 3;
@@ -648,15 +761,26 @@ struct Plan::Impl {
                 p[b] = z * sqrt_three - fixed - last;
                 const Point p1 = scaled_point(origin + to_world * p);
                 if (p0 == p1) return;
-                raw.emplace_back(p0, p1);
-                if (partitions == nullptr) return;
-                RawLine source{p0, p1, {}};
-                for (const ProducerInterval &owner : producers.at(plane)) {
+                if (tag_work != nullptr && tag_work->owns_geometry()) {
+                    tag_work->grow(raw);
+                    Points points;
+                    tag_work->reserve(points, 2);
+                    points.push_back(p0); points.push_back(p1);
+                    raw.emplace_back(std::move(points));
+                } else raw.emplace_back(p0, p1);
+                if (!retain_sources) return;
+                LineSource source{LineSource::Kind::Partition, p0, p1, {}};
+                if (tag_work != nullptr) tag_work->lookup(producers.size());
+                for (const RawProducer &owner : producers.at(plane)) {
                     visit();
                     const double begin = (std::max(first, owner.first) - first) / (last - first);
                     const double end = (std::min(last, owner.last) - first) / (last - first);
-                    if (end > begin) source.producers.push_back({owner.id, begin, end});
+                    if (end > begin) {
+                        if (tag_work != nullptr) tag_work->grow(source.producers);
+                        source.producers.push_back({owner.id, begin, end});
+                    }
                 }
+                if (tag_work != nullptr) tag_work->grow(original);
                 original.push_back(std::move(source));
             };
             double first = intervals.front().first;
@@ -677,13 +801,34 @@ struct Plan::Impl {
         // Preserve one identical boolean batch for emission and ownership.
         // Clipper's handling of touching open subjects can depend on the other
         // subjects in its scan; separately clipping a face loses real output.
-        if (partitions == nullptr) {
+        if (!retain_sources) {
             if (solid != nullptr && !solid->empty()) raw = diff_pl(raw, *solid);
             return intersection_pl(raw, domain);
         }
-        std::vector<size_t> source_ids(raw.size());
+        std::vector<size_t> source_ids;
+        if (tag_work != nullptr) tag_work->reserve(source_ids, raw.size());
+        source_ids.resize(raw.size());
+        if (tag_work != nullptr) tag_work->charge(source_ids.size());
         std::iota(source_ids.begin(), source_ids.end(), size_t(0));
         const auto clip = [&](ClipperLib::ClipType operation, const auto &mask) {
+            size_t admitted_output_points = 0;
+            if (tag_work != nullptr && tag_work->owns_geometry()) {
+                // reference_lines supplies only two-point open inputs and one
+                // four-edge rectangle. Each input can add at most four clip
+                // crossings plus its two endpoints. Open/open crossings add
+                // no output points. Admit the transferred contour buffers
+                // before Execute allocates them; Clipper's internal scan and
+                // edge allocator remains under the existing geometry limits.
+                for (const Polyline &line : raw) {
+                    tag_work->charge();
+                    if (line.size() != 2) throw TaggingUnavailable{};
+                }
+                if (operation != ClipperLib::ctIntersection) throw TaggingUnavailable{};
+                admitted_output_points = raw.size() * 6;
+                tag_work->admit(admitted_output_points, admitted_output_points);
+                tag_work->charge(admitted_output_points + 4);
+                tag_work->poll();
+            }
             ClipperLib::Clipper clipper;
             clipper.AddPaths(ClipperUtils::PolylinesProvider(raw), ClipperLib::ptSubject, false);
             clipper.AddPaths(mask, ClipperLib::ptClip, true);
@@ -691,15 +836,23 @@ struct Plan::Impl {
             clipper.Execute(operation, result, ClipperLib::pftNonZero, ClipperLib::pftNonZero);
             Polylines clipped;
             std::vector<size_t> clipped_sources;
-            clipped.reserve(result.Total());
-            clipped_sources.reserve(result.Total());
+            if (tag_work != nullptr && tag_work->owns_geometry()) tag_work->reserve(clipped, result.Total());
+            else clipped.reserve(result.Total());
+            if (tag_work != nullptr) tag_work->reserve(clipped_sources, result.Total());
+            else clipped_sources.reserve(result.Total());
             // Match PolyTreeToPolylines' traversal exactly. The metadata is
             // carried by open output records, not inferred from rounded axes.
             for (auto *node = result.GetFirst(); node != nullptr; node = node->GetNext()) {
                 if (node->Contour.empty()) continue;
                 visit();
-                if (!node->IsOpen() || node->OpenPathIndex() >= source_ids.size())
+                if (tag_work != nullptr && tag_work->owns_geometry()) {
+                    if (node->Contour.capacity() > admitted_output_points) throw TaggingUnavailable{};
+                    admitted_output_points -= node->Contour.capacity();
+                }
+                if (!node->IsOpen() || node->OpenPathIndex() >= source_ids.size()) {
+                    if (tag_work != nullptr) throw TaggingUnavailable{};
                     throw std::runtime_error("Bridge aware cubic lost a clipped partition's source identity");
+                }
                 clipped_sources.push_back(source_ids[node->OpenPathIndex()]);
                 clipped.emplace_back(std::move(node->Contour));
             }
@@ -710,17 +863,26 @@ struct Plan::Impl {
             clip(ClipperLib::ctDifference, ClipperUtils::ExPolygonsProvider(*solid));
         clip(ClipperLib::ctIntersection, ClipperUtils::ExPolygonProvider(domain));
 
+        if (tagged != nullptr && partitions == nullptr) {
+            // Retain every original source, not just output-referenced rows.
+            // Near-coincident axes outside this domain can matter to the
+            // consumer's separate legacy-classification ambiguity guard.
+            tagged->sources = std::move(original);
+            tagged->source_for_path = std::move(source_ids);
+            return raw;
+        }
+
         std::map<CellId, Polylines> owned;
         for (size_t line_index = 0; line_index < raw.size(); ++line_index) {
             const Polyline &line = raw[line_index];
-            const RawLine &source = original.at(source_ids[line_index]);
-            const Vec2d direction = (source.last - source.first).cast<double>();
+            const LineSource &source = original.at(source_ids[line_index]);
+            const Vec2d direction = (source.canonical_b - source.canonical_a).cast<double>();
             const double squared = direction.squaredNorm();
             for (size_t i = 1; i < line.size(); ++i) {
-                cancel();
+                check_cancel();
                 const Point &start = line.points[i - 1], &finish = line.points[i];
-                const double from = direction.dot((start - source.first).cast<double>()) / squared;
-                const double to = direction.dot((finish - source.first).cast<double>()) / squared;
+                const double from = direction.dot((start - source.canonical_a).cast<double>()) / squared;
+                const double to = direction.dot((finish - source.canonical_a).cast<double>()) / squared;
                 if (from == to) continue;
                 for (const ProducerInterval &owner : source.producers) {
                     visit();
@@ -735,16 +897,39 @@ struct Plan::Impl {
                         return Point(coord_t(std::llround(point.x())), coord_t(std::llround(point.y())));
                     };
                     const Point a = point_at(low), b = point_at(high);
-                    if (a != b) owned[owner.id].emplace_back(a, b);
+                    if (a != b) {
+                        if (tag_work != nullptr) {
+                            tag_work->lookup(owned.size());
+                            auto found = owned.find(owner.owner);
+                            if (found == owned.end()) {
+                                tag_work->admit(TaggingWork::units_for<decltype(owned)::value_type>() +
+                                                4 * TaggingWork::units_for<void *>(), 1);
+                                found = owned.emplace(owner.owner, Polylines{}).first;
+                            }
+                            tag_work->grow(found->second);
+                            Points points;
+                            tag_work->reserve(points, 2);
+                            points.push_back(a); points.push_back(b);
+                            found->second.emplace_back(std::move(points));
+                        } else owned[owner.owner].emplace_back(a, b);
+                    }
                 }
             }
         }
-        partitions->reserve(owned.size());
-        for (auto &entry : owned) partitions->emplace_back(entry.first, std::move(entry.second));
+        if (tag_work != nullptr) tag_work->reserve(*partitions, owned.size());
+        else partitions->reserve(owned.size());
+        for (auto &entry : owned) {
+            if (tag_work != nullptr) tag_work->charge();
+            partitions->emplace_back(entry.first, std::move(entry.second));
+        }
+        if (tagged != nullptr) {
+            tagged->sources = std::move(original);
+            tagged->source_for_path = std::move(source_ids);
+        }
         return raw;
     }
 
-    Polylines bulk(double z, const ExPolygon &domain) const
+    Polylines bulk(double z, const ExPolygon &domain, TaggingWork *tag_work = nullptr) const
     {
         Polylines raw;
         if (domain.contour.empty())
@@ -770,10 +955,11 @@ struct Plan::Impl {
             if (last >= first && uint64_t(last - first) >= parameters.max_nodes)
                 throw std::runtime_error("Bridge aware cubic exceeds the output line work limit");
             for (int64_t plane = first; plane <= last; ++plane) {
+                if (tag_work != nullptr) tag_work->charge();
                 if (++count > parameters.max_nodes)
                     throw std::runtime_error("Bridge aware cubic exceeds the output line work limit");
                 if ((count & 255) == 0)
-                    cancel();
+                    tag_work != nullptr ? tag_work->poll() : cancel();
                 const double offset = plane * bulk_edge - z / sqrt_three;
                 const Vec2d midpoint = center + normal *
                     ((offset - normal.dot(center - origin.head<2>())) / normal.squaredNorm());
@@ -832,6 +1018,129 @@ Polylines Plan::lines(double z, const ExPolygon &domain) const
     return emitted;
 }
 
+TaggedLineBatch Plan::tagged_lines(double z, const ExPolygon &domain, size_t capacity_units,
+                                 BridgeAwareCubicValidation::WorkBudget *budget) const
+{
+    m_impl->cancel();
+    if (!m_impl->has_elevation(z)) {
+        TaggedLineBatch empty;
+        empty.complete = true;
+        return empty;
+    }
+    const auto ordinary = [&] {
+        TaggedLineBatch unavailable;
+        unavailable.paths = lines(z, domain);
+        return unavailable;
+    };
+    // Initial provenance consumers cannot yet prove the solid/closure output
+    // and attachment policy as one emitter. Keep their ordinary path intact.
+    if (capacity_units == 0 || !solid_area(z).empty()) return ordinary();
+    for (const LayerClosure &closure : m_impl->closures)
+        if (m_impl->closure_active(closure, z)) return ordinary();
+    try {
+        TaggingWork work(capacity_units, budget, m_impl->parameters.throw_if_canceled);
+        work.poll();
+        work.admit(8, 1); // Batch containers and scalar state.
+        TaggedLineBatch result;
+        Polylines bulk = m_impl->bulk(z, domain, &work);
+        Polylines added = m_impl->refinement(z, domain, nullptr, nullptr, &result, &work);
+
+        // Refinement records remain in their original deterministic order,
+        // including unreferenced ones. Bulk has no producer ranges: a record
+        // per actual bulk output is enough to carry its origin through the
+        // filler's later mixed clipping batch without changing bulk endpoints.
+        std::vector<size_t> source_ids;
+        work.reserve(source_ids, bulk.size() + result.source_for_path.size());
+        for (const Polyline &path : bulk) {
+            work.charge();
+            if (path.size() < 2 || path.front() == path.back()) throw TaggingUnavailable{};
+            work.grow(result.sources);
+            source_ids.push_back(result.sources.size());
+            result.sources.push_back({LineSource::Kind::Bulk, path.front(), path.back(), {}});
+        }
+        for (size_t source : result.source_for_path) {
+            work.charge();
+            source_ids.push_back(source);
+        }
+        result.source_for_path = std::move(source_ids);
+        result.paths = std::move(bulk);
+        result.paths.insert(result.paths.end(), std::make_move_iterator(added.begin()),
+                                               std::make_move_iterator(added.end()));
+        work.poll();
+        result.complete = true;
+        return result;
+    } catch (const TaggingCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const TaggingUnavailable &) {
+    } catch (const std::bad_alloc &) {
+    }
+    // All partial metadata dies before the fallback; spent shared work stays
+    // charged. Re-run the unchanged ordinary path, never return partial output.
+    return ordinary();
+}
+
+ReferenceLineBatch Plan::reference_lines(double z, const BoundingBox &bounds, size_t capacity_units,
+                                       BridgeAwareCubicValidation::WorkBudget *budget) const
+{
+    m_impl->cancel();
+    const bool in_range = m_impl->has_elevation(z);
+    if (!bounds.defined || bounds.min.x() >= bounds.max.x() || bounds.min.y() >= bounds.max.y()) return {};
+    // Match the consumer's safe integer domain before any native clipping;
+    // optional malformed bounds must decline, not enter Clipper range errors.
+    constexpr int64_t coordinate_limit = std::min<int64_t>(std::numeric_limits<coord_t>::max() / 4,
+                                                           std::numeric_limits<int32_t>::max() / 4);
+    for (const Point &point : {bounds.min, bounds.max})
+        if (point.x() < -coordinate_limit || point.x() > coordinate_limit ||
+            point.y() < -coordinate_limit || point.y() > coordinate_limit) return {};
+    try {
+        TaggingWork work(capacity_units, budget, m_impl->parameters.throw_if_canceled, true);
+        work.poll();
+        work.admit(TaggingWork::units_for<ReferenceLineBatch>() + TaggingWork::units_for<TaggedLineBatch>() +
+                   TaggingWork::units_for<ExPolygon>() + 16, 3);
+        ReferenceLineBatch result;
+        if (in_range) {
+            // A solid section's zero-area birth/death may also decline. This
+            // optional scope never substitutes sparse provenance for solid.
+            for (const Refinement &refinement : m_impl->refinements) {
+                work.charge();
+                if (refinement.solid && z >= refinement.bottom_z && z <= refinement.top_z) return {};
+            }
+            for (const LayerClosure &closure : m_impl->closures) {
+                work.charge();
+                if (std::abs(closure.z - z) > 1.e-9) continue;
+                if (closure.owners.empty()) return {};
+                for (const CellId &owner : closure.owners) {
+                    work.lookup(m_impl->active_owners.size());
+                    if (m_impl->active_owners.find(owner) != m_impl->active_owners.end()) return {};
+                }
+            }
+            Points corners;
+            work.reserve(corners, 4);
+            corners.push_back(bounds.min);
+            corners.emplace_back(bounds.max.x(), bounds.min.y());
+            corners.push_back(bounds.max);
+            corners.emplace_back(bounds.min.x(), bounds.max.y());
+            const ExPolygon domain(Polygon(std::move(corners)));
+            TaggedLineBatch tagged;
+            result.paths = m_impl->refinement(z, domain, nullptr, &result.partitions, &tagged, &work);
+            result.sources = std::move(tagged.sources);
+            result.source_for_path = std::move(tagged.source_for_path);
+        }
+        result.plan_identity = immutable_identity();
+        result.z = z;
+        result.bounds = bounds;
+        work.poll();
+        result.complete = true;
+        return result;
+    } catch (const TaggingCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const TaggingUnavailable &) {
+    } catch (const std::bad_alloc &) {
+    }
+    // Reference-only failure never needs to allocate replacement geometry.
+    return {};
+}
+
 Polylines Plan::refinement_lines(double z, const ExPolygon &domain) const
 {
     m_impl->cancel();
@@ -882,15 +1191,38 @@ std::vector<LayerClosure> Plan::closures(double z) const
     return result;
 }
 
+bool Plan::has_closures(double z) const
+{
+    m_impl->cancel();
+    if (!m_impl->has_elevation(z)) return false;
+    size_t visited = 0;
+    for (const LayerClosure &closure : m_impl->closures) {
+        if ((++visited & 255) == 0) m_impl->cancel();
+        if (m_impl->closure_active(closure, z)) return true;
+    }
+    return false;
+}
+
 std::vector<LayerAttachment> Plan::attachments(double z) const
+{
+    std::vector<LayerAttachment> result;
+    visit_attachments(z, [&](const LayerAttachment &attachment) { result.push_back(attachment); return true; });
+    return result;
+}
+
+bool Plan::visit_attachments(double z, const std::function<bool(const LayerAttachment &)> &visitor) const
 {
     m_impl->cancel();
     if (!std::isfinite(z)) throw std::invalid_argument("Bridge aware cubic requires a finite attachment elevation");
-    std::vector<LayerAttachment> result;
+    if (!visitor) throw std::invalid_argument("Bridge aware cubic requires an attachment visitor");
+    size_t visited = 0;
     for (const LayerAttachment &attachment : m_impl->layer_attachments)
+    {
+        if ((++visited & 255) == 0) m_impl->cancel();
         if (std::abs(attachment.z - z) <= 1.e-9 &&
-                (attachment.owners.empty() || m_impl->has_owner(attachment.owners))) result.push_back(attachment);
-    return result;
+                (attachment.owners.empty() || m_impl->has_owner(attachment.owners)) && !visitor(attachment)) return false;
+    }
+    return true;
 }
 
 ExPolygons Plan::refinement_area(double z) const
@@ -972,7 +1304,10 @@ Plan Plan::clone() const
     return Plan(m_impl);
 }
 
-std::shared_ptr<const void> Plan::immutable_identity() const noexcept { return m_impl; }
+std::shared_ptr<const void> Plan::immutable_identity() const noexcept
+{
+    return m_impl ? std::shared_ptr<const void>(m_impl->identity) : std::shared_ptr<const void>{};
+}
 
 Plan Plan::with_demands(std::vector<Demand> demands) const
 {

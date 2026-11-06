@@ -12,6 +12,7 @@
 #include "Fill/BridgeAwareCubicSerialization.hpp"
 #include "Fill/BridgeAwareCubicModelProofCache.hpp"
 #include "Fill/BridgeAwareCubicSpanProofCache.hpp"
+#include "Fill/BridgeAwareCubicEmissionLedger.hpp"
 #include "Fill/BridgeAwareCubicFailureReplay.hpp"
 #include "Fill/BridgeAwareCubicContainment.hpp"
 #include "Fill/BridgeAwareCubicCertificate.hpp"
@@ -32,6 +33,7 @@
 #include <mutex>
 #include <sstream>
 #include <set>
+#include <string_view>
 #include <tuple>
 
 namespace Slic3r {
@@ -70,6 +72,8 @@ struct ProfileState {
     uint64_t model_replay_probes = 0, model_replay_rejections = 0, model_replay_passes = 0;
     uint64_t model_replay_unavailable = 0, model_replay_stores = 0, model_replay_entries = 0;
     uint64_t construction_containment_indices = 0, construction_containment_queries = 0, construction_containment_proofs = 0;
+    uint64_t emission_ledger_hits = 0, emission_ledger_fallbacks = 0, emission_ledger_construction_paths = 0;
+    std::array<std::pair<const char *, uint64_t>, 32> emission_capture_reasons{};
     uint64_t whole_support_queries = 0, whole_support_proofs = 0, whole_support_segments = 0;
     uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
     uint64_t model_layer_proof_hits = 0, model_layer_proof_misses = 0, model_layer_proof_publications = 0;
@@ -84,6 +88,17 @@ struct ProfileState {
     uint64_t sequence, object_id;
     Clock::time_point started = Clock::now();
     int exceptions = std::uncaught_exceptions();
+
+    void emission_capture(const char *reason) noexcept {
+        reason = reason ? reason : "unavailable";
+        for (auto &entry : emission_capture_reasons)
+            if (entry.first == nullptr || std::string_view(entry.first) == reason) {
+                entry.first = reason;
+                ++entry.second;
+                return;
+            }
+        truncated = true;
+    }
 
     void layer(ProfilePhase phase, size_t index) noexcept {
         auto &metric = metrics[size_t(phase)];
@@ -140,6 +155,9 @@ struct ProfileState {
                     << ",\"construction_containment_indices\":" << construction_containment_indices
                     << ",\"construction_containment_queries\":" << construction_containment_queries
                     << ",\"construction_containment_proofs\":" << construction_containment_proofs
+                    << ",\"emission_ledger_hits\":" << emission_ledger_hits
+                    << ",\"emission_ledger_fallbacks\":" << emission_ledger_fallbacks
+                    << ",\"emission_ledger_construction_paths\":" << emission_ledger_construction_paths
                     << ",\"full_trial_checks\":" << (full_trial_checks ? "true" : "false")
                     << ",\"model_cache_hits\":" << model_cache_hits << ",\"model_cache_fallbacks\":" << model_cache_fallbacks
                     << ",\"model_cache_vertices\":" << model_cache_vertices << ",\"model_cache_items\":" << model_cache_items
@@ -159,7 +177,15 @@ struct ProfileState {
                     << ",\"whole_support_segments\":" << whole_support_segments
                     << ",\"final_proof_hits\":" << final_proof_hits << ",\"final_proof_misses\":" << final_proof_misses
                     << ",\"final_proof_publications\":" << final_proof_publications << ",\"final_proof_bytes\":" << final_proof_bytes
-                    << ",\"identity_counts_truncated\":" << (truncated ? "true" : "false") << ",\"metrics\": [";
+                    << ",\"identity_counts_truncated\":" << (truncated ? "true" : "false")
+                    << ",\"emission_capture_reasons\":{";
+                bool first_reason = true;
+                for (const auto &entry : emission_capture_reasons) if (entry.first != nullptr) {
+                    if (!first_reason) out << ',';
+                    first_reason = false;
+                    out << '"' << entry.first << "\":" << entry.second;
+                }
+                out << "},\"metrics\": [";
                 static constexpr const char *names[] = {"plan_build", "plan_clone", "plan_collapse", "plan_payload", "dependency_prune",
                     "generate_full", "generate_changed", "generate_rollback", "collect_model", "collect_construction",
                     "check_model", "check_construction", "check_mixed", "prepare_model_targets", "compare_final_proof",
@@ -407,6 +433,110 @@ ActiveAttachments active_attachments(const Layer &layer)
     return active;
 }
 
+// Divide the optional metadata allowance by every layer and emitting region,
+// including layers currently regenerated in parallel. A second equal allowance
+// bounds transient caller views/copies; builder and filler scratch share the
+// first allowance with retained ledgers. No global mutable accounting is used.
+size_t emission_quota(const Layer &layer)
+{
+    constexpr size_t allowance = 24 * 1024 * 1024;
+    return allowance / std::max(size_t(1), layer.object()->layers().size()) /
+        std::max(size_t(1), layer.object()->num_printing_regions());
+}
+
+bool emission_charge(const PrintObject &object, BridgeAwareCubicValidation::WorkBudget &budget, size_t amount = 1)
+{
+    if (object.print()->canceled()) throw CanceledException();
+    if (amount > budget.remaining_work) return false;
+    budget.remaining_work -= amount;
+    budget.charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)] += amount;
+    return true;
+}
+
+bool emission_bindings(const Layer &layer, std::vector<BridgeAwareCubic::EmissionPlanBinding> &bindings,
+    size_t byte_limit, BridgeAwareCubicValidation::WorkBudget &budget)
+{
+    const PrintObject &object = *layer.object();
+    const size_t count = object.num_printing_regions();
+    if (count > byte_limit / sizeof(BridgeAwareCubic::EmissionPlanBinding) ||
+        !emission_charge(object, budget, count)) return false;
+    bindings.reserve(count);
+    if (bindings.capacity() > byte_limit / sizeof(BridgeAwareCubic::EmissionPlanBinding)) return false;
+    for (size_t owner = 0; owner < count; ++owner)
+        if (const auto *plan = object.bridge_aware_cubic_plan(owner))
+            bindings.push_back({owner, plan->immutable_identity()});
+    return true;
+}
+
+// Read every active internal-infill leaf in the same traversal order as the
+// reference collector. Unknown tree shapes and non-free leaves are unavailable
+// in the first capture scope; they cannot disappear from a partial ledger.
+bool emission_views(const Layer &layer, size_t emitter,
+    std::vector<BridgeAwareCubic::EmissionPathView> &views, size_t byte_limit,
+    BridgeAwareCubicValidation::WorkBudget &budget)
+{
+    const size_t limit = std::min(size_t(20000), byte_limit / sizeof(BridgeAwareCubic::EmissionPathView));
+    const auto visit = [&](auto &&self, const ExtrusionEntity &entity, size_t depth) -> bool {
+        if (depth > 64 || !emission_charge(*layer.object(), budget)) return false;
+        if (typeid(entity) == typeid(ExtrusionPath)) {
+            const auto &path = static_cast<const ExtrusionPath &>(entity);
+            if (path.role() != erInternalInfill || path.is_force_no_extrusion() ||
+                !(path.mm3_per_mm > 0.) || path.polyline.size() < 2) return true;
+            if (views.size() == limit) return false;
+            if (views.size() == views.capacity()) {
+                views.reserve(std::min(limit, std::max(size_t(8), 2 * views.capacity())));
+                if (views.capacity() > limit) return false;
+            }
+            views.push_back({&path, true});
+            return true;
+        }
+        if (typeid(entity) == typeid(ExtrusionEntityCollection)) {
+            for (const ExtrusionEntity *child : static_cast<const ExtrusionEntityCollection &>(entity).entities)
+                if (child == nullptr || !self(self, *child, depth + 1)) return false;
+            return true;
+        }
+        // Existing loops/multipaths may carry model solid fill, but an active
+        // internal-infill component is outside the standalone-path scope.
+        const ExtrusionPaths *joined = nullptr;
+        if (typeid(entity) == typeid(ExtrusionMultiPath)) joined = &static_cast<const ExtrusionMultiPath &>(entity).paths;
+        else if (typeid(entity) == typeid(ExtrusionLoop)) joined = &static_cast<const ExtrusionLoop &>(entity).paths;
+        else return false;
+        for (const auto &path : *joined) {
+            if (!emission_charge(*layer.object(), budget)) return false;
+            if (path.role() == erInternalInfill && !path.is_force_no_extrusion() &&
+                path.mm3_per_mm > 0. && path.polyline.size() >= 2) return false;
+        }
+        return true;
+    };
+    return emitter < layer.regions().size() && visit(visit, layer.get_region(int(emitter))->fills, 0);
+}
+
+bool emission_attachment_bytes(const BridgeAwareCubic::LayerAttachment &attachment, size_t &remaining,
+    const PrintObject &object, BridgeAwareCubicValidation::WorkBudget &budget)
+{
+    const auto charge = [&](size_t count, size_t size) {
+        if (count > remaining / size || !emission_charge(object, budget, count)) return false;
+        remaining -= count * size;
+        return true;
+    };
+    // Reserve twice the exact copied elements, leaving room for vector control
+    // blocks/capacity rounding. Callers reserve the outer vector once.
+    if (!charge(1, 2 * sizeof(BridgeAwareCubic::EmissionTransition)) ||
+        !charge(attachment.original.size(), 2 * sizeof(Point)) ||
+        !charge(attachment.replacement.size(), 2 * sizeof(Point)) ||
+        !charge(attachment.original.fitting_result.size(), 2 * sizeof(PathFittingData)) ||
+        !charge(attachment.replacement.fitting_result.size(), 2 * sizeof(PathFittingData)) ||
+        !charge(attachment.owners.size(), 2 * sizeof(BridgeAwareCubic::CellId)) ||
+        !charge(attachment.demand_selection.size(), 2 * sizeof(ExPolygon))) return false;
+    for (const ExPolygon &polygon : attachment.demand_selection) {
+        if (!charge(polygon.contour.size(), 2 * sizeof(Point)) ||
+            !charge(polygon.holes.size(), 2 * sizeof(Polygon))) return false;
+        for (const Polygon &hole : polygon.holes)
+            if (!charge(hole.size(), 2 * sizeof(Point))) return false;
+    }
+    return true;
+}
+
 BridgeAwareCubicAttachment::ResolvedChain resolve_attachments(const Layer &layer, const Polyline &path,
     double width, double height, size_t emitter, const ActiveAttachments &active)
 {
@@ -523,8 +653,31 @@ std::unique_ptr<BridgeAwareCubicContact::QueryCache> make_contact_query_cache(
 // Group equal contact planes, but retain complete emitted paths and endpoints.
 // Only the demand mask is clipped to the supplying region; it never closes a
 // cell or supplies an artificial endpoint to the validator.
+enum class ConstructionCollection { Reference, Emitted };
+
+BridgeAwareCubic::EmissionLedgerPtr current_emission_ledger(const Layer &layer, size_t emitter,
+    BridgeAwareCubicValidation::WorkBudget &budget)
+{
+    if (emitter >= layer.bridge_aware_emission_ledgers.size()) return {};
+    const auto &ledger = layer.bridge_aware_emission_ledgers[emitter];
+    if (!ledger) return {};
+    const size_t quota = emission_quota(layer);
+    try {
+        std::vector<BridgeAwareCubic::EmissionPlanBinding> bindings;
+        std::vector<BridgeAwareCubic::EmissionPathView> views;
+        if (!emission_bindings(layer, bindings, quota / 4, budget) ||
+            !emission_views(layer, emitter, views, quota / 3, budget)) return {};
+        if (ledger->matches(emitter, layer.print_z, {layer.object()->bounding_box(), geometry_tolerance},
+                bindings, views, &budget,
+                [&] { if (layer.object()->print()->canceled()) throw CanceledException(); })) return ledger;
+    } catch (const std::bad_alloc &) {}
+    return {};
+}
+
 std::vector<Target> collect_targets(const PrintObject &object, bool dependencies, bool unsupported_only = true,
-                                    const std::set<size_t> *selected_layers = nullptr)
+                                    const std::set<size_t> *selected_layers = nullptr,
+                                    ConstructionCollection construction = ConstructionCollection::Reference,
+                                    BridgeAwareCubic::EmissionCollectionAudit *audit = nullptr)
 {
     std::vector<Target> targets;
     BridgeAwareCubicValidation::WorkBudget contact_budget;
@@ -756,6 +909,33 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
             for (size_t region_id = 0; region_id < upper.regions().size(); ++region_id) {
                 const auto *plan = object.bridge_aware_cubic_plan(region_id);
                 if (plan == nullptr) continue;
+                if (construction == ConstructionCollection::Emitted &&
+                    !(active_profile && active_profile->full_trial_checks)) {
+                    if (const auto ledger = current_emission_ledger(upper, region_id, contact_budget)) {
+                        if (audit) ++audit->ledger_emitters;
+                        if (active_profile) ++active_profile->emission_ledger_hits;
+                        for (const auto &record : ledger->records()) {
+                            if (!record.construction) continue;
+                            if (audit) ++audit->ledger_construction_paths;
+                            if (active_profile) ++active_profile->emission_ledger_construction_paths;
+                            std::vector<BridgeAwareCubic::CellId> producers = record.partition_owners;
+                            const std::set<size_t> lineage(record.attachment_indices.begin(), record.attachment_indices.end());
+                            for (size_t id : lineage)
+                                if (active.storage_regions.at(id) == region_id)
+                                    append(producers, active.entries.at(id).owners);
+                            const auto selection = BridgeAwareCubic::merged_attachment_selection(
+                                record.mask_full_path, active.entries, lineage);
+                            add(record.path, true, region_id, true, producers,
+                                selection ? &*selection : nullptr, selection.has_value());
+                        }
+                        // Closure layers are excluded during capture, including
+                        // foreign storage/emitter arrangements. All other
+                        // policy and physical checking still uses add() above.
+                        continue;
+                    }
+                    if (audit) ++audit->reference_emitters;
+                    if (active_profile) ++active_profile->emission_ledger_fallbacks;
+                }
                 std::optional<ProfileScope> sections_profile;
                 if (active_profile) sections_profile.emplace(ProfilePhase::ConstructionSections);
                 const Polylines added = plan->refinement_lines(upper.print_z, broad_domain);
@@ -1732,6 +1912,11 @@ void remove_stationary_construction(Layer &layer, const ActiveAttachments &activ
                 // is retained intact, as is every path with moving output in
                 // every actual instance.
                 if (discard) {
+                    if (const auto *path = dynamic_cast<const ExtrusionPath*>(entity))
+                        if (emitter < layer.bridge_aware_emission_builders.size())
+                            if (const auto &builder = layer.bridge_aware_emission_builders[emitter])
+                                builder->erased(*path, layer.bridge_aware_emission_budget.get(),
+                                    [&] { if (object.print()->canceled()) throw CanceledException(); });
                     delete entity;
                     it = collection.entities.erase(it);
                 } else ++it;
@@ -2885,6 +3070,75 @@ Polylines layer_closure_lines(const Layer &layer)
     return result;
 }
 
+void begin_layer_emissions(Layer &layer)
+{
+    // Drop every old address handle before Layer::make_fills destroys paths.
+    layer.bridge_aware_emission_builders.clear();
+    layer.bridge_aware_emission_ledgers.clear();
+    layer.bridge_aware_emission_budget.reset();
+    const PrintObject &object = *layer.object();
+    if (!object.has_bridge_aware_cubic()) return;
+    const size_t quota = emission_quota(layer);
+    if (quota < 2048 || layer.regions().size() > 20000) {
+        if (active_profile) active_profile->emission_capture("init_quota");
+        return;
+    }
+    if (object.print()->canceled()) throw CanceledException();
+    try {
+        auto work = std::make_shared<BridgeAwareCubicValidation::WorkBudget>();
+        std::vector<EmissionPlanBinding> bindings;
+        if (!emission_bindings(layer, bindings, quota / 4, *work)) {
+            if (active_profile) active_profile->emission_capture("init_bindings");
+            return;
+        }
+        if (bindings.empty()) return;
+        size_t remaining = quota / 2, active_count = 0;
+        for (size_t owner = 0; owner < layer.regions().size(); ++owner) {
+            const Plan *plan = object.bridge_aware_cubic_plan(owner);
+            if (plan == nullptr) continue;
+            // Cross-region closure storage requires the reference collector's
+            // separate visit. No emitter on a closure layer is eligible yet.
+            if (plan->has_closures(layer.print_z)) {
+                if (active_profile) active_profile->emission_capture("init_closures");
+                return;
+            }
+            if (!plan->visit_attachments(layer.print_z, [&](const LayerAttachment &attachment) {
+                    if (!emission_attachment_bytes(attachment, remaining, object, *work)) return false;
+                    ++active_count;
+                    return active_count <= 20000;
+                })) {
+                    if (active_profile) active_profile->emission_capture("init_attachments");
+                    return;
+                }
+        }
+        std::vector<EmissionTransition> active;
+        active.reserve(active_count);
+        if (active.capacity() > quota / (4 * sizeof(EmissionTransition))) return;
+        for (size_t owner = 0; owner < layer.regions().size(); ++owner)
+            if (const Plan *plan = object.bridge_aware_cubic_plan(owner))
+                if (!plan->visit_attachments(layer.print_z, [&](const LayerAttachment &attachment) {
+                        if (!emission_charge(object, *work)) return false;
+                        active.push_back({owner, attachment});
+                        return true;
+                    })) return;
+        const EmissionReference reference{object.bounding_box(), geometry_tolerance};
+        layer.bridge_aware_emission_builders.resize(layer.regions().size());
+        layer.bridge_aware_emission_ledgers.resize(layer.regions().size());
+        layer.bridge_aware_emission_budget = std::move(work);
+        for (size_t emitter = 0; emitter < layer.regions().size(); ++emitter)
+            if (object.bridge_aware_cubic_plan(emitter) != nullptr)
+                layer.bridge_aware_emission_builders[emitter] = std::make_shared<EmissionLedgerBuilder>(
+                    emitter, layer.print_z, reference, bindings, active, EmissionLedgerLimits{quota, 0},
+                    layer.bridge_aware_emission_budget.get(),
+                    [&] { if (object.print()->canceled()) throw CanceledException(); });
+    } catch (const std::bad_alloc &) {
+        if (active_profile) active_profile->emission_capture("init_allocation");
+        layer.bridge_aware_emission_builders.clear();
+        layer.bridge_aware_emission_ledgers.clear();
+        layer.bridge_aware_emission_budget.reset();
+    }
+}
+
 void apply_layer_paths(Layer &layer)
 {
     const PrintObject &object = *layer.object();
@@ -2898,7 +3152,28 @@ void apply_layer_paths(Layer &layer)
         for (size_t emitter = 0; emitter < layer.regions().size(); ++emitter) {
             LayerRegion &region = *layer.get_region(int(emitter));
             const auto replay = [&](ExtrusionPath &path) {
-                path.polyline = resolve_attachments(layer, path.polyline, path.width, path.height, emitter, active).polyline;
+                auto resolved = resolve_attachments(layer, path.polyline, path.width, path.height, emitter, active);
+                path.polyline = std::move(resolved.polyline);
+                if (path.role() == erInternalInfill && !resolved.applied_indices.empty() &&
+                    emitter < layer.bridge_aware_emission_builders.size()) {
+                    const auto &builder = layer.bridge_aware_emission_builders[emitter];
+                    if (!builder) return;
+                    try {
+                        size_t remaining = emission_quota(layer);
+                        for (size_t id : resolved.applied_indices)
+                            if (!emission_attachment_bytes(active.entries.at(id), remaining, object,
+                                    *layer.bridge_aware_emission_budget)) {
+                                builder->decline();
+                                return;
+                            }
+                        std::vector<EmissionTransition> transitions;
+                        transitions.reserve(resolved.applied_indices.size());
+                        for (size_t id : resolved.applied_indices)
+                            transitions.push_back({active.storage_regions.at(id), active.entries.at(id)});
+                        builder->applied(path, transitions, layer.bridge_aware_emission_budget.get(),
+                            [&] { if (object.print()->canceled()) throw CanceledException(); });
+                    } catch (const std::bad_alloc &) { builder->decline(); }
+                }
             };
             visit_free_paths(region.perimeters, replay);
             visit_free_paths(region.fills, replay);
@@ -2947,6 +3222,94 @@ void apply_layer_paths(Layer &layer)
     // runs on every trial and final fill; the remaining model, cell and
     // dependency geometry must still pass the ordinary final certificate.
     remove_stationary_construction(layer, active);
+    // Capture only the final surviving complete emitter after both replay
+    // passes and stationary removal. The optional ledger owns values, never
+    // live entity addresses, when this generation finishes.
+    if (layer.bridge_aware_emission_budget) {
+        auto &budget = *layer.bridge_aware_emission_budget;
+        const size_t quota = emission_quota(layer);
+        try {
+            std::vector<EmissionPlanBinding> bindings;
+            if (emission_bindings(layer, bindings, quota / 4, budget))
+                for (size_t emitter = 0; emitter < layer.bridge_aware_emission_builders.size(); ++emitter) {
+                    const auto &builder = layer.bridge_aware_emission_builders[emitter];
+                    if (!builder) continue;
+                    std::vector<EmissionPathView> views;
+                    // Old and new view buffers may coexist during growth;
+                    // two thirds plus the binding quarter stays in quota.
+                    if (emission_views(layer, emitter, views, quota / 3, budget)) {
+                        layer.bridge_aware_emission_ledgers[emitter] = builder->seal(views, bindings, &budget,
+                            [&] { if (object.print()->canceled()) throw CanceledException(); });
+                        if (active_profile) active_profile->emission_capture(
+                            layer.bridge_aware_emission_ledgers[emitter] ? "captured" : builder->decline_reason());
+                    } else if (active_profile) active_profile->emission_capture("final_views");
+                }
+        } catch (const std::bad_alloc &) {
+            for (auto &ledger : layer.bridge_aware_emission_ledgers) ledger.reset();
+        }
+    }
+    layer.bridge_aware_emission_builders.clear();
+    layer.bridge_aware_emission_budget.reset();
+}
+
+EmissionCollectionAudit audit_construction_collection(const PrintObject &object)
+{
+    if (!object.is_step_done(posInfill) || object.layers().empty())
+        throw std::logic_error("Construction collection audit requires completed infill.");
+    if (object.print()->canceled()) throw CanceledException();
+    EmissionCollectionAudit audit;
+    const auto actual = collect_targets(object, true, false, nullptr, ConstructionCollection::Emitted, &audit);
+    const auto reference = collect_targets(object, true, false, nullptr, ConstructionCollection::Reference);
+    const auto mismatch = [&](size_t target, const std::string &field) {
+        audit.mismatch = "Construction target " + std::to_string(target) + " differs in " + field + ".";
+        return audit;
+    };
+    const auto same_polyline_state = [](const Polyline &a, const Polyline &b) {
+        if (a.points != b.points || a.fitting_result.size() != b.fitting_result.size()) return false;
+        for (size_t i = 0; i < a.fitting_result.size(); ++i) {
+            const auto &left = a.fitting_result[i], &right = b.fitting_result[i];
+            if (left.start_point_index != right.start_point_index || left.end_point_index != right.end_point_index ||
+                left.path_type != right.path_type) return false;
+            const auto &x = left.arc_data, &y = right.arc_data;
+            if (x.center != y.center || x.radius != y.radius || x.is_arc != y.is_arc || x.length != y.length ||
+                x.angle_radians != y.angle_radians || x.polar_start_theta != y.polar_start_theta ||
+                x.polar_end_theta != y.polar_end_theta || x.start_point != y.start_point ||
+                x.end_point != y.end_point || x.direction != y.direction) return false;
+        }
+        return true;
+    };
+    if (actual.size() != reference.size()) return mismatch(0, "target count");
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (object.print()->canceled()) throw CanceledException();
+        const Target &a = actual[i], &b = reference[i];
+        if (a.upper_layer != b.upper_layer) return mismatch(i, "layer");
+        if (a.supporting_region != b.supporting_region) return mismatch(i, "supporting region");
+        if (a.gap != b.gap) return mismatch(i, "gap policy");
+        if (a.bottom_z != b.bottom_z) return mismatch(i, "contact elevation");
+        if (a.dependency != b.dependency || a.bridge_followup != b.bridge_followup) return mismatch(i, "target kind");
+        if (a.paths.size() != b.paths.size()) return mismatch(i, "path count");
+        for (size_t j = 0; j < a.paths.size(); ++j)
+            if (!same_polyline_state(a.paths[j], b.paths[j])) return mismatch(i, "path " + std::to_string(j));
+        if (a.path_widths != b.path_widths) return mismatch(i, "selection widths");
+        if (a.footprint != b.footprint) return mismatch(i, "complete footprint");
+        if (a.path_footprints != b.path_footprints) return mismatch(i, "individual footprints");
+        if (a.emitting_regions != b.emitting_regions) return mismatch(i, "emitting regions");
+        if (a.free_ended != b.free_ended) return mismatch(i, "free endpoints");
+        if (a.producers != b.producers) return mismatch(i, "ordered producers");
+        if (a.solid_cuts != b.solid_cuts) return mismatch(i, "solid-cut selection");
+        if (a.extrusions.size() != b.extrusions.size()) return mismatch(i, "extrusion count");
+        for (size_t j = 0; j < a.extrusions.size(); ++j) {
+            const ExtrusionPath &x = a.extrusions[j], &y = b.extrusions[j];
+            if (!same_polyline_state(x.polyline, y.polyline) || x.role() != y.role() || x.width != y.width ||
+                x.height != y.height || x.mm3_per_mm != y.mm3_per_mm || x.can_reverse() != y.can_reverse() ||
+                x.is_force_no_extrusion() != y.is_force_no_extrusion() || x.overhang_degree != y.overhang_degree ||
+                x.curve_degree != y.curve_degree || x.smooth_speed != y.smooth_speed ||
+                x.get_customize_flag() != y.get_customize_flag() || x.get_cooling_node() != y.get_cooling_node())
+                return mismatch(i, "extrusion " + std::to_string(j));
+        }
+    }
+    audit.equal = true;
+    return audit;
 }
 
 } // namespace BridgeAwareCubic
@@ -3428,7 +3791,8 @@ void PrintObject::prepare_bridge_aware_cubic()
                 else {
                     TargetCheckContext construction_context;
                     construction_context.span_proofs = &span_proofs;
-                    rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers), nullptr, mode,
+                    rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers,
+                        ConstructionCollection::Emitted), nullptr, mode,
                         nullptr, &construction_context);
                     for (const Failure &failure : rejected)
                         if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);

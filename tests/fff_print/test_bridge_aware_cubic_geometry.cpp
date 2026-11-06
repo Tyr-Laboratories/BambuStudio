@@ -1122,7 +1122,7 @@ TEST_CASE("Bridge aware cubic immutable identities distinguish rebuilds from exa
     same_output(unchanged);
 }
 
-TEST_CASE("Bridge aware cubic identity tokens retain their exact implementation lifetime", "[bridge_aware_cubic][geometry]")
+TEST_CASE("Bridge aware cubic identity tokens retain their lifetime beyond the Plan", "[bridge_aware_cubic][geometry]")
 {
     std::shared_ptr<const void> retained;
     std::weak_ptr<const void> lifetime;
@@ -1134,11 +1134,33 @@ TEST_CASE("Bridge aware cubic identity tokens retain their exact implementation 
     }
     REQUIRE_FALSE(lifetime.expired());
     // A newly constructed, geometrically identical plan cannot impersonate a
-    // destroyed wrapper while a proof still retains its implementation token.
+    // destroyed wrapper while a proof still retains its identity token.
     const BAC::Plan replacement(parameters(), {});
     CHECK(replacement.immutable_identity() != retained);
     retained.reset();
     CHECK(lifetime.expired());
+}
+
+TEST_CASE("Bridge aware cubic retained identity releases Plan owned resources", "[bridge_aware_cubic][geometry]")
+{
+    auto resource = std::make_shared<int>(7);
+    std::weak_ptr<int> resource_lifetime = resource;
+    std::shared_ptr<const void> retained;
+    {
+        BAC::Parameters p = parameters();
+        p.throw_if_canceled = [resource] { (void)resource; };
+        const BAC::Plan original(std::move(p), {{{rectangle(-.1, -.1, .1, .1)}, 19., 20.}});
+        retained = original.immutable_identity();
+        REQUIRE(retained);
+        resource.reset();
+        REQUIRE_FALSE(resource_lifetime.expired());
+    }
+    // An identity is a lifetime-owned nonce, not an ownership lease on the
+    // Plan's geometry, callback captures, or other backing allocations.
+    CHECK(resource_lifetime.expired());
+    REQUIRE(retained);
+    const BAC::Plan replacement(parameters(), {});
+    CHECK(replacement.immutable_identity() != retained);
 }
 
 TEST_CASE("Bridge aware cubic shared clones preserve cancellation", "[bridge_aware_cubic][geometry]")
