@@ -105,6 +105,7 @@ add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cu
     test_bridge_aware_cubic_layer_grouping.cpp test_bridge_aware_cubic_trial_rejection.cpp
     test_bridge_aware_cubic_model_proof_cache.cpp test_bridge_aware_cubic_certificate.cpp
     test_bridge_aware_cubic_failure_replay.cpp
+    test_bridge_aware_cubic_containment.cpp
     test_bridge_aware_cubic_certificate_export.cpp test_bridge_aware_cubic_owner_bounds.cpp
     test_gcode_z_parsing.cpp)
 target_link_libraries(bridge_aware_cubic_tests test_common libslic3r slicer_test_support)

@@ -246,6 +246,11 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
             CAPTURE(counter);
             REQUIRE(result.counters.at(counter).get<size_t>() == 0);
         }
+        for (const char *counter : {"construction_containment_indices", "construction_containment_queries",
+                                   "construction_containment_proofs"}) {
+            CAPTURE(counter);
+            REQUIRE(result.counters.at(counter).get<size_t>() == 0);
+        }
     } else {
         REQUIRE(result.counters.at("early_trial_rejections").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_cache_hits").get<size_t>() > 0);
@@ -261,6 +266,11 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
         REQUIRE(result.counters.at("model_replay_rejections").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_replay_stores").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_replay_entries").get<size_t>() <= 4096);
+        for (const char *counter : {"construction_containment_indices", "construction_containment_queries",
+                                   "construction_containment_proofs"}) {
+            CAPTURE(counter);
+            REQUIRE(result.counters.at(counter).get<size_t>() > 0);
+        }
     }
     return result;
 }

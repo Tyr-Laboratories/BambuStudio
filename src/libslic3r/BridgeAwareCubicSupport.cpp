@@ -12,6 +12,7 @@
 #include "Fill/BridgeAwareCubicSerialization.hpp"
 #include "Fill/BridgeAwareCubicModelProofCache.hpp"
 #include "Fill/BridgeAwareCubicFailureReplay.hpp"
+#include "Fill/BridgeAwareCubicContainment.hpp"
 #include "Fill/BridgeAwareCubicCertificate.hpp"
 #include "Fill/BridgeAwareCubicOwnerBounds.hpp"
 
@@ -67,6 +68,7 @@ struct ProfileState {
     uint64_t early_trial_rejections = 0;
     uint64_t model_replay_probes = 0, model_replay_rejections = 0, model_replay_passes = 0;
     uint64_t model_replay_unavailable = 0, model_replay_stores = 0, model_replay_entries = 0;
+    uint64_t construction_containment_indices = 0, construction_containment_queries = 0, construction_containment_proofs = 0;
     uint64_t whole_support_queries = 0, whole_support_proofs = 0, whole_support_segments = 0;
     uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
     uint64_t model_layer_proof_hits = 0, model_layer_proof_misses = 0, model_layer_proof_publications = 0;
@@ -132,6 +134,9 @@ struct ProfileState {
                     << ",\"model_replay_unavailable\":" << model_replay_unavailable
                     << ",\"model_replay_stores\":" << model_replay_stores
                     << ",\"model_replay_entries\":" << model_replay_entries
+                    << ",\"construction_containment_indices\":" << construction_containment_indices
+                    << ",\"construction_containment_queries\":" << construction_containment_queries
+                    << ",\"construction_containment_proofs\":" << construction_containment_proofs
                     << ",\"full_trial_checks\":" << (full_trial_checks ? "true" : "false")
                     << ",\"model_cache_hits\":" << model_cache_hits << ",\"model_cache_fallbacks\":" << model_cache_fallbacks
                     << ",\"model_cache_vertices\":" << model_cache_vertices << ",\"model_cache_items\":" << model_cache_items
@@ -749,6 +754,12 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                 const ExPolygons solid_area = plan->solid_area(upper.print_z);
                 Polygons added_mask = offset(added, scale_(geometry_tolerance));
                 append(added_mask, to_polygons(solid_area));
+                std::optional<BridgeAwareCubic::StrictMaskContainment> strict_mask;
+                if (!(active_profile && active_profile->full_trial_checks)) {
+                    strict_mask.emplace(added_mask, &contact_budget,
+                        [&] { if (object.print()->canceled()) throw CanceledException(); });
+                    if (active_profile && strict_mask->available()) ++active_profile->construction_containment_indices;
+                }
                 const BridgeAwareCubic::BoundedClipMask added_clip_mask(std::move(added_mask));
                 const auto &saved_attachments = active.entries;
                 const auto solid_sections = plan->solid_sections(upper.print_z);
@@ -783,7 +794,19 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                     if (path.role() != erInternalInfill) return;
                     std::optional<ProfileScope> match_profile;
                     if (active_profile) match_profile.emplace(ProfilePhase::ConstructionMatch);
-                    const Polylines matched = intersection_pl(Polylines{path.polyline}, added_clip_mask.candidates(path.polyline));
+                    // This classifies the complete original strand only. The
+                    // actual mask's winding and strict boundary clearance can
+                    // establish full containment without clipping; it supplies
+                    // no deposited-material support or cell-wall evidence.
+                    bool full_containment = false;
+                    if (strict_mask && strict_mask->available()) {
+                        if (active_profile) ++active_profile->construction_containment_queries;
+                        full_containment = strict_mask->proves(path.polyline, &contact_budget,
+                            [&] { if (object.print()->canceled()) throw CanceledException(); });
+                        if (active_profile && full_containment) ++active_profile->construction_containment_proofs;
+                    }
+                    const Polylines matched = full_containment ? Polylines{} :
+                        intersection_pl(Polylines{path.polyline}, added_clip_mask.candidates(path.polyline));
                     // Full emitted strand identity, not a clipped fragment.
                     bool attachment_match = false;
                     std::set<size_t> attachment_lineage;
@@ -795,7 +818,8 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                                 attachment_lineage.insert(chain.applied_indices.begin(), chain.applied_indices.end());
                             }
                         }
-                    const bool ordinary_full_path = BridgeAwareCubic::complete_construction_match(path.polyline, matched, geometry_tolerance);
+                    const bool ordinary_full_path = full_containment ||
+                        BridgeAwareCubic::complete_construction_match(path.polyline, matched, geometry_tolerance);
                     match_profile.reset();
                     if (attachment_match || ordinary_full_path) {
                         std::optional<ProfileScope> owners_profile;
