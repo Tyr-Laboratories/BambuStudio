@@ -687,9 +687,11 @@ void Layer::set_outlook_range(LockRegionParam &lock_param){
     }
 }
 // friend to Layer
-void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator)
+void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree,
+                      FillLightning::Generator* lightning_generator, bool capture_emissions,
+                      const std::vector<size_t> *retained_emission_bytes)
 {
-    BridgeAwareCubic::begin_layer_emissions(*this);
+    BridgeAwareCubic::begin_layer_emissions(*this, capture_emissions, retained_emission_bytes);
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
 

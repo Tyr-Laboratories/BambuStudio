@@ -100,6 +100,7 @@ add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cu
     test_bridge_aware_cubic_tagged_lines.cpp
     test_bridge_aware_cubic_emission_collection.cpp
     test_bridge_aware_cubic_emission_ledger.cpp
+    test_bridge_aware_cubic_emission_snapshot.cpp
     test_bridge_aware_cubic.cpp test_bridge_aware_cubic_modifiers.cpp
     test_bridge_aware_cubic_repair.cpp test_bridge_aware_cubic_acceptance.cpp
     test_bridge_aware_cubic_export.cpp test_bridge_aware_cubic_attachment.cpp

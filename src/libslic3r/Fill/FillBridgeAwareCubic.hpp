@@ -52,19 +52,6 @@ public:
             if (m_limit < sizeof(BridgeAwareCubic::TaggedLineBatch)) decline_capture();
         }
         try {
-            if (m_capture && emission_builder->needs_reference()) {
-                // No pending surface tags or child vectors coexist with this
-                // optional reference. Transfer ownership, then refresh the
-                // quota before the ordinary fill batches begin.
-                auto reference = plan->reference_lines(z, emission_builder->reference_bounds(),
-                    m_limit / sizeof(Point), work_budget());
-                if (!reference.complete || !emission_builder->bind_reference(std::move(reference),
-                        work_budget(), [&] { poll(); }, 0)) decline_capture();
-                if (m_capture) {
-                    m_limit = emission_builder->available_scratch_bytes();
-                    if (m_limit < sizeof(BridgeAwareCubic::TaggedLineBatch)) decline_capture();
-                }
-            }
             // Keep the production conversion, flow calculation, validity
             // filtering, collection construction and reversal policy intact.
             Fill::fill_surface_extrusion(surface, params, out);

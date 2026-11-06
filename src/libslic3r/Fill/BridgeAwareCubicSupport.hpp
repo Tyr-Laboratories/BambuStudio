@@ -19,7 +19,8 @@ struct LayerAttachment;
 
 // Reset generation-local provenance before any previous fill entity is freed.
 // Optional capture is bounded across the object and never changes deposition.
-void begin_layer_emissions(Layer &layer);
+void begin_layer_emissions(Layer &layer, bool capture = true,
+                           const std::vector<size_t> *retained_bytes = nullptr);
 
 // Apply immutable, once-per-layer closure deposition and saved model-path
 // attachments after the ordinary fill groups have finished generating.

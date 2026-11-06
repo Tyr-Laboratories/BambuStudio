@@ -33,7 +33,7 @@ namespace FillLightning {
 
 namespace BridgeAwareCubic {
     class EmissionLedgerBuilder;
-    class EmissionLedger;
+    class EmissionSnapshot;
 }
 namespace BridgeAwareCubicValidation { struct WorkBudget; }
 
@@ -162,9 +162,9 @@ public:
     coordf_t            bottom_z() const { return this->print_z - this->height; }
 
     // Generation-local optional provenance, indexed by emitting region. Reset
-    // before old fill entities are destroyed; sealed ledgers own exact values.
+    // before old fill entities are destroyed; sealed snapshots own exact values.
     std::vector<std::shared_ptr<BridgeAwareCubic::EmissionLedgerBuilder>> bridge_aware_emission_builders;
-    std::vector<std::shared_ptr<const BridgeAwareCubic::EmissionLedger>> bridge_aware_emission_ledgers;
+    std::vector<std::shared_ptr<const BridgeAwareCubic::EmissionSnapshot>> bridge_aware_emission_snapshots;
     std::shared_ptr<BridgeAwareCubicValidation::WorkBudget> bridge_aware_emission_budget;
 
     // BBS
@@ -221,7 +221,11 @@ public:
     // Phony version of make_fills() without parameters for Perl integration only.
     void                    make_fills() { this->make_fills(nullptr, nullptr); }
     void                    set_outlook_range(LockRegionParam &lock_param);
-    void                    make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree, FillLightning::Generator* lightning_generator = nullptr);
+    // Capture policy and retained bytes belong to this synchronous generation
+    // call. The byte view is copied into builder limits and never retained.
+    void                    make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree,
+                                      FillLightning::Generator* lightning_generator = nullptr, bool capture_emissions = true,
+                                      const std::vector<size_t> *retained_emission_bytes = nullptr);
     Polylines               generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Octree *adaptive_fill_octree,
         FillAdaptive::Octree *support_fill_octree,
         FillLightning::Generator* lightning_generator) const;

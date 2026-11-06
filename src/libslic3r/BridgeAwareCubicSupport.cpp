@@ -73,6 +73,10 @@ struct ProfileState {
     uint64_t model_replay_unavailable = 0, model_replay_stores = 0, model_replay_entries = 0;
     uint64_t construction_containment_indices = 0, construction_containment_queries = 0, construction_containment_proofs = 0;
     uint64_t emission_ledger_hits = 0, emission_ledger_fallbacks = 0, emission_ledger_construction_paths = 0;
+    uint64_t emission_projection_builds = 0, emission_projection_reuses = 0;
+    uint64_t emission_rollback_restored = 0, emission_rollback_mismatches = 0;
+    uint64_t emission_rejected_without_projection = 0;
+    uint64_t emission_collection_audits = 0;
     std::array<std::pair<const char *, uint64_t>, 32> emission_capture_reasons{};
     uint64_t whole_support_queries = 0, whole_support_proofs = 0, whole_support_segments = 0;
     uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
@@ -82,6 +86,7 @@ struct ProfileState {
     uint64_t span_proof_entries = 0, span_proof_units = 0;
     uint64_t final_proof_hits = 0, final_proof_misses = 0, final_proof_publications = 0, final_proof_bytes = 0;
     bool full_trial_checks = false;
+    bool audit_emission_collection = false;
     bool truncated = false;
     std::string file, stage;
     const char *session;
@@ -158,6 +163,12 @@ struct ProfileState {
                     << ",\"emission_ledger_hits\":" << emission_ledger_hits
                     << ",\"emission_ledger_fallbacks\":" << emission_ledger_fallbacks
                     << ",\"emission_ledger_construction_paths\":" << emission_ledger_construction_paths
+                    << ",\"emission_projection_builds\":" << emission_projection_builds
+                    << ",\"emission_projection_reuses\":" << emission_projection_reuses
+                    << ",\"emission_rollback_restored\":" << emission_rollback_restored
+                    << ",\"emission_rollback_mismatches\":" << emission_rollback_mismatches
+                    << ",\"emission_rejected_without_projection\":" << emission_rejected_without_projection
+                    << ",\"emission_collection_audits\":" << emission_collection_audits
                     << ",\"full_trial_checks\":" << (full_trial_checks ? "true" : "false")
                     << ",\"model_cache_hits\":" << model_cache_hits << ",\"model_cache_fallbacks\":" << model_cache_fallbacks
                     << ",\"model_cache_vertices\":" << model_cache_vertices << ",\"model_cache_items\":" << model_cache_items
@@ -226,6 +237,8 @@ public:
             state->object_id = object_id;
             if (const char *full = std::getenv("BAC_PROFILE_FULL_TRIAL_CHECKS"))
                 state->full_trial_checks = full[0] == '1' && full[1] == '\0';
+            if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_EMISSION_COLLECTION"))
+                state->audit_emission_collection = audit[0] == '1' && audit[1] == '\0';
             static std::atomic<uint64_t> sequence{0};
             state->sequence = ++sequence;
             if (const char *stage = std::getenv("BAC_PROFILE_STAGE"))
@@ -437,11 +450,16 @@ ActiveAttachments active_attachments(const Layer &layer)
 // including layers currently regenerated in parallel. A second equal allowance
 // bounds transient caller views/copies; builder and filler scratch share the
 // first allowance with retained ledgers. No global mutable accounting is used.
+constexpr size_t emission_allowance = 24 * 1024 * 1024;
+constexpr size_t emission_context_slot_bytes = 512;
+
 size_t emission_quota(const Layer &layer)
 {
-    constexpr size_t allowance = 24 * 1024 * 1024;
-    return allowance / std::max(size_t(1), layer.object()->layers().size()) /
+    const size_t share = emission_allowance / std::max(size_t(1), layer.object()->layers().size()) /
         std::max(size_t(1), layer.object()->num_printing_regions());
+    // Includes current/base handles, row capacities and retained-byte views in
+    // the one coarsening-local context. No second allowance for a trial state.
+    return share > emission_context_slot_bytes ? share - emission_context_slot_bytes : 0;
 }
 
 bool emission_charge(const PrintObject &object, BridgeAwareCubicValidation::WorkBudget &budget, size_t amount = 1)
@@ -655,21 +673,196 @@ std::unique_ptr<BridgeAwareCubicContact::QueryCache> make_contact_query_cache(
 // cell or supplies an artificial endpoint to the validator.
 enum class ConstructionCollection { Reference, Emitted };
 
-BridgeAwareCubic::EmissionLedgerPtr current_emission_ledger(const Layer &layer, size_t emitter,
-    BridgeAwareCubicValidation::WorkBudget &budget)
+// One sequential coarsening transaction owns both versions. Parallel final
+// generation neither accesses this context nor mutates immutable snapshots.
+struct EmissionReuseEntry {
+    BridgeAwareCubic::EmissionProjectionPtr projection;
+    BridgeAwareCubic::EmissionSnapshotPtr base;
+    BridgeAwareCubic::EmissionProjectionPtr base_projection;
+};
+
+struct EmissionReuseRow {
+    std::vector<EmissionReuseEntry> entries;
+    std::vector<size_t> retained;
+};
+
+bool current_emission_matches(const Layer &layer, size_t emitter,
+    const BridgeAwareCubic::EmissionSnapshotPtr &snapshot, size_t other_bytes,
+    BridgeAwareCubicValidation::WorkBudget &budget,
+    const std::vector<BridgeAwareCubic::EmissionPlanBinding> *restored_bindings = nullptr)
 {
-    if (emitter >= layer.bridge_aware_emission_ledgers.size()) return {};
-    const auto &ledger = layer.bridge_aware_emission_ledgers[emitter];
-    if (!ledger) return {};
     const size_t quota = emission_quota(layer);
+    if (!snapshot || other_bytes > quota || snapshot->resident_bytes() > quota - other_bytes) return false;
+    const size_t scratch = quota - other_bytes - snapshot->resident_bytes();
     try {
         std::vector<BridgeAwareCubic::EmissionPlanBinding> bindings;
         std::vector<BridgeAwareCubic::EmissionPathView> views;
-        if (!emission_bindings(layer, bindings, quota / 4, budget) ||
-            !emission_views(layer, emitter, views, quota / 3, budget)) return {};
-        if (ledger->matches(emitter, layer.print_z, {layer.object()->bounding_box(), geometry_tolerance},
-                bindings, views, &budget,
-                [&] { if (layer.object()->print()->canceled()) throw CanceledException(); })) return ledger;
+        // Vector growth may temporarily retain the old views allocation.
+        if ((!restored_bindings && !emission_bindings(layer, bindings, scratch / 4, budget)) ||
+            !emission_views(layer, emitter, views, scratch / 3, budget)) return false;
+        return snapshot->matches(emitter, layer.print_z, {layer.object()->bounding_box(), geometry_tolerance},
+            restored_bindings ? *restored_bindings : bindings, views, &budget,
+            [&] { if (layer.object()->print()->canceled()) throw CanceledException(); });
+    } catch (const std::bad_alloc &) {}
+    return false;
+}
+
+class EmissionReuseContext {
+public:
+    explicit EmissionReuseContext(const PrintObject &object)
+    {
+        if (active_profile && active_profile->full_trial_checks) return;
+        const size_t layers = object.layers().size(), regions = object.num_printing_regions();
+        if (layers == 0 || regions == 0 || regions > emission_allowance / emission_context_slot_bytes ||
+            layers > emission_allowance / emission_context_slot_bytes / regions ||
+            emission_quota(*object.layers().front()) < 2048) return;
+        const size_t reserved = layers * regions * emission_context_slot_bytes;
+        static_assert(sizeof(EmissionReuseRow) + sizeof(EmissionReuseEntry) + sizeof(size_t) < emission_context_slot_bytes);
+        try {
+            m_rows.resize(layers);
+            size_t used = m_rows.capacity() * sizeof(EmissionReuseRow);
+            if (used > reserved) { clear(); return; }
+            for (auto &row : m_rows) {
+                row.entries.resize(regions);
+                row.retained.resize(regions);
+                const size_t remaining = reserved - used;
+                if (row.entries.capacity() > remaining / sizeof(EmissionReuseEntry)) { clear(); return; }
+                used += row.entries.capacity() * sizeof(EmissionReuseEntry);
+                if (row.retained.capacity() > (reserved - used) / sizeof(size_t)) { clear(); return; }
+                used += row.retained.capacity() * sizeof(size_t);
+            }
+        } catch (const std::bad_alloc &) { clear(); }
+    }
+
+    EmissionReuseRow *row(size_t index) noexcept { return index < m_rows.size() ? &m_rows[index] : nullptr; }
+
+    void save(const PrintObject &object, const std::set<size_t> &changed,
+              const std::vector<std::unique_ptr<BridgeAwareCubic::Plan>> &previous_plans)
+    {
+        BridgeAwareCubicValidation::WorkBudget budget;
+        for (size_t index : changed) {
+            auto *saved = row(index);
+            if (!saved) continue;
+            const Layer &layer = *object.layers()[index];
+            for (size_t emitter = 0; emitter < saved->entries.size(); ++emitter) {
+                auto &entry = saved->entries[emitter];
+                entry.base = emitter < layer.bridge_aware_emission_snapshots.size() ?
+                    layer.bridge_aware_emission_snapshots[emitter] : nullptr;
+                if (entry.projection && entry.projection->snapshot() == entry.base)
+                    entry.base_projection = std::move(entry.projection);
+                else { entry.projection.reset(); entry.base_projection.reset(); }
+                const size_t raw = entry.base ? entry.base->resident_bytes() : 0;
+                const size_t derived = entry.base_projection ? entry.base_projection->owned_bytes() : 0;
+                const size_t quota = emission_quota(layer);
+                // The live fills still belong to the previous Plans. A
+                // snapshot left untouched by an earlier accepted trial may
+                // carry an older Plan token: do not save it as a usable base.
+                // Check every previous namespace without copying its table.
+                bool baseline = entry.base != nullptr;
+                size_t binding = 0;
+                if (baseline) {
+                    const auto &bindings = entry.base->plan_bindings();
+                    for (size_t owner = 0; owner < previous_plans.size(); ++owner) if (previous_plans[owner]) {
+                        if (!emission_charge(object, budget) || binding == bindings.size() ||
+                            bindings[binding].storage_region != owner ||
+                            bindings[binding].identity != previous_plans[owner]->immutable_identity()) {
+                            baseline = false;
+                            break;
+                        }
+                        ++binding;
+                    }
+                    baseline = baseline && binding == bindings.size() &&
+                        current_emission_matches(layer, emitter, entry.base, derived, budget, &bindings);
+                }
+                if (!baseline || raw > quota || derived > quota - raw) {
+                    entry.base.reset(); entry.base_projection.reset(); saved->retained[emitter] = 0;
+                } else saved->retained[emitter] = raw + derived;
+            }
+        }
+    }
+
+    void accept(const std::set<size_t> &changed) noexcept
+    {
+        for (size_t index : changed) if (auto *saved = row(index))
+            for (size_t emitter = 0; emitter < saved->entries.size(); ++emitter) {
+                saved->entries[emitter].base.reset();
+                saved->entries[emitter].base_projection.reset();
+                saved->retained[emitter] = 0;
+            }
+    }
+
+    void discard_candidate(const std::set<size_t> &changed) noexcept
+    {
+        for (size_t index : changed) if (auto *saved = row(index))
+            for (auto &entry : saved->entries) entry.projection.reset();
+    }
+
+    // Call only after physical regeneration under restored Plans and payloads.
+    // A failure publishes no saved metadata; ordinary reference collection is
+    // always available. No optional handle authorizes a deposition change.
+    void restore(Layer &layer, size_t index)
+    {
+        auto *saved = row(index);
+        if (!saved) return;
+        try {
+            layer.bridge_aware_emission_snapshots.resize(layer.regions().size());
+            BridgeAwareCubicValidation::WorkBudget budget;
+            for (size_t emitter = 0; emitter < saved->entries.size(); ++emitter) {
+                auto &entry = saved->entries[emitter];
+                if (!entry.base || emitter >= layer.regions().size()) continue;
+                const size_t derived = entry.base_projection ? entry.base_projection->owned_bytes() : 0;
+                if (current_emission_matches(layer, emitter, entry.base, derived, budget)) {
+                    layer.bridge_aware_emission_snapshots[emitter] = entry.base;
+                    entry.projection = std::move(entry.base_projection);
+                    if (active_profile) ++active_profile->emission_rollback_restored;
+                } else if (active_profile) ++active_profile->emission_rollback_mismatches;
+            }
+        } catch (const std::bad_alloc &) {
+            layer.bridge_aware_emission_snapshots.clear();
+            for (auto &entry : saved->entries) entry.projection.reset();
+        }
+    }
+private:
+    std::vector<EmissionReuseRow> m_rows;
+    void clear() noexcept { std::vector<EmissionReuseRow>().swap(m_rows); }
+};
+
+BridgeAwareCubic::EmissionProjectionPtr current_emission_projection(const Layer &layer, size_t emitter,
+    BridgeAwareCubicValidation::WorkBudget &budget, EmissionReuseRow *reuse)
+{
+    if (emitter >= layer.bridge_aware_emission_snapshots.size()) return {};
+    const auto &snapshot = layer.bridge_aware_emission_snapshots[emitter];
+    if (!snapshot) return {};
+    auto *entry = reuse && emitter < reuse->entries.size() ? &reuse->entries[emitter] : nullptr;
+    const size_t retained = entry ? reuse->retained[emitter] : 0;
+    // A stale projection retains another raw allocation. Evict before either
+    // live matching or generating a replacement reference; saved base storage
+    // remains explicitly charged by retained.
+    if (entry && entry->projection && entry->projection->snapshot() != snapshot) entry->projection.reset();
+    const size_t derived = entry && entry->projection ? entry->projection->owned_bytes() : 0;
+    const size_t quota = emission_quota(layer);
+    if (retained > quota || derived > quota - retained ||
+        !current_emission_matches(layer, emitter, snapshot, retained + derived, budget)) return {};
+    if (entry && entry->projection) {
+        if (active_profile) ++active_profile->emission_projection_reuses;
+        return entry->projection;
+    }
+    try {
+        const auto *plan = layer.object()->bridge_aware_cubic_plan(emitter);
+        if (!plan || snapshot->resident_bytes() > quota - retained) return {};
+        // Fresh live-view buffers have already been released. Reference and
+        // projection staging must fit beside BOTH retained raw generations.
+        const size_t available = quota - retained - snapshot->resident_bytes();
+        auto reference = plan->reference_lines(layer.print_z, snapshot->reference().classification_bounds,
+            available / sizeof(Point), &budget);
+        if (!reference.complete) return {};
+        auto projection = BridgeAwareCubic::project_emissions(snapshot, std::move(reference), {quota, retained}, &budget,
+            [&] { if (layer.object()->print()->canceled()) throw CanceledException(); });
+        if (projection) {
+            if (active_profile) ++active_profile->emission_projection_builds;
+            if (entry) entry->projection = projection;
+        }
+        return projection;
     } catch (const std::bad_alloc &) {}
     return {};
 }
@@ -677,7 +870,8 @@ BridgeAwareCubic::EmissionLedgerPtr current_emission_ledger(const Layer &layer, 
 std::vector<Target> collect_targets(const PrintObject &object, bool dependencies, bool unsupported_only = true,
                                     const std::set<size_t> *selected_layers = nullptr,
                                     ConstructionCollection construction = ConstructionCollection::Reference,
-                                    BridgeAwareCubic::EmissionCollectionAudit *audit = nullptr)
+                                    BridgeAwareCubic::EmissionCollectionAudit *audit = nullptr,
+                                    EmissionReuseContext *reuse = nullptr)
 {
     std::vector<Target> targets;
     BridgeAwareCubicValidation::WorkBudget contact_budget;
@@ -911,10 +1105,13 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                 if (plan == nullptr) continue;
                 if (construction == ConstructionCollection::Emitted &&
                     !(active_profile && active_profile->full_trial_checks)) {
-                    if (const auto ledger = current_emission_ledger(upper, region_id, contact_budget)) {
+                    if (const auto projection = current_emission_projection(upper, region_id, contact_budget,
+                            reuse ? reuse->row(index) : nullptr)) {
                         if (audit) ++audit->ledger_emitters;
                         if (active_profile) ++active_profile->emission_ledger_hits;
-                        for (const auto &record : ledger->records()) {
+                        const auto &raw = projection->snapshot()->records();
+                        for (size_t path_index = 0; path_index < projection->records().size(); ++path_index) {
+                            const auto &record = projection->records()[path_index];
                             if (!record.construction) continue;
                             if (audit) ++audit->ledger_construction_paths;
                             if (active_profile) ++active_profile->emission_ledger_construction_paths;
@@ -925,7 +1122,7 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                                     append(producers, active.entries.at(id).owners);
                             const auto selection = BridgeAwareCubic::merged_attachment_selection(
                                 record.mask_full_path, active.entries, lineage);
-                            add(record.path, true, region_id, true, producers,
+                            add(raw.at(path_index).path, true, region_id, true, producers,
                                 selection ? &*selection : nullptr, selection.has_value());
                         }
                         // Closure layers are excluded during capture, including
@@ -3070,29 +3267,42 @@ Polylines layer_closure_lines(const Layer &layer)
     return result;
 }
 
-void begin_layer_emissions(Layer &layer)
+void begin_layer_emissions(Layer &layer, bool capture, const std::vector<size_t> *retained_bytes)
 {
     // Drop every old address handle before Layer::make_fills destroys paths.
     layer.bridge_aware_emission_builders.clear();
-    layer.bridge_aware_emission_ledgers.clear();
+    layer.bridge_aware_emission_snapshots.clear();
     layer.bridge_aware_emission_budget.reset();
     const PrintObject &object = *layer.object();
-    if (!object.has_bridge_aware_cubic()) return;
+    if (!capture || !object.has_bridge_aware_cubic()) return;
     const size_t quota = emission_quota(layer);
     if (quota < 2048 || layer.regions().size() > 20000) {
         if (active_profile) active_profile->emission_capture("init_quota");
         return;
     }
+    if (retained_bytes && (retained_bytes->size() != object.num_printing_regions() ||
+            retained_bytes->size() < layer.regions().size())) {
+        if (active_profile) active_profile->emission_capture("retained_namespace");
+        return;
+    }
+    size_t available = quota;
+    if (retained_bytes)
+        for (size_t emitter = 0; emitter < layer.regions().size(); ++emitter)
+            if (object.bridge_aware_cubic_plan(emitter) != nullptr) {
+                const size_t held = retained_bytes->at(emitter);
+                if (held > quota) return;
+                available = std::min(available, quota - held);
+            }
     if (object.print()->canceled()) throw CanceledException();
     try {
         auto work = std::make_shared<BridgeAwareCubicValidation::WorkBudget>();
         std::vector<EmissionPlanBinding> bindings;
-        if (!emission_bindings(layer, bindings, quota / 4, *work)) {
+        if (!emission_bindings(layer, bindings, available / 4, *work)) {
             if (active_profile) active_profile->emission_capture("init_bindings");
             return;
         }
         if (bindings.empty()) return;
-        size_t remaining = quota / 2, active_count = 0;
+        size_t remaining = available / 2, active_count = 0;
         for (size_t owner = 0; owner < layer.regions().size(); ++owner) {
             const Plan *plan = object.bridge_aware_cubic_plan(owner);
             if (plan == nullptr) continue;
@@ -3113,7 +3323,7 @@ void begin_layer_emissions(Layer &layer)
         }
         std::vector<EmissionTransition> active;
         active.reserve(active_count);
-        if (active.capacity() > quota / (4 * sizeof(EmissionTransition))) return;
+        if (active.capacity() > available / (4 * sizeof(EmissionTransition))) return;
         for (size_t owner = 0; owner < layer.regions().size(); ++owner)
             if (const Plan *plan = object.bridge_aware_cubic_plan(owner))
                 if (!plan->visit_attachments(layer.print_z, [&](const LayerAttachment &attachment) {
@@ -3123,18 +3333,19 @@ void begin_layer_emissions(Layer &layer)
                     })) return;
         const EmissionReference reference{object.bounding_box(), geometry_tolerance};
         layer.bridge_aware_emission_builders.resize(layer.regions().size());
-        layer.bridge_aware_emission_ledgers.resize(layer.regions().size());
+        layer.bridge_aware_emission_snapshots.resize(layer.regions().size());
         layer.bridge_aware_emission_budget = std::move(work);
         for (size_t emitter = 0; emitter < layer.regions().size(); ++emitter)
             if (object.bridge_aware_cubic_plan(emitter) != nullptr)
                 layer.bridge_aware_emission_builders[emitter] = std::make_shared<EmissionLedgerBuilder>(
-                    emitter, layer.print_z, reference, bindings, active, EmissionLedgerLimits{quota, 0},
+                    emitter, layer.print_z, reference, bindings, active,
+                    EmissionLedgerLimits{quota, retained_bytes ? retained_bytes->at(emitter) : 0},
                     layer.bridge_aware_emission_budget.get(),
                     [&] { if (object.print()->canceled()) throw CanceledException(); });
     } catch (const std::bad_alloc &) {
         if (active_profile) active_profile->emission_capture("init_allocation");
         layer.bridge_aware_emission_builders.clear();
-        layer.bridge_aware_emission_ledgers.clear();
+        layer.bridge_aware_emission_snapshots.clear();
         layer.bridge_aware_emission_budget.reset();
     }
 }
@@ -3159,7 +3370,7 @@ void apply_layer_paths(Layer &layer)
                     const auto &builder = layer.bridge_aware_emission_builders[emitter];
                     if (!builder) return;
                     try {
-                        size_t remaining = emission_quota(layer);
+                        size_t remaining = builder->available_scratch_bytes();
                         for (size_t id : resolved.applied_indices)
                             if (!emission_attachment_bytes(active.entries.at(id), remaining, object,
                                     *layer.bridge_aware_emission_budget)) {
@@ -3168,6 +3379,12 @@ void apply_layer_paths(Layer &layer)
                             }
                         std::vector<EmissionTransition> transitions;
                         transitions.reserve(resolved.applied_indices.size());
+                        // The pre-copy walk reserved two outer slots per
+                        // transition along with all nested payload capacity.
+                        if (transitions.capacity() > 2 * resolved.applied_indices.size()) {
+                            builder->decline();
+                            return;
+                        }
                         for (size_t id : resolved.applied_indices)
                             transitions.push_back({active.storage_regions.at(id), active.entries.at(id)});
                         builder->applied(path, transitions, layer.bridge_aware_emission_budget.get(),
@@ -3223,46 +3440,48 @@ void apply_layer_paths(Layer &layer)
     // dependency geometry must still pass the ordinary final certificate.
     remove_stationary_construction(layer, active);
     // Capture only the final surviving complete emitter after both replay
-    // passes and stationary removal. The optional ledger owns values, never
-    // live entity addresses, when this generation finishes.
+    // passes and stationary removal. Raw survival owns values, never live
+    // entity addresses. Classification/reference work is deferred until a
+    // construction collector actually requests it after the trial model gate.
     if (layer.bridge_aware_emission_budget) {
         auto &budget = *layer.bridge_aware_emission_budget;
-        const size_t quota = emission_quota(layer);
+        size_t available = emission_quota(layer);
+        bool staged = false;
+        for (const auto &builder : layer.bridge_aware_emission_builders)
+            if (builder && builder->staged_bytes() != 0) {
+                staged = true;
+                available = std::min(available, builder->available_scratch_bytes());
+            }
+        if (!staged) available = 0;
         try {
             std::vector<EmissionPlanBinding> bindings;
-            if (emission_bindings(layer, bindings, quota / 4, budget))
+            if (emission_bindings(layer, bindings, available / 4, budget))
                 for (size_t emitter = 0; emitter < layer.bridge_aware_emission_builders.size(); ++emitter) {
                     const auto &builder = layer.bridge_aware_emission_builders[emitter];
                     if (!builder) continue;
                     std::vector<EmissionPathView> views;
                     // Old and new view buffers may coexist during growth;
                     // two thirds plus the binding quarter stays in quota.
-                    if (emission_views(layer, emitter, views, quota / 3, budget)) {
-                        layer.bridge_aware_emission_ledgers[emitter] = builder->seal(views, bindings, &budget,
+                    if (emission_views(layer, emitter, views, builder->available_scratch_bytes() / 3, budget)) {
+                        layer.bridge_aware_emission_snapshots[emitter] = builder->seal_snapshot(views, bindings, &budget,
                             [&] { if (object.print()->canceled()) throw CanceledException(); });
                         if (active_profile) active_profile->emission_capture(
-                            layer.bridge_aware_emission_ledgers[emitter] ? "captured" : builder->decline_reason());
+                            layer.bridge_aware_emission_snapshots[emitter] ? "captured" : builder->decline_reason());
                     } else if (active_profile) active_profile->emission_capture("final_views");
                 }
         } catch (const std::bad_alloc &) {
-            for (auto &ledger : layer.bridge_aware_emission_ledgers) ledger.reset();
+            for (auto &snapshot : layer.bridge_aware_emission_snapshots) snapshot.reset();
         }
     }
     layer.bridge_aware_emission_builders.clear();
     layer.bridge_aware_emission_budget.reset();
 }
 
-EmissionCollectionAudit audit_construction_collection(const PrintObject &object)
+static std::string construction_collection_difference(const PrintObject &object,
+    const std::vector<Target> &actual, const std::vector<Target> &reference)
 {
-    if (!object.is_step_done(posInfill) || object.layers().empty())
-        throw std::logic_error("Construction collection audit requires completed infill.");
-    if (object.print()->canceled()) throw CanceledException();
-    EmissionCollectionAudit audit;
-    const auto actual = collect_targets(object, true, false, nullptr, ConstructionCollection::Emitted, &audit);
-    const auto reference = collect_targets(object, true, false, nullptr, ConstructionCollection::Reference);
     const auto mismatch = [&](size_t target, const std::string &field) {
-        audit.mismatch = "Construction target " + std::to_string(target) + " differs in " + field + ".";
-        return audit;
+        return "Construction target " + std::to_string(target) + " differs in " + field + ".";
     };
     const auto same_polyline_state = [](const Polyline &a, const Polyline &b) {
         if (a.points != b.points || a.fitting_result.size() != b.fitting_result.size()) return false;
@@ -3308,7 +3527,20 @@ EmissionCollectionAudit audit_construction_collection(const PrintObject &object)
                 return mismatch(i, "extrusion " + std::to_string(j));
         }
     }
-    audit.equal = true;
+    return {};
+}
+
+EmissionCollectionAudit audit_construction_collection(const PrintObject &object)
+{
+    if (!object.is_step_done(posInfill) || object.layers().empty())
+        throw std::logic_error("Construction collection audit requires completed infill.");
+    if (object.print()->canceled()) throw CanceledException();
+    EmissionCollectionAudit audit;
+    EmissionReuseContext reuse(object);
+    const auto actual = collect_targets(object, true, false, nullptr, ConstructionCollection::Emitted, &audit, &reuse);
+    const auto reference = collect_targets(object, true, false, nullptr, ConstructionCollection::Reference);
+    audit.mismatch = construction_collection_difference(object, actual, reference);
+    audit.equal = audit.mismatch.empty();
     return audit;
 }
 
@@ -3599,6 +3831,7 @@ void PrintObject::prepare_bridge_aware_cubic()
             const auto model_proofs = prepare_model_proofs(*this, prepared_roofs.get(), roofs);
             BridgeAwareCubic::ModelFailureReplay model_replay;
             BridgeAwareCubic::SpanProofCache span_proofs;
+            EmissionReuseContext emission_reuse(*this);
             size_t trials = 0;
             const auto changed_plan_layers = [&](const auto &previous, const auto &previous_indices) {
                 std::set<size_t> changed;
@@ -3708,7 +3941,9 @@ void PrintObject::prepare_bridge_aware_cubic()
                     ProfileScope profile(ProfilePhase::GenerateChanged);
                     for (size_t index : changed) {
                         profile.layer(index);
-                        m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                        const auto *saved = emission_reuse.row(index);
+                        m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(),
+                            m_lightning_generator.get(), true, saved ? &saved->retained : nullptr);
                         if (index > 0) checked_layers.insert(index);
                         if (index + 1 < m_layers.size()) checked_layers.insert(index + 1);
                     }
@@ -3721,12 +3956,18 @@ void PrintObject::prepare_bridge_aware_cubic()
                         frozen_indices.push_back(index);
                     }
                 const auto actual = collect_targets(*this, false, false, &checked_layers);
+                const auto reject_model = [&] {
+                    // No reference/projection is requested during generation
+                    // or model checks. This trial never reached classification.
+                    if (active_profile) ++active_profile->emission_rejected_without_projection;
+                    return false;
+                };
                 // Coarsening may remove support, never adopt a different
                 // required model path to avoid its frozen support obligation.
                 if (!same_model_targets(selected, actual)) {
                     if (candidate_key) model_replay.erase(*candidate_key);
                     if (active_profile) active_profile->model_replay_entries = model_replay.size();
-                    return false;
+                    return reject_model();
                 }
                 const TargetCheck mode = active_profile && active_profile->full_trial_checks ?
                     TargetCheck::CollectFailures : TargetCheck::RejectTrial;
@@ -3767,7 +4008,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                             if (!rejected.empty()) {
                                 if (active_profile) ++active_profile->model_replay_rejections;
                                 remember_failure();
-                                return false;
+                                return reject_model();
                             }
                             if (active_profile) checked ? ++active_profile->model_replay_passes : ++active_profile->model_replay_unavailable;
                         } else if (active_profile) ++active_profile->model_replay_unavailable;
@@ -3787,12 +4028,31 @@ void PrintObject::prepare_bridge_aware_cubic()
                 }
                 for (const Failure &failure : rejected)
                     if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
-                if (!rejected.empty()) remember_failure();
+                if (!rejected.empty()) {
+                    remember_failure();
+                    return reject_model();
+                }
                 else {
                     TargetCheckContext construction_context;
                     construction_context.span_proofs = &span_proofs;
-                    rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers,
-                        ConstructionCollection::Emitted), nullptr, mode,
+                    const auto construction_targets = collect_targets(*this, true, false, &checked_layers,
+                        ConstructionCollection::Emitted, nullptr, &emission_reuse);
+                    if (active_profile && active_profile->audit_emission_collection) {
+                        const auto reference = collect_targets(*this, true, false, &checked_layers);
+                        const std::string mismatch = BridgeAwareCubic::construction_collection_difference(*this,
+                            construction_targets, reference);
+                        if (!mismatch.empty()) throw std::logic_error(mismatch);
+                        // Deliberately read the same generation twice in the
+                        // diagnostic audit to exercise exact cache-hit checks.
+                        // A normal passing trial requests it only once.
+                        const auto repeated = collect_targets(*this, true, false, &checked_layers,
+                            ConstructionCollection::Emitted, nullptr, &emission_reuse);
+                        const std::string repeat_mismatch = BridgeAwareCubic::construction_collection_difference(*this,
+                            repeated, reference);
+                        if (!repeat_mismatch.empty()) throw std::logic_error(repeat_mismatch);
+                        ++active_profile->emission_collection_audits;
+                    }
+                    rejected = check_targets(*this, construction_targets, nullptr, mode,
                         nullptr, &construction_context);
                     for (const Failure &failure : rejected)
                         if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
@@ -3840,18 +4100,26 @@ void PrintObject::prepare_bridge_aware_cubic()
                     }
                     prune_dependencies();
                     const auto changed = changed_plan_layers(previous, previous_indices);
+                    emission_reuse.save(*this, changed, previous);
                     const BridgeAwareCubic::ModelFailureReplay::Key candidate_key{candidate.region, candidate.refinement.id};
                     const bool verified = check_changed_layers(changed, &candidate_key);
                     if (active_profile) verified ? ++active_profile->accepted : ++active_profile->rejected;
-                    if (verified) accepted = true;
+                    if (verified) {
+                        accepted = true;
+                        emission_reuse.accept(changed);
+                    }
                     else {
                         m_bridge_aware_cubic_plans = std::move(previous);
                         demand_indices = previous_indices;
+                        emission_reuse.discard_candidate(changed);
                         ProfileScope profile(ProfilePhase::GenerateRollback);
                         for (size_t index : changed) {
                             profile.layer(index);
-                            m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                            m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(),
+                                m_lightning_generator.get(), false);
+                            emission_reuse.restore(*m_layers[index], index);
                         }
+                        emission_reuse.accept(changed);
                     }
                 }
                 // A shared interface partition is a complete construction
@@ -3895,18 +4163,26 @@ void PrintObject::prepare_bridge_aware_cubic()
                         }
                         prune_dependencies();
                         const auto changed = changed_plan_layers(previous, previous_indices);
+                        emission_reuse.save(*this, changed, previous);
                         const bool verified = check_changed_layers(changed);
                         if (active_profile) verified ? ++active_profile->accepted : ++active_profile->rejected;
-                        if (verified) accepted = true;
+                        if (verified) {
+                            accepted = true;
+                            emission_reuse.accept(changed);
+                        }
                         else {
                             m_bridge_aware_cubic_plans = std::move(previous);
                             demand_indices = previous_indices;
                             closures[owner] = previous_closures;
+                            emission_reuse.discard_candidate(changed);
                             ProfileScope profile(ProfilePhase::GenerateRollback);
                             for (size_t index : changed) {
                                 profile.layer(index);
-                                m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                                m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(),
+                                    m_lightning_generator.get(), false);
+                                emission_reuse.restore(*m_layers[index], index);
                             }
+                            emission_reuse.accept(changed);
                         }
                     }
                 }

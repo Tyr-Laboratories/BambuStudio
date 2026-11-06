@@ -203,7 +203,70 @@ struct EmissionLedgerState {
     size_t bytes = 0;
 };
 
+struct EmissionSnapshotState {
+    size_t emitter = 0;
+    double z = 0.;
+    EmissionReference reference;
+    std::vector<EmissionPlanBinding> plans;
+    std::vector<EmissionTransition> active;
+    std::vector<LineSource> sources;
+    std::vector<size_t> partition_table;
+    std::vector<EmissionSnapshotRecord> records;
+    size_t bytes = 0, items = 0, vertices = 0;
+};
+
+struct EmissionProjectionState {
+    EmissionSnapshotPtr snapshot;
+    std::vector<EmissionClassification> records;
+    size_t bytes = 0;
+};
+
+struct EmissionDeltaState {
+    EmissionSnapshotPtr before, after;
+    std::vector<EmissionMatch> matches;
+    std::vector<size_t> removed, added;
+    bool order_changed = false, context_changed = false;
+    size_t bytes = 0;
+};
+
 namespace {
+// Views let eager and lazy projection share exactly the same classifier and
+// lineage predicates. No raw path, source or attachment payload is copied.
+struct ProjectedRecord {
+    const ExtrusionPath &path;
+    size_t source_index;
+    const std::vector<EmissionTransition> &transitions;
+    bool &construction, &mask_full_path;
+    std::vector<CellId> &partition_owners;
+    std::vector<size_t> &attachment_indices;
+    ProjectedRecord(const EmissionSnapshotRecord &raw, EmissionClassification &derived)
+        : path(raw.path), source_index(raw.source_index), transitions(raw.transitions),
+          construction(derived.construction), mask_full_path(derived.mask_full_path),
+          partition_owners(derived.partition_owners), attachment_indices(derived.attachment_indices) {}
+};
+
+struct ProjectionView {
+    const EmissionSnapshotState &raw;
+    EmissionProjectionState &output;
+    const ReferenceLineBatch &batch;
+    const size_t emitter;
+    const EmissionReference &reference;
+    const std::vector<EmissionTransition> &active;
+    const std::vector<LineSource> &sources;
+    const std::vector<size_t> &partition_table;
+    const Polylines &reference_paths;
+    const std::vector<size_t> &reference_sources;
+    const std::vector<std::pair<CellId, Polylines>> &reference_partitions;
+    const bool reference_bound = true;
+    std::vector<ProjectedRecord> records;
+    size_t bytes = 0;
+    ProjectionView(const EmissionSnapshotState &input, EmissionProjectionState &result,
+                   const ReferenceLineBatch &broad)
+        : raw(input), output(result), batch(broad), emitter(input.emitter), reference(input.reference),
+          active(input.active), sources(input.sources), partition_table(input.partition_table),
+          reference_paths(broad.paths), reference_sources(broad.source_for_path), reference_partitions(broad.partitions) {}
+};
+
 size_t measure(const EmissionLedgerState &state, Work &work, size_t limit, size_t *items = nullptr)
 {
     Measure m{work, limit};
@@ -221,6 +284,46 @@ size_t measure(const EmissionLedgerState &state, Work &work, size_t limit, size_
         m.line(record.path.polyline); m.array(record.partition_owners);
         m.transitions(record.transitions); m.array(record.attachment_indices);
     }
+    if (items) *items = m.items;
+    return m.bytes;
+}
+
+size_t measure_snapshot(EmissionSnapshotState &state, Work &work, size_t limit)
+{
+    Measure m{work, limit};
+    m.add(sizeof(EmissionSnapshotState) + sizeof(EmissionSnapshot) + 128);
+    m.array(state.plans); m.add(state.plans.size(), 128);
+    m.transitions(state.active); m.sources(state.sources); m.array(state.partition_table); m.array(state.records);
+    for (const auto &record : state.records) {
+        m.line(record.path.polyline); m.transitions(record.transitions);
+    }
+    state.items = m.items;
+    state.vertices = m.vertices;
+    return m.bytes;
+}
+
+void measure_reference(Measure &m, const ReferenceLineBatch &batch)
+{
+    m.add(sizeof(ReferenceLineBatch) + 128);
+    m.lines(batch.paths); m.array(batch.source_for_path); m.sources(batch.sources); m.partitions(batch.partitions);
+}
+
+void measure_projection(Measure &m, const EmissionProjectionState &state)
+{
+    m.add(sizeof(EmissionProjectionState) + sizeof(EmissionProjection) + 128);
+    m.array(state.records);
+    for (const auto &record : state.records) {
+        m.array(record.partition_owners); m.array(record.attachment_indices);
+    }
+}
+
+size_t measure(const ProjectionView &state, Work &work, size_t limit, size_t *items = nullptr)
+{
+    Measure m{work, limit};
+    m.add(state.raw.bytes);
+    m.items = state.raw.items; m.vertices = state.raw.vertices;
+    measure_reference(m, state.batch); measure_projection(m, state.output);
+    m.add(sizeof(ProjectionView)); m.array(state.records);
     if (items) *items = m.items;
     return m.bytes;
 }
@@ -331,7 +434,8 @@ Point at(const LineSource &source, double position, bool reverse)
     return Point(coord_t(std::llround(point.x())), coord_t(std::llround(point.y())));
 }
 
-void classify(EmissionLedgerState &state, Work &work, size_t state_and_temporary_limit)
+template<class State>
+void classify(State &state, Work &work, size_t state_and_temporary_limit)
 {
     const auto &box = state.reference.classification_bounds;
     const long double mask_radius = state.reference.tolerance_mm / SCALING_FACTOR;
@@ -481,7 +585,8 @@ void classify(EmissionLedgerState &state, Work &work, size_t state_and_temporary
 // Compare the complete legacy applicable-index union against actual replay.
 // Starting at every active original is necessary: a convergent alternate
 // chain need not have been the path that the filler emitted.
-void lineage(EmissionLedgerState &state, EmissionRecord &record, Work &work)
+template<class State, class Record>
+void lineage(const State &state, Record &record, Work &work)
 {
     std::vector<size_t> applicable;
     for (size_t start = 0; start < state.active.size(); ++start) {
@@ -872,6 +977,311 @@ EmissionLedgerPtr EmissionLedgerBuilder::seal(const std::vector<EmissionPathView
         work.poll();
         EmissionLedgerPtr ledger(new EmissionLedger(std::move(m_state)));
         return ledger;
+    } catch (const CallbackError &e) { decline(); std::rethrow_exception(e.exception); }
+      catch (const Unavailable &e) { m_decline_reason = e.reason ? e.reason : "seal"; }
+      catch (const std::bad_alloc &) { m_decline_reason = "allocation"; }
+    decline(); return {};
+}
+
+EmissionSnapshot::EmissionSnapshot(std::unique_ptr<EmissionSnapshotState> state) : m_state(std::move(state)) {}
+EmissionSnapshot::~EmissionSnapshot() = default;
+bool EmissionSnapshot::matches(size_t emitter, double z, const EmissionReference &reference,
+    const std::vector<EmissionPlanBinding> &plans, const std::vector<EmissionPathView> &paths,
+    BridgeAwareCubicValidation::WorkBudget *budget, const EmissionCancel &cancel) const
+{
+    try {
+        Work work(budget, cancel);
+        work.charge();
+        const auto &s = *m_state;
+        if (emitter != s.emitter || z != s.z || reference.tolerance_mm != s.reference.tolerance_mm ||
+            reference.classification_bounds.defined != s.reference.classification_bounds.defined ||
+            reference.classification_bounds.min != s.reference.classification_bounds.min ||
+            reference.classification_bounds.max != s.reference.classification_bounds.max ||
+            paths.size() != s.records.size() || !same_bindings(plans, s.plans, work)) return false;
+        for (size_t i = 0; i < paths.size(); ++i)
+            if (!paths[i].path || !paths[i].free_ended || !same_path(*paths[i].path, s.records[i].path, work)) return false;
+        work.poll();
+        return true;
+    } catch (const CallbackError &e) { std::rethrow_exception(e.exception); }
+      catch (const Unavailable &) { return false; }
+}
+size_t EmissionSnapshot::emitting_region() const noexcept { return m_state->emitter; }
+double EmissionSnapshot::print_z() const noexcept { return m_state->z; }
+const EmissionReference &EmissionSnapshot::reference() const noexcept { return m_state->reference; }
+const std::vector<EmissionPlanBinding> &EmissionSnapshot::plan_bindings() const noexcept { return m_state->plans; }
+const std::vector<EmissionSnapshotRecord> &EmissionSnapshot::records() const noexcept { return m_state->records; }
+const std::vector<LineSource> &EmissionSnapshot::sources() const noexcept { return m_state->sources; }
+const std::vector<EmissionTransition> &EmissionSnapshot::active_attachments() const noexcept { return m_state->active; }
+size_t EmissionSnapshot::owned_bytes() const noexcept { return m_state->bytes; }
+size_t EmissionSnapshot::resident_bytes() const noexcept { return m_state->bytes; }
+
+EmissionProjection::EmissionProjection(std::unique_ptr<EmissionProjectionState> state) : m_state(std::move(state)) {}
+EmissionProjection::~EmissionProjection() = default;
+const EmissionSnapshotPtr &EmissionProjection::snapshot() const noexcept { return m_state->snapshot; }
+const std::vector<EmissionClassification> &EmissionProjection::records() const noexcept { return m_state->records; }
+size_t EmissionProjection::owned_bytes() const noexcept { return m_state->bytes; }
+size_t EmissionProjection::resident_bytes() const noexcept { return m_state->bytes + m_state->snapshot->resident_bytes(); }
+
+EmissionDelta::EmissionDelta(std::unique_ptr<EmissionDeltaState> state) : m_state(std::move(state)) {}
+EmissionDelta::~EmissionDelta() = default;
+const EmissionSnapshotPtr &EmissionDelta::before() const noexcept { return m_state->before; }
+const EmissionSnapshotPtr &EmissionDelta::after() const noexcept { return m_state->after; }
+const std::vector<EmissionMatch> &EmissionDelta::matches() const noexcept { return m_state->matches; }
+const std::vector<size_t> &EmissionDelta::removed() const noexcept { return m_state->removed; }
+const std::vector<size_t> &EmissionDelta::added() const noexcept { return m_state->added; }
+bool EmissionDelta::order_changed() const noexcept { return m_state->order_changed; }
+bool EmissionDelta::classification_context_changed() const noexcept { return m_state->context_changed; }
+size_t EmissionDelta::owned_bytes() const noexcept { return m_state->bytes; }
+size_t EmissionDelta::resident_bytes() const noexcept
+{
+    return m_state->bytes + m_state->before->resident_bytes() +
+        (m_state->before == m_state->after ? 0 : m_state->after->resident_bytes());
+}
+
+EmissionProjectionPtr project_emissions(const EmissionSnapshotPtr &snapshot, ReferenceLineBatch &&batch,
+    EmissionLedgerLimits limits, BridgeAwareCubicValidation::WorkBudget *budget,
+    const EmissionCancel &cancel, size_t additional_scratch_bytes)
+{
+    try {
+        Work work(budget, cancel);
+        work.charge();
+        if (!snapshot) throw Unavailable{};
+        const auto &raw = *snapshot->m_state;
+        const size_t limit = allowance(limits);
+        Measure input{work, limit};
+        input.add(raw.bytes); input.items = raw.items; input.vertices = raw.vertices;
+        input.add(additional_scratch_bytes); measure_reference(input, batch);
+        const auto &box = raw.reference.classification_bounds;
+        if (!batch.complete || batch.z != raw.z || !batch.bounds.defined || batch.bounds.min != box.min ||
+            batch.bounds.max != box.max || batch.sources.size() != raw.partition_table.size() ||
+            batch.paths.size() != batch.source_for_path.size()) throw Unavailable{"reference"};
+        bool identity = false;
+        for (const auto &binding : raw.plans) {
+            work.charge();
+            identity |= binding.storage_region == raw.emitter && binding.identity == batch.plan_identity;
+        }
+        if (!identity) throw Unavailable{"reference"};
+        for (size_t i = 0; i < batch.sources.size(); ++i)
+            if (!same_source(batch.sources[i], raw.sources.at(raw.partition_table[i]), work))
+                throw Unavailable{"reference"};
+        for (size_t i = 0; i < batch.paths.size(); ++i) {
+            work.charge();
+            if (batch.source_for_path[i] >= batch.sources.size() || batch.paths[i].size() != 2 ||
+                !linear(batch.paths[i], work)) throw Unavailable{"reference_shape"};
+        }
+        for (size_t i = 0; i < batch.partitions.size(); ++i) {
+            work.charge();
+            if ((i && !(batch.partitions[i - 1].first < batch.partitions[i].first)) || batch.partitions[i].second.empty())
+                throw Unavailable{"reference"};
+            for (const auto &line : batch.partitions[i].second)
+                if (line.size() != 2 || !linear(line, work)) throw Unavailable{"reference_shape"};
+        }
+        const size_t active_count = raw.active.size();
+        if (active_count > 1024) throw Unavailable{"lineage_capacity"};
+        const size_t lineage_scratch = (active_count * active_count + 4 * active_count + 16) * sizeof(size_t) * 2;
+        // Admit the entire initial simultaneous peak before allocating. Later
+        // derived-vector growth is checked by the same eager classifier.
+        input.add(sizeof(EmissionProjectionState) + sizeof(EmissionProjection) + 128 + sizeof(ProjectionView));
+        input.add(raw.records.size(), sizeof(EmissionClassification) + sizeof(ProjectedRecord));
+        input.add(lineage_scratch);
+        auto state = std::make_unique<EmissionProjectionState>();
+        state->snapshot = snapshot;
+        state->records.resize(raw.records.size());
+        for (size_t &source : batch.source_for_path) { work.charge(); source = raw.partition_table[source]; }
+        ProjectionView view(raw, *state, batch);
+        view.records.reserve(raw.records.size());
+        for (size_t i = 0; i < raw.records.size(); ++i) {
+            work.charge(); view.records.emplace_back(raw.records[i], state->records[i]);
+        }
+        const size_t available = remaining(limit, additional_scratch_bytes);
+        view.bytes = measure(view, work, remaining(available, lineage_scratch));
+        for (auto &record : view.records) {
+            lineage(view, record, work);
+            view.bytes = measure(view, work, remaining(available, lineage_scratch));
+        }
+        classify(view, work, available);
+        view.bytes = measure(view, work, available);
+        Measure own{work, remaining(limit, raw.bytes)};
+        measure_projection(own, *state);
+        state->bytes = own.bytes;
+        work.poll();
+        return EmissionProjectionPtr(new EmissionProjection(std::move(state)));
+    } catch (const CallbackError &e) { std::rethrow_exception(e.exception); }
+      catch (const Unavailable &) { return {}; }
+      catch (const std::bad_alloc &) { return {}; }
+}
+
+namespace {
+bool same_context(const EmissionSnapshotState &a, const EmissionSnapshotState &b, Work &work)
+{
+    work.charge();
+    if (a.emitter != b.emitter || a.z != b.z ||
+        a.reference.tolerance_mm != b.reference.tolerance_mm ||
+        a.reference.classification_bounds.defined != b.reference.classification_bounds.defined ||
+        a.reference.classification_bounds.min != b.reference.classification_bounds.min ||
+        a.reference.classification_bounds.max != b.reference.classification_bounds.max ||
+        !same_bindings(a.plans, b.plans, work) || a.partition_table.size() != b.partition_table.size() ||
+        a.active.size() != b.active.size()) return false;
+    for (size_t i = 0; i < a.partition_table.size(); ++i)
+        if (!same_source(a.sources.at(a.partition_table[i]), b.sources.at(b.partition_table[i]), work)) return false;
+    for (size_t i = 0; i < a.active.size(); ++i)
+        if (!same_transition(a.active[i], b.active[i], work)) return false;
+    return true;
+}
+bool same_provenance(const EmissionSnapshotRecord &a, const EmissionSnapshotState &before,
+                     const EmissionSnapshotRecord &b, const EmissionSnapshotState &after, Work &work)
+{
+    work.charge();
+    if (!same_source(before.sources.at(a.source_index), after.sources.at(b.source_index), work) ||
+        a.transitions.size() != b.transitions.size()) return false;
+    for (size_t i = 0; i < a.transitions.size(); ++i)
+        if (!same_transition(a.transitions[i], b.transitions[i], work)) return false;
+    return true;
+}
+struct PathFingerprint { size_t hash = 0, index = 0; };
+size_t fingerprint(const ExtrusionPath &path, Work &work)
+{
+    size_t value = 0;
+    const auto mix = [&](size_t part) { value ^= part + size_t(0x9e3779b9) + (value << 6) + (value >> 2); };
+    work.charge(5);
+    mix(std::hash<float>{}(path.width)); mix(std::hash<float>{}(path.height));
+    mix(std::hash<double>{}(path.mm3_per_mm)); mix(size_t(path.role())); mix(path.polyline.size());
+    for (const Point &point : path.polyline.points) {
+        work.charge(); mix(std::hash<coord_t>{}(point.x())); mix(std::hash<coord_t>{}(point.y()));
+    }
+    // Remaining metadata is deliberately resolved by exact same_path below.
+    // A hash collision can only spend work, never establish correspondence.
+    return value;
+}
+void measure_delta(Measure &m, const EmissionDeltaState &state)
+{
+    m.add(sizeof(EmissionDeltaState) + sizeof(EmissionDelta) + 128);
+    m.array(state.matches); m.array(state.removed); m.array(state.added);
+}
+}
+
+EmissionDeltaPtr compare_emissions(const EmissionSnapshotPtr &before, const EmissionSnapshotPtr &after,
+    EmissionLedgerLimits limits, BridgeAwareCubicValidation::WorkBudget *budget, const EmissionCancel &cancel)
+{
+    try {
+        Work work(budget, cancel);
+        work.charge();
+        if (!before || !after || before->emitting_region() != after->emitting_region()) throw Unavailable{};
+        const auto &a = *before->m_state, &b = *after->m_state;
+        const size_t limit = allowance(limits);
+        Measure input{work, limit};
+        input.add(a.bytes); input.items = a.items; input.vertices = a.vertices;
+        if (before != after) {
+            input.add(b.bytes);
+            if (b.items > max_items - input.items || b.vertices > max_vertices - input.vertices) throw Unavailable{};
+            input.items += b.items; input.vertices += b.vertices;
+        }
+        const size_t raw_bytes = input.bytes;
+        input.add(sizeof(EmissionDeltaState) + sizeof(EmissionDelta) + 128);
+        input.add(a.records.size(), sizeof(PathFingerprint) + sizeof(unsigned char));
+        input.add(a.records.size() + b.records.size(), sizeof(size_t));
+        input.add(std::min(a.records.size(), b.records.size()), sizeof(EmissionMatch));
+        auto state = std::make_unique<EmissionDeltaState>();
+        state->before = before; state->after = after;
+        state->matches.reserve(std::min(a.records.size(), b.records.size()));
+        state->removed.reserve(a.records.size()); state->added.reserve(b.records.size());
+        std::vector<PathFingerprint> index;
+        std::vector<unsigned char> used(a.records.size(), 0);
+        index.reserve(a.records.size());
+        for (size_t i = 0; i < a.records.size(); ++i) index.push_back({fingerprint(a.records[i].path, work), i});
+        const auto less = [&](const PathFingerprint &x, const PathFingerprint &y) {
+            work.charge(); return x.hash < y.hash || (x.hash == y.hash && x.index < y.index);
+        };
+        std::sort(index.begin(), index.end(), less);
+        // Allocators may reserve more than requested; verify actual capacities
+        // while all buffers are live, before interpreting any correspondence.
+        Measure live{work, limit};
+        live.add(raw_bytes); live.items = input.items; live.vertices = input.vertices;
+        measure_delta(live, *state); live.array(index); live.array(used);
+        state->context_changed = !same_context(a, b, work);
+        bool have_previous = false;
+        size_t previous = 0;
+        for (size_t i = 0; i < b.records.size(); ++i) {
+            const size_t hash = fingerprint(b.records[i].path, work);
+            size_t found = a.records.size();
+            if (a.z == b.z) {
+                auto entry = std::lower_bound(index.begin(), index.end(), PathFingerprint{hash, 0}, less);
+                for (; entry != index.end() && entry->hash == hash; ++entry) {
+                    work.charge();
+                    if (!used[entry->index] && same_path(a.records[entry->index].path, b.records[i].path, work)) {
+                        found = entry->index; break;
+                    }
+                }
+            }
+            if (found == a.records.size()) state->added.push_back(i);
+            else {
+                used[found] = 1;
+                state->order_changed |= have_previous && found < previous;
+                previous = found; have_previous = true;
+                state->matches.push_back({found, i, !same_provenance(a.records[found], a, b.records[i], b, work)});
+            }
+        }
+        for (size_t i = 0; i < used.size(); ++i) { work.charge(); if (!used[i]) state->removed.push_back(i); }
+        Measure final_live{work, limit};
+        final_live.add(raw_bytes); final_live.items = input.items; final_live.vertices = input.vertices;
+        measure_delta(final_live, *state); final_live.array(index); final_live.array(used);
+        Measure own{work, remaining(limit, raw_bytes)};
+        measure_delta(own, *state);
+        state->bytes = own.bytes;
+        work.poll();
+        return EmissionDeltaPtr(new EmissionDelta(std::move(state)));
+    } catch (const CallbackError &e) { std::rethrow_exception(e.exception); }
+      catch (const Unavailable &) { return {}; }
+      catch (const std::bad_alloc &) { return {}; }
+}
+
+EmissionSnapshotPtr EmissionLedgerBuilder::seal_snapshot(const std::vector<EmissionPathView> &paths,
+    const std::vector<EmissionPlanBinding> &plans, BridgeAwareCubicValidation::WorkBudget *budget,
+    const EmissionCancel &cancel)
+{
+    try {
+        Work work(budget, cancel);
+        if (!m_state) return {};
+        const size_t limit = allowance(m_limits);
+        Measure input{work, remaining(limit, m_state->bytes)};
+        input.array(paths); input.array(plans);
+        if (!m_state->bound || !same_bindings(plans, m_state->plans, work)) throw Unavailable{"seal_context"};
+        auto &old = *m_state;
+        size_t live = 0;
+        for (size_t i = 0; i < old.records.size(); ++i) {
+            work.charge();
+            if (old.handles[i] == nullptr) continue;
+            if (live == paths.size() || !paths[live].path || !paths[live].free_ended ||
+                paths[live].path != old.handles[i] || !same_path(*paths[live].path, old.records[i].path, work))
+                throw Unavailable{"seal_survival"};
+            if (live != i) old.records[live] = std::move(old.records[i]);
+            ++live;
+        }
+        if (live != paths.size()) throw Unavailable{"seal_leaf_count"};
+        old.records.resize(live);
+        // Only outer record storage is new; paths/transitions and common tables
+        // move once. Admit old + new outer buffers before that private transfer.
+        Measure growth{work, remaining(remaining(limit, old.bytes), input.bytes)};
+        growth.add(sizeof(EmissionSnapshotState) + sizeof(EmissionSnapshot) + 128);
+        growth.add(live, sizeof(EmissionSnapshotRecord));
+        auto state = std::make_unique<EmissionSnapshotState>();
+        state->records.reserve(live);
+        if (state->records.capacity() > remaining(growth.limit,
+                sizeof(EmissionSnapshotState) + sizeof(EmissionSnapshot) + 128) / sizeof(EmissionSnapshotRecord))
+            throw Unavailable{"work_or_capacity"};
+        state->emitter = old.emitter; state->z = old.z; state->reference = old.reference;
+        state->plans = std::move(old.plans); state->active = std::move(old.active);
+        state->sources = std::move(old.sources); state->partition_table = std::move(old.partition_table);
+        for (auto &record : old.records) {
+            work.charge();
+            state->records.push_back({std::move(record.path), record.source_index, std::move(record.transitions)});
+        }
+        // Discard event handles and any eager reference geometry before final
+        // publication. No classification or lineage resolver is called here.
+        m_state.reset();
+        state->bytes = measure_snapshot(*state, work, remaining(limit, input.bytes));
+        work.poll();
+        return EmissionSnapshotPtr(new EmissionSnapshot(std::move(state)));
     } catch (const CallbackError &e) { decline(); std::rethrow_exception(e.exception); }
       catch (const Unavailable &e) { m_decline_reason = e.reason ? e.reason : "seal"; }
       catch (const std::bad_alloc &) { m_decline_reason = "allocation"; }

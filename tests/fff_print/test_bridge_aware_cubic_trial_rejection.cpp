@@ -40,7 +40,8 @@ struct TrialEnvironment {
 
     TrialEnvironment()
     {
-        for (const char *name : {"BAC_PROFILE_FILE", "BAC_PROFILE_STAGE", "BAC_PROFILE_FULL_TRIAL_CHECKS"}) {
+        for (const char *name : {"BAC_PROFILE_FILE", "BAC_PROFILE_STAGE", "BAC_PROFILE_FULL_TRIAL_CHECKS",
+                                 "BAC_PROFILE_AUDIT_EMISSION_COLLECTION"}) {
             const char *value = std::getenv(name);
             previous.emplace(name, value == nullptr ? std::nullopt : std::optional<std::string>(value));
         }
@@ -62,6 +63,7 @@ struct TrialEnvironment {
         REQUIRE(set("BAC_PROFILE_FILE", file.c_str()) == 0);
         REQUIRE(set("BAC_PROFILE_STAGE", "process") == 0);
         REQUIRE(set("BAC_PROFILE_FULL_TRIAL_CHECKS", exhaustive ? "1" : nullptr) == 0);
+        REQUIRE(set("BAC_PROFILE_AUDIT_EMISSION_COLLECTION", exhaustive ? nullptr : "1") == 0);
         return file;
     }
 };
@@ -283,6 +285,15 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
         REQUIRE(result.counters.at("span_proof_entries").get<size_t>() <= 20000);
         REQUIRE(result.counters.at("span_proof_units").get<size_t>() > 0);
         REQUIRE(result.counters.at("span_proof_units").get<size_t>() <= 200000);
+        // Exercise deferred classification and exact rollback reuse on real
+        // regenerated fills. Complete output/Plan parity is checked below;
+        // these counters ensure the optimized lifecycle was actually used.
+        REQUIRE(result.counters.at("emission_projection_builds").get<size_t>() > 0);
+        REQUIRE(result.counters.at("emission_projection_reuses").get<size_t>() > 0);
+        REQUIRE(result.counters.at("emission_rollback_restored").get<size_t>() > 0);
+        REQUIRE(result.counters.at("emission_rollback_mismatches").get<size_t>() == 0);
+        REQUIRE(result.counters.at("emission_rejected_without_projection").get<size_t>() > 0);
+        REQUIRE(result.counters.at("emission_collection_audits").get<size_t>() > 0);
     }
     return result;
 }
