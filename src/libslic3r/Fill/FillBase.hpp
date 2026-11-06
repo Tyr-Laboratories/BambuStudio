@@ -56,6 +56,8 @@ struct FillParams
     double      filter_out_gap_fill { 0.0 };
     // Fill density, fraction in <0, 1>
     float       density 		{ 0.f };
+    // Separate bridge pitch from solid spacing, which also determines strand flow.
+    float       bridge_layer_density { 1.f };
     int         multiline       { 1 };
 
     // Length of an infill anchor along the perimeter.

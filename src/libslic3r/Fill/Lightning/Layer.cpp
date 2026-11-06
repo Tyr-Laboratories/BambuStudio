@@ -440,7 +440,7 @@ Polylines Layer::convertToLines(const Polygons& limit_to_outline, const coord_t 
 
     Polylines result_lines;
     for (const auto &tree : tree_roots)
-        tree->convertToPolylines(result_lines, line_overlap);
+        tree->convertToPolylines(result_lines, line_overlap, m_stable_traversal);
 
     return intersection_pl(result_lines, limit_to_outline);
 }

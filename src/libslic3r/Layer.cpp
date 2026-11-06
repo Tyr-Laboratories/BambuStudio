@@ -185,6 +185,7 @@ bool Layer::has_compatible_layer_regions(const PrintRegionConfig &config, const 
            && config.opt_serialize("outer_wall_line_width") == other_config.opt_serialize("outer_wall_line_width")
            && config.detect_thin_wall == other_config.detect_thin_wall
            && config.infill_wall_overlap == other_config.infill_wall_overlap
+           && config.bridge_line_travel_extend == other_config.bridge_line_travel_extend
            && config.override_filament_scarf_seam_setting == other_config.override_filament_scarf_seam_setting
            && config.seam_slope_type == other_config.seam_slope_type
            && config.seam_slope_start_height == other_config.seam_slope_start_height
@@ -205,8 +206,11 @@ void Layer::make_perimeters()
     BOOST_LOG_TRIVIAL(trace) << "Generating perimeters for layer " << this->id();
     // keep track of regions whose perimeters we have already generated
     std::vector<unsigned char> done(m_regions.size(), false);
-    for (auto *region:m_regions)
+    for (auto *region:m_regions) {
         region->has_slope_wall_reinforcement=false;
+        region->bridge_fill_expolygons.clear();
+        region->bridge_fill_overlap_delta = 0;
+    }
 
     for (LayerRegionPtrs::iterator layerm = m_regions.begin(); layerm != m_regions.end(); ++ layerm)
     	if ((*layerm)->slices.empty()) {
@@ -253,7 +257,9 @@ void Layer::make_perimeters()
 	        if (layerms.size() == 1) {  // optimization
 	            (*layerm)->fill_surfaces.surfaces.clear();
                 (*layerm)->fill_no_overlap_expolygons.clear();
-                (*layerm)->make_perimeters((*layerm)->slices, perimeter_regions, &(*layerm)->fill_surfaces, &(*layerm)->fill_no_overlap_expolygons, this->loop_nodes);
+                (*layerm)->bridge_fill_expolygons.clear();
+                (*layerm)->bridge_fill_overlap_delta = 0;
+                (*layerm)->make_perimeters((*layerm)->slices, perimeter_regions, &(*layerm)->fill_surfaces, &(*layerm)->fill_no_overlap_expolygons, &(*layerm)->bridge_fill_expolygons, &(*layerm)->bridge_fill_overlap_delta, this->loop_nodes);
 
 	            (*layerm)->fill_expolygons = to_expolygons((*layerm)->fill_surfaces.surfaces);
 	        } else {
@@ -280,8 +286,9 @@ void Layer::make_perimeters()
 	            // make perimeters
 	            SurfaceCollection fill_surfaces;
                 //BBS
-                ExPolygons fill_no_overlap;
-                (*layerm)->make_perimeters(new_slices, perimeter_regions, &fill_surfaces, &fill_no_overlap, this->loop_nodes);
+                ExPolygons fill_no_overlap, bridge_fill;
+                coord_t bridge_overlap_delta = 0;
+                (*layerm)->make_perimeters(new_slices, perimeter_regions, &fill_surfaces, &fill_no_overlap, &bridge_fill, &bridge_overlap_delta, this->loop_nodes);
 
 	            // assign fill_surfaces to each layer
 	            if (!fill_surfaces.surfaces.empty()) {
@@ -292,6 +299,8 @@ void Layer::make_perimeters()
 	                    (*l)->fill_surfaces.set(std::move(expp), fill_surfaces.surfaces.front());
                         //BBS: Separate fill_no_overlap
                         (*l)->fill_no_overlap_expolygons = intersection_ex((*l)->slices.surfaces, fill_no_overlap);
+                        (*l)->bridge_fill_expolygons = intersection_ex((*l)->slices.surfaces, bridge_fill);
+                        (*l)->bridge_fill_overlap_delta = bridge_overlap_delta;
 	                }
 	            }
 	        }

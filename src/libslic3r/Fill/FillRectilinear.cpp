@@ -2841,6 +2841,8 @@ bool FillRectilinear::fill_surface_by_lines(const Surface *surface, const FillPa
     assert(params.density > 0.0001f && params.density <= 1.f);
     coord_t line_spacing = coord_t(scale_(this->spacing) / params.density);
 
+    const bool bridge_controls = surface->is_bridge() && params.extrusion_role == erBridgeInfill;
+
     // On the polygons of poly_with_offset, the infill lines will be connected.
     ExPolygonWithOffset poly_with_offset(
         surface->expolygon,
@@ -2875,12 +2877,18 @@ bool FillRectilinear::fill_surface_by_lines(const Surface *surface, const FillPa
             refpt));
     }
 
+    if (bridge_controls && params.bridge_layer_density < 1.f)
+        line_spacing = coord_t(std::round(line_spacing / std::clamp(params.bridge_layer_density, 0.01f, 1.f)));
+
     // Intersect a set of euqally spaced vertical lines wiht expolygon.
     // n_vlines = ceil(bbox_width / line_spacing)
     size_t  n_vlines = (bounding_box.max(0) - bounding_box.min(0) + line_spacing - 1) / line_spacing;
 	coord_t x0 = bounding_box.min(0);
 	if (params.full_infill())
-		x0 += (line_spacing + coord_t(SCALED_EPSILON)) / 2;
+        // At the allowed 1% density the pitch may exceed the entire region.
+        // Keep one centered strand instead of silently omitting the bridge.
+        x0 += (bridge_controls && params.bridge_layer_density < 1.f && line_spacing > bounding_box.size().x()) ?
+            bounding_box.size().x() / 2 : (line_spacing + coord_t(SCALED_EPSILON)) / 2;
 
     int gap_line = params.horiz_move / line_spacing;
     if (gap_line % 2 == 0) {

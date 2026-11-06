@@ -56,6 +56,8 @@ public:
     SurfaceCollection           *fill_surfaces;
     //BBS
     ExPolygons                  *fill_no_overlap;
+    ExPolygons                  *bridge_fill = nullptr;
+    coord_t                     *bridge_overlap_delta = nullptr;
 
     //BBS
     Flow                        smaller_ext_perimeter_flow;

@@ -10,10 +10,11 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 
-from tyr_cloud_helper.build_runtime import sha256_file, stage_runtime, validate_runtime
+from tyr_cloud_helper.build_runtime import sha256_file, stage_runtime, validate_runtime, forbidden_plugin_path
 
 
 def run(*args):
@@ -54,16 +55,71 @@ def audit(binary, frameworks, minimum):
             raise RuntimeError(f"Nonportable runtime search path: {path}")
 
 
+def audit_public_app_payloads(app):
+    for candidate in app.rglob('*'):
+        if forbidden_plugin_path(candidate.name):
+            raise RuntimeError(f"Public app contains a vendor plugin payload: {candidate.relative_to(app)}")
+        if candidate.suffix.lower() == '.app' and candidate.is_dir():
+            raise RuntimeError("Public app contains a nested application; use the unbundled Tyr build")
+
+
+def stage_public_app(source, target):
+    shutil.copytree(source, target, symlinks=False,
+                    ignore=shutil.ignore_patterns(".DS_Store", "_CodeSignature"))
+    # Build apps commonly link Contents/Resources to the source checkout.
+    # Audit the materialized tree that will actually be signed and released;
+    # Path.rglob on the input does not descend through directory symlinks.
+    audit_public_app_payloads(target)
+
+
+def native_license_inventory(directory):
+    if directory.is_symlink() or not directory.is_dir():
+        raise RuntimeError(f"Native licenses must be a real directory, not a symlink: {directory}")
+    hashes = {}
+    for candidate in sorted(directory.rglob('*')):
+        mode = candidate.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"Native licenses contain a nonregular file or symlink: {candidate}")
+        hashes[candidate.relative_to(directory).as_posix()] = sha256_file(candidate)
+    if not hashes:
+        raise RuntimeError(f"Native license notice directory is empty: {directory}")
+    return hashes
+
+
+def verify_native_licenses(directory, expected):
+    if native_license_inventory(directory) != expected:
+        raise RuntimeError("Native license notice inventory or checksum changed")
+
+
+def stage_native_licenses(source, target):
+    if target.exists() or target.is_symlink():
+        raise RuntimeError(f"Native license destination already exists: {target}")
+    resolved_source, resolved_target = source.resolve(), target.resolve()
+    if (resolved_source == resolved_target or resolved_source in resolved_target.parents
+            or resolved_target in resolved_source.parents):
+        raise RuntimeError("Native license source and destination overlap")
+    hashes = native_license_inventory(source)
+    # Do not dereference a symlink introduced between inspection and copying.
+    # The second inventory rejects any such link as well as changed bytes.
+    shutil.copytree(source, target, symlinks=True)
+    verify_native_licenses(target, hashes)
+    return hashes
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", required=True, type=Path)
     parser.add_argument("--cloud-helper-runtime", type=Path, required=True,
-                        help="Verified immutable cloud upload helper artifact built by scripts/tyr_cloud_helper/build_runtime.py")
+                        help="Verified public cloud runtime (schema 2, vendor plugin downloaded by the installed app)")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--zstd", required=True, type=Path)
     parser.add_argument("--imath", required=True, type=Path)
     parser.add_argument("--zstd-license", required=True, type=Path)
     parser.add_argument("--imath-license", required=True, type=Path)
+    parser.add_argument("--native-licenses", required=True, type=Path,
+                        help="Verified native corresponding-source LICENSES directory; no symlinks or special files")
     parser.add_argument("--release", required=True)
     parser.add_argument("--minimum-macos", default="14.0")
     args = parser.parse_args()
@@ -75,16 +131,17 @@ def main():
         parser.error("commit tracked changes before packaging so the source revision is exact")
     if args.cloud_helper_runtime:
         validate_runtime(args.cloud_helper_runtime)
+    native_license_inventory(args.native_licenses)
     if (args.app / "Contents/Resources/cloud-helper").exists():
         parser.error("input app already contains a helper runtime; use the build app and --cloud-helper-runtime separately")
+    audit_public_app_payloads(args.app)
     for source in (args.app / "Contents/MacOS/BambuStudio", args.zstd, args.imath,
                    args.zstd_license, args.imath_license):
         if not source.is_file():
             parser.error(f"missing input: {source}")
     args.output.mkdir(parents=True, exist_ok=False)
     app = args.output / "BambuStudio.app"
-    shutil.copytree(args.app, app, symlinks=False,
-                    ignore=shutil.ignore_patterns(".DS_Store", "_CodeSignature"))
+    stage_public_app(args.app, app)
     contents = app / "Contents"
     frameworks = contents / "Frameworks"
     frameworks.mkdir(exist_ok=True)
@@ -112,7 +169,7 @@ def main():
     info = plistlib.loads(plist_path.read_bytes())
     info["LSMinimumSystemVersion"] = args.minimum_macos
     info["CFBundleVersion"] = info["CFBundleShortVersionString"]
-    info["CFBundleGetInfoString"] = "Tyr Laboratories Wall Painting " + args.release
+    info["CFBundleGetInfoString"] = "Tyr Laboratories Bambu Studio " + args.release
     plist_path.write_bytes(plistlib.dumps(info))
     resources = contents / "Resources"
     notices = resources / "TyrFork"
@@ -134,6 +191,10 @@ def main():
             "zstd": {"version": "1.5.7", "source": "https://github.com/facebook/zstd/releases/tag/v1.5.7"},
             "Imath": {"version": "3.2.3", "source": "https://github.com/AcademySoftwareFoundation/Imath/releases/tag/v3.2.3"},
         },
+        "native_licenses": {
+            "path": "Contents/Resources/TyrFork/native-licenses",
+            "hashes": stage_native_licenses(args.native_licenses, notices / "native-licenses"),
+        },
     }
     if args.cloud_helper_runtime:
         manifest["cloud_helper"] = stage_runtime(args.cloud_helper_runtime, resources / "cloud-helper")
@@ -146,6 +207,7 @@ def main():
         run("codesign", "--force", "--sign", "-", "--timestamp=none", binary)
     run("codesign", "--force", "--sign", "-", "--timestamp=none", app)
     run("codesign", "--verify", "--deep", "--strict", "--verbose=2", app)
+    verify_native_licenses(notices / "native-licenses", manifest["native_licenses"]["hashes"])
     if args.cloud_helper_runtime:
         if validate_runtime(resources / "cloud-helper") != manifest["cloud_helper"]:
             raise RuntimeError("Cloud helper runtime changed during app packaging")
@@ -156,6 +218,8 @@ def main():
             run("ditto", "-x", "-k", archive, unpacked)
             extracted = Path(unpacked) / app.name
             run("codesign", "--verify", "--deep", "--strict", "--verbose=2", extracted)
+            verify_native_licenses(extracted / manifest["native_licenses"]["path"],
+                                   manifest["native_licenses"]["hashes"])
             if validate_runtime(extracted / "Contents/Resources/cloud-helper") != manifest["cloud_helper"]:
                 raise RuntimeError("Cloud helper runtime changed in release archive")
     digest = sha256_file(archive)

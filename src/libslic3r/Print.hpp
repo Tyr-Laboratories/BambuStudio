@@ -635,6 +635,7 @@ private:
     void discover_vertical_shells();
     void discover_shell_for_perimeters();
     void bridge_over_infill();
+    void add_internal_bridge_layers(const std::vector<std::vector<Surfaces>> &original_sparse);
     void clip_fill_surfaces();
     void discover_horizontal_shells();
     void merge_infill_types();
@@ -683,6 +684,8 @@ private:
 
     std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> m_adaptive_fill_octrees;
     FillLightning::GeneratorPtr m_lightning_generator;
+    // Imported toolpaths do not include the generators or pre-bridge surfaces needed for refill.
+    bool m_cached_infill_dependencies_missing = false;
 
     std::vector < VolumeSlices >            firstLayerObjSliceByVolume;
     std::vector<groupedVolumeSlices>        firstLayerObjSliceByGroups;

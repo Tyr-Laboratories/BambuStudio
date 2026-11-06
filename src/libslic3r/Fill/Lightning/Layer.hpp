@@ -37,6 +37,9 @@ class Layer
 public:
     std::vector<NodeSPtr> tree_roots;
 
+    // Bridge anchoring and final extrusion must trim the same junction branches.
+    void set_stable_traversal() { m_stable_traversal = true; }
+
     void generateNewTrees
     (
         const Polygons& current_overhang,
@@ -85,6 +88,9 @@ public:
     coord_t getWeightedDistance(const Point& boundary_loc, const Point& unsupported_location);
 
     void fillLocator(SparseNodeGrid& tree_node_locator, const BoundingBox& current_outlines_bbox);
+
+private:
+    bool m_stable_traversal = false;
 };
 
 } // namespace Slic3r::FillLightning

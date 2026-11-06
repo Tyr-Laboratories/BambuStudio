@@ -67,6 +67,25 @@ void LayerRegion::slices_to_fill_surfaces_clipped()
     }
 }
 
+// Select the bridge's share of the dedicated perimeter overlap footprint.
+// Both footprints were built from the identical pre-overlap contours by the
+// perimeter generator. Only the overlap band changes; internal bridge-to-fill
+// boundaries retain the normal bridge detection and anchoring geometry.
+ExPolygons LayerRegion::bridge_fill_boundary(const ExPolygon &surface) const
+{
+    if (bridge_fill_overlap_delta == 0)
+        return {surface};
+    const ExPolygons removed = diff_ex(fill_expolygons, bridge_fill_expolygons);
+    ExPolygons result = removed.empty() ? ExPolygons{surface} : diff_ex(surface, removed);
+    ExPolygons added = diff_ex(bridge_fill_expolygons, fill_expolygons);
+    if (!added.empty()) {
+        added = intersection_ex(added, offset_ex(surface, bridge_fill_overlap_delta + SCALED_EPSILON));
+        append(result, std::move(added));
+        result = union_ex(result);
+    }
+    return result;
+}
+
 void LayerRegion::auto_circle_compensation(SurfaceCollection& slices, const AutoContourHolesCompensationParams &auto_contour_holes_compensation_params, float manual_offset)
 {
      // filament is 1 base
@@ -129,7 +148,7 @@ void LayerRegion::auto_circle_compensation(SurfaceCollection& slices, const Auto
     }
 }
 
-void LayerRegion::make_perimeters(const SurfaceCollection &slices, const PerimeterRegions &perimeter_regions, SurfaceCollection *fill_surfaces, ExPolygons *fill_no_overlap, std::vector<LoopNode> &loop_nodes)
+void LayerRegion::make_perimeters(const SurfaceCollection &slices, const PerimeterRegions &perimeter_regions, SurfaceCollection *fill_surfaces, ExPolygons *fill_no_overlap, ExPolygons *bridge_fill, coord_t *bridge_overlap_delta, std::vector<LoopNode> &loop_nodes)
 {
     this->perimeters.clear();
     this->thin_fills.clear();
@@ -167,6 +186,8 @@ void LayerRegion::make_perimeters(const SurfaceCollection &slices, const Perimet
     if (this->layer()->upper_layer != NULL)
         g.upper_slices = &this->layer()->upper_layer->lslices;
 
+    g.bridge_fill = bridge_fill;
+    g.bridge_overlap_delta = bridge_overlap_delta;
     g.layer_id              = (int)this->layer()->id();
     g.slice_z               = this->layer()->slice_z;
     g.ext_perimeter_flow    = this->flow(frExternalPerimeter);

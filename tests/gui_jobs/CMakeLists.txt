@@ -38,12 +38,13 @@ if (APPLE)
     target_sources(gui_job_tests PRIVATE test_webview_mac.cpp)
     add_executable(cloud_send_helper_tests
         test_cloud_send_helper.cpp
+        test_cloud_plugin.cpp
         test_camera_requests.cpp
         test_cloud_send_recovery.cpp
         ${PROJECT_SOURCE_DIR}/src/slic3r/Utils/TyrCloudSendHelper.cpp
     )
     target_include_directories(cloud_send_helper_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
-    target_link_libraries(cloud_send_helper_tests PRIVATE test_common OpenSSL::Crypto)
+    target_link_libraries(cloud_send_helper_tests PRIVATE test_common OpenSSL::Crypto libcurl miniz)
     set_property(TARGET cloud_send_helper_tests PROPERTY FOLDER "tests")
     add_test(NAME cloud_send_helper_tests COMMAND cloud_send_helper_tests ${CATCH_EXTRA_ARGS})
 endif ()

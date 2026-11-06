@@ -1520,8 +1520,11 @@ void PerimeterGenerator::process_classic()
         if (active_wall_policy) inset = 0; // last is already the wall footprint boundary.
         // only apply infill overlap if we actually have one perimeter
         coord_t infill_peri_overlap = 0;
+        coord_t bridge_peri_overlap = 0;
         if (inset > 0 || (active_wall_policy && !painted_wall_coverage.empty())) {
             infill_peri_overlap = coord_t(scale_(this->config->infill_wall_overlap.get_abs_value(unscale<double>((active_wall_policy ? perimeter_spacing / 2 : inset) + solid_infill_spacing / 2))));
+            bridge_peri_overlap = coord_t(scale_(this->config->bridge_line_travel_extend.get_abs_value(
+                unscale<double>((active_wall_policy ? perimeter_spacing / 2 : inset) + solid_infill_spacing / 2))));
             inset -= infill_peri_overlap;
         }
         // simplify infill contours according to resolution
@@ -1547,6 +1550,21 @@ void PerimeterGenerator::process_classic()
         if (active_wall_policy)
             infill_exp = intersection_ex(infill_exp, ExPolygons{surface.expolygon});
         this->fill_surfaces->append(infill_exp, stInternal);
+        if (this->bridge_fill != nullptr) {
+            if (bridge_peri_overlap == infill_peri_overlap)
+                append(*this->bridge_fill, infill_exp);
+            else {
+                const coord_t bridge_inset = inset + infill_peri_overlap - bridge_peri_overlap;
+                ExPolygons bridge_exp = offset2_ex(not_filled_exp,
+                    float(-bridge_inset - min_perimeter_infill_spacing / 2.), float(min_perimeter_infill_spacing / 2.));
+                if (!top_fills.empty())
+                    bridge_exp = union_ex(bridge_exp, offset_ex(top_infill_exp, double(bridge_peri_overlap)));
+                if (active_wall_policy)
+                    bridge_exp = intersection_ex(bridge_exp, ExPolygons{surface.expolygon});
+                append(*this->bridge_fill, std::move(bridge_exp));
+                *this->bridge_overlap_delta = std::max(*this->bridge_overlap_delta, std::abs(bridge_peri_overlap - infill_peri_overlap));
+            }
+        }
 
         // BBS: get the no-overlap infill expolygons
         {
@@ -1591,6 +1609,7 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
     if (is_inner_part || loops > 0)
         insert = perimeter_spacing;
 
+    const coord_t bridge_insert = coord_t(scale_(this->config->bridge_line_travel_extend.get_abs_value(unscale<double>(insert))));
     insert = coord_t(scale_(this->config->infill_wall_overlap.get_abs_value(unscale<double>(insert))));
 
     Polygons inner_pp;
@@ -1601,6 +1620,18 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
     if (material != nullptr)
         fill = intersection_ex(fill, ExPolygons{*material});
     this->fill_surfaces->append(fill, stInternal);
+    if (this->bridge_fill != nullptr) {
+        if (bridge_insert == insert)
+            append(*this->bridge_fill, fill);
+        else {
+            ExPolygons bridge_exp = offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.),
+                float(bridge_insert + min_perimeter_infill_spacing / 2.));
+            if (material != nullptr)
+                bridge_exp = intersection_ex(bridge_exp, ExPolygons{*material});
+            append(*this->bridge_fill, std::move(bridge_exp));
+            *this->bridge_overlap_delta = std::max(*this->bridge_overlap_delta, std::abs(bridge_insert - insert));
+        }
+    }
 
     append(*this->fill_no_overlap, offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.), float(+min_perimeter_infill_spacing / 2.)));
 }
@@ -2216,6 +2247,8 @@ void PerimeterGenerator::process_no_bridge(Surfaces& all_surfaces, coord_t perim
                         this->fill_surfaces->append(
                             unsupported_filtered,
                             stInternal);
+                        if (this->bridge_fill != nullptr)
+                            append(*this->bridge_fill, unsupported_filtered);
 
                         // store the results
                         last = diff_ex(last, unsupported_filtered, ApplySafetyOffset::Yes);
@@ -2225,6 +2258,8 @@ void PerimeterGenerator::process_no_bridge(Surfaces& all_surfaces, coord_t perim
                                 this->fill_surfaces->append(
                                     ExPolygons() = { last[i] },
                                     stInternal);
+                                if (this->bridge_fill != nullptr)
+                                    this->bridge_fill->push_back(last[i]);
                                 last.erase(last.begin() + i);
                                 i--;
                             }

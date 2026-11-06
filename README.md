@@ -1,10 +1,20 @@
-# Tyr Laboratories Bambu Studio fork
+# Tyr Laboratories Bambu Studio
 
-This Tyr Laboratories fork adds **Wall Painting**: choose a different total wall count for painted surfaces while retaining the normal wall count elsewhere, using the native Classic and Arachne wall generators. It is based on upstream Bambu Studio `master` at `79df7ae309be398ed30c9f397c13c9911c2edc57`.
+A public fork of [Bambu Studio](https://github.com/bambulab/BambuStudio) with additional wall-painting and bridge controls for thin-walled parts.
 
-The fork also adds a dedicated **Bridge acceleration** setting for regular and internal bridge infill under **Speed > Acceleration**.
+**[Download the latest Tyr release](https://github.com/Tyr-Laboratories/BambuStudio/releases/latest)** · **[User and build guide](docs/tyr-fork.md)** · **[Report a Tyr issue](https://github.com/Tyr-Laboratories/BambuStudio/issues)**
 
-See the [Tyr fork guide](docs/tyr-fork.md) for painting controls, settings, project compatibility, and validation limits. This is a Tyr Laboratories build; the upstream releases linked below do not include this fork's changes. The upstream project description, credits, and license notices follow.
+The current prebuilt application supports **Apple silicon Macs running macOS 14 or newer**. It is ad-hoc signed, without Apple notarization; see the guide for installation. Docker Desktop is required for cloud print sending and cloud video, but not for slicing or exporting G-code. Bambu's optional networking components are downloaded from Bambu and remain proprietary.
+
+Tyr additions include:
+
+- **Wall Painting:** choose a total wall count for painted surfaces using Classic or Arachne, with automatic painting of circular internal holes.
+- **Support blockers in round holes:** mark overhanging hole surfaces to prevent support generation in screw holes.
+- **Extra wall slope angle:** add an inner wall to single-wall surfaces beyond a chosen angle from vertical, in either slope direction.
+- **Bridge controls:** dedicated bridge acceleration, bridge-layer density, separate bridge/wall overlap, and one to three internal bridge layers.
+- Corrections to overhang-wall width interpolation, short open-wall filtering, and duplicate extrusion during modifier clipping, plus macOS stability and cloud-send integration fixes.
+
+The [guide](docs/tyr-fork.md) explains each control, compatibility, and validation limits. Source history retains the upstream base at `79df7ae309be398ed30c9f397c13c9911c2edc57` and all Tyr changes. This is a community fork maintained by Tyr Laboratories, not an official Bambu Lab release. The upstream releases linked below do not contain Tyr's changes. Upstream description, credits, and license notices follow.
 
 ---
 

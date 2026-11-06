@@ -44,6 +44,7 @@ struct SurfaceFillParams
 
     // FillParams
     float       	density = 0.f;
+    float           bridge_layer_density = 1.f;
 	int 			multiline = 1;
 	// travel into wall length, ratio to line width
     float           monotonic_travel_into_wall = 0.f;
@@ -100,6 +101,7 @@ struct SurfaceFillParams
 		RETURN_COMPARE_NON_EQUAL(overlap);
 		RETURN_COMPARE_NON_EQUAL(angle);
 		RETURN_COMPARE_NON_EQUAL(density);
+        RETURN_COMPARE_NON_EQUAL(bridge_layer_density);
 		RETURN_COMPARE_NON_EQUAL(multiline);
 //		RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, dont_adjust);
 		RETURN_COMPARE_NON_EQUAL(anchor_length);
@@ -140,6 +142,7 @@ struct SurfaceFillParams
 				this->bridge   			== rhs.bridge   		&&
 //				this->bridge_angle 		== rhs.bridge_angle		&&
 				this->density   		== rhs.density   		&&
+                this->bridge_layer_density == rhs.bridge_layer_density &&
 				this->multiline 		== rhs.multiline  		&&
 //				this->dont_adjust   	== rhs.dont_adjust 		&&
 				this->anchor_length  	== rhs.anchor_length    &&
@@ -178,6 +181,8 @@ struct SurfaceFill {
     // BBS
     std::vector<size_t> region_id_group;
     ExPolygons          no_overlap_expolygons;
+    ExPolygons          bridge_overlap_additions;
+    ExPolygons          bridge_overlap_removals;
 };
 
 // BBS: used to judge whether the internal solid infill area is narrow
@@ -284,6 +289,9 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		                    (surface.is_top() ? erTopSolidInfill : (surface.is_bottom()? erBottomSurface : surface.is_floating_vertical_shell()?erFloatingVerticalShell:erSolidInfill)) :
 		                    erInternalInfill);
 		        params.bridge_angle = float(surface.bridge_angle);
+                if (is_bridge) {
+                    params.bridge_layer_density = float(region_config.bridge_layer_density.value * 0.01);
+                }
 		        params.angle 		= float(Geometry::deg2rad(region_config.infill_direction.value));
                 bool support_multiline_infill = params.pattern == ipCubic || params.pattern == ipGrid || params.pattern == ipRectilinear || params.pattern == ipStars ||
                                                 params.pattern == ipAlignedRectilinear || params.pattern == ipGyroid || params.pattern == ipHoneycomb ||
@@ -295,7 +303,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		        params.bridge = is_bridge || Fill::use_bridge_flow(params.pattern);
 				params.flow   = params.bridge ?
 					//BBS: always enable thick bridge for internal bridge
-					layerm.bridging_flow(extrusion_role, (surface.is_bridge() && !surface.is_external()) || object_config.thick_bridges) :
+					layerm.bridging_flow(extrusion_role, !surface.bridge_followup && ((surface.is_bridge() && !surface.is_external()) || object_config.thick_bridges)) :
 					layerm.flow(extrusion_role, (surface.thickness == -1) ? layer.height : surface.thickness);
 				//BBS: record speed params
                 if (!params.bridge) {
@@ -383,15 +391,22 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 	        	const SurfaceFillParams *params = region_to_surface_params[region_id][&surface - &layerm.fill_surfaces.surfaces.front()];
 				if (params != nullptr) {
 	        		SurfaceFill &fill = surface_fills[params->idx];
+                    ExPolygons polygons{surface.expolygon};
+                    if (surface.is_bridge() && layerm.bridge_fill_overlap_delta != 0) {
+                        const ExPolygons bridge_area = layerm.bridge_fill_boundary(surface.expolygon);
+                        append(fill.bridge_overlap_additions, diff_ex(bridge_area, polygons));
+                        append(fill.bridge_overlap_removals, diff_ex(polygons, bridge_area));
+                    }
                     if (fill.region_id == size_t(-1)) {
 	        			fill.region_id = region_id;
 	        			fill.surface = surface;
-	        			fill.expolygons.emplace_back(std::move(fill.surface.expolygon));
+                        append(fill.expolygons, std::move(polygons));
+                        fill.surface.expolygon.clear();
 						//BBS
 						fill.region_id_group.push_back(region_id);
 						fill.no_overlap_expolygons = layerm.fill_no_overlap_expolygons;
 					} else {
-						fill.expolygons.emplace_back(surface.expolygon);
+                        append(fill.expolygons, std::move(polygons));
 						//BBS
 						auto t = find(fill.region_id_group.begin(), fill.region_id_group.end(), region_id);
 						if (t == fill.region_id_group.end()) {
@@ -597,6 +612,17 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 		}
 	}
 
+    // Preserve stock classification and mutual clipping for every ordinary fill.
+    // Only after that work is complete, replace each bridge's perimeter-overlap
+    // band with the footprint produced by the native perimeter generator.
+    for (SurfaceFill &fill : surface_fills) {
+        if (!fill.bridge_overlap_removals.empty())
+            fill.expolygons = diff_ex(fill.expolygons, fill.bridge_overlap_removals);
+        if (!fill.bridge_overlap_additions.empty()) {
+            append(fill.expolygons, std::move(fill.bridge_overlap_additions));
+            fill.expolygons = union_ex(fill.expolygons);
+        }
+    }
 	return surface_fills;
 }
 
@@ -648,6 +674,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
     LockRegionParam lock_param;
     set_outlook_range(lock_param);
     std::vector<SurfaceFill>     surface_fills = group_fills(*this, lock_param);
+
     const Slic3r::BoundingBox bbox 			= this->object()->bounding_box();
     const auto                resolution 	= this->object()->print()->config().resolution.value;
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
@@ -750,6 +777,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         // apply half spacing using this flow's own spacing and generate infill
         FillParams params;
         params.density 		     = float(0.01 * surface_fill.params.density);
+        params.bridge_layer_density = surface_fill.params.bridge_layer_density;
 		params.multiline        = surface_fill.params.multiline;
         params.pattern           = surface_fill.params.pattern;
 		params.dont_adjust		 = false; //  surface_fill.params.dont_adjust;

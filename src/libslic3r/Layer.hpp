@@ -59,6 +59,9 @@ public:
     // Unspecified fill polygons, used for overhang detection ("ensure vertical wall thickness feature")
     // and for re-starting of infills.
     ExPolygons                  fill_expolygons;
+    // The same perimeter-derived fill boundary with the dedicated bridge overlap.
+    ExPolygons                  bridge_fill_expolygons;
+    coord_t                     bridge_fill_overlap_delta = 0;
     // collection of surfaces for infill generation
     SurfaceCollection           fill_surfaces;
     // BBS: Unspecified fill polygons, used for interecting when we don't want the infill/perimeter overlap
@@ -86,6 +89,7 @@ public:
 
     void    slices_to_fill_surfaces_clipped();
     void    prepare_fill_surfaces();
+    ExPolygons bridge_fill_boundary(const ExPolygon &surface) const;
     //BBS
     void    auto_circle_compensation(SurfaceCollection &slices, const AutoContourHolesCompensationParams &auto_contour_holes_compensation_params, float manual_offset = 0.0f);
     void    make_perimeters(const SurfaceCollection &slices,
@@ -93,6 +97,8 @@ public:
                             const PerimeterRegions &perimeter_regions,
                             SurfaceCollection     *fill_surfaces,
                             ExPolygons            *fill_no_overlap,
+                            ExPolygons            *bridge_fill,
+                            coord_t               *bridge_overlap_delta,
                             std::vector<LoopNode> &loop_nodes);
     void    process_external_surfaces(const Layer *lower_layer, const Polygons *lower_layer_covered);
     double  infill_area_threshold() const;

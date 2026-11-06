@@ -434,6 +434,28 @@ TEST_CASE("Cloud helper stages the selected plate, authenticates privately and b
     REQUIRE(read_file(f.root / "BambuNetworkEngine.conf") == "opaque SDK session SECRET_TOKEN");
     REQUIRE(jobs_empty(f.root / "data/cloud-send-jobs"));
 }
+TEST_CASE("Public helper refuses an unpinned vendor download before starting Docker", "[cloud-helper][public-runtime]")
+{
+    Fixture f;
+    const auto manifest_path = f.root / "resources/cloud-helper/manifest.json";
+    auto manifest = json::parse(read_file(manifest_path));
+    manifest["schema_version"] = 2;
+    manifest["plugin_delivery"] = "vendor-download";
+    for (const auto *name : {"libbambu_networking.so", "libBambuSource.so", "liblive555.so", "linux_payload_manifest.json"})
+        manifest["hashes"].erase(std::string("plugin/") + name);
+    fs::remove_all(f.root / "resources/cloud-helper/plugin");
+    for (const auto *name : {"certs/ca-certificates.crt", "certs/printer.cer", "licenses/host-AGPL-3.0.txt", "licenses/plugin-source.json", "licenses/runtime-dependencies.txt"}) {
+        write_file(f.root / "resources/cloud-helper" / name, "fixture");
+        manifest["hashes"][name] = digest("fixture");
+    }
+    const std::string pin = json({{"plugin_url", "https://untrusted.invalid/plugin.zip"}}).dump();
+    write_file(f.root / "resources/cloud-helper/pin.json", pin);
+    manifest["hashes"]["pin.json"] = digest(pin);
+    write_file(manifest_path, manifest.dump());
+    REQUIRE_THROWS_WITH(f.send(), Catch::Matchers::Contains("dependency pin"));
+    REQUIRE_FALSE(f.marked("docker-called"));
+}
+
 TEST_CASE("Cloud helper refuses changed resources before invoking any runtime", "[cloud-helper]")
 {
     Fixture f;

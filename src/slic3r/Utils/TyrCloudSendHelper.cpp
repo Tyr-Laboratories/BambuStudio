@@ -1,5 +1,6 @@
 #include "TyrCloudSendHelper.hpp"
 #include "TyrCloudSendRecovery.hpp"
+#include "TyrCloudPlugin.hpp"
 #include "nlohmann/json.hpp"
 #include <openssl/evp.h>
 #include <algorithm>
@@ -182,6 +183,8 @@ struct Runtime
     fs::path                        root;
     std::string                     image;
     fs::path                        archive;
+    fs::path                        plugin_root;
+    bool                            vendor_plugin = false;
     std::map<fs::path, std::string> mount_hashes;
 };
 Runtime verified_runtime(const std::string &resources)
@@ -189,15 +192,32 @@ Runtime verified_runtime(const std::string &resources)
     Runtime r;
     r.root       = fs::absolute(fs::path(resources) / "cloud-helper");
     const auto m = parse_json(file_text(r.root / "manifest.json"), "The bundled print helper manifest is invalid.");
-    if (m.value("schema_version", 0) != 1 || m.value("protocol_version", 0) != 1 || m.value("host_patch_version", 0) != 1 || m.value("platform", "") != "linux/arm64" ||
+    const int schema = m.value("schema_version", 0);
+    if ((schema != 1 && schema != 2) || m.value("protocol_version", 0) != 1 || m.value("host_patch_version", 0) != 1 || m.value("platform", "") != "linux/arm64" ||
         m.value("network_abi", "") != "02.05.02.58" || m.value("executable", "") != "/runtime/tyr_bambu_cloud_host" || m.value("image_file", "") != "image.tar")
         fail("The bundled print helper version is incompatible. Reinstall this build.");
     r.image = m.value("image_id", "");
     if (r.image.substr(0, 7) != "sha256:" || !hex_digest(r.image.substr(7))) fail("The bundled print helper image identity is invalid.");
     const auto &hashes = m.at("hashes");
-    for (const char *required : {"image.tar", "pin.json", "plugin/libbambu_networking.so", "plugin/libBambuSource.so", "plugin/liblive555.so",
-                                 "plugin/linux_payload_manifest.json", "certs/slicer_base64.cer"})
-        if (!hashes.contains(required)) fail("The bundled print helper integrity manifest is incomplete.");
+    if (schema == 2) {
+        r.vendor_plugin = true;
+        const std::set<std::string> required = {"image.tar", "pin.json", "certs/slicer_base64.cer", "certs/ca-certificates.crt", "certs/printer.cer",
+                                               "licenses/host-AGPL-3.0.txt", "licenses/plugin-source.json", "licenses/runtime-dependencies.txt"};
+        if (m.value("plugin_delivery", "") != "vendor-download" || !hashes.is_object() || hashes.size() != required.size())
+            fail("The public print helper manifest is incomplete. Reinstall this build.");
+        for (const auto &name : required)
+            if (!hashes.contains(name)) fail("The public print helper manifest is incomplete. Reinstall this build.");
+        for (const auto &file : fs::recursive_directory_iterator(r.root)) {
+            const auto relative = file.path().lexically_relative(r.root).generic_string();
+            if (file.is_symlink() || (file.is_regular_file() && relative != "manifest.json" && !required.count(relative)) ||
+                (file.is_directory() && relative != "certs" && relative != "licenses"))
+                fail("The public print helper contains an unexpected bundled file.");
+        }
+    } else {
+        for (const char *required : {"image.tar", "pin.json", "plugin/libbambu_networking.so", "plugin/libBambuSource.so", "plugin/liblive555.so",
+                                     "plugin/linux_payload_manifest.json", "certs/slicer_base64.cer"})
+            if (!hashes.contains(required)) fail("The bundled print helper integrity manifest is incomplete.");
+    }
     if (!hashes.is_object()) fail("The bundled print helper integrity manifest is invalid.");
     for (auto it = hashes.begin(); it != hashes.end(); ++it) {
         const fs::path relative(it.key());
@@ -213,10 +233,16 @@ Runtime verified_runtime(const std::string &resources)
         if (*relative.begin() == "plugin" || *relative.begin() == "certs") r.mount_hashes.emplace(relative, digest);
     }
     // The SDK loads files by name from these directories; reject unhashed extras.
-    for (const char *directory : {"plugin", "certs"})
+    for (const char *directory : {"plugin", "certs"}) {
+        if (r.vendor_plugin && std::string(directory) == "plugin") continue;
         for (const auto &file : fs::recursive_directory_iterator(r.root / directory))
             if (file.is_symlink() || (file.is_regular_file() && !hashes.contains(fs::relative(file.path(), r.root).generic_string())))
                 fail("The bundled print helper contains an unverified file.");
+    }
+    if (r.vendor_plugin)
+        (void) TyrCloudPlugin::verified_pin(parse_json(file_text(r.root / "pin.json"), "The cloud plugin dependency pin is invalid."));
+    else
+        r.plugin_root = r.root / "plugin";
     r.archive = r.root / "image.tar";
     return r;
 }
@@ -516,7 +542,8 @@ public:
                 private_directory(directory);
             }
             const auto destination = root / "runtime" / relative;
-            fs::copy_file(runtime.root / relative, destination, fs::copy_options::none);
+            const auto source = *relative.begin() == "plugin" ? runtime.plugin_root / relative.filename() : runtime.root / relative;
+            fs::copy_file(source, destination, fs::copy_options::none);
             fs::permissions(destination, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
             if (sha256(destination) != digest) fail("The staged print helper failed its integrity check. Reinstall this build.");
         }
@@ -788,7 +815,7 @@ int run_send(const BBL::PrintParams &params,
     if ((params.task_record_timelapse && params.task_timelapse_use_internal) || !params.queue_plate_id.empty())
         fail("This cloud helper does not support internal-storage timelapse or queued print jobs. Disable that option for this print.");
     if (!fs::is_regular_file(session_file)) fail("The saved Bambu account session is missing. Sign in again before sending.");
-    const Runtime runtime = verified_runtime(resources);
+    Runtime runtime = verified_runtime(resources);
     mark("runtime_verified");
     const std::string docker = docker_executable();
     verify_local_context(docker, cancelled);
@@ -799,6 +826,19 @@ int run_send(const BBL::PrintParams &params,
             fail("A previous interrupted send may already have reached its printer. Check the previous printer before retrying this print.");
     }
     ensure_image(docker, runtime, cancelled);
+    if (runtime.vendor_plugin) {
+        const auto spec = TyrCloudPlugin::official_spec();
+        try {
+            runtime.plugin_root = TyrCloudPlugin::acquire(data, spec, [&](const fs::path &path, const TyrCloudPlugin::Cancelled &cancel) {
+                TyrCloudPlugin::download_official(path, runtime.root / "certs/ca-certificates.crt", cancel, [&](int percent) {
+                    if (update) update(BBL::PrintingStageUpload, 0, "Downloading Bambu cloud networking plugin: " + std::to_string(percent) + "%");
+                });
+            }, cancelled);
+        } catch (const TyrCloudPlugin::CancelledDownload &) { throw PreparationCancelled{}; }
+        for (const auto &[name, digest] : spec.payload_sha256)
+            runtime.mount_hashes.emplace(fs::path("plugin") / name, digest);
+        runtime.mount_hashes.emplace("plugin/linux_payload_manifest.json", sha256(runtime.plugin_root / "linux_payload_manifest.json"));
+    }
     mark("runtime_ready");
     if (was_cancelled(cancelled)) return BAMBU_NETWORK_ERR_CANCELED;
     Job job(data, docker, params.dev_id);

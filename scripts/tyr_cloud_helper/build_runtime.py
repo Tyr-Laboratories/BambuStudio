@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Build an immutable Docker runtime for the app's private cloud upload helper.
+"""Build a redistributable Docker runtime for the cloud upload helper.
 
-Only public pinned source/plugin data are inputs. This command does not launch
+Only pinned open source code and public certificates are build inputs. Vendor
+plugin libraries are downloaded separately by the installed app and never
+included in this artifact. This command does not launch
 Bambu Studio, authenticate, contact a printer, or modify Tyr Print Farm.
 """
 import argparse
 import hashlib
-import io
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -15,17 +16,15 @@ import stat
 import subprocess
 import tarfile
 import tempfile
-import urllib.request
-import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 PLUGIN_FILES = ('libbambu_networking.so', 'libBambuSource.so', 'liblive555.so')
 PUBLIC_CERT_FILES = ('slicer_base64.cer', 'ca-certificates.crt', 'printer.cer')
-REQUIRED_FILES = {'image.tar', 'pin.json', 'plugin/linux_payload_manifest.json',
-                  *('plugin/' + name for name in PLUGIN_FILES),
+REQUIRED_FILES = {'image.tar', 'pin.json',
                   *('certs/' + name for name in PUBLIC_CERT_FILES),
-                  'licenses/host-AGPL-3.0.txt', 'licenses/plugin-source.json'}
+                  'licenses/host-AGPL-3.0.txt', 'licenses/plugin-source.json',
+                  'licenses/runtime-dependencies.txt'}
 HEX256 = re.compile(r'[0-9a-f]{64}')
 
 
@@ -79,21 +78,80 @@ def public_asset_hashes():
 
 
 def plugin_provenance(pin):
-    return {key: pin[key] for key in ('plugin_url', 'plugin_sha256', 'network_abi', 'network_sha256')}
+    return {key: pin[key] for key in ('plugin_url', 'plugin_sha256', 'network_abi', 'network_sha256',
+                                     'payload_sha256', 'plugin_entries')}
 
 
-def plugin_payload_manifest(pin, hashes):
-    return {'files': [{'name': name, 'sha256': hashes[name], 'abi_version': pin['network_abi']}
-                      for name in PLUGIN_FILES]}
+def validate_plugin_pin(pin):
+    if (set(pin['payload_sha256']) != set(PLUGIN_FILES)
+            or set(pin['plugin_entries']) != set(PLUGIN_FILES)
+            or pin['payload_sha256']['libbambu_networking.so'] != pin['network_sha256']
+            or not HEX256.fullmatch(pin['plugin_sha256'])
+            or not pin['plugin_url'].startswith('https://')):
+        raise RuntimeError('Invalid pinned vendor plugin metadata')
+    for name in PLUGIN_FILES:
+        entry = pin['plugin_entries'][name]
+        if (not isinstance(entry, str) or not entry or entry.startswith('/')
+                or '..' in PurePosixPath(entry).parts or '\\' in entry
+                or PurePosixPath(entry).name != name
+                or not isinstance(pin['payload_sha256'][name], str)
+                or not HEX256.fullmatch(pin['payload_sha256'][name])):
+            raise RuntimeError('Invalid pinned vendor plugin entry or checksum')
+
+
+def runtime_dependency_notice(pin):
+    return f"""Tyr Bambu Studio cloud helper runtime
+
+This artifact contains the open-source Tyr Linux cloud host and its Debian
+execution environment. It contains no Bambu Lab networking or camera plugin
+binaries. The installed application obtains the separately licensed plugin
+from Bambu Lab using the exact URL, archive checksum, member names and payload
+checksums recorded in pin.json and plugin-source.json.
+
+Host source: {pin['source']}
+Host upstream revision: {pin['revision']}
+Tyr modifications and build recipes: https://github.com/Tyr-Laboratories/BambuStudio
+Host license: AGPL-3.0; see host-AGPL-3.0.txt.
+
+Debian base: {pin['debian_base']}
+Debian snapshot: {pin['debian_snapshot']}
+The image retains Debian package copyright files in /usr/share/doc and common
+license texts in /usr/share/common-licenses. Its package database identifies
+the exact binary and source package versions. Dependencies include QEMU user
+emulation (GPL-2.0 with separately licensed components), glibc (LGPL-2.1 and
+other licenses), GCC runtime libraries (GPL-3.0 with GCC Runtime Library
+Exception), OpenSSL (Apache-2.0), zlib (zlib license), and CA certificates.
+Consult each package's copyright file for authoritative component terms.
+
+Debian corresponding source packages are available at the pinned Debian
+snapshot https://snapshot.debian.org/archive/debian/{pin['debian_snapshot']}/
+and security snapshot https://snapshot.debian.org/archive/debian-security/{pin['debian_snapshot']}/.
+Source-delivery obligations must be satisfied when publishing the binary
+release; a link to a dependency or this notice alone is not a source offer.
+"""
+
+
+def forbidden_plugin_path(name):
+    basename = PurePosixPath(name).name.lower()
+    return (basename.startswith(('libbambu_networking.', 'libbambusource.',
+                                 'liblive555.', 'libagora'))
+            or basename in ('bambu_networking.dll', 'bambusource.dll'))
 
 
 def verify_image_archive(path, expected_id):
-    """Check Docker's immutable image config identity without extracting layers."""
+    """Verify image identity and audit every shipped layer, including deleted files."""
     try:
+        known_payload_hashes = set(json.loads((HERE / 'pin.json').read_text())['payload_sha256'].values())
         with tarfile.open(path, 'r:*') as archive:
+            entries = archive.getmembers()
+            names = [member.name for member in entries]
+            if len(names) != len(set(names)):
+                raise RuntimeError('Duplicate Docker image archive entry')
+            for member in entries:
+                if (member.name.startswith('/') or '..' in PurePosixPath(member.name).parts
+                        or not (member.isfile() or member.isdir())):
+                    raise RuntimeError('Invalid Docker image archive path or entry')
             def read_json(name):
-                if name.startswith('/') or '..' in PurePosixPath(name).parts:
-                    raise RuntimeError('Invalid Docker image manifest path')
                 member = archive.getmember(name)
                 if not member.isfile() or member.size > 1024 * 1024:
                     raise RuntimeError('Invalid Docker image manifest entry')
@@ -101,12 +159,58 @@ def verify_image_archive(path, expected_id):
             saved = json.loads(read_json('manifest.json'))
             if not isinstance(saved, list) or len(saved) != 1:
                 raise RuntimeError('Runtime archive must contain exactly one image')
-            config = read_json(saved[0]['Config'])
+            config_name = saved[0]['Config']
+            config = read_json(config_name)
             if 'sha256:' + hashlib.sha256(config).hexdigest() != expected_id:
                 raise RuntimeError('Docker image identity does not match runtime manifest')
             identity = json.loads(config)
             if identity.get('architecture') != 'arm64' or identity.get('os') != 'linux':
                 raise RuntimeError('Runtime Docker image must be linux/arm64')
+            layers = saved[0]['Layers']
+            if not isinstance(layers, list) or len(set(layers)) != len(layers):
+                raise RuntimeError('Invalid Docker image layer inventory')
+            diff_ids = identity.get('rootfs', {}).get('diff_ids', [])
+            if len(diff_ids) != len(layers):
+                raise RuntimeError('Docker image layer identity inventory differs')
+            for name, expected_layer in zip(layers, diff_ids):
+                member = archive.getmember(name)
+                if not member.isfile():
+                    raise RuntimeError('Invalid Docker image layer entry')
+                # Docker save uses uncompressed layers; compare their immutable
+                # identities before inspecting names in all layers, including
+                # files hidden by a later whiteout.
+                digest = hashlib.sha256()
+                with archive.extractfile(member) as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                        digest.update(chunk)
+                if 'sha256:' + digest.hexdigest() != expected_layer:
+                    raise RuntimeError('Docker image layer identity mismatch')
+                with archive.extractfile(member) as stream, tarfile.open(fileobj=stream, mode='r|') as layer:
+                    for item in layer:
+                        parts = PurePosixPath(item.name).parts
+                        if item.name.startswith('/') or '..' in parts:
+                            raise RuntimeError('Invalid Docker layer path')
+                        if (forbidden_plugin_path(item.name)
+                                or (parts and parts[0] == 'plugin' and (len(parts) > 1 or not item.isdir()))
+                                or ((item.issym() or item.islnk()) and
+                                    (forbidden_plugin_path(item.linkname)
+                                     or 'plugin' in PurePosixPath(item.linkname).parts))):
+                            raise RuntimeError('Proprietary plugin payload is forbidden in public Docker layers')
+                        if item.isfile():
+                            payload_hash = hashlib.sha256()
+                            with layer.extractfile(item) as payload:
+                                for chunk in iter(lambda: payload.read(1024 * 1024), b''):
+                                    payload_hash.update(chunk)
+                            if payload_hash.hexdigest() in known_payload_hashes:
+                                raise RuntimeError('Renamed proprietary plugin payload is forbidden in public Docker layers')
+            for member in entries:
+                if not member.isfile() or member.name in {config_name, *layers}:
+                    continue
+                # OCI image/index metadata are JSON, not additional layers or
+                # arbitrary unreferenced blobs that could conceal payloads.
+                if member.name not in ('manifest.json', 'repositories', 'index.json', 'oci-layout') and not member.name.startswith('blobs/sha256/'):
+                    raise RuntimeError('Unexpected Docker image archive entry')
+                json.loads(read_json(member.name))
     except (tarfile.TarError, KeyError, ValueError, TypeError, OSError) as error:
         raise RuntimeError('Invalid runtime Docker image archive') from error
 
@@ -114,10 +218,13 @@ def verify_image_archive(path, expected_id):
 def validate_runtime(root):
     root = Path(root)
     files = file_inventory(root)
+    if (root / 'plugin').exists():
+        raise RuntimeError('Public runtime must not contain a plugin directory')
     try:
         manifest = json.loads(files['manifest.json'].read_text())
         hashes = manifest['hashes']
-        if (manifest['schema_version'] != 1 or manifest['protocol_version'] != 1
+        if (manifest['schema_version'] != 2 or manifest.get('plugin_delivery') != 'vendor-download'
+                or manifest['protocol_version'] != 1
                 or manifest['host_patch_version'] != 1
                 or manifest['image_file'] != 'image.tar'
                 or manifest['platform'] != 'linux/arm64'
@@ -137,16 +244,14 @@ def validate_runtime(root):
             raise RuntimeError('Runtime upstream revision differs from its dependency pin')
         if pin['network_abi'] != manifest['network_abi']:
             raise RuntimeError('Runtime plugin ABI does not match its pin')
-        if hashes['plugin/libbambu_networking.so'] != pin['network_sha256']:
-            raise RuntimeError('Runtime networking library does not match its pinned checksum')
-        library_hashes = {name: hashes['plugin/' + name] for name in PLUGIN_FILES}
-        if json.loads(files['plugin/linux_payload_manifest.json'].read_text()) != plugin_payload_manifest(pin, library_hashes):
-            raise RuntimeError('Runtime plugin payload manifest contains unexpected content')
+        validate_plugin_pin(pin)
         for name, expected in public_asset_hashes().items():
             if hashes[name] != expected:
                 raise RuntimeError(f'Runtime public asset differs from its pinned upstream content: {name}')
         if json.loads(files['licenses/plugin-source.json'].read_text()) != plugin_provenance(pin):
             raise RuntimeError('Runtime plugin provenance contains unexpected content')
+        if files['licenses/runtime-dependencies.txt'].read_text() != runtime_dependency_notice(pin):
+            raise RuntimeError('Runtime dependency notice contains unexpected content')
         if manifest.get('host_source_sha256') != context_digest(build_context_files()):
             raise RuntimeError('Runtime host source or Dockerfile changed; rebuild the runtime before packaging')
         verify_image_archive(files['image.tar'], manifest['image_id'])
@@ -169,29 +274,6 @@ def stage_runtime(source, target):
     return manifest
 
 
-def install_plugin_archive(body, pin, target):
-    if hashlib.sha256(body).hexdigest() != pin['plugin_sha256']:
-        raise RuntimeError('Pinned plugin archive checksum mismatch')
-    payloads = {}
-    try:
-        with zipfile.ZipFile(io.BytesIO(body)) as archive:
-            for name in PLUGIN_FILES:
-                candidates = [entry for entry in archive.infolist() if PurePosixPath(entry.filename).name == name]
-                if len(candidates) != 1 or candidates[0].file_size > 100 * 1024 * 1024:
-                    raise RuntimeError('Unexpected plugin archive layout')
-                payloads[name] = archive.read(candidates[0])
-    except zipfile.BadZipFile as error:
-        raise RuntimeError('Invalid plugin archive') from error
-    hashes = {name: hashlib.sha256(data).hexdigest() for name, data in payloads.items()}
-    if hashes['libbambu_networking.so'] != pin['network_sha256']:
-        raise RuntimeError('Pinned networking library checksum mismatch')
-    target = Path(target)
-    target.mkdir(parents=True, exist_ok=False)
-    for name, payload in payloads.items():
-        (target / name).write_bytes(payload)
-    (target / 'linux_payload_manifest.json').write_text(json.dumps(plugin_payload_manifest(pin, hashes), indent=2) + '\n')
-
-
 def build(output):
     output = Path(output).absolute()
     if output.exists():
@@ -201,11 +283,7 @@ def build(output):
     if not (host_source / 'CMakeLists.txt').is_file():
         raise RuntimeError('Vendored cloud helper source is missing')
     output.mkdir(parents=True)
-    with urllib.request.urlopen(pin['plugin_url'], timeout=120) as response:
-        payload = response.read(50 * 1024 * 1024 + 1)
-    if len(payload) > 50 * 1024 * 1024:
-        raise RuntimeError('Pinned plugin archive exceeds the download limit')
-    install_plugin_archive(payload, pin, output / 'plugin')
+    validate_plugin_pin(pin)
     shutil.copy2(HERE / 'pin.json', output / 'pin.json')
     public_sources = {'certs/' + name: host_source / 'resources/cert' / name for name in PUBLIC_CERT_FILES}
     public_sources['licenses/host-AGPL-3.0.txt'] = host_source / 'LICENSE.upstream'
@@ -216,6 +294,7 @@ def build(output):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(public_sources[name], target)
     (output / 'licenses/plugin-source.json').write_text(json.dumps(plugin_provenance(pin), indent=2) + '\n')
+    (output / 'licenses/runtime-dependencies.txt').write_text(runtime_dependency_notice(pin))
     with tempfile.TemporaryDirectory(prefix='tyr-studio-helper-build-') as temporary:
         context = Path(temporary)
         # Minimal build context: no repository .git, user profile, session, or credentials.
@@ -231,7 +310,7 @@ def build(output):
     image_id = subprocess.check_output(['docker', 'image', 'inspect', tag, '--format', '{{.Id}}'], text=True).strip()
     subprocess.run(['docker', 'image', 'save', '--output', str(output / 'image.tar'), image_id], check=True)
     manifest = {
-        'schema_version': 1, 'protocol_version': 1, 'host_patch_version': 1,
+        'schema_version': 2, 'plugin_delivery': 'vendor-download', 'protocol_version': 1, 'host_patch_version': 1,
         'image_id': image_id, 'image_file': 'image.tar', 'platform': 'linux/arm64',
         'executable': '/runtime/tyr_bambu_cloud_host', 'network_abi': pin['network_abi'],
         'host_source_sha256': source_digest, 'upstream_revision': pin['revision'],

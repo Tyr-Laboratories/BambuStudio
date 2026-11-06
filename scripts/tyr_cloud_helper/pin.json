@@ -6,5 +6,15 @@
   "plugin_sha256": "e7158dca80c0853520877229a18739e1b6f21b70a9c0f01db19af78a374287d3",
   "network_sha256": "c9bdb8e6868c461d5c456dc7ba913744e449e2cc4ce2f29e175b381a1ff95d05",
   "debian_base": "debian:bookworm@sha256:4466bf7af8c14212301aa7b61cb9504f97041992e541eaad4af4ded52308037c",
-  "debian_snapshot": "20261101T000000Z"
+  "debian_snapshot": "20261101T000000Z",
+  "payload_sha256": {
+    "libBambuSource.so": "506a202d225e9efb7e082b7920983bcadb93e85f0927d7b5b43c4dd7bf7d2f21",
+    "liblive555.so": "1dd3be062635b56db4fe9a3e446935f7223de1d02c60c7958bd5fda4c92b5df1",
+    "libbambu_networking.so": "c9bdb8e6868c461d5c456dc7ba913744e449e2cc4ce2f29e175b381a1ff95d05"
+  },
+  "plugin_entries": {
+    "libBambuSource.so": "libBambuSource.so",
+    "liblive555.so": "liblive555.so",
+    "libbambu_networking.so": "libbambu_networking.so"
+  }
 }

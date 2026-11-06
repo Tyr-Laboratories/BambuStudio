@@ -57,6 +57,11 @@ public:
      */
     const Layer& getTreesForLayer(const size_t& layer_id) const;
 
+    void set_stable_traversal() {
+        for (Layer &layer : m_lightning_layers)
+            layer.set_stable_traversal();
+    }
+
     std::vector<Polygons>& Overhangs() { return m_overhang_per_layer; }
 
     float infilll_extrusion_width() const { return m_infill_extrusion_width; }

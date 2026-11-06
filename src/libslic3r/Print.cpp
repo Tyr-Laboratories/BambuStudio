@@ -4195,6 +4195,8 @@ std::string PrintStatistics::finalize_output_path(const std::string &path_in) co
 //#define JSON_LAYER_REGION_ENTITIES                "entities"
 #define JSON_LAYER_REGION_THIN_FILLS                  "thin_fills"
 #define JSON_LAYER_REGION_FILL_EXPOLYGONS             "fill_expolygons"
+#define JSON_LAYER_REGION_BRIDGE_FILL_EXPOLYGONS      "bridge_fill_expolygons"
+#define JSON_LAYER_REGION_BRIDGE_FILL_OVERLAP_DELTA   "bridge_fill_overlap_delta"
 #define JSON_LAYER_REGION_FILL_SURFACES               "fill_surfaces"
 #define JSON_LAYER_REGION_FILL_NO_OVERLAP             "fill_no_overlap_expolygons"
 #define JSON_LAYER_REGION_UNSUPPORTED_BRIDGE_EDGES    "unsupported_bridge_edges"
@@ -4207,6 +4209,7 @@ std::string PrintStatistics::finalize_output_path(const std::string &path_in) co
 #define JSON_SURF_THICKNESS         "thickness"
 #define JSON_SURF_THICKNESS_LAYER   "thickness_layers"
 #define JSON_SURF_BRIDGE_ANGLE       "bridge_angle"
+#define JSON_SURF_BRIDGE_FOLLOWUP    "bridge_followup"
 #define JSON_SURF_EXTRA_PERIMETERS   "extra_perimeters"
 
 #define JSON_ARC_DATA                "arc_data"
@@ -4285,6 +4288,7 @@ static void to_json(json& j, const Surface& surf) {
     j[JSON_SURF_THICKNESS] = surf.thickness;
     j[JSON_SURF_THICKNESS_LAYER] = surf.thickness_layers;
     j[JSON_SURF_BRIDGE_ANGLE] = surf.bridge_angle;
+    j[JSON_SURF_BRIDGE_FOLLOWUP] = surf.bridge_followup;
     j[JSON_SURF_EXTRA_PERIMETERS] = surf.extra_perimeters;
 }
 
@@ -4446,6 +4450,9 @@ static void to_json(json& j, const LayerRegion& layer_region) {
     }
     j.push_back({JSON_LAYER_REGION_FILL_EXPOLYGONS, std::move(fill_expolygons_json)});
 
+    j[JSON_LAYER_REGION_BRIDGE_FILL_EXPOLYGONS] = layer_region.bridge_fill_expolygons;
+    j[JSON_LAYER_REGION_BRIDGE_FILL_OVERLAP_DELTA] = layer_region.bridge_fill_overlap_delta;
+
     //fill_surfaces
     for (const Surface& fill_surface : layer_region.fill_surfaces.surfaces) {
         json surface_json = fill_surface;
@@ -4561,6 +4568,7 @@ static void from_json(const json& j, Surface& surf) {
     surf.thickness = j[JSON_SURF_THICKNESS];
     surf.thickness_layers = j[JSON_SURF_THICKNESS_LAYER];
     surf.bridge_angle = j[JSON_SURF_BRIDGE_ANGLE];
+    surf.bridge_followup = j.value(JSON_SURF_BRIDGE_FOLLOWUP, false);
     surf.extra_perimeters = j[JSON_SURF_EXTRA_PERIMETERS];
 
     return;
@@ -4733,6 +4741,13 @@ static void convert_layer_region_from_json(const json& j, LayerRegion& layer_reg
         polygon = j[JSON_LAYER_REGION_FILL_EXPOLYGONS][fill_expolygons_index];
         layer_region.fill_expolygons.push_back(std::move(polygon));
     }
+
+    // Older caches predate dedicated bridge overlap and contain the stock footprint.
+    // Region configuration hashes prevent them being reused with new nondefault controls.
+    layer_region.bridge_fill_expolygons = j.contains(JSON_LAYER_REGION_BRIDGE_FILL_EXPOLYGONS)
+        ? j[JSON_LAYER_REGION_BRIDGE_FILL_EXPOLYGONS].get<ExPolygons>()
+        : layer_region.fill_expolygons;
+    layer_region.bridge_fill_overlap_delta = j.value(JSON_LAYER_REGION_BRIDGE_FILL_OVERLAP_DELTA, coord_t(0));
 
     //fill_surfaces
     int fill_surfaces_count = j[JSON_LAYER_REGION_FILL_SURFACES].size();
@@ -5384,6 +5399,14 @@ int Print::load_cached_data(const std::string& directory)
                 firstlayer_objgroups.push_back(std::move(firstlayer_group));
             }
 
+            // The cache contains finalized typed surfaces and toolpaths, but not the
+            // adaptive / lightning generators or the original bridge preparation input.
+            // Keep it usable for export; a later infill edit must rebuild preparation.
+            obj->m_adaptive_fill_octrees.first.reset();
+            obj->m_adaptive_fill_octrees.second.reset();
+            obj->m_lightning_generator.reset();
+            obj->m_typed_slices = true;
+            obj->m_cached_infill_dependencies_missing = true;
             count ++;
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": load object %1% from %2% successfully.")%count%object_filenames[obj_index].first;
         }

@@ -988,7 +988,26 @@ void PrintObject::prepare_infill()
 
     // the following step needs to be done before combination because it may need
     // to remove only half of the combined infill
+    // Keep the distinction between required solid roofs and optional anchor
+    // growth made by bridge_over_infill. Relocated stacks may discard obsolete
+    // anchor fringe, but must retain the roof and its downward projection.
+    std::vector<std::vector<Surfaces>> original_sparse;
+    const bool extra_bridge_layers = std::any_of(m_shared_regions->all_regions.begin(),
+        m_shared_regions->all_regions.end(), [](const auto &region) {
+            return region->config().internal_bridge_layers.value > 1;
+        });
+    if (extra_bridge_layers) {
+        original_sparse.resize(m_layers.size());
+        for (size_t index = 0; index < m_layers.size(); ++index) {
+            original_sparse[index].resize(m_layers[index]->regions().size());
+            for (size_t region_id = 0; region_id < m_layers[index]->regions().size(); ++region_id)
+                for (const Surface &surface : m_layers[index]->get_region(int(region_id))->fill_surfaces.surfaces)
+                    if (surface.surface_type == stInternal || surface.surface_type == stInternalVoid)
+                        original_sparse[index][region_id].push_back(surface);
+        }
+    }
     this->bridge_over_infill();
+    this->add_internal_bridge_layers(original_sparse);
     m_print->throw_if_canceled();
 
     // combine fill surfaces to honor the "infill every N layers" option
@@ -1012,6 +1031,11 @@ void PrintObject::prepare_infill()
     } // for each layer
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
 
+    {
+        std::scoped_lock<std::mutex> lock(m_print->state_mutex());
+        this->throw_if_canceled();
+        m_cached_infill_dependencies_missing = false;
+    }
     this->set_done(posPrepareInfill);
 
     if (record_prepare_infill_time)
@@ -1534,6 +1558,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "initial_layer_line_width"
             || opt_key == "inner_wall_line_width"
             || opt_key == "infill_wall_overlap"
+            || opt_key == "bridge_line_travel_extend"
             || opt_key == "apply_scarf_seam_on_circles") {
             steps.emplace_back(posPerimeters);
             if (opt_key == "extra_wall_slope_angle") {
@@ -1680,11 +1705,13 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "infill_direction"
             || opt_key == "ensure_vertical_shell_thickness"
             || opt_key == "bridge_angle"
+            || opt_key == "internal_bridge_layers"
             //BBS
         ) {
             steps.emplace_back(posPrepareInfill);
         } else if (
                opt_key == "top_surface_pattern"
+            || opt_key == "bridge_layer_density"
             || opt_key == "top_surface_density"
             || opt_key == "monotonic_travel_into_wall"
             || opt_key == "bottom_surface_pattern"
@@ -1826,6 +1853,9 @@ bool PrintObject::invalidate_state_by_config_options(
 
 bool PrintObject::invalidate_step(PrintObjectStep step)
 {
+    if (m_cached_infill_dependencies_missing && step == posInfill)
+        step = posPrepareInfill;
+
 	bool invalidated = Inherited::invalidate_step(step);
 
     // propagate to dependent steps
@@ -2630,7 +2660,264 @@ void PrintObject::discover_shell_for_perimeters()
             }
     });
 }
-// This method applies bridge flow to the first internal solid layer above sparse infill.
+// Shared by ordinary internal bridges and the relocated bases of bridge stacks.
+static double determine_bridging_angle(const Polygons &bridged_area, const Lines &anchors, InfillPattern dominant_pattern, double infill_direction) {
+        AABBTreeLines::LinesDistancer<Line> lines_tree(anchors);
+
+        // Check it the infill that require a fixed infill angle.
+        switch (dominant_pattern) {
+        case ip3DHoneycomb:
+        case ipCrossHatch:
+            return (infill_direction + 45.0) * 2.0 * M_PI / 360.;
+        default: break;
+        }
+
+        std::map<double, int> counted_directions;
+        for (const Polygon &p : bridged_area) {
+            double acc_distance = 0;
+            for (int point_idx = 0; point_idx < int(p.points.size()) - 1; ++point_idx) {
+                Vec2d  start        = p.points[point_idx].cast<double>();
+                Vec2d  next         = p.points[point_idx + 1].cast<double>();
+                Vec2d  v            = next - start; // vector from next to current
+                double dist_to_next = v.norm();
+                acc_distance += dist_to_next;
+                if (acc_distance > scaled(2.0)) {
+                    acc_distance = 0.0;
+                    v.normalize();
+                    int   lines_count = int(std::ceil(dist_to_next / scaled(2.0)));
+                    float step_size   = dist_to_next / lines_count;
+                    for (int i = 0; i < lines_count; ++i) {
+                        Point a                   = (start + v * (i * step_size)).cast<coord_t>();
+                        auto [distance, index, p] = lines_tree.distance_from_lines_extra<false>(a);
+                        double angle = lines_tree.get_line(index).orientation();
+                        if (angle > PI) {
+                            angle -= PI;
+                        }
+                        angle += PI * 0.5;
+                        counted_directions[angle]++;
+                    }
+                }
+            }
+        }
+
+        std::pair<double, int> best_dir{0, 0};
+        // sliding window accumulation
+        for (const auto &dir : counted_directions) {
+            int    score_acc          = 0;
+            double dir_acc            = 0;
+            double window_start_angle = dir.first - PI * 0.1;
+            double window_end_angle   = dir.first + PI * 0.1;
+            for (auto dirs_window = counted_directions.lower_bound(window_start_angle);
+                dirs_window != counted_directions.upper_bound(window_end_angle); dirs_window++) {
+                dir_acc += dirs_window->first * dirs_window->second;
+                score_acc += dirs_window->second;
+            }
+            // current span of directions is 0.5 PI to 1.5 PI (due to the aproach.). Edge values should also account for the
+            //  opposite direction.
+            if (window_start_angle < 0.5 * PI) {
+                for (auto dirs_window = counted_directions.lower_bound(1.5 * PI - (0.5 * PI - window_start_angle));
+                    dirs_window != counted_directions.end(); dirs_window++) {
+                    dir_acc += dirs_window->first * dirs_window->second;
+                    score_acc += dirs_window->second;
+                }
+            }
+            if (window_start_angle > 1.5 * PI) {
+                for (auto dirs_window = counted_directions.begin();
+                    dirs_window != counted_directions.upper_bound(window_start_angle - 1.5 * PI); dirs_window++) {
+                    dir_acc += dirs_window->first * dirs_window->second;
+                    score_acc += dirs_window->second;
+                }
+            }
+
+            if (score_acc > best_dir.second) {
+                best_dir = {dir_acc / score_acc, score_acc};
+            }
+        }
+        double bridging_angle = best_dir.first;
+        if (bridging_angle == 0) {
+            bridging_angle = 0.001;
+        }
+        switch (dominant_pattern) {
+        case ipHilbertCurve: bridging_angle += 0.25 * PI; break;
+        case ipOctagramSpiral: bridging_angle += (1.0 / 16.0) * PI; break;
+        default: break;
+        }
+
+        return bridging_angle;
+        }
+
+    // LAMBDA that will fill given polygons with lines, exapand the lines to the nearest anchor, and reconstruct polygons from the newly
+    // generated lines
+static Polygons construct_anchored_polygon(Polygons bridged_area, Lines anchors, const Flow &bridging_flow, double bridging_angle) {
+        auto lines_rotate = [](Lines &lines, double cos_angle, double sin_angle) {
+            for (Line &l : lines) {
+                double ax = double(l.a.x());
+                double ay = double(l.a.y());
+                l.a.x()   = coord_t(round(cos_angle * ax - sin_angle * ay));
+                l.a.y()   = coord_t(round(cos_angle * ay + sin_angle * ax));
+                double bx = double(l.b.x());
+                double by = double(l.b.y());
+                l.b.x()   = coord_t(round(cos_angle * bx - sin_angle * by));
+                l.b.y()   = coord_t(round(cos_angle * by + sin_angle * bx));
+            }
+            };
+
+        auto segments_overlap = [](coord_t alow, coord_t ahigh, coord_t blow, coord_t bhigh) {
+            return (alow >= blow && alow <= bhigh) || (ahigh >= blow && ahigh <= bhigh) || (blow >= alow && blow <= ahigh) ||
+                (bhigh >= alow && bhigh <= ahigh);
+            };
+
+        Polygons expanded_bridged_area{};
+        double   aligning_angle = -bridging_angle + PI * 0.5;
+        {
+            polygons_rotate(bridged_area, aligning_angle);
+            lines_rotate(anchors, cos(aligning_angle), sin(aligning_angle));
+            BoundingBox bb_x = get_extents(bridged_area);
+            BoundingBox bb_y = get_extents(anchors);
+
+            const size_t n_vlines = (bb_x.max.x() - bb_x.min.x() + bridging_flow.scaled_spacing() - 1) / bridging_flow.scaled_spacing();
+            std::vector<Line> vertical_lines(n_vlines);
+            for (size_t i = 0; i < n_vlines; i++) {
+                coord_t x           = bb_x.min.x() + i * bridging_flow.scaled_spacing();
+                coord_t y_min       = bb_y.min.y() - bridging_flow.scaled_spacing();
+                coord_t y_max       = bb_y.max.y() + bridging_flow.scaled_spacing();
+                vertical_lines[i].a = Point{x, y_min};
+                vertical_lines[i].b = Point{x, y_max};
+            }
+
+            auto anchors_and_walls_tree = AABBTreeLines::LinesDistancer<Line>{std::move(anchors)};
+            auto bridged_area_tree      = AABBTreeLines::LinesDistancer<Line>{to_lines(bridged_area)};
+
+            std::vector<std::vector<Line>> polygon_sections(n_vlines);
+            for (size_t i = 0; i < n_vlines; i++) {
+                auto area_intersections = bridged_area_tree.intersections_with_line<true>(vertical_lines[i]);
+                for (int intersection_idx = 0; intersection_idx < int(area_intersections.size()) - 1; intersection_idx++) {
+                    if (bridged_area_tree.outside(
+                        (area_intersections[intersection_idx].first + area_intersections[intersection_idx + 1].first) / 2) < 0) {
+                        polygon_sections[i].emplace_back(area_intersections[intersection_idx].first,
+                            area_intersections[intersection_idx + 1].first);
+                    }
+                }
+                auto anchors_intersections = anchors_and_walls_tree.intersections_with_line<true>(vertical_lines[i]);
+
+                for (Line &section : polygon_sections[i]) {
+                    auto maybe_below_anchor = std::upper_bound(anchors_intersections.rbegin(), anchors_intersections.rend(), section.a,
+                        [](const Point &a, const std::pair<Point, size_t> &b) {
+                            return a.y() > b.first.y();
+                        });
+                    if (maybe_below_anchor != anchors_intersections.rend()) {
+                        section.a = maybe_below_anchor->first;
+                        section.a.y() -= bridging_flow.scaled_width() * (0.5 + 0.5);
+                    }
+
+                    auto maybe_upper_anchor = std::upper_bound(anchors_intersections.begin(), anchors_intersections.end(), section.b,
+                        [](const Point &a, const std::pair<Point, size_t> &b) {
+                            return a.y() < b.first.y();
+                        });
+                    if (maybe_upper_anchor != anchors_intersections.end()) {
+                        section.b = maybe_upper_anchor->first;
+                        section.b.y() += bridging_flow.scaled_width() * (0.5 + 0.5);
+                    }
+                }
+
+                for (int section_idx = 0; section_idx < int(polygon_sections[i].size()) - 1; section_idx++) {
+                    Line &section_a = polygon_sections[i][section_idx];
+                    Line &section_b = polygon_sections[i][section_idx + 1];
+                    if (segments_overlap(section_a.a.y(), section_a.b.y(), section_b.a.y(), section_b.b.y())) {
+                        section_b.a = section_a.a.y() < section_b.a.y() ? section_a.a : section_b.a;
+                        section_b.b = section_a.b.y() < section_b.b.y() ? section_b.b : section_a.b;
+                        section_a.a = section_a.b;
+                    }
+                }
+
+                polygon_sections[i].erase(std::remove_if(polygon_sections[i].begin(), polygon_sections[i].end(),
+                    [](const Line &s) { return s.a == s.b; }),
+                    polygon_sections[i].end());
+                std::sort(polygon_sections[i].begin(), polygon_sections[i].end(),
+                    [](const Line &a, const Line &b) { return a.a.y() < b.b.y(); });
+            }
+
+            // reconstruct polygon from polygon sections
+            struct TracedPoly
+            {
+                Points lows;
+                Points highs;
+            };
+
+            std::vector<TracedPoly> current_traced_polys;
+            for (const auto &polygon_slice : polygon_sections) {
+                std::unordered_set<const Line *> used_segments;
+                for (TracedPoly &traced_poly : current_traced_polys) {
+                    auto candidates_begin = std::upper_bound(polygon_slice.begin(), polygon_slice.end(), traced_poly.lows.back(),
+                        [](const Point &low, const Line &seg) { return seg.b.y() > low.y(); });
+                    auto candidates_end   = std::upper_bound(polygon_slice.begin(), polygon_slice.end(), traced_poly.highs.back(),
+                        [](const Point &high, const Line &seg) { return seg.a.y() > high.y(); });
+
+                    bool segment_added = false;
+                    for (auto candidate = candidates_begin; candidate != candidates_end && !segment_added; candidate++) {
+                        if (used_segments.find(&(*candidate)) != used_segments.end()) {
+                            continue;
+                        }
+
+                        if ((traced_poly.lows.back() - candidate->a).cast<double>().squaredNorm() <
+                            36.0 * double(bridging_flow.scaled_spacing()) * bridging_flow.scaled_spacing()) {
+                            traced_poly.lows.push_back(candidate->a);
+                        } else {
+                            traced_poly.lows.push_back(traced_poly.lows.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
+                            traced_poly.lows.push_back(candidate->a - Point{bridging_flow.scaled_spacing() / 2, 0});
+                            traced_poly.lows.push_back(candidate->a);
+                        }
+
+                        if ((traced_poly.highs.back() - candidate->b).cast<double>().squaredNorm() <
+                            36.0 * double(bridging_flow.scaled_spacing()) * bridging_flow.scaled_spacing()) {
+                            traced_poly.highs.push_back(candidate->b);
+                        } else {
+                            traced_poly.highs.push_back(traced_poly.highs.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
+                            traced_poly.highs.push_back(candidate->b - Point{bridging_flow.scaled_spacing() / 2, 0});
+                            traced_poly.highs.push_back(candidate->b);
+                        }
+                        segment_added = true;
+                        used_segments.insert(&(*candidate));
+                    }
+
+                    if (!segment_added) {
+                        // Zero overlapping segments, we just close this polygon
+                        traced_poly.lows.push_back(traced_poly.lows.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
+                        traced_poly.highs.push_back(traced_poly.highs.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
+                        Polygon &new_poly = expanded_bridged_area.emplace_back(std::move(traced_poly.lows));
+                        new_poly.points.insert(new_poly.points.end(), traced_poly.highs.rbegin(), traced_poly.highs.rend());
+                        traced_poly.lows.clear();
+                        traced_poly.highs.clear();
+                    }
+                }
+
+                current_traced_polys.erase(std::remove_if(current_traced_polys.begin(), current_traced_polys.end(),
+                    [](const TracedPoly &tp) { return tp.lows.empty(); }),
+                    current_traced_polys.end());
+
+                for (const auto &segment : polygon_slice) {
+                    if (used_segments.find(&segment) == used_segments.end()) {
+                        TracedPoly &new_tp = current_traced_polys.emplace_back();
+                        new_tp.lows.push_back(segment.a - Point{bridging_flow.scaled_spacing() / 2, 0});
+                        new_tp.lows.push_back(segment.a);
+                        new_tp.highs.push_back(segment.b - Point{bridging_flow.scaled_spacing() / 2, 0});
+                        new_tp.highs.push_back(segment.b);
+                    }
+                }
+            }
+
+            // add not closed polys
+            for (TracedPoly &traced_poly : current_traced_polys) {
+                Polygon &new_poly = expanded_bridged_area.emplace_back(std::move(traced_poly.lows));
+                new_poly.points.insert(new_poly.points.end(), traced_poly.highs.rbegin(), traced_poly.highs.rend());
+            }
+            expanded_bridged_area = union_safety_offset(expanded_bridged_area);
+        }
+
+        polygons_rotate(expanded_bridged_area, -aligning_angle);
+        return expanded_bridged_area;
+        }
+
 // This method applies bridge flow to the first internal solid layer above sparse infill.
 void PrintObject::bridge_over_infill()
 {
@@ -2961,270 +3248,11 @@ void PrintObject::bridge_over_infill()
         return diff(layers_sparse_infill, not_sparse_infill);
         };
 
-    // LAMBDA do determine optimal bridging angle
-    auto determine_bridging_angle = [](const Polygons &bridged_area, const Lines &anchors, InfillPattern dominant_pattern, double infill_direction) {
-        AABBTreeLines::LinesDistancer<Line> lines_tree(anchors);
-
-        // Check it the infill that require a fixed infill angle.
-        switch (dominant_pattern) {
-        case ip3DHoneycomb:
-        case ipCrossHatch:
-            return (infill_direction + 45.0) * 2.0 * M_PI / 360.;
-        default: break;
-        }
-
-        std::map<double, int> counted_directions;
-        for (const Polygon &p : bridged_area) {
-            double acc_distance = 0;
-            for (int point_idx = 0; point_idx < int(p.points.size()) - 1; ++point_idx) {
-                Vec2d  start        = p.points[point_idx].cast<double>();
-                Vec2d  next         = p.points[point_idx + 1].cast<double>();
-                Vec2d  v            = next - start; // vector from next to current
-                double dist_to_next = v.norm();
-                acc_distance += dist_to_next;
-                if (acc_distance > scaled(2.0)) {
-                    acc_distance = 0.0;
-                    v.normalize();
-                    int   lines_count = int(std::ceil(dist_to_next / scaled(2.0)));
-                    float step_size   = dist_to_next / lines_count;
-                    for (int i = 0; i < lines_count; ++i) {
-                        Point a                   = (start + v * (i * step_size)).cast<coord_t>();
-                        auto [distance, index, p] = lines_tree.distance_from_lines_extra<false>(a);
-                        double angle = lines_tree.get_line(index).orientation();
-                        if (angle > PI) {
-                            angle -= PI;
-                        }
-                        angle += PI * 0.5;
-                        counted_directions[angle]++;
-                    }
-                }
-            }
-        }
-
-        std::pair<double, int> best_dir{0, 0};
-        // sliding window accumulation
-        for (const auto &dir : counted_directions) {
-            int    score_acc          = 0;
-            double dir_acc            = 0;
-            double window_start_angle = dir.first - PI * 0.1;
-            double window_end_angle   = dir.first + PI * 0.1;
-            for (auto dirs_window = counted_directions.lower_bound(window_start_angle);
-                dirs_window != counted_directions.upper_bound(window_end_angle); dirs_window++) {
-                dir_acc += dirs_window->first * dirs_window->second;
-                score_acc += dirs_window->second;
-            }
-            // current span of directions is 0.5 PI to 1.5 PI (due to the aproach.). Edge values should also account for the
-            //  opposite direction.
-            if (window_start_angle < 0.5 * PI) {
-                for (auto dirs_window = counted_directions.lower_bound(1.5 * PI - (0.5 * PI - window_start_angle));
-                    dirs_window != counted_directions.end(); dirs_window++) {
-                    dir_acc += dirs_window->first * dirs_window->second;
-                    score_acc += dirs_window->second;
-                }
-            }
-            if (window_start_angle > 1.5 * PI) {
-                for (auto dirs_window = counted_directions.begin();
-                    dirs_window != counted_directions.upper_bound(window_start_angle - 1.5 * PI); dirs_window++) {
-                    dir_acc += dirs_window->first * dirs_window->second;
-                    score_acc += dirs_window->second;
-                }
-            }
-
-            if (score_acc > best_dir.second) {
-                best_dir = {dir_acc / score_acc, score_acc};
-            }
-        }
-        double bridging_angle = best_dir.first;
-        if (bridging_angle == 0) {
-            bridging_angle = 0.001;
-        }
-        switch (dominant_pattern) {
-        case ipHilbertCurve: bridging_angle += 0.25 * PI; break;
-        case ipOctagramSpiral: bridging_angle += (1.0 / 16.0) * PI; break;
-        default: break;
-        }
-
-        return bridging_angle;
-        };
-
-    // LAMBDA that will fill given polygons with lines, exapand the lines to the nearest anchor, and reconstruct polygons from the newly
-    // generated lines
-    auto construct_anchored_polygon = [](Polygons bridged_area, Lines anchors, const Flow &bridging_flow, double bridging_angle) {
-        auto lines_rotate = [](Lines &lines, double cos_angle, double sin_angle) {
-            for (Line &l : lines) {
-                double ax = double(l.a.x());
-                double ay = double(l.a.y());
-                l.a.x()   = coord_t(round(cos_angle * ax - sin_angle * ay));
-                l.a.y()   = coord_t(round(cos_angle * ay + sin_angle * ax));
-                double bx = double(l.b.x());
-                double by = double(l.b.y());
-                l.b.x()   = coord_t(round(cos_angle * bx - sin_angle * by));
-                l.b.y()   = coord_t(round(cos_angle * by + sin_angle * bx));
-            }
-            };
-
-        auto segments_overlap = [](coord_t alow, coord_t ahigh, coord_t blow, coord_t bhigh) {
-            return (alow >= blow && alow <= bhigh) || (ahigh >= blow && ahigh <= bhigh) || (blow >= alow && blow <= ahigh) ||
-                (bhigh >= alow && bhigh <= ahigh);
-            };
-
-        Polygons expanded_bridged_area{};
-        double   aligning_angle = -bridging_angle + PI * 0.5;
-        {
-            polygons_rotate(bridged_area, aligning_angle);
-            lines_rotate(anchors, cos(aligning_angle), sin(aligning_angle));
-            BoundingBox bb_x = get_extents(bridged_area);
-            BoundingBox bb_y = get_extents(anchors);
-
-            const size_t n_vlines = (bb_x.max.x() - bb_x.min.x() + bridging_flow.scaled_spacing() - 1) / bridging_flow.scaled_spacing();
-            std::vector<Line> vertical_lines(n_vlines);
-            for (size_t i = 0; i < n_vlines; i++) {
-                coord_t x           = bb_x.min.x() + i * bridging_flow.scaled_spacing();
-                coord_t y_min       = bb_y.min.y() - bridging_flow.scaled_spacing();
-                coord_t y_max       = bb_y.max.y() + bridging_flow.scaled_spacing();
-                vertical_lines[i].a = Point{x, y_min};
-                vertical_lines[i].b = Point{x, y_max};
-            }
-
-            auto anchors_and_walls_tree = AABBTreeLines::LinesDistancer<Line>{std::move(anchors)};
-            auto bridged_area_tree      = AABBTreeLines::LinesDistancer<Line>{to_lines(bridged_area)};
-
-            std::vector<std::vector<Line>> polygon_sections(n_vlines);
-            for (size_t i = 0; i < n_vlines; i++) {
-                auto area_intersections = bridged_area_tree.intersections_with_line<true>(vertical_lines[i]);
-                for (int intersection_idx = 0; intersection_idx < int(area_intersections.size()) - 1; intersection_idx++) {
-                    if (bridged_area_tree.outside(
-                        (area_intersections[intersection_idx].first + area_intersections[intersection_idx + 1].first) / 2) < 0) {
-                        polygon_sections[i].emplace_back(area_intersections[intersection_idx].first,
-                            area_intersections[intersection_idx + 1].first);
-                    }
-                }
-                auto anchors_intersections = anchors_and_walls_tree.intersections_with_line<true>(vertical_lines[i]);
-
-                for (Line &section : polygon_sections[i]) {
-                    auto maybe_below_anchor = std::upper_bound(anchors_intersections.rbegin(), anchors_intersections.rend(), section.a,
-                        [](const Point &a, const std::pair<Point, size_t> &b) {
-                            return a.y() > b.first.y();
-                        });
-                    if (maybe_below_anchor != anchors_intersections.rend()) {
-                        section.a = maybe_below_anchor->first;
-                        section.a.y() -= bridging_flow.scaled_width() * (0.5 + 0.5);
-                    }
-
-                    auto maybe_upper_anchor = std::upper_bound(anchors_intersections.begin(), anchors_intersections.end(), section.b,
-                        [](const Point &a, const std::pair<Point, size_t> &b) {
-                            return a.y() < b.first.y();
-                        });
-                    if (maybe_upper_anchor != anchors_intersections.end()) {
-                        section.b = maybe_upper_anchor->first;
-                        section.b.y() += bridging_flow.scaled_width() * (0.5 + 0.5);
-                    }
-                }
-
-                for (int section_idx = 0; section_idx < int(polygon_sections[i].size()) - 1; section_idx++) {
-                    Line &section_a = polygon_sections[i][section_idx];
-                    Line &section_b = polygon_sections[i][section_idx + 1];
-                    if (segments_overlap(section_a.a.y(), section_a.b.y(), section_b.a.y(), section_b.b.y())) {
-                        section_b.a = section_a.a.y() < section_b.a.y() ? section_a.a : section_b.a;
-                        section_b.b = section_a.b.y() < section_b.b.y() ? section_b.b : section_a.b;
-                        section_a.a = section_a.b;
-                    }
-                }
-
-                polygon_sections[i].erase(std::remove_if(polygon_sections[i].begin(), polygon_sections[i].end(),
-                    [](const Line &s) { return s.a == s.b; }),
-                    polygon_sections[i].end());
-                std::sort(polygon_sections[i].begin(), polygon_sections[i].end(),
-                    [](const Line &a, const Line &b) { return a.a.y() < b.b.y(); });
-            }
-
-            // reconstruct polygon from polygon sections
-            struct TracedPoly
-            {
-                Points lows;
-                Points highs;
-            };
-
-            std::vector<TracedPoly> current_traced_polys;
-            for (const auto &polygon_slice : polygon_sections) {
-                std::unordered_set<const Line *> used_segments;
-                for (TracedPoly &traced_poly : current_traced_polys) {
-                    auto candidates_begin = std::upper_bound(polygon_slice.begin(), polygon_slice.end(), traced_poly.lows.back(),
-                        [](const Point &low, const Line &seg) { return seg.b.y() > low.y(); });
-                    auto candidates_end   = std::upper_bound(polygon_slice.begin(), polygon_slice.end(), traced_poly.highs.back(),
-                        [](const Point &high, const Line &seg) { return seg.a.y() > high.y(); });
-
-                    bool segment_added = false;
-                    for (auto candidate = candidates_begin; candidate != candidates_end && !segment_added; candidate++) {
-                        if (used_segments.find(&(*candidate)) != used_segments.end()) {
-                            continue;
-                        }
-
-                        if ((traced_poly.lows.back() - candidate->a).cast<double>().squaredNorm() <
-                            36.0 * double(bridging_flow.scaled_spacing()) * bridging_flow.scaled_spacing()) {
-                            traced_poly.lows.push_back(candidate->a);
-                        } else {
-                            traced_poly.lows.push_back(traced_poly.lows.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
-                            traced_poly.lows.push_back(candidate->a - Point{bridging_flow.scaled_spacing() / 2, 0});
-                            traced_poly.lows.push_back(candidate->a);
-                        }
-
-                        if ((traced_poly.highs.back() - candidate->b).cast<double>().squaredNorm() <
-                            36.0 * double(bridging_flow.scaled_spacing()) * bridging_flow.scaled_spacing()) {
-                            traced_poly.highs.push_back(candidate->b);
-                        } else {
-                            traced_poly.highs.push_back(traced_poly.highs.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
-                            traced_poly.highs.push_back(candidate->b - Point{bridging_flow.scaled_spacing() / 2, 0});
-                            traced_poly.highs.push_back(candidate->b);
-                        }
-                        segment_added = true;
-                        used_segments.insert(&(*candidate));
-                    }
-
-                    if (!segment_added) {
-                        // Zero overlapping segments, we just close this polygon
-                        traced_poly.lows.push_back(traced_poly.lows.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
-                        traced_poly.highs.push_back(traced_poly.highs.back() + Point{bridging_flow.scaled_spacing() / 2, 0});
-                        Polygon &new_poly = expanded_bridged_area.emplace_back(std::move(traced_poly.lows));
-                        new_poly.points.insert(new_poly.points.end(), traced_poly.highs.rbegin(), traced_poly.highs.rend());
-                        traced_poly.lows.clear();
-                        traced_poly.highs.clear();
-                    }
-                }
-
-                current_traced_polys.erase(std::remove_if(current_traced_polys.begin(), current_traced_polys.end(),
-                    [](const TracedPoly &tp) { return tp.lows.empty(); }),
-                    current_traced_polys.end());
-
-                for (const auto &segment : polygon_slice) {
-                    if (used_segments.find(&segment) == used_segments.end()) {
-                        TracedPoly &new_tp = current_traced_polys.emplace_back();
-                        new_tp.lows.push_back(segment.a - Point{bridging_flow.scaled_spacing() / 2, 0});
-                        new_tp.lows.push_back(segment.a);
-                        new_tp.highs.push_back(segment.b - Point{bridging_flow.scaled_spacing() / 2, 0});
-                        new_tp.highs.push_back(segment.b);
-                    }
-                }
-            }
-
-            // add not closed polys
-            for (TracedPoly &traced_poly : current_traced_polys) {
-                Polygon &new_poly = expanded_bridged_area.emplace_back(std::move(traced_poly.lows));
-                new_poly.points.insert(new_poly.points.end(), traced_poly.highs.rbegin(), traced_poly.highs.rend());
-            }
-            expanded_bridged_area = union_safety_offset(expanded_bridged_area);
-        }
-
-        polygons_rotate(expanded_bridged_area, -aligning_angle);
-        return expanded_bridged_area;
-        };
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, clustered_layers_for_threads.size()), [po = static_cast<const PrintObject *>(this),
         target_flow_height_factor, &surfaces_by_layer,
         &clustered_layers_for_threads,
-        gather_areas_w_depth, &infill_lines,
-        determine_bridging_angle,
-        construct_anchored_polygon](
+        gather_areas_w_depth, &infill_lines](
             tbb::blocked_range<size_t> r) {
                 for (size_t cluster_idx = r.begin(); cluster_idx < r.end(); cluster_idx++) {
                     for (size_t job_idx = 0; job_idx < clustered_layers_for_threads[cluster_idx].size(); job_idx++) {
@@ -3491,6 +3519,368 @@ void PrintObject::bridge_over_infill()
     BOOST_LOG_TRIVIAL(info) << "Bridge over infill - End" << log_memory_info();
 
 } // void PrintObject::bridge_over_infill()
+
+void PrintObject::add_internal_bridge_layers(const std::vector<std::vector<Surfaces>> &original_sparse)
+{
+    if (original_sparse.empty())
+        return;
+    using RegionKey = std::pair<size_t, size_t>;
+    std::map<RegionKey, ExPolygons> required_roofs;
+    for (size_t index = 0; index < m_layers.size(); ++index)
+        for (size_t region_id = 0; region_id < m_layers[index]->regions().size(); ++region_id) {
+            ExPolygons bridges;
+            for (const Surface &surface : m_layers[index]->get_region(int(region_id))->fill_surfaces.surfaces)
+                if (surface.surface_type == stInternalBridge)
+                    bridges.push_back(surface.expolygon);
+            if (!bridges.empty())
+                required_roofs[{index, region_id}] = diff_ex(bridges, to_expolygons(original_sparse[index][region_id]));
+        }
+    struct Seed { size_t layer, region; Surface surface; int layers; };
+    std::vector<Seed> seeds;
+    // Snapshot only the bridges found by the normal algorithm. Newly added
+    // planes cannot themselves seed another stack.
+    for (size_t index = 0; index < m_layers.size(); ++index)
+        for (size_t region_id = 0; region_id < m_layers[index]->regions().size(); ++region_id) {
+            const LayerRegion &region = *m_layers[index]->get_region(int(region_id));
+            const int count = region.region().config().internal_bridge_layers.value;
+            if (count <= 1)
+                continue;
+            for (const Surface &surface : region.fill_surfaces.surfaces)
+                if (surface.surface_type == stInternalBridge)
+                    seeds.push_back({index, region_id, surface, std::min(count, 3)});
+        }
+
+    bool added_bridge = false;
+    for (const Seed &seed : seeds) {
+        ExPolygons projection{seed.surface.expolygon};
+        ExPolygons required = intersection_ex(projection, required_roofs[{seed.layer, seed.region}]);
+        for (int depth = 1; depth < seed.layers && seed.layer >= size_t(depth); ++depth) {
+            m_print->throw_if_canceled();
+            const size_t layer_index = seed.layer - depth;
+            LayerRegion &target = *m_layers[layer_index]->get_region(int(seed.region));
+            if (target.region().config().sparse_infill_density.value >= 100.)
+                break;
+            const auto sparse = target.fill_surfaces.filter_by_types({stInternal, stInternalVoid});
+            projection = intersection_ex(projection, to_expolygons(sparse));
+            if (projection.empty() || layer_index == 0)
+                break;
+
+            // The bottom strand retains thick bridge flow. Ensure it has the
+            // same vertical clearance over sparse infill as a normal bridge.
+            const double bottom_z = target.layer()->print_z - target.bridging_flow(frSolidInfill, true).height() * 0.9;
+            for (int below = int(layer_index) - 1; below >= 0; --below) {
+                const Layer *lower = m_layers[below];
+                if (below < int(layer_index) - 1 && lower->print_z < bottom_z - EPSILON)
+                    break;
+                const LayerRegion &lower_region = *lower->get_region(int(seed.region));
+                if (lower_region.region().config().sparse_infill_density.value >= 100.) {
+                    projection.clear();
+                    break;
+                }
+                ExPolygons lower_sparse;
+                for (const Surface &surface : lower_region.fill_surfaces.surfaces)
+                    if (surface.surface_type == stInternal || surface.surface_type == stInternalVoid)
+                        lower_sparse.push_back(surface.expolygon);
+                projection = intersection_ex(projection, lower_sparse);
+                if (projection.empty())
+                    break;
+            }
+            if (projection.empty())
+                break;
+            required = intersection_ex(required, projection);
+            append(required_roofs[{layer_index, seed.region}], required);
+
+            Surfaces replacement;
+            for (const Surface &surface : target.fill_surfaces.surfaces) {
+                if (surface.surface_type == stInternal || surface.surface_type == stInternalVoid) {
+                    for (const ExPolygon &remainder : diff_ex(surface.expolygon, projection))
+                        replacement.emplace_back(surface, remainder);
+                } else
+                    replacement.push_back(surface);
+            }
+            Surface bridge(seed.surface);
+            bridge.bridge_followup = false;
+            bridge.bridge_angle = std::fmod(seed.surface.bridge_angle + depth * M_PI / 2., M_PI);
+            for (const ExPolygon &area : projection)
+                replacement.emplace_back(bridge, area);
+            target.fill_surfaces.surfaces = std::move(replacement);
+            added_bridge = true;
+
+            // A thick bead above another bridge would occupy the same volume.
+            // Convert only the supported portion of the plane above to normal
+            // layer-height bridge flow; shell classifications stay untouched.
+            LayerRegion &upper = *m_layers[layer_index + 1]->get_region(int(seed.region));
+            replacement.clear();
+            for (const Surface &surface : upper.fill_surfaces.surfaces) {
+                if (surface.surface_type == stInternalBridge) {
+                    for (const ExPolygon &remainder : diff_ex(surface.expolygon, projection))
+                        replacement.emplace_back(surface, remainder);
+                    Surface followup(surface);
+                    followup.bridge_followup = true;
+                    for (const ExPolygon &area : intersection_ex(surface.expolygon, projection))
+                        replacement.emplace_back(followup, area);
+                } else
+                    replacement.push_back(surface);
+            }
+            upper.fill_surfaces.surfaces = std::move(replacement);
+        }
+    }
+
+    // Default one-layer jobs must retain their existing support generators,
+    // anchoring and geometry exactly. A request that cannot fit also has no
+    // effect on the baseline bridge preparation.
+    if (!added_bridge)
+        return;
+
+    struct BridgeBase {
+        size_t layer, region;
+        Surface surface;
+        ExPolygons footprint;
+        ExPolygons anchor_domain;
+    };
+    const auto sparse_areas = [](const LayerRegion &region) {
+        ExPolygons areas;
+        for (const Surface &surface : region.fill_surfaces.surfaces)
+            if (surface.surface_type == stInternal || surface.surface_type == stInternalVoid)
+                areas.push_back(surface.expolygon);
+        return areas;
+    };
+    std::vector<BridgeBase> bases;
+    for (size_t index = 1; index < m_layers.size(); ++index) {
+        const Layer &layer = *m_layers[index];
+        for (size_t region_id = 0; region_id < layer.regions().size(); ++region_id) {
+            const LayerRegion &region = *layer.get_region(int(region_id));
+            for (const Surface &surface : region.fill_surfaces.surfaces) {
+                if (surface.surface_type != stInternalBridge || surface.bridge_followup)
+                    continue;
+
+                ExPolygons available = sparse_areas(region);
+                // An anchor extension must fit at this Z as well as in XY.
+                // In particular it may not replace any existing solid shell,
+                // another bridge, a modifier region or a hole in the part.
+                const double bottom_z = layer.print_z - region.bridging_flow(frSolidInfill, true).height() * 0.9;
+                for (int below = int(index) - 1; below >= 0 && !available.empty(); --below) {
+                    const Layer &lower = *m_layers[size_t(below)];
+                    if (below < int(index) - 1 && lower.print_z < bottom_z - EPSILON)
+                        break;
+                    const LayerRegion &lower_region = *lower.get_region(int(region_id));
+                    if (lower_region.region().config().sparse_infill_density.value >= 100.) {
+                        available.clear();
+                        break;
+                    }
+                    available = intersection_ex(available, sparse_areas(lower_region));
+                }
+                // Use the ordinary bridge algorithm's nearby-infill search
+                // distance. Prepare sparse demand over this entire allowable
+                // domain so subsequent anchor growth uses the final supports.
+                ExPolygons domain = intersection_ex(available, offset_ex(surface.expolygon, scale_(10.)));
+                domain.push_back(surface.expolygon);
+                // The ordinary algorithm can emit several disconnected
+                // polygons from one candidate. Reconstruct them together at
+                // this plane: treating each polygon as an independent roof
+                // makes them compete for anchors and choose conflicting angles.
+                if (!bases.empty() && bases.back().layer == index && bases.back().region == region_id) {
+                    bases.back().footprint.push_back(surface.expolygon);
+                    append(bases.back().anchor_domain, std::move(domain));
+                } else
+                    bases.push_back({index, region_id, surface, {surface.expolygon}, std::move(domain)});
+            }
+        }
+    }
+
+    for (BridgeBase &base : bases) {
+        base.footprint = union_ex(base.footprint);
+        base.anchor_domain = union_ex(base.anchor_domain);
+    }
+
+    // Ordinary internal bridges add a narrow solid strip next to the lower
+    // wall to support their ends. Moving a base down must prepare that same
+    // strip at its actual supporting plane, without removing old shell or
+    // ensuring material. Limit additions to sparse/void in the same region.
+    for (const BridgeBase &base : bases) {
+        LayerRegion &lower = *m_layers[base.layer - 1]->get_region(int(base.region));
+        const coord_t spacing = lower.flow(frSolidInfill).scaled_spacing();
+        const Polygons footprint = to_polygons(base.anchor_domain);
+        const Polygons bridge_rim = diff(footprint, shrink(footprint, spacing));
+        const Polygons lower_fill = to_polygons(union_safety_offset_ex(to_polygons(lower.fill_surfaces.surfaces)));
+        const Polygons wall_rim = diff(lower_fill, shrink(lower_fill, spacing));
+        // The old ensuring strip can leave the relocated base one spacing
+        // inside the wall. Keep its new supporting strip connected to the
+        // lower wall; an isolated one-line ring is too narrow to fill reliably.
+        Polygons ensuring_rim = intersection(bridge_rim, expand(wall_rim, spacing + SCALED_EPSILON));
+        append(ensuring_rim, intersection(wall_rim, expand(footprint, spacing + SCALED_EPSILON)));
+        const ExPolygons ensuring = intersection_ex(union_ex(ensuring_rim), sparse_areas(lower));
+        if (ensuring.empty())
+            continue;
+        Surfaces replacement;
+        for (const Surface &surface : lower.fill_surfaces.surfaces) {
+            if (surface.surface_type == stInternal || surface.surface_type == stInternalVoid) {
+                for (const ExPolygon &remainder : diff_ex(surface.expolygon, ensuring))
+                    replacement.emplace_back(surface, remainder);
+            } else
+                replacement.push_back(surface);
+        }
+        for (const ExPolygon &area : ensuring)
+            replacement.emplace_back(stInternalSolid, area);
+        lower.fill_surfaces.surfaces = std::move(replacement);
+    }
+
+    // Build support demands at the actual lowest planes. A follow-up bridge
+    // sits on another bridge, so it must not create a second, higher sparse
+    // support target. Copies keep all demand pointers stable while surfaces
+    // are temporarily expanded for Lightning.
+    Surfaces demands;
+    std::vector<float> demand_bottom_z;
+    for (const BridgeBase &base : bases)
+        for (const ExPolygon &domain : base.anchor_domain) {
+            demands.emplace_back(base.surface, domain);
+            demand_bottom_z.push_back(float(m_layers[base.layer]->bottom_z()));
+        }
+    std::vector<std::pair<const Surface *, float>> surfaces_w_bottom_z;
+    surfaces_w_bottom_z.reserve(demands.size());
+    for (size_t index = 0; index < demands.size(); ++index)
+        surfaces_w_bottom_z.emplace_back(&demands[index], demand_bottom_z[index]);
+    m_adaptive_fill_octrees = prepare_adaptive_infill_data(surfaces_w_bottom_z);
+
+    std::map<LayerRegion *, ExPolygons> lightning_demands;
+    for (const BridgeBase &base : bases) {
+        LayerRegion *region = m_layers[base.layer]->get_region(int(base.region));
+        append(lightning_demands[region], base.anchor_domain);
+    }
+    std::map<LayerRegion *, SurfaceCollection> originals;
+    for (auto &[region, domain] : lightning_demands) {
+        originals.emplace(region, std::move(region->fill_surfaces));
+        for (const Surface &surface : originals.at(region).surfaces) {
+            if (surface.surface_type == stInternal || surface.surface_type == stInternalVoid) {
+                for (const ExPolygon &remainder : diff_ex(surface.expolygon, domain))
+                    region->fill_surfaces.surfaces.emplace_back(surface, remainder);
+                for (const ExPolygon &anchor : intersection_ex(surface.expolygon, domain))
+                    region->fill_surfaces.surfaces.emplace_back(stInternalSolid, anchor);
+            } else
+                region->fill_surfaces.surfaces.push_back(surface);
+        }
+    }
+    try {
+        m_lightning_generator = prepare_lightning_infill_data();
+        if (m_lightning_generator)
+            m_lightning_generator->set_stable_traversal();
+    } catch (...) {
+        for (auto &[region, original] : originals)
+            region->fill_surfaces = std::move(original);
+        throw;
+    }
+    for (auto &[region, original] : originals)
+        region->fill_surfaces = std::move(original);
+
+    // A generator rebuild can also change sparse lines under an old thick
+    // bridge remnant where a stack only partly fit. Re-anchor every actual
+    // thick base, bottom-up, using those same caches that final fill will use.
+    // Do not rebuild after reconstruction: its bounded growth is already
+    // included in the conservative support demands above.
+    for (const BridgeBase &base : bases) {
+        m_print->throw_if_canceled();
+        Layer &layer = *m_layers[base.layer];
+        LayerRegion &region = *layer.get_region(int(base.region));
+        const Layer &lower = *layer.lower_layer;
+        Polylines sparse = lower.generate_sparse_infill_polylines_for_anchoring(
+            m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+        sparse = intersection_pl(sparse, base.anchor_domain);
+
+        // Perimeter paths are already generated at this stage. Use their
+        // actual positions as wall anchors instead of treating the edge of
+        // an arbitrary bridge footprint as a supporting wall.
+        Polylines wall_anchors;
+        for (const LayerRegion *lower_region : lower.regions())
+            lower_region->perimeters.collect_polylines(wall_anchors);
+        const Lines direction_anchors = to_lines(sparse.empty() ? wall_anchors : sparse);
+        if (direction_anchors.empty())
+            continue;
+        const ExPolygons required = intersection_ex(base.footprint, required_roofs[{base.layer, base.region}]);
+        const double angle = required.empty() ? base.surface.bridge_angle :
+            determine_bridging_angle(to_polygons(required), direction_anchors,
+                sparse.empty() ? ipLine : region.region().config().sparse_infill_pattern.value,
+                region.region().config().infill_direction.value);
+        append(wall_anchors, sparse);
+        const Flow flow = region.bridging_flow(frSolidInfill, true);
+        // Match ordinary bridge preparation: widen the candidate by one
+        // strand spacing before constructing and regularizing its anchors.
+        const Polygons candidate = intersection(expand(to_polygons(required), flow.scaled_spacing()), to_polygons(base.anchor_domain));
+        ExPolygons anchored = candidate.empty() ? ExPolygons{} : union_ex(construct_anchored_polygon(
+            candidate, to_lines(wall_anchors), flow, angle));
+        anchored = intersection_ex(closing(opening(to_polygons(anchored), flow.scaled_spacing()), flow.scaled_spacing()), base.anchor_domain);
+
+        // Previous bases at this same layer may have consumed part of the
+        // shared expansion domain. Preserve their geometry and ownership.
+        ExPolygons still_available = to_expolygons(region.fill_surfaces.filter_by_types({stInternal, stInternalVoid}));
+        append(still_available, base.footprint);
+        anchored = intersection_ex(anchored, union_ex(still_available));
+
+        // Preserve the actual roof, not old anchor extensions into sparse
+        // infill. Retaining those extensions after choosing a new bridge angle
+        // can create short strands which start in air beside the new anchors.
+        append(anchored, required);
+        anchored = union_ex(anchored);
+        const ExPolygons discarded = diff_ex(base.footprint, anchored);
+
+        Surfaces replacement;
+        for (const Surface &surface : region.fill_surfaces.surfaces) {
+            if (surface.surface_type == stInternal || surface.surface_type == stInternalVoid) {
+                for (const ExPolygon &remainder : diff_ex(surface.expolygon, anchored))
+                    replacement.emplace_back(surface, remainder);
+            } else if (surface.surface_type == stInternalBridge && !surface.bridge_followup) {
+                // All thick base components in this region are reconstructed
+                // together; follow-up bridge areas retain their ownership.
+            } else
+                replacement.push_back(surface);
+        }
+        for (const Surface &original : original_sparse[base.layer][base.region])
+            for (const ExPolygon &area : intersection_ex(original.expolygon, discarded))
+                replacement.emplace_back(original, area);
+        Surface bridge(base.surface);
+        bridge.bridge_angle = angle;
+        for (const ExPolygon &area : anchored)
+            replacement.emplace_back(bridge, area);
+        region.fill_surfaces.surfaces = std::move(replacement);
+
+        // Follow-ups inherit the actual supporting footprint. Any trimmed
+        // optional anchor fringe returns to its pre-bridge sparse/void type.
+        // Required roof masks were projected with the stack and retained
+        // above, so this cannot remove a requested solid roof layer.
+        ExPolygons affected = base.footprint;
+        ExPolygons supported = anchored;
+        for (size_t depth = 1; depth < 3 && base.layer + depth < m_layers.size(); ++depth) {
+            const size_t upper_index = base.layer + depth;
+            LayerRegion &upper = *m_layers[upper_index]->get_region(int(base.region));
+            ExPolygons next_affected, next_supported, restore;
+            replacement.clear();
+            for (const Surface &surface : upper.fill_surfaces.surfaces) {
+                if (surface.surface_type == stInternalBridge && surface.bridge_followup) {
+                    for (const ExPolygon &remainder : diff_ex(surface.expolygon, affected))
+                        replacement.emplace_back(surface, remainder);
+                    ExPolygons owned = intersection_ex(surface.expolygon, affected);
+                    ExPolygons changed = intersection_ex(owned, supported);
+                    append(restore, diff_ex(owned, supported));
+                    Surface followup(surface);
+                    followup.bridge_angle = std::fmod(angle + depth * M_PI / 2., M_PI);
+                    for (const ExPolygon &area : changed)
+                        replacement.emplace_back(followup, area);
+                    append(next_affected, std::move(owned));
+                    append(next_supported, std::move(changed));
+                } else
+                    replacement.push_back(surface);
+            }
+            for (const Surface &original : original_sparse[upper_index][base.region])
+                for (const ExPolygon &area : intersection_ex(original.expolygon, restore))
+                    replacement.emplace_back(original, area);
+            assert(diff_ex(restore, to_expolygons(original_sparse[upper_index][base.region])).empty());
+            upper.fill_surfaces.surfaces = std::move(replacement);
+            affected = std::move(next_affected);
+            supported = std::move(next_supported);
+            if (affected.empty())
+                break;
+        }
+    }
+}
 
 static void clamp_exturder_to_default(ConfigOptionInt &opt, size_t num_extruders)
 {

@@ -2062,6 +2062,39 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("bridge_layer_density", coPercent);
+    def->label = L("Bridge Layer Density");
+    def->category = L("Quality");
+    def->tooltip = L("Density of regular and internal bridge lines. Lower values increase the distance between lines without changing each line's width or flow. 100% preserves the normal bridge spacing.");
+    def->sidetext = "%";
+    def->min = 1;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(100));
+
+    def = this->add("bridge_line_travel_extend", coPercent);
+    def->label = L("Bridge line travel extend");
+    def->category = L("Quality");
+    def->tooltip = L("Infill/wall overlap for regular and internal bridges. Uses the same overlap calculation as Infill/Wall overlap, independently of other infill. Higher values extend bridge infill farther into walls while continuing to extrude.");
+    def->sidetext = "%";
+    def->min = 1;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(15));
+
+    def = this->add("internal_bridge_layers", coInt);
+    def->label = L("Internal bridge layers");
+    def->category = L("Quality");
+    def->tooltip = L("Number of bridge layers below internal solid infill. Extra bridge layers extend downward into available sparse infill and do not replace top or bottom shell layers. Follow-up bridge layers use the current layer height to avoid overlapping thick bridge strands.");
+    def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
+    def->sidetext = L("layers");
+    def->min = 1;
+    def->max = 3;
+    def->enum_values = {"1", "2", "3"};
+    def->enum_labels = {"1", "2", "3"};
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionInt(1));
+
     def = this->add("max_bridge_length", coFloat);
     def->label = L("Max bridge length");
     def->category = L("Support");

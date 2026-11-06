@@ -239,7 +239,7 @@ public:
      * 
      * \param output all branches in this tree connected into polylines
      */
-    void convertToPolylines(Polylines &output, coord_t line_overlap) const;
+    void convertToPolylines(Polylines &output, coord_t line_overlap, bool stable_traversal = false) const;
 
     /*! If this was ever a direct child of the root, it'll have a previous grounding location.
      *
@@ -260,7 +260,7 @@ protected:
      * \param long_line a reference to a polyline in \p output which to continue building on in the recursion
      * \param output all branches in this tree connected into polylines
      */
-    void convertToPolylines(size_t long_line_idx, Polylines &output) const;
+    void convertToPolylines(size_t long_line_idx, Polylines &output, bool stable_traversal) const;
 
     void removeJunctionOverlap(Polylines &polylines, coord_t line_overlap) const;
 

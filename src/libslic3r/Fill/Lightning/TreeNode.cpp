@@ -347,23 +347,25 @@ coord_t Node::prune(const coord_t& pruning_distance)
     return max_distance_pruned;
 }
 
-void Node::convertToPolylines(Polylines &output, const coord_t line_overlap) const
+void Node::convertToPolylines(Polylines &output, const coord_t line_overlap, bool stable_traversal) const
 {
     Polylines result;
     result.emplace_back();
-    convertToPolylines(0, result);
+    convertToPolylines(0, result, stable_traversal);
     removeJunctionOverlap(result, line_overlap);
     append(output, std::move(result));
 }
 
-void Node::convertToPolylines(size_t long_line_idx, Polylines &output) const
+void Node::convertToPolylines(size_t long_line_idx, Polylines &output, bool stable_traversal) const
 {
     if (m_children.empty()) {
         output[long_line_idx].points.push_back(m_p);
         return;
     }
-    size_t first_child_idx = rand() % m_children.size();
-    m_children[first_child_idx]->convertToPolylines(long_line_idx, output);
+    // Stable mode is used by relocated bridge stacks: repeating conversion
+    // must not move the trimmed end from one branch to another after anchoring.
+    const size_t first_child_idx = stable_traversal ? 0 : rand() % m_children.size();
+    m_children[first_child_idx]->convertToPolylines(long_line_idx, output, stable_traversal);
     output[long_line_idx].points.push_back(m_p);
 
     for (size_t idx_offset = 1; idx_offset < m_children.size(); idx_offset++) {
@@ -371,7 +373,7 @@ void Node::convertToPolylines(size_t long_line_idx, Polylines &output) const
         const Node& child = *m_children[child_idx];
         output.emplace_back();
         size_t child_line_idx = output.size() - 1;
-        child.convertToPolylines(child_line_idx, output);
+        child.convertToPolylines(child_line_idx, output, stable_traversal);
         output[child_line_idx].points.emplace_back(m_p);
     }
 }

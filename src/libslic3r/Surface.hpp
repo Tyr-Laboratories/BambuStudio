@@ -40,6 +40,8 @@ public:
     unsigned short  thickness_layers;   // in layers
     double          bridge_angle;       // in radians, ccw, 0 = East, only 0+ (negative means undefined)
     unsigned short  extra_perimeters;
+    // Follow-up planes in an internal bridge stack use layer-height flow.
+    bool            bridge_followup{false};
     bool            counter_circle_compensation{false};
     std::vector<int> holes_circle_compensation; // hole index
 
@@ -50,7 +52,7 @@ public:
     Surface(const Slic3r::Surface &rhs)
         : surface_type(rhs.surface_type), expolygon(rhs.expolygon),
             thickness(rhs.thickness), thickness_layers(rhs.thickness_layers),
-            bridge_angle(rhs.bridge_angle), extra_perimeters(rhs.extra_perimeters)
+            bridge_angle(rhs.bridge_angle), extra_perimeters(rhs.extra_perimeters), bridge_followup(rhs.bridge_followup)
         {};
 
     Surface(SurfaceType _surface_type, const ExPolygon &_expolygon)
@@ -60,12 +62,12 @@ public:
     Surface(const Surface &other, const ExPolygon &_expolygon)
         : surface_type(other.surface_type), expolygon(_expolygon),
             thickness(other.thickness), thickness_layers(other.thickness_layers),
-            bridge_angle(other.bridge_angle), extra_perimeters(other.extra_perimeters)
+            bridge_angle(other.bridge_angle), extra_perimeters(other.extra_perimeters), bridge_followup(other.bridge_followup)
         {};
     Surface(Surface &&rhs)
         : surface_type(rhs.surface_type), expolygon(std::move(rhs.expolygon)),
             thickness(rhs.thickness), thickness_layers(rhs.thickness_layers),
-            bridge_angle(rhs.bridge_angle), extra_perimeters(rhs.extra_perimeters)
+            bridge_angle(rhs.bridge_angle), extra_perimeters(rhs.extra_perimeters), bridge_followup(rhs.bridge_followup)
         {};
     Surface(SurfaceType _surface_type, const ExPolygon &&_expolygon)
         : surface_type(_surface_type), expolygon(std::move(_expolygon)),
@@ -74,7 +76,7 @@ public:
     Surface(const Surface &other, const ExPolygon &&_expolygon)
         : surface_type(other.surface_type), expolygon(std::move(_expolygon)),
             thickness(other.thickness), thickness_layers(other.thickness_layers),
-            bridge_angle(other.bridge_angle), extra_perimeters(other.extra_perimeters)
+            bridge_angle(other.bridge_angle), extra_perimeters(other.extra_perimeters), bridge_followup(other.bridge_followup)
         {};
 
     Surface& operator=(const Surface &rhs)
@@ -84,6 +86,7 @@ public:
         thickness        = rhs.thickness;
         thickness_layers = rhs.thickness_layers;
         bridge_angle     = rhs.bridge_angle;
+        bridge_followup  = rhs.bridge_followup;
         extra_perimeters = rhs.extra_perimeters;
         return *this;
     }
@@ -95,6 +98,7 @@ public:
         thickness        = rhs.thickness;
         thickness_layers = rhs.thickness_layers;
         bridge_angle     = rhs.bridge_angle;
+        bridge_followup  = rhs.bridge_followup;
         extra_perimeters = rhs.extra_perimeters;
         return *this;
     }
@@ -297,7 +301,8 @@ inline bool surfaces_could_merge(const Surface &s1, const Surface &s2)
         s1.surface_type      == s2.surface_type     &&
         s1.thickness         == s2.thickness        &&
         s1.thickness_layers  == s2.thickness_layers &&
-        s1.bridge_angle      == s2.bridge_angle;
+        s1.bridge_angle      == s2.bridge_angle       &&
+        s1.bridge_followup   == s2.bridge_followup;
 }
 
 class SVG;

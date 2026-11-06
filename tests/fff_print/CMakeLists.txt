@@ -88,3 +88,9 @@ add_executable(wall_painting_regression_tests
 target_link_libraries(wall_painting_regression_tests test_common libslic3r slicer_test_support)
 set_property(TARGET wall_painting_regression_tests PROPERTY FOLDER "tests")
 add_test(wall_painting_regression_tests wall_painting_regression_tests ${CATCH_EXTRA_ARGS})
+
+add_executable(bridge_controls_tests fff_print_tests.cpp test_bridge_controls.cpp test_bridge_controls_config.cpp test_bridge_controls_reslice.cpp test_bridge_stack_patterns.cpp test_bridge_controls_cache.cpp)
+target_link_libraries(bridge_controls_tests test_common libslic3r slicer_test_support)
+target_include_directories(bridge_controls_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/libslic3r)
+set_property(TARGET bridge_controls_tests PROPERTY FOLDER "tests")
+add_test(bridge_controls_tests bridge_controls_tests ${CATCH_EXTRA_ARGS})
