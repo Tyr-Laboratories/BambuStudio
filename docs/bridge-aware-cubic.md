@@ -80,6 +80,13 @@ The full geometry suite passed 443 executions and 426,060 assertions. The build 
 | Rib | 0.278 s | 31.888 s | 114.71× |
 | Modifier | 0.260 s | 122.716 s | 471.98× |
 
+The first roof at Z 17.6 mm was measured directly from the four exported cube G-code files above, using nominal bead widths and the preceding layer's deposited paths. Both feature roofs had zero unanchored ends and zero open selected cells. The experimental qualification branch records the independent output observer and the separate physical-contact checks.
+
+| First roof at a 5 mm setting | Official small cube | Feature small cube | Official large cube | Feature large cube |
+| --- | ---: | ---: | ---: | ---: |
+| Longest unsupported run | 21.0270 mm | 4.10085 mm | 21.0271 mm | 4.17647 mm |
+| Largest selected opening diameter | 24.2797 mm | 4.97650 mm | 24.2799 mm | 4.92492 mm |
+
 Preparation now computes protection polygons only when sparse trimming restores material or a participating region enables infill combination. When needed, the polygons use the ordered model and construction footprints from final verification. Regression tests switch these consumers on and off, compare ordered geometry and deposition with an independent full recomputation, and verify a fresh slice against a reslice. All 117,963 executable G-code commands across the four fixtures matched the preceding feature build in order and content.
 
 The 6 November 2026 model-target reuse checkpoint passes the complete arm64 RelWithDebInfo application build, all 17 existing CTest targets, 44 packaging tests and 70 benchmark-tool tests. Bridge aware cubic passes 431 default cases across 433 executions, plus the small and large geometry qualifications and the exhaustive-versus-optimized comparison: 436 executions and 379,742 assertions in total. The three modifier-reslice sections run independently. Exact-name manifests, source inventory and XML results are tied to unchanged test executable SHA-256 `ae6f666052ac3e51e3c9b376334c8f991b7d680ca69f4eff7333544a2b4f5b7a`. The separate native fixture writer passes another 244 assertions and is excluded from those geometry totals.
