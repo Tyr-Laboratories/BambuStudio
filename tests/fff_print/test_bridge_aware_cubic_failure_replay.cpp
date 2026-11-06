@@ -1,8 +1,10 @@
 #include <catch2/catch.hpp>
+#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 
 #include "libslic3r/Fill/BridgeAwareCubicContact.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicFailureReplay.hpp"
+#include "libslic3r/Fill/BridgeAwareCubicInteriorShadow.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicSupport.hpp"
 
 #include <stdexcept>
@@ -239,4 +241,75 @@ TEST_CASE("Sparse generation restores original owned fills and provenance on unw
     REQUIRE(snapshots.size() == 1);
     CHECK(snapshots.data() == base_slots);
     CHECK(snapshots.front() == base_token);
+}
+
+TEST_CASE("Parent-interior shadow demands a selected connected chord, not a large remote cell",
+          "[BridgeAwareCubic][FirstSweepInterior]") {
+    namespace S=BAC::InteriorShadow;
+    const auto yes=[](size_t){return true;};
+    const auto p=[](double x,double y){return Point::new_scale(x,y);};
+    const S::Chord c{p(3,3),p(1,1),p(9,9)};
+    auto window=rectangle(0,0,10,10);
+    CHECK(S::contains(window,c,yes));
+    CHECK(S::long_enough(c.a,c.b,11.));
+    CHECK_FALSE(S::long_enough(p(1,1),p(4,5),5.));
+    CHECK_FALSE(S::contains(window,S::Chord{p(3,3),p(0,1),p(9,9)},yes));
+    auto hole=rectangle(5,5,6,6).contour;hole.make_clockwise();window.holes.push_back(hole);
+    CHECK_FALSE(S::contains(window,c,yes)); // Connector crosses a hole despite all three endpoints being in material.
+    CHECK_FALSE(S::inside_any(ExPolygons{window},S::Chord{p(5.5,5.5),p(5.5,5.5),p(5.5,5.5)},yes));
+    CHECK_FALSE(S::contains(rectangle(20,0,30,10),c,yes)); // Same diameter is not the same opening.
+    CHECK_FALSE(S::tube_disjoint(p(0,0),p(4,0),p(2,1),p(2,3),scale_(1.)));
+    CHECK(S::tube_disjoint(p(0,0),p(4,0),p(2,1),p(2,3),scale_(1.)-1));
+    CHECK_FALSE(S::tube_disjoint(p(3,3),p(3,3),p(3,3),p(3,3),0)); // Even an actual zero-width axis is retained.
+    CHECK_FALSE(S::contains(rectangle(0,0,10,10),c,[](size_t){return false;}));
+}
+TEST_CASE("First-sweep geometric selection uses a finite positive path mask and a strict inset",
+          "[BridgeAwareCubic][FirstSweepInterior]") {
+    namespace S=BAC::InteriorShadow;
+    const auto yes=[](size_t){return true;};
+    const auto parent=rectangle(0,0,12,12);
+    const auto upper=bead({-3.,6.},{15.,6.});
+    S::Chord c;
+    REQUIRE(S::propose(parent.contour,upper.polyline,{rectangle(.5,5.9,11.5,6.1)},8.,scale_(.4),c,yes));
+    CHECK(S::contains(parent,c,yes));
+    CHECK_FALSE(S::propose(parent.contour,upper.polyline,{rectangle(0,8,12,9)},8.,scale_(.4),c,yes));
+    CHECK_FALSE(S::propose(parent.contour,upper.polyline,{parent},30.,scale_(.4),c,yes));
+    CHECK_FALSE(S::propose(parent.contour,upper.polyline,{parent},8.,scale_(8.),c,yes));
+}
+
+TEST_CASE("First-sweep chord challenge identifies an actual selected failing cell and rejects a dividing stroke",
+          "[BridgeAwareCubic][FirstSweepInterior]") {
+    namespace S=BAC::InteriorShadow;
+    const auto pos=[](double x,double y){return Point::new_scale(x,y);};
+    const S::Chord chord{pos(6,6),pos(2,2),pos(10,10)};
+    const auto yes=[](size_t){return true;};
+    const auto upper=bead({1.,6.},{11.,6.});
+    ExtrusionPaths lower{bead({0.,-1.},{0.,13.}),bead({12.,-1.},{12.,13.}),
+                         bead({-1.,0.},{13.,0.}),bead({-1.,12.},{13.,12.})};
+    const bool divider=GENERATE(false,true);
+    if (divider) lower.push_back(bead({6.,-1.},{6.,13.}));
+    std::vector<Contact::Bead> beads;
+    for(const auto &path:lower) beads.push_back({&path,.2});
+    auto prep=Contact::prepare_lower(beads,.4,upper.height);
+    const auto raw=Contact::footprint(*prep,upper,.4,0.,Contact::FootprintMode::ContactsOnly);
+    REQUIRE(raw.input_valid); REQUIRE(raw.completed);
+    const auto physical=Contact::physical_sections(*prep);
+    REQUIRE(physical.input_valid); REQUIRE(physical.completed);
+    Polylines air;
+    for (const auto &seg:raw.segments) {
+        const auto i=seg.segment_index;
+        append(air,diff_pl(Polylines{Polyline(upper.polyline.points[i],upper.polyline.points[i+1])},seg.centerline_support));
+    }
+    const auto selected=intersection_ex(ExPolygons{rectangle(0,5.9,12,6.1)},union_ex(offset(air,scale_(.5*upper.width))));
+    const auto checked=Validation::validate_contacts({rectangle(-3,-3,15,15)},physical.physical_footprint,
+        {upper.polyline},selected,8.,0.,{raw});
+    REQUIRE(checked.input_valid); REQUIRE(checked.completed); REQUIRE_FALSE(checked.passed());
+    bool any_bad=false, matching=false;
+    for (const auto &cell:checked.void_cells) if (!cell.closed || cell.exceeds_gap) {
+        any_bad=true;
+        matching |= S::contains(cell.geometry,chord,yes);
+    }
+    REQUIRE(any_bad); // Both variants still have an oversized opening on this path.
+    CHECK(matching == !divider); // Only the undivided opening contains the proposed connected chord.
+    if (!divider) CHECK(S::inside_any(selected,S::Chord{chord.q,chord.q,chord.q},yes));
 }

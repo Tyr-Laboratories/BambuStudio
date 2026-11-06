@@ -191,6 +191,8 @@ public:
     // Callers add any preceding-layer scaffold required by contact validation.
     ExPolygons refinement_area(double z) const;
     std::vector<LeafSection> leaf_sections(double z) const;
+    // Diagnostic selector only; caller supplies an existing candidate ID from this lattice.
+    Polygon shadow_plain_cell_section(const CellId &id, double z, BridgeAwareCubicValidation::WorkBudget &work) const;
     std::vector<LeafSection> solid_sections(double z) const;
     ExPolygons solid_area(double z) const;
 

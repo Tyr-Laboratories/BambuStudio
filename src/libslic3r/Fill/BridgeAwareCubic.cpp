@@ -1251,6 +1251,28 @@ ExPolygons Plan::refinement_area(double z) const
     return union_ex(selected);
 }
 
+Polygon Plan::shadow_plain_cell_section(const CellId &id,double z,BridgeAwareCubicValidation::WorkBudget &work) const
+{
+    m_impl->cancel();
+    if (!std::isfinite(z) || id.depth>m_impl->parameters.max_depth || m_impl->statistics.solid_cells ||
+        m_impl->closures.size()>2048 || m_impl->layer_attachments.size()>2048) return {};
+    const size_t count=32+m_impl->closures.size()+m_impl->layer_attachments.size();
+    if(count>work.remaining_work) return {};
+    work.remaining_work-=count;
+    work.charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)]+=count;
+    // Raw matching-elevation payloads are conservatively ineligible even if their owners are inactive.
+    size_t i=0;
+    for (const auto &v:m_impl->closures) {
+        if ((++i & 255)==0) m_impl->cancel();
+        if (std::abs(v.z-z)<=EPSILON) return {};
+    }
+    for (const auto &v:m_impl->layer_attachments) {
+        if ((++i & 255)==0) m_impl->cancel();
+        if (std::abs(v.z-z)<=EPSILON) return {};
+    }
+    return m_impl->section(Cell{id.address,id.depth},z);
+}
+
 std::vector<LeafSection> Plan::leaf_sections(double z) const
 {
     m_impl->cancel();

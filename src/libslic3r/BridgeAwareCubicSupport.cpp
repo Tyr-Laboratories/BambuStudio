@@ -15,6 +15,7 @@
 #include "Fill/BridgeAwareCubicSpanProofCache.hpp"
 #include "Fill/BridgeAwareCubicEmissionLedger.hpp"
 #include "Fill/BridgeAwareCubicFailureReplay.hpp"
+#include "Fill/BridgeAwareCubicInteriorShadow.hpp"
 #include "Fill/BridgeAwareCubicContainment.hpp"
 #include "Fill/BridgeAwareCubicCertificate.hpp"
 #include "Fill/BridgeAwareCubicOwnerBounds.hpp"
@@ -414,6 +415,8 @@ struct ProfileState {
     bool audit_contact_epochs = false;
     bool audit_complete_spans = false;
     bool audit_sparse_rejections = false;
+    bool first_sweep_shadow = false;
+    size_t fs_stages = 0, fs_budget = 500000000;
     bool truncated = false;
     std::string file, stage;
     const char *session;
@@ -584,6 +587,25 @@ struct ProfileState {
 };
 
 thread_local ProfileState *active_profile = nullptr;
+namespace IS = BridgeAwareCubic::InteriorShadow;
+struct FirstSweepPick {
+    BridgeAwareCubic::ModelFailureReplay::Hint hint;
+    IS::Chord chord;
+    BridgeAwareCubic::ModelFailureReplay::ExactWitness path_event;
+    std::optional<BridgeAwareCubic::ModelFailureReplay::Kind> path_failure;
+    const char *full_path_result = "not_run";
+    uint64_t native_path_ns = 0, full_path_ns = 0;
+    size_t layer=0, phase=0;
+    bool selected=false, observed_selection=false, coverage_positive=false, did_stage=false, stage_q=false, stage_seen=false;
+    BridgeAwareCubic::ModelFailureReplay::ExactWitness event;
+    const char *proposal="no_target", *staged="not_run", *full="not_run";
+    uint64_t select_ns=0, gen_ns=0, cover_ns=0, stage_proof_ns=0, full_proof_ns=0, work=0;
+};
+struct ShadowProfilePause {
+    ProfileState *previous=active_profile;
+    ShadowProfilePause() {active_profile=nullptr;}
+    ~ShadowProfilePause() {active_profile=previous;}
+};
 
 class ProfileSession {
     std::unique_ptr<ProfileState> state;
@@ -603,6 +625,8 @@ public:
                 state->audit_emission_collection = audit[0] == '1' && audit[1] == '\0';
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_CONTACT_EPOCHS"))
                 state->audit_contact_epochs = audit[0] == '1' && audit[1] == '\0';
+            if (const char *flag = std::getenv("BAC_PROFILE_FIRST_SWEEP_INTERIOR"))
+                state->first_sweep_shadow = std::string_view(flag) == "1";
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_SPARSE_REJECTIONS"))
                 state->audit_sparse_rejections = audit[0] == '1' && audit[1] == '\0';
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_COMPLETE_SPANS"))
@@ -1884,6 +1908,7 @@ struct TargetCheckContext {
     bool *probe_checked = nullptr;
     BridgeAwareCubic::SpanProofCache *span_proofs = nullptr;
     ContactEpochReuse *contact_epochs = nullptr;
+    FirstSweepPick *interior_shadow = nullptr; // Only set on a separate, non-authoritative diagnostic verifier.
 };
 
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
@@ -3240,6 +3265,23 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     if (!contact.input_valid || !contact.completed || contact.segments.empty()) unsupported = {upper.polyline};
                     const ExPolygons selected = intersection_ex(path_selection,
                         union_ex(offset(unsupported, scale_(.5 * target.path_widths[index]))));
+                    if (context && context->interior_shadow) {
+                        auto &p=*context->interior_shadow;
+                        bool within=true;
+                        const auto charge=[&](size_t n) {
+                            const bool ok=emission_charge(object,budget,n);
+                            within=within && ok;return ok;
+                        };
+                        const auto &q=p.chord.q;
+                        bool admitted=selected.size()<=2048;
+                        for (const auto &poly:selected) {
+                            if (!admitted || !charge(1) || poly.contour.size()>8192 || poly.holes.size()>1024) {admitted=false;break;}
+                            for (const auto &hole:poly.holes)
+                                if (!charge(1) || hole.size()>8192) {admitted=false;break;}
+                        }
+                        p.selected=admitted && IS::inside_any(selected,IS::Chord{q,q,q},charge);
+                        p.observed_selection=within && admitted;
+                    }
                     if (target.bridge_followup || target.dependency || selected.empty() || !contact.input_valid || !contact.completed) {
                         // Construction and follow-up paths require actual prior
                         // anchors and bounded complete air runs. They do not turn
@@ -4674,11 +4716,205 @@ void PrintObject::prepare_bridge_aware_cubic(bool has_restored_sparse)
                     (capture && !capture->take(result, emission_reuse.audit_slack(), charge))) return {};
                 return kind;
             };
+            // Diagnostic only: no remembered failure, decision, output path or persistent proof is an input.
+            // Select by the actual parent section and all previously frozen model paths on changed predecessors.
+            const auto pick_first_sweep = [&](const auto &candidate,const std::set<size_t> &changed,
+                    FirstSweepPick &pick, BridgeAwareCubicValidation::WorkBudget &w) {
+                if (!prepared_roofs || candidate.refinement.solid) {pick.proposal="no_preparation_or_solid";return false;}
+                auto charge=[&](size_t n){return emission_charge(*this,w,n);};
+                size_t paths=0, layers=0, last_layer=size_t(-1);
+                bool usable=false;
+                Polygon section;
+                for (size_t t=0;t<roofs.size();++t) {
+                    if (!charge(1)) {pick.proposal="selection_budget";return false;}
+                    const Target &target=roofs[t];
+                    if (target.supporting_region!=candidate.region || target.bridge_followup || target.dependency || !target.upper_layer) continue;
+                    const size_t l=target.upper_layer-1;
+                    if (!changed.count(l)) continue;
+                    Layer &lower=*m_layers[l];
+                    if (lower.print_z < candidate.refinement.bottom_z-EPSILON || lower.print_z > candidate.refinement.top_z+EPSILON) continue;
+                    if (l!=last_layer) {
+                        last_layer=l; if (++layers>128) {pick.proposal="layer_cap";return false;}
+                        usable=sparse_probe_layer_eligible(lower,emission_reuse.row(l),w);
+                        // Actual staged deposition is inspected below. This cheap predictor deliberately
+                        // excludes any explicit extra course or endpoint replacement on its source layer.
+                        const auto *plan=bridge_aware_cubic_plan(candidate.region);
+                        if (usable) section=plan->shadow_plain_cell_section(candidate.refinement.id,lower.print_z,w);
+                        if (usable && (section.size()<3 || section.size()>12)) usable=false;
+                    }
+                    if (!usable) {pick.proposal="layer_ineligible";continue;}
+                    for (size_t ph=0;ph<prepared_roofs->phases.size();++ph) {
+                        const auto &phase=prepared_roofs->phases[ph];
+                        const auto origin=phase.transform(Point(0,0));
+                        Polygon local;
+                        for (const Point &p:section.points) {
+                            const auto v=phase.transform(p);
+                            const int64_t x=int64_t(v.x())-origin.x(), y=int64_t(v.y())-origin.y();
+                            if (std::abs(x)>IS::bound || std::abs(y)>IS::bound) {pick.proposal="phase_range";return false;}
+                            local.points.emplace_back(coord_t(x),coord_t(y));
+                        }
+                        for(size_t k=0;k<target.paths.size();++k) {
+                            if (++paths>4096 || !charge(16)) {pick.proposal="path_or_work_cap";return false;}
+                            const auto &path=phase.extrusions.at(t).at(k);
+                            if (!std::isfinite(path.width) || path.width<=0. || path.width/SCALING_FACTOR >= IS::bound) continue;
+                            const double pad_mm=.5*(path.width+lower.get_region(0)->flow(frInfill).width())+2.*geometry_tolerance;
+                            if (!std::isfinite(pad_mm) || pad_mm<=0. || pad_mm/SCALING_FACTOR>=IS::bound) continue;
+                            pick.proposal="no_long_selected_chord";
+                            if (IS::propose(local,path.polyline,phase.path_demands.at(t).at(k),target.gap,
+                                    int64_t(std::ceil(pad_mm/SCALING_FACTOR)),pick.chord,charge)) {
+                                pick.hint={t,k,phase.transform,Replay::Kind::Cell};pick.layer=l;pick.phase=ph;
+                                pick.proposal="interior_chord"; return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            };
+            // Negative evidence uses *all* actual emitted lower roles at this phase. The L-infinity
+            // bead cover is deliberately oversized for this prediction; source-angle rounding needs
+            // no guessed error bound because the tested segment endpoints are actual writer output.
+            const auto actual_cover = [&](FirstSweepPick &pick,BridgeAwareCubicValidation::WorkBudget &w) {
+                const Layer &l=*m_layers[pick.layer];
+                const auto &phase=prepared_roofs->phases[pick.phase];
+                auto charge=[&](size_t n){return emission_charge(*this,w,n);};
+                const auto origin=phase.transform(Point(0,0));
+                const auto &up=phase.extrusions.at(pick.hint.frozen_target).at(pick.hint.path);
+                auto xy=[&](const Point &p) {
+                    const auto v=phase.transform(p); const int64_t x=int64_t(v.x())-origin.x(),y=int64_t(v.y())-origin.y();
+                    if (std::abs(x)>IS::bound || std::abs(y)>IS::bound) throw std::range_error("shadow phase range");
+                    return Point(coord_t(x),coord_t(y));
+                };
+                size_t points=0;
+                auto ring=[&](const Polygon &source,Polygon &out) {
+                    if (source.size()>8192 || source.size()>12000-points || !charge(4*source.size()+1)) return false;
+                    points+=source.size();out.points.reserve(source.size());
+                    for (const auto &p:source.points) out.points.push_back(xy(p));
+                    return true;
+                };
+                bool in_material=false;
+                if (l.lslices.size()>2048) {pick.staged="material_cap";return false;}
+                for (const ExPolygon &source:l.lslices) {
+                    if (source.holes.size()>1024 || !charge(source.holes.size()+1)) {pick.staged="material_cap";return false;}
+                    ExPolygon material;
+                    if (!ring(source.contour,material.contour)) {pick.staged="material_cap";return false;}
+                    for (const auto &hole:source.holes) {
+                        material.holes.emplace_back();
+                        if (!ring(hole,material.holes.back())) {pick.staged="material_cap";return false;}
+                    }
+                    if (IS::contains(material,pick.chord,charge)) {in_material=true;break;}
+                }
+                if (!in_material) {pick.staged="outside_or_touches_material";return false;}
+                size_t segments=0, visited=0;
+                bool clear=true;
+                // Cap the actual tree enumeration, including empty collection and suppressed leaves.
+                const auto scan=[&](auto &&self,const ExtrusionEntity &ent,size_t depth)->void {
+                    if (!clear) return;
+                    if (++visited>16000 || depth>=64 || !charge(1)) {clear=false;pick.staged="tree_cap";return;}
+                    if (const auto *path=dynamic_cast<const ExtrusionPath*>(&ent)) {
+                        if (path->is_force_no_extrusion() || path->mm3_per_mm<=0. || path->polyline.size()<2) return;
+                        if (!path->polyline.fitting_result.empty() || !std::isfinite(path->mm3_per_mm) ||
+                            !std::isfinite(path->width) || !std::isfinite(path->height) || path->width<=0 || path->height<=0) {
+                            clear=false;pick.staged="unsupported_lower";return;
+                        }
+                        const double radius_mm=.5*std::max(path->width,path->height)+geometry_tolerance;
+                        const double reach_mm=radius_mm+.5*up.width+geometry_tolerance;
+                        if (!std::isfinite(reach_mm) || reach_mm/SCALING_FACTOR>=IS::bound) {clear=false;pick.staged="radius_range";return;}
+                        const int64_t radius=int64_t(std::ceil(radius_mm/SCALING_FACTOR));
+                        const int64_t reach=int64_t(std::ceil(reach_mm/SCALING_FACTOR));
+                        Point prev=xy(path->polyline.points.front());
+                        for (size_t j=1;clear && j<path->polyline.size();++j) {
+                            if (++segments>16000 || !charge(32)) {clear=false;pick.staged="stroke_cap";return;}
+                            const Point next=xy(path->polyline.points[j]);
+                            // Including stationary and vertically unusable strokes is conservative here.
+                            clear=IS::tube_disjoint(pick.chord.q,pick.chord.a,prev,next,radius) &&
+                                IS::tube_disjoint(pick.chord.q,pick.chord.b,prev,next,radius) &&
+                                IS::tube_disjoint(pick.chord.q,pick.chord.q,prev,next,reach);
+                            if (!clear) pick.staged="blocked_by_actual_stroke";
+                            prev=next;
+                        }
+                    } else if (const auto *c=dynamic_cast<const ExtrusionEntityCollection*>(&ent)) {
+                        for(const auto *child:c->entities) {if (!clear) break;if(!child){clear=false;pick.staged="null_child";break;}self(self,*child,depth+1);}
+                    } else if (const auto *c=dynamic_cast<const ExtrusionLoop*>(&ent)) {
+                        for(const auto &p:c->paths) {if(!clear) break; self(self,p,depth+1);}
+                    } else if (const auto *c=dynamic_cast<const ExtrusionMultiPath*>(&ent)) {
+                        for(const auto &p:c->paths) {if(!clear) break; self(self,p,depth+1);}
+                    } else {clear=false;pick.staged="unsupported_lower";}
+                };
+                for(const auto *r:l.regions()) {scan(scan,r->perimeters,0);scan(scan,r->fills,0);}
+                if (clear) pick.staged="predicted_oversized";
+                return clear;
+            };
+            const auto challenge_first_sweep = [&](FirstSweepPick &pick,bool full,BridgeAwareCubicValidation::WorkBudget &w) {
+                const auto &h=pick.hint;
+                const Replay::Probe probe{h.frozen_target,h.path,h.phase};
+                const std::vector<size_t> no_remap;
+                const PreparedModelView view{prepared_roofs.get(),no_remap,nullptr,&roofs};
+                bool checked=false;
+                TargetCheckContext ctx{&w,&probe,nullptr,nullptr,&checked};
+                ctx.interior_shadow=&pick;
+                pick.selected=pick.observed_selection=false;
+                auto charge=[&](size_t n){return emission_charge(*this,w,n);};
+                if (roofs.size()>w.remaining_work/4 || !charge(4*roofs.size())) return "oracle_work_cap";
+                auto failures=check_targets(*this,roofs,nullptr,TargetCheck::RejectTrial,&view,&ctx);
+                if(!checked || !pick.observed_selection) return "oracle_unavailable";
+                if (failures.empty()) return "path_pass";
+                if (failures.size()!=1) return "oracle_unavailable";
+                auto &r=failures.front().result;
+                if (!r.input_valid || !r.completed || r.resource_limited) return "oracle_unavailable";
+                if (!pick.selected) return "different_selection";
+                if (full && pick.event.cell) return pick.event.matches(r,charge) ? "same_cell" : "different_event_or_budget";
+                for (auto &cell:r.void_cells) {
+                    if (!charge(1)) return "oracle_work_cap";
+                    if ((cell.closed && !cell.exceeds_gap) || !IS::contains(cell.geometry,pick.chord,charge)) continue;
+                    if (full) return "matching_chord_without_prior_receipt";
+                    BridgeAwareCubicValidation::Result single;
+                    single.void_cells.emplace_back(std::move(cell));
+                    if (!pick.event.take(single,emission_reuse.audit_slack(),charge)) return "receipt_unavailable";
+                    return "same_cell";
+                }
+                return "different_event_or_budget";
+            };
+            const auto shadow_part = [&](FirstSweepPick &pick, const char *&status, auto &&fn) {
+                ProfileState *profile=active_profile;
+                const size_t allowed=std::min(size_t(8000000),profile->fs_budget);
+                if (!allowed) {status="session_budget";return;}
+                BridgeAwareCubicValidation::WorkBudget w{allowed};
+                try { ShadowProfilePause quiet;fn(w); }
+                catch(const CanceledException &) {throw;}
+                catch(const std::exception &) {status="diagnostic_exception";}
+                const size_t spent=allowed-w.remaining_work;
+                profile->fs_budget-=spent;pick.work+=spent;
+            };
+            const auto fs_now=[] {return std::chrono::steady_clock::now();};
+            const auto fs_ns=[&](const auto &from) {return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(fs_now()-from).count());};
+            // One JSONL row per first-sweep CELL trial: abstentions and completed decisions have the same denominator.
+            const auto fs_record=[&](const auto &candidate,const FirstSweepPick &p,bool verified,uint64_t ordinary_ns) noexcept {
+                try {
+                    static std::mutex diagnostic_log_mutex;
+                    std::lock_guard<std::mutex> held(diagnostic_log_mutex);
+                    std::ofstream out(active_profile->file+".first-sweep.jsonl",std::ios::app);
+                    const auto &id=candidate.refinement.id;
+                    out<<"{\"record\":\"first_sweep_interior\",\"sequence\":"<<active_profile->sequence
+                       <<",\"region\":"<<candidate.region<<",\"depth\":"<<id.depth<<",\"address\":["<<id.address[0]<<','<<id.address[1]<<','<<id.address[2]<<']'
+                       <<",\"lower_layer\":"<<p.layer<<",\"target\":"<<p.hint.frozen_target<<",\"path\":"<<p.hint.path<<",\"phase\":"<<p.phase
+                       <<",\"proposal\":\""<<p.proposal<<"\",\"did_stage\":"<<(p.did_stage?"true":"false")
+                       <<",\"actual_cover_clear\":"<<(p.coverage_positive?"true":"false")<<",\"selection_observed\":"<<(p.stage_seen?"true":"false")
+                       <<",\"q_selected\":"<<(p.stage_q?"true":"false")<<",\"predicted_fail\":"<<(p.coverage_positive&&p.stage_seen&&p.stage_q?"true":"false")<<",\"staged_verifier\":\""<<p.staged
+                       <<"\",\"full_generation_witness\":\""<<p.full<<"\",\"ordinary_candidate_pass\":"<<(verified?"true":"false")
+                       <<",\"q\":["<<p.chord.q.x()<<','<<p.chord.q.y()<<"],\"a\":["<<p.chord.a.x()<<','<<p.chord.a.y()<<"],\"b\":["<<p.chord.b.x()<<','<<p.chord.b.y()<<']'
+                       <<",\"select_ns\":"<<p.select_ns<<",\"native_generate_ns\":"<<p.gen_ns<<",\"cover_ns\":"<<p.cover_ns
+                       <<",\"stage_proof_ns\":"<<p.stage_proof_ns<<",\"full_proof_ns\":"<<p.full_proof_ns
+                       <<",\"staged_path_failed\":"<<(p.path_failure?"true":"false")<<",\"full_path_result\":\""<<p.full_path_result<<"\""
+                       <<",\"native_path_ns\":"<<p.native_path_ns<<",\"full_path_ns\":"<<p.full_path_ns
+                       <<",\"ordinary_check_including_diagnostic_ns\":"<<ordinary_ns<<",\"shadow_budget_debit\":"<<p.work<<"}\n";
+                } catch (...) {} // Optional output cannot change a slice decision.
+            };
             const auto check_changed_layers = [&](const std::set<size_t> &changed,
                                                    const Replay::Key *candidate_key = nullptr,
                                                    BridgeAwareCubicValidation::WorkBudget *trial_model_budget = nullptr,
                                                    const SparseWitness *sparse_audit = nullptr,
-                                                   bool *audit_matched = nullptr) {
+                                                   bool *audit_matched = nullptr,
+                                                   FirstSweepPick *first_shadow = nullptr) {
                 std::set<size_t> checked_layers;
                 {
                     ProfileScope profile(ProfilePhase::GenerateChanged);
@@ -4799,9 +5035,27 @@ void PrintObject::prepare_bridge_aware_cubic(bool has_restored_sparse)
                 // Coarsening may remove support, never adopt a different
                 // required model path to avoid its frozen support obligation.
                 if (!same_model_targets(selected, actual)) {
+                    if (first_shadow && first_shadow->coverage_positive) first_shadow->full="different_model_target";
+                    if (first_shadow && first_shadow->path_failure) first_shadow->full_path_result = "different_model_target";
                     if (candidate_key) model_replay.erase(*candidate_key);
                     if (active_profile) active_profile->model_replay_entries = model_replay.size();
                     return reject_model();
+                }
+                // Only report the same actual model event after the ordinary frozen/actual target gate.
+                if (first_shadow && first_shadow->path_failure) {
+                    auto &p = *first_shadow;
+                    const auto begin = fs_now();
+                    shadow_part(p, p.full_path_result, [&](auto &w) {
+                        const auto failure = probe_frozen_witness(p.hint, w, nullptr, &p.path_event);
+                        p.full_path_result = failure == p.path_failure ? "same_failure" : "different_or_unavailable";
+                    });
+                    p.full_path_ns = fs_ns(begin);
+                }
+                if (first_shadow && first_shadow->coverage_positive) {
+                    auto &p=*first_shadow;
+                    const auto begin=fs_now();
+                    shadow_part(p,p.full,[&](auto &w){p.full=challenge_first_sweep(p,true,w);});
+                    p.full_proof_ns=fs_ns(begin);
                 }
                 const TargetCheck mode = active_profile && active_profile->full_trial_checks ?
                     TargetCheck::CollectFailures : TargetCheck::RejectTrial;
@@ -4936,6 +5190,37 @@ void PrintObject::prepare_bridge_aware_cubic(bool has_restored_sparse)
                     prune_dependencies();
                     const auto changed = changed_plan_layers(previous, previous_indices);
                     const Replay::Key candidate_key{candidate.region, candidate.refinement.id};
+                    std::optional<FirstSweepPick> first_shadow;
+                    try { if (active_profile && active_profile->first_sweep_shadow && sweep_number==1) {
+                        first_shadow.emplace();
+                        auto &p=*first_shadow;p.chord={Point(0,0),Point(0,0),Point(0,0)};
+                        if (model_replay.find(candidate_key)) p.proposal="existing_hint_excluded";
+                        else if (active_profile->fs_stages>=128) p.proposal="session_stage_cap";
+                        else {
+                            const auto begin=fs_now();
+                            bool picked=false;
+                            shadow_part(p,p.proposal,[&](auto &w){picked=pick_first_sweep(candidate,changed,p,w);});
+                            p.select_ns=fs_ns(begin);
+                            if (picked) {
+                                ++active_profile->fs_stages;
+                                shadow_part(p,p.staged,[&](auto &w) {
+                                    Layer &lower=*m_layers[p.layer];
+                                    Replay::ScopedLowerStage stage(lower.get_region(0)->fills,lower.bridge_aware_emission_snapshots);
+                                    p.did_stage=true;
+                                    const auto gb=fs_now(); lower.make_fills(m_adaptive_fill_octrees.first.get(),
+                                        m_adaptive_fill_octrees.second.get(),m_lightning_generator.get(),false);
+                                    p.gen_ns=fs_ns(gb);
+                                    const auto path_begin = fs_now();
+                                    p.path_failure = probe_frozen_witness(p.hint, w, &p.path_event, nullptr);
+                                    p.native_path_ns = fs_ns(path_begin);
+                                    const auto cb=fs_now();p.coverage_positive=actual_cover(p,w);p.cover_ns=fs_ns(cb);
+                                    if (p.coverage_positive) {const auto pb=fs_now();p.staged=challenge_first_sweep(p,false,w);p.stage_seen=p.observed_selection;p.stage_q=p.selected;p.stage_proof_ns=fs_ns(pb);}
+                                });
+                            }
+                        }
+                    } } catch(const CanceledException &) {
+                        m_bridge_aware_cubic_plans=std::move(previous);demand_indices.swap(previous_indices);throw;
+                    }
                     BridgeAwareCubicValidation::WorkBudget trial_budget;
                     std::optional<SparseWitness> sparse;
                     try {
@@ -5004,9 +5289,11 @@ void PrintObject::prepare_bridge_aware_cubic(bool has_restored_sparse)
                     bool audit_matched = false;
                     bool ordinary_verified = false;
                     std::exception_ptr audit_error;
+                    const auto ordinary_start=first_shadow ? fs_now() : std::chrono::steady_clock::time_point{};
                     try {
                         ordinary_verified = check_changed_layers(changed, &candidate_key, &trial_budget,
-                            audit ? &*sparse : nullptr, &audit_matched);
+                            audit ? &*sparse : nullptr, &audit_matched, first_shadow ? &*first_shadow : nullptr);
+                        if (first_shadow) fs_record(candidate,*first_shadow,ordinary_verified,fs_ns(ordinary_start));
                     } catch (...) {
                         if (!audit) throw;
                         // Diagnostic generation/checks run only to challenge a
