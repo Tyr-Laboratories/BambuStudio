@@ -2,6 +2,7 @@
 
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicPilot.hpp"
+#include "libslic3r/Fill/BridgeAwareCubicPilotAudit.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicAttachment.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicContact.hpp"
 #include "libslic3r/Fill/BridgeAwareCubic.hpp"
@@ -15,6 +16,7 @@
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/GCodeWriter.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Utils.hpp"
@@ -133,7 +135,7 @@ struct EmittedPath {
     std::vector<double> extrusion_deltas;
 };
 
-std::vector<EmittedPath> read_extrusions(const std::string &filename, const DynamicPrintConfig &config)
+std::vector<EmittedPath> read_extrusions(const std::string &filename, const DynamicPrintConfig &config,bool model_only=false)
 {
     std::vector<EmittedPath> paths;
     GCodeReader reader;
@@ -170,6 +172,7 @@ std::vector<EmittedPath> read_extrusions(const std::string &filename, const Dyna
             height = std::stod(std::string(comment.substr(height_tag.size())));
 
         const bool depositing = motion && extrusion_delta > 0. && line.dist_XY(before) > 0.;
+        if (model_only && depositing) REQUIRE(model_role(role));
         if (!depositing || !model_role(role)) {
             if (motion && (line.dist_XY(before) > 0. || line.dist_Z(before) != 0. || extrusion_delta != 0.))
                 continuous = false;
@@ -411,9 +414,142 @@ TEST_CASE("Bridge aware cubic export observer preserves the exact decimal XY gri
     CHECK(delta.cast<double>().norm() * SCALING_FACTOR == Approx(std::hypot(15.023, 15.023)).margin(1e-12));
 }
 
-static void observe_real_roof_export(bool translated, double layer_height, bool relative_e, bool pilot)
+// Actual-file oracle: multiplicity (not swept union) and additive moving volume
+// for every role on every emitted model plane. Exact collinear splits, reverse
+// order and path reordering have the same normalized interval-event profile.
+static void require_additive_pilot_output(const Print &print, const std::vector<EmittedPath> &emitted)
 {
-    CAPTURE(translated, layer_height, relative_e);
+    using namespace BridgeAwareCubic;
+    using Key = std::pair<double, ExtrusionRole>;
+    struct Sum
+    {
+        Pilot::Profile edges;
+        double         volume = 0.;
+        size_t         n      = 0;
+    };
+    std::map<Key, Sum> source, actual;
+    const auto        *object = print.get_object(size_t(0));
+    const auto        *plan   = object->bridge_aware_cubic_plan(0);
+    REQUIRE(plan != nullptr);
+    REQUIRE(plan->parameters().canonical_phase.has_value());
+    const auto  &phase    = *plan->parameters().canonical_phase;
+    const double diameter = print.config().filament_diameter.get_at(0), area = .25 * PI * diameter * diameter;
+    const double ff = print.config().filament_flow_ratio.get_at(0);
+    for (const auto *layer : object->layers())
+        for (const auto *region : layer->regions()) {
+            const auto &cfg     = region->region().config();
+            const auto  collect = [&](const ExtrusionPath &p) {
+                if (p.is_force_no_extrusion() || p.mm3_per_mm <= 0.) return;
+                double rate = ff * p.mm3_per_mm * cfg.print_flow_ratio.value;
+                if (p.role() == erTopSolidInfill)
+                    rate *= cfg.top_solid_infill_flow_ratio.get_at(0);
+                else if (layer->id() == 0)
+                    rate *= cfg.initial_layer_flow_ratio.value;
+                for (const auto &line : p.polyline.lines()) {
+                    const Point a = phase(line.a), b = phase(line.b);
+                    if (a == b) continue;
+                    auto &sum = source[{GCodeWriter::serialized_z(layer->print_z, true), p.role()}];
+                    Pilot::event(sum.edges, a, b);
+                    sum.volume += (b - a).cast<double>().norm() * SCALING_FACTOR * rate;
+                    ++sum.n;
+                }
+            };
+            visit_paths(region->perimeters, collect);
+            visit_paths(region->fills, collect);
+        }
+    for (const auto &p : emitted) {
+        auto &sum = actual[{p.z, p.role}];
+        REQUIRE(p.path.size() == p.extrusion_deltas.size() + 1);
+        for (size_t i = 0; i < p.extrusion_deltas.size(); ++i) {
+            Pilot::event(sum.edges, p.path.points[i], p.path.points[i + 1]);
+            sum.volume += p.extrusion_deltas[i] * area;
+            ++sum.n;
+        }
+    }
+    REQUIRE(source.size() == actual.size());
+    for (const auto &[key, expected] : source) {
+        CAPTURE(key.first, int(key.second), expected.volume, expected.n);
+        auto hit = actual.find(key);
+        REQUIRE(hit != actual.end());
+        const auto &got = hit->second;
+        REQUIRE(expected.edges == got.edges);
+        const double tolerance = double(got.n) * area * 1.01e-9 + 64. * std::numeric_limits<double>::epsilon() * std::max(1., expected.volume) * double(got.n + expected.n);
+        REQUIRE(std::abs(expected.volume - got.volume) <= tolerance);
+    }
+}
+
+// Use the real generated layer, source atoms, plan and export entry point. These
+// interventions are test-only, after the unmodified positive export completed.
+static void challenge_pilot_output(Print &print, PrintObject &object, const ExportWorkspace &workspace)
+{
+    using namespace BridgeAwareCubic;
+    Layer           *selected = nullptr;
+    const PilotPath *part     = nullptr;
+    for (auto *layer : object.layers()) {
+        visit_paths(layer->get_region(0)->fills, [&](const ExtrusionPath &p) {
+            const auto *q = dynamic_cast<const PilotPath *>(&p);
+            if (!part && q && q->partition()) {
+                part     = q;
+                selected = layer;
+            }
+        });
+        if (part) break;
+    }
+    REQUIRE(selected != nullptr);
+    REQUIRE(part != nullptr);
+    const auto   source = part->source;
+    const float  width = part->width, height = part->height;
+    const double rate = part->mm3_per_mm;
+    {
+        const auto &groups = selected->get_region(0)->perimeters.entities;
+        REQUIRE_FALSE(groups.empty());
+        auto *group = dynamic_cast<ExtrusionEntityCollection *>(groups.front());
+        REQUIRE(group != nullptr);
+        auto &walls     = group->entities;
+        auto  extra     = std::make_unique<ExtrusionPath>(erPerimeter, rate, width, height);
+        extra->polyline = Polyline(source.points[1], source.points[0]);
+        walls.push_back(extra.get());
+        struct Pop
+        {
+            ExtrusionEntitiesPtr &v;
+            ~Pop() { v.pop_back(); }
+        } pop{walls};
+        GCodeProcessorResult preview;
+        REQUIRE_THROWS_WITH(print.export_gcode((workspace.path / "injected-wall.gcode").string(), &preview), Catch::Matchers::Contains("duplicate moving course"));
+    }
+    auto *plan = const_cast<Plan *>(object.bridge_aware_cubic_plan(0));
+    REQUIRE(plan != nullptr);
+    auto previous = plan->clone();
+    struct Restore
+    {
+        Plan &live;
+        Plan  saved;
+        ~Restore() { live = std::move(saved); }
+    } restore{*plan, std::move(previous)};
+    std::vector<LayerAttachment> payload;
+    for (const auto *layer : object.layers()) append(payload, plan->attachments(layer->print_z));
+    // The near terminal owner is live. The far end is not this source's actual
+    // far end: the original full O1–O2–O3 identity cannot be replayed on its
+    // shortened O1–O2 image. An active but unused transition must be reported.
+    LayerAttachment stale;
+    stale.z               = selected->print_z;
+    stale.emitting_region = 0;
+    stale.width           = width;
+    stale.height          = height;
+    stale.original        = Polyline(source.points);
+    stale.original.append(stale.original.last_point() + Point(400, 327));
+    stale.replacement = stale.original;
+    stale.replacement.append_before(stale.original.first_point() - Point(100, 137));
+    stale.owners = {source.atoms.front().source.owner};
+    payload.push_back(stale);
+    *plan = plan->with_payloads({}, payload);
+    REQUIRE_THROWS_WITH(selected->make_fills(nullptr, nullptr, nullptr), Catch::Matchers::Contains("no unique live replay root"));
+}
+
+static void observe_real_roof_export(bool translated, double layer_height, bool relative_e, bool pilot,
+                                     double width = 32., double depth = 28.)
+{
+    CAPTURE(translated, layer_height, relative_e, width, depth);
     ExportWorkspace workspace;
     auto config = export_config();
     config.set_key_value("layer_height", new ConfigOptionFloat(layer_height));
@@ -425,7 +561,7 @@ static void observe_real_roof_export(bool translated, double layer_height, bool 
     Model model;
     auto *model_object = model.add_object();
     model_object->name = "Bridge aware cubic exported roof";
-    model_object->add_volume(TriangleMesh(its_make_cube(32., 28., 18.)));
+    model_object->add_volume(TriangleMesh(its_make_cube(width, depth, 18.)));
     model_object->add_instance()->set_offset(translated ? Vec3d(91.00037, 87.00061, 0.) : Vec3d(80., 80., 0.));
     Print print;
     print.set_status_silent();
@@ -483,7 +619,7 @@ static void observe_real_roof_export(bool translated, double layer_height, bool 
     REQUIRE_NOTHROW(filename = print.export_gcode((workspace.path / "roof.gcode").string(), &preview));
     REQUIRE(boost::filesystem::is_regular_file(filename));
     REQUIRE_FALSE(preview.moves.empty());
-    const auto paths = read_extrusions(filename, config);
+    const auto paths = read_extrusions(filename, config, pilot);
     REQUIRE_FALSE(paths.empty());
     std::map<int, EmittedLayer> layers;
     for (const EmittedPath &path : paths) layers[plane_key(path.z)].push_back(&path);
@@ -559,6 +695,11 @@ static void observe_real_roof_export(bool translated, double layer_height, bool 
     CHECK(actual.open_cells == 0);
     CHECK(actual.max_gap <= 5.);
     CHECK(actual.max_cell <= 5.);
+    if (pilot)
+        std::cout << "BAC_CANONICAL_ROOF width=" << width << " depth=" << depth
+                  << " selected_gaps=" << actual.gaps << " selected_cells=" << actual.cells
+                  << " max_gap_mm=" << actual.max_gap << " max_cell_mm=" << actual.max_cell << std::endl;
+
 
     // This is an output-input regression of the shared contact model, in
     // addition to the independent nominal-width observer above. Reconstruct
@@ -609,6 +750,7 @@ static void observe_real_roof_export(bool translated, double layer_height, bool 
     // At least one tested source edge changes length enough on the output grid
     // to reject the former source-length E calculation by a wide margin.
     REQUIRE(volume_rounding_witnesses > 0);
+    if (pilot) { require_additive_pilot_output(print,paths); challenge_pilot_output(print,*object,workspace); }
 }
 
 TEST_CASE("Bridge aware cubic exported coordinates retain roof gaps and preview support geometry",
@@ -629,6 +771,12 @@ TEST_CASE("Canonical pilot actually prints and certifies the small roof", "[.][B
 {
     observe_real_roof_export(false, .2, true, true);
 }
+
+TEST_CASE("Canonical pilot actually prints and certifies the large roof", "[.][BACCanonicalGenerationLarge]")
+{
+    observe_real_roof_export(false, .2, true, true, 64., 56.);
+}
+
 
 TEST_CASE("Bridge aware cubic export retains ordinary fitted arcs in a mixed print",
           "[BridgeAwareCubic][Integration][Export][MixedObjects]")
@@ -1747,4 +1895,113 @@ TEST_CASE("Canonical generation keeps ownership and splits at stationary source 
     REQUIRE(out[0].atoms.front().source.owner==a); REQUIRE(out[1].atoms.front().source.owner==b);
     run.points={Point(100,0),Point(101,0)};run.atoms.resize(1);
     REQUIRE(pilot_courses({0,1,1},run,SerializedXY{}).empty());
+}
+
+TEST_CASE("Canonical pilot accounts for every attachment including the truncated far end", "[BACCanonicalCorrection]")
+{
+    using namespace BridgeAwareCubic;
+    const CellId o1{{0,0,0},1},o2{{0,1,0},1},o3{{0,2,0},1};
+    PilotCourse source;source.points={Point(0,0),Point(100,0),Point(200,0),Point(300,0)};
+    for(const auto &owner:{o1,o2,o3})source.atoms.push_back({{{0,false},{1,false},owner},{0,1},{1,1},0});
+    ExtrusionPath raw(erInternalInfill,.1,.4f,.2f);raw.polyline=Polyline(source.points);PilotPath part(raw,source,{});
+    LayerAttachment first;first.original=raw.polyline;first.replacement=raw.polyline;first.replacement.append_before(Point(-100,0));
+    first.owners={o1};first.width=raw.width;first.height=raw.height;
+    auto second=first;second.original=first.replacement;second.replacement=second.original;second.replacement.append(Point(400,0));second.owners={o3};
+    const std::vector<LayerAttachment> active{first,second};
+    const auto full=BridgeAwareCubicAttachment::resolve_chain(raw.polyline,raw.width,raw.height,0,active);
+    REQUIRE(full.applied_indices==std::vector<size_t>{0,1});
+    Pilot::AttachmentCounts complete(2);for(auto i:full.applied_indices)complete.consume(i,active[i],&part);REQUIRE_NOTHROW(complete.finish());
+    // With O3 gone, O1 is still active but the whole original no longer exists.
+    const Polyline shorter(Points{source.points[0],source.points[1],source.points[2]});
+    const auto orphan=BridgeAwareCubicAttachment::resolve_chain(shorter,raw.width,raw.height,0,{first});
+    Pilot::AttachmentCounts missing(1);for(auto i:orphan.applied_indices)missing.consume(i,first,&part);
+    REQUIRE_THROWS_WITH(missing.finish(),Catch::Matchers::Contains("no unique live replay root"));
+    second.owners={o1};Pilot::AttachmentCounts wrong(1);
+    REQUIRE_THROWS_WITH(wrong.consume(0,second,&part),Catch::Matchers::Contains("actual terminal owner"));
+    REQUIRE_THROWS(complete.consume(0,first,&part));
+    auto model=first;model.owners.clear();Pilot::AttachmentCounts direct(1);direct.consume(0,model,nullptr);REQUIRE_NOTHROW(direct.finish());
+}
+
+TEST_CASE("Canonical pilot detects model-role overlap and preserves legal split multiplicity", "[BACCanonicalCorrection]")
+{
+    using namespace BridgeAwareCubic;
+    const Point a(0,0), m(100,0), b(200,0),c(300,0),top(100,100),bottom(100,-100);
+    Pilot::Coverage legal;legal.add(a,b,true);legal.add(b,c,false);legal.add(top,bottom,false);REQUIRE_NOTHROW(legal.verify());
+    for(auto role:{erPerimeter,erSolidInfill,erBridgeInfill}){
+        ExtrusionPath other(role,.08,.4,.2);other.polyline=Polyline(b,m);
+        ExtrusionMultiPath multi;multi.paths.emplace_back(other);
+        auto invalid=legal;Pilot::walk(multi,[&](const ExtrusionPath &p){for(auto &line:p.polyline.lines())invalid.add(line.a,line.b,false);});
+        REQUIRE_THROWS_WITH(invalid.verify(),Catch::Matchers::Contains("duplicate moving course"));
+    }
+    Pilot::Profile direct,split;Pilot::event(direct,a,b);Pilot::event(split,b,m);Pilot::event(split,m,a);REQUIRE(direct==split);
+    Pilot::event(split,m,a);REQUIRE(direct!=split);
+}
+
+TEST_CASE("Canonical pilot checks the serialized edge against the original inset and its holes", "[BACCanonicalCorrection]")
+{
+    using namespace BridgeAwareCubic;
+    StrandBudget budget;const SerializedXY phase;const auto inverse=Pilot::grid_translation(phase);
+    const ExPolygon edge(Polygon{Points{Point(500041,-100),Point(600000,-100),Point(600000,1000),Point(500041,1000)}});
+    const Point a(500041,0),b(500041,400);REQUIRE(Pilot::inside_material(a,b,edge,budget));
+    REQUIRE_FALSE(Pilot::inside_material(Pilot::local_point(phase(a),inverse),Pilot::local_point(phase(b),inverse),edge,budget));
+    ExPolygon hole(Polygon{Points{Point(-100,-100),Point(500,-100),Point(500,100),Point(-100,100)}});
+    hole.holes.emplace_back(Points{Point(190,-10),Point(190,10),Point(210,10),Point(210,-10)});
+    const Point u(0,49),v(400,49);REQUIRE(Pilot::inside_material(u,v,hole,budget));
+    REQUIRE(Pilot::inside_material(phase(u),phase(u),hole,budget));REQUIRE(Pilot::inside_material(phase(v),phase(v),hole,budget));
+    REQUIRE_FALSE(Pilot::inside_material(phase(u),phase(v),hole,budget));
+    SerializedXY non_grid;non_grid.plate_origin.x()=.000004;
+    REQUIRE_THROWS_WITH(Pilot::grid_translation(non_grid),Catch::Matchers::Contains("grid-exact"));
+}
+
+// Read the immutable products of a completed benchmark. Measurement is kept
+// outside timing so this diagnostic cannot influence either slicer's result.
+TEST_CASE("Compare the first roofs in existing paired cubic CLI exports", "[.][BACPairedCubeRoof]")
+{
+    const char *directory = std::getenv("BAC_PAIRED_OUTPUT_DIR");
+    REQUIRE(directory != nullptr);
+    for (const char *size : {"small", "large"}) {
+        for (bool feature : {false, true}) {
+            const std::string case_dir = std::string(size) + (feature ? "-sample-01-fork" : "-sample-01-official");
+            const auto filename = boost::filesystem::path(directory) / case_dir / "output" / "plate_1.gcode";
+            CAPTURE(case_dir);
+            REQUIRE(boost::filesystem::is_regular_file(filename));
+            const auto emitted = read_extrusions(filename.string(), export_config(), true);
+            std::map<int, EmittedLayer> layers;
+            for (const auto &path : emitted)
+                layers[plane_key(path.z)].push_back(&path);
+            REQUIRE(layers.size() == 90);
+            bool measured = false;
+            for (auto upper = std::next(layers.begin()); upper != layers.end(); ++upper) {
+                const EmittedLayer &previous = std::prev(upper)->second;
+                if (std::none_of(previous.begin(), previous.end(), [](const auto *p) { return p->role == erInternalInfill; }))
+                    continue;
+                EmittedLayer roof;
+                std::copy_if(upper->second.begin(), upper->second.end(), std::back_inserter(roof),
+                             [](const auto *p) { return p->role == erBridgeInfill; });
+                if (roof.empty()) continue;
+                const auto walls = footprint(previous, erExternalPerimeter);
+                REQUIRE(walls.size() == 1);
+                REQUIRE_FALSE(walls.front().holes.empty());
+                const Measurement observed = measure(previous, roof, ExPolygons{ExPolygon(walls.front().contour)});
+                CAPTURE(observed.gaps, observed.cells, observed.max_gap, observed.max_cell);
+                REQUIRE(observed.cells > 0);
+                REQUIRE(observed.gaps > 0);
+                std::cout << "BAC_PAIRED_ROOF case=" << case_dir << " z_mm=" << roof.front()->z
+                          << " max_gap_mm=" << observed.max_gap << " max_cell_mm=" << observed.max_cell
+                          << " gaps=" << observed.gaps << " cells=" << observed.cells << std::endl;
+                if (feature) {
+                    REQUIRE(observed.max_gap <= 5.);
+                    REQUIRE(observed.max_cell <= 5.);
+                    REQUIRE(observed.unanchored == 0);
+                    REQUIRE(observed.open_cells == 0);
+                } else {
+                    REQUIRE(observed.max_gap > 5.);
+                    REQUIRE(observed.max_cell > 5.);
+                }
+                measured = true;
+                break;
+            }
+            REQUIRE(measured);
+        }
+    }
 }

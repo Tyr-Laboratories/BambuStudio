@@ -443,6 +443,21 @@ template<class Emit> void clip_atom(const Point &a,const Point &b,const StrandAt
 }
 } // namespace strand_clip
 
+bool Pilot::inside_material(const Point &a,const Point &b,const ExPolygon &mask,StrandBudget &budget,
+                            const std::function<void()> &cancel)
+{
+    using namespace strand_clip;
+    Work work(budget,cancel); Memory mem{work}; Memory::Temp space(mem);
+    check_xy(a); check_xy(b); const auto allowed=region(mask,space);
+    if (!locate(allowed,at(a,b,{0,1}),work).closed || !locate(allowed,at(a,b,{1,1}),work).closed) return false;
+    if (a==b) return true;
+    space.take(2);std::vector<F> cuts{{0,1},{1,1}};
+    intersections(allowed,a,b,cuts,space);sorted_events(cuts,work);
+    for(size_t i=1;i<cuts.size();++i)
+        if (!locate(allowed,at(a,b,interior(cuts[i-1],cuts[i])),work).closed) return false;
+    return true;
+}
+
 struct ClippedStrands::Impl {
     std::shared_ptr<const StrandProgram::Impl> raw;
     std::map<StrandPlane,std::vector<strand_clip::Fragment>> rows;

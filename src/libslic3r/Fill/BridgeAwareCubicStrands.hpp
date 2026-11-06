@@ -47,6 +47,13 @@ struct ClippedStrandAtom {
     size_t material_component = 0;
 };
 struct ClippedStrandRun { Points points; std::vector<ClippedStrandAtom> atoms; };
+// All positive parameter intervals on the ORIGINAL integer material polygon,
+// including holes. No writer quantization, tolerance or boundary dilation here.
+// Caller supplies machine endpoints mapped back to this domain's exact grid.
+namespace Pilot {
+    bool inside_material(const Point &,const Point &,const ExPolygon &,StrandBudget &,
+        const std::function<void()> &cancel = {});
+}
 class ClippedStrands {
 public:
     std::vector<StrandPlane> planes(StrandBudget &) const;

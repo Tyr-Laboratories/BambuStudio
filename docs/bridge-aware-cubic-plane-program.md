@@ -35,3 +35,22 @@ All 1,392 incremental comparisons matched fresh geometry. The cavity exercised 4
 An opt-in, single-region generator now emits clipped partition runs as sparse paths. Each moving edge retains its source cell. Generated endpoints, including repaired terminals, participate in ordinary construction, coarsening and final support checks. This first experiment regenerates whole layers so that later incremental-generation changes can be compared with a complete reference.
 
 The 32 × 28 × 18 mm cube with a 5 mm gap produced 2,626 actual partition paths from 3,896 source atoms and seven attachment records. The exported roof passed the existing contact, closed-opening, unsupported-run and E-per-moving-distance checks (34,777 assertions). The no-generator control failed at the required generator-selection check. This result covers one placement, layer height and relative-E mode. Expanding the experiment requires independent checks for orphan attachment records, cross-role duplicate material and post-rounding containment.
+
+## Audited canonical output
+
+The generator checks every active attachment against a unique moving source and the responsible terminal owner. A previous repair can become unreachable when cubic refinement extends the original strand beyond its free endpoint. During planning only, an unused partition repair is removed from the exact candidate payload and the layers are regenerated before support verification. Rejecting the trial restores the previous repairs. An unmatched record at final verification fails.
+
+The exported-model check compares interval multiplicity and calibrated moving volume at every layer and role. It accepts reversals and collinear splits, detects a wall retracing a partition and checks each serialized added edge against its original inset material, including holes. The experiment admits one grid-representable placement with a single region, model-only paths and no closures or saturated cells.
+
+| 5% Cubic with 5 mm target | Small cube | Large cube |
+| --- | ---: | ---: |
+| Emitted partition paths / source atoms | 2,629 / 3,974 | 9,339 / 15,106 |
+| Active attachment records | 5 | 6 |
+| Measured gaps / selected openings in the first roof | 794 / 140 | 3,371 / 561 |
+| Longest unsupported run | 4.10072 mm | 4.17648 mm |
+| Largest selected opening diameter | 4.97705 mm | 4.92398 mm |
+| Whole-export test assertions | 46,029 | 136,730 |
+
+Both cubes completed the full removal sweep and passed the export checks, including deliberate duplicate-wall and orphan-record challenges. Thirteen focused cases passed 4,263 assertions. The legacy generator's export cases passed 148,106 assertions with the experimental generator disabled. On the large cube this deliberately exhaustive reference spent 650.86 seconds in preparation, including 544 removal trials. A five-second sample during candidate verification attributed 136 of 269 main-thread observations to model checks, 107 to construction checks, 21 to target collection and five to generation.
+
+The optional test tagged `[BACPairedCubeRoof]` reads the first measured official and fork cube exports under `BAC_PAIRED_OUTPUT_DIR` after the timing harness finishes. On the four archived cube exports for production candidate `67a1cf755`, the independent nominal-width observer passed 141,930 assertions. Official 2.9.1.70 regular Cubic produced 21.0270 / 21.0271 mm worst unsupported runs and 24.2797 / 24.2799 mm opening diameters. The production feature produced 4.10085 / 4.17647 mm and 4.97650 / 4.92492 mm respectively. These are sliced output measurements. Material and printer behavior require a physical trial.

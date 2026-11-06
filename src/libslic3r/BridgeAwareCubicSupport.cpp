@@ -6,6 +6,7 @@
 #include "Fill/BridgeAwareCubicValidation.hpp"
 #include "Fill/BridgeAwareCubicSupport.hpp"
 #include "Fill/BridgeAwareCubicPilot.hpp"
+#include "Fill/BridgeAwareCubicPilotAudit.hpp"
 #include <boost/multiprecision/cpp_int.hpp>
 #include "Fill/BridgeAwareCubicAttachment.hpp"
 #include "Fill/BridgeAwareCubicContact.hpp"
@@ -4125,6 +4126,98 @@ void begin_layer_emissions(Layer &layer, bool capture, const std::vector<size_t>
     }
 }
 
+static void require_pilot_producers(const PrintObject &object)
+{
+    const auto &p        = *object.print();
+    const auto  nonblank = [](const std::string &v) { return v.find_first_not_of(" \t\r\n") != std::string::npos; };
+    for (const auto &key : p.config().keys())
+        if (key.size() >= 5 && key.compare(key.size() - 5, 5, "gcode") == 0) {
+            const auto *option = p.config().option(key);
+            if (const auto *v = dynamic_cast<const ConfigOptionString *>(option); v && nonblank(v->value)) throw SlicingError("Canonical pilot declines custom motion programs");
+            if (const auto *v = dynamic_cast<const ConfigOptionStrings *>(option); v && std::any_of(v->values.begin(), v->values.end(), nonblank))
+                throw SlicingError("Canonical pilot declines custom motion programs");
+        }
+    if (std::any_of(p.config().post_process.values.begin(), p.config().post_process.values.end(), nonblank))
+        throw SlicingError("Canonical pilot declines external G-code postprocessing");
+    if (!p.model().get_curr_plate_custom_gcodes().gcodes.empty() || p.calib_mode() != CalibMode::Calib_None)
+        throw SlicingError("Canonical pilot declines custom layer actions and printer calibration programs");
+    if (object.has_support_material() || !object.support_layers().empty() || p.has_brim() || p.has_skirt() || p.has_wipe_tower())
+        throw SlicingError("Canonical pilot requires model-only deposition: support, raft, skirt, brim and purge tower are not admitted");
+}
+
+static void audit_pilot_plane(const Layer &layer, const ActiveAttachments &active, const PilotReplayProof &proof)
+{
+    const auto &object = *layer.object();
+    if (const auto *plan = object.bridge_aware_cubic_plan(0); plan && plan->parameters().canonical_phase) {
+        if (plan->has_closures(layer.print_z) || !plan->solid_area(layer.print_z).empty())
+            throw SlicingError("Canonical pilot does not yet emit closures or saturation", object.model_object()->id().id);
+        using namespace BridgeAwareCubic;
+        using Key = std::tuple<StrandPlane, StrandEvent, StrandEvent>;
+        std::map<Key, std::vector<std::pair<StrandFraction, StrandFraction>>> spans;
+        require_pilot_producers(object);
+        if (!proof.identity || proof.identity != plan->immutable_identity()) throw SlicingError("Missing or stale canonical replay proof");
+        Pilot::validate_roots(layer, active.entries, proof);
+        Pilot::Coverage             coverage;
+        size_t                      entries = 0, segments = 0;
+        std::map<float, ExPolygons> allowed;
+        StrandBudget                geometry_budget;
+        const auto                  cancel = [&] {
+            if (object.print()->canceled()) throw CanceledException();
+        };
+        const auto &phase       = *plan->parameters().canonical_phase;
+        const auto  translation = Pilot::grid_translation(phase);
+        const auto  inspect     = [&](const ExtrusionPath &p) {
+            const auto *s = dynamic_cast<const PilotPath *>(&p);
+            if (p.role() == erInternalInfill && (!s || s->plan_identity != plan->immutable_identity())) throw SlicingError("Missing or stale canonical sparse path provenance");
+            const bool       added    = s && s->partition();
+            const ExPolygon *material = nullptr;
+            if (added) {
+                const auto id = s->source.atoms.front().material_component;
+                for (const auto &atom : s->source.atoms)
+                    if (atom.material_component != id) throw SlicingError("Canonical run crosses material components");
+                auto it = allowed.find(p.width);
+                if (it == allowed.end()) it = allowed.emplace(p.width, offset_ex(layer.lslices, -scale_(.5 * double(p.width)))).first;
+                if (id >= it->second.size()) throw SlicingError("Missing original inset material component");
+                material = &it->second[id];
+            }
+            for (const auto &line : p.polyline.lines()) {
+                if (++segments > 200000) throw SlicingError("Canonical pilot layer segment limit");
+                if ((segments & 255) == 0) cancel();
+                const Point a = phase(line.a), b = phase(line.b);
+                if (a == b) {
+                    if (added) throw SlicingError("Canonical endpoint repair would deposit a stationary segment");
+                    continue;
+                }
+                coverage.add(a, b, added);
+                if (added && !Pilot::inside_material(Pilot::local_point(a, translation), Pilot::local_point(b, translation), *material, geometry_budget, cancel))
+                    throw SlicingError("Serialized canonical moving segment leaves its original inset material component");
+            }
+            if (!added) return;
+            for (const auto &a : s->source.atoms) {
+                if (++entries > 200000) throw SlicingError("Canonical pilot layer incidence limit");
+                if ((entries & 255) == 0) cancel();
+                spans[{s->source.plane, a.source.first, a.source.last}].emplace_back(a.first, a.last);
+            }
+        };
+        // Include loops, multipaths, all fill roles and every producing region.
+        // Only positive-length overlap involving a partition is disallowed.
+        for (const LayerRegion *r : layer.regions()) {
+            Pilot::walk(r->perimeters, inspect);
+            Pilot::walk(r->fills, inspect);
+        }
+        coverage.verify();
+        const auto less = [](StrandFraction a, StrandFraction b) {
+            using W = boost::multiprecision::int128_t;
+            return W(a.numerator) * b.denominator < W(b.numerator) * a.denominator;
+        };
+        for (auto &[key, v] : spans) {
+            std::sort(v.begin(), v.end(), [&](const auto &a, const auto &b) { return less(a.first, b.first); });
+            for (size_t i = 1; i < v.size(); ++i)
+                if (less(v[i].first, v[i - 1].second)) throw SlicingError("Canonical pilot grouped sparse components duplicate a positive source interval");
+        }
+    }
+}
+
 void apply_layer_paths(Layer &layer)
 {
     const PrintObject &object = *layer.object();
@@ -4134,11 +4227,20 @@ void apply_layer_paths(Layer &layer)
     for (const auto &attachment : active.entries)
         if (attachment.emitting_region >= layer.regions().size())
             throw SlicingError("Bridge aware cubic attachment has no printable owning region.", object.model_object()->id().id);
+    std::shared_ptr<PilotReplayProof> pilot_proof;
+    layer.pilot_replay_proof.reset();
+    if (const auto *plan=object.bridge_aware_cubic_plan(0);plan && plan->parameters().canonical_phase) {
+        pilot_proof=std::make_shared<PilotReplayProof>();pilot_proof->identity=plan->immutable_identity();
+    }
     const auto replay_attachments = [&] {
         for (size_t emitter = 0; emitter < layer.regions().size(); ++emitter) {
             LayerRegion &region = *layer.get_region(int(emitter));
             const auto replay = [&](ExtrusionPath &path) {
                 auto resolved = resolve_attachments(layer, path.polyline, path.width, path.height, emitter, active);
+                if (pilot_proof && !resolved.applied_indices.empty()) {
+                    if (pilot_proof->roots.size()>=active.entries.size()) throw SlicingError("Canonical attachment consumed by multiple root paths");
+                    pilot_proof->roots.push_back({emitter,path.role(),path.width,path.height,path.polyline,resolved.applied_indices});
+                }
                 path.polyline = std::move(resolved.polyline);
                 if (path.role() == erInternalInfill && !resolved.applied_indices.empty() &&
                     emitter < layer.bridge_aware_emission_builders.size()) {
@@ -4172,57 +4274,6 @@ void apply_layer_paths(Layer &layer)
         }
     };
     replay_attachments();
-    if (const auto *plan=object.bridge_aware_cubic_plan(0); plan && plan->parameters().canonical_phase) {
-        if (plan->has_closures(layer.print_z) || !plan->solid_area(layer.print_z).empty())
-            throw SlicingError("Canonical pilot does not yet emit closures or saturation",object.model_object()->id().id);
-        using namespace BridgeAwareCubic;
-        using Key=std::tuple<StrandPlane,StrandEvent,StrandEvent>;
-        std::map<Key,std::vector<std::pair<StrandFraction,StrandFraction>>> spans;
-        struct Segment {coord_t lo,hi; bool added;};
-        using LineKey=std::tuple<int64_t,int64_t,int64_t>;
-        std::map<LineKey,std::vector<Segment>> serialized_segments;
-        size_t entries=0, segments=0;
-        visit_paths(layer.get_region(0)->fills,[&](const ExtrusionPath &p){
-            if (p.role()!=erInternalInfill) return;
-            const auto *s=dynamic_cast<const PilotPath *>(&p);
-            if (!s || s->plan_identity!=plan->immutable_identity()) throw SlicingError("Canonical pilot cannot account for a missing or stale sparse extrusion source");
-            for (const auto &line:p.polyline.lines()) {
-                if (++segments>200000) throw SlicingError("Canonical pilot layer segment limit");
-                if ((segments & 255) == 0 && object.print()->canceled()) throw CanceledException();
-                const Point a=(*plan->parameters().canonical_phase)(line.a), b=(*plan->parameters().canonical_phase)(line.b);
-                if (a==b) { if (s->partition()) throw SlicingError("Canonical endpoint repair would deposit a stationary segment"); continue; }
-                int64_t dx=int64_t(b.x())-a.x(), dy=int64_t(b.y())-a.y();
-                const int64_t divisor=std::gcd(dx,dy);dx/=divisor;dy/=divisor;
-                if (dx<0 || (dx==0 && dy<0)) {dx=-dx;dy=-dy;}
-                // SerializedXY coordinates are int32 multiples of 100. Their
-                // primitive axis and determinant therefore fit int64_t.
-                const int64_t c=dx*int64_t(a.y())-dy*int64_t(a.x());
-                const auto u=dx?a.x():a.y(), v=dx?b.x():b.y();
-                serialized_segments[{dx,dy,c}].push_back({std::min(u,v),std::max(u,v),s->partition()});
-            }
-            if (!s->partition()) return;
-            for (const auto &a:s->source.atoms) {
-                if (++entries>200000) throw SlicingError("Canonical pilot layer incidence limit");
-                if ((entries & 255) == 0 && object.print()->canceled()) throw CanceledException();
-                spans[{s->source.plane,a.source.first,a.source.last}].emplace_back(a.first,a.last);
-            }
-        });
-        for (auto &[key,v]:serialized_segments) {
-            std::sort(v.begin(),v.end(),[](const auto &a,const auto &b){return a.lo<b.lo;});
-            coord_t any=std::numeric_limits<coord_t>::lowest(), partition=any;
-            for (const auto &e:v) {
-                if (e.lo < (e.added?any:partition)) throw SlicingError("Canonical pilot would deposit a duplicate moving course");
-                any=std::max(any,e.hi);if(e.added)partition=std::max(partition,e.hi);
-            }
-        }
-        const auto less=[](StrandFraction a,StrandFraction b){ using W=boost::multiprecision::int128_t;
-            return W(a.numerator)*b.denominator<W(b.numerator)*a.denominator; };
-        for (auto &[key,v]:spans) {
-            std::sort(v.begin(),v.end(),[&](const auto &a,const auto &b){return less(a.first,b.first);});
-            for (size_t i=1;i<v.size();++i) if (less(v[i].first,v[i-1].second))
-                throw SlicingError("Canonical pilot grouped sparse components duplicate a positive source interval");
-        }
-    }
 
     Polylines deposited;
     visit_layer(layer, [&](const ExtrusionPath &path) { deposited.push_back(path.polyline); });
@@ -4265,6 +4316,10 @@ void apply_layer_paths(Layer &layer)
     // runs on every trial and final fill; the remaining model, cell and
     // dependency geometry must still pass the ordinary final certificate.
     remove_stationary_construction(layer, active);
+    if (pilot_proof) {
+        audit_pilot_plane(layer,active,*pilot_proof);
+        layer.pilot_replay_proof=std::move(pilot_proof);
+    }
     // Capture only the final surviving complete emitter after both replay
     // passes and stationary removal. Raw survival owns values, never live
     // entity addresses. Classification/reference work is deferred until a
@@ -4573,6 +4628,41 @@ void PrintObject::prepare_bridge_aware_cubic()
         }
     };
 
+    const auto same_attachment = [](const auto &a, const auto &b) {
+        return a.z == b.z && a.emitting_region == b.emitting_region &&
+            a.original == b.original && a.replacement == b.replacement &&
+            a.width == b.width && a.height == b.height && a.owners == b.owners &&
+            a.solid_cut == b.solid_cut && a.demand_selection == b.demand_selection;
+    };
+    using SavedPilotRepairs = std::optional<std::vector<BridgeAwareCubic::LayerAttachment>>;
+    const auto retry_unused_partition_repairs = [&](const auto &operation, SavedPilotRepairs *rollback) {
+        for (;;) {
+            try {
+                return operation();
+            } catch (const BridgeAwareCubic::Pilot::UnusedPartitionRepair &unused) {
+                // The single-region pilot generated every source on this plane
+                // and accounted for all used transitions. Refining its lattice
+                // can turn a formerly free terminal into an interior vertex.
+                if (!canonical_cubic_pilot() || attachments.size() != 1 ||
+                    !m_bridge_aware_cubic_plans[0] || m_bridge_aware_cubic_plans[0]->immutable_identity() != unused.plan)
+                    throw;
+                throw_if_canceled();
+                auto &repairs = attachments[0];
+                const auto matches = [&](const auto &repair) { return same_attachment(repair, unused.attachment); };
+                const auto entry = std::find_if(repairs.begin(), repairs.end(), matches);
+                if (entry == repairs.end() || std::find_if(std::next(entry), repairs.end(), matches) != repairs.end())
+                    throw;
+                if (rollback && !*rollback) rollback->emplace(repairs);
+                repairs.erase(entry);
+                auto &plan = m_bridge_aware_cubic_plans[0];
+                plan = std::make_unique<BridgeAwareCubic::Plan>(plan->with_payloads(closures[0], repairs));
+                // The finite repair list strictly shrinks. Regenerate every
+                // pilot layer from the new identity before collecting demands
+                // or accepting the candidate. A rejected trial restores both
+                // the previous Plan and its planner-owned repair list.
+            }
+        }
+    };
     std::vector<Failure> failures;
     // Every accepted repair batch receives a fresh deposition/verification
     // pass, including the final bounded batch. Never report the stale failure
@@ -4615,7 +4705,8 @@ void PrintObject::prepare_bridge_aware_cubic()
             }
         }
         prune_dependencies();
-        generate();
+        if (canonical_cubic_pilot()) retry_unused_partition_repairs(generate, nullptr);
+        else generate();
         // Attachments alter the actual model path. Preserve the original
         // demand selection while following each committed replay identity, so
         // later validation and coarsening never certify abandoned endpoints.
@@ -4684,12 +4775,6 @@ void PrintObject::prepare_bridge_aware_cubic()
                 const auto same_closure = [](const auto &a, const auto &b) {
                     return a.z == b.z && a.paths == b.paths && a.reservation == b.reservation &&
                         a.owners == b.owners && a.emitting_region == b.emitting_region;
-                };
-                const auto same_attachment = [](const auto &a, const auto &b) {
-                    return a.z == b.z && a.emitting_region == b.emitting_region &&
-                        a.original == b.original && a.replacement == b.replacement &&
-                        a.width == b.width && a.height == b.height && a.owners == b.owners &&
-                        a.solid_cut == b.solid_cut && a.demand_selection == b.demand_selection;
                 };
                 for (size_t region = 0; region < previous.size(); ++region) {
                     const auto *before = previous[region].get();
@@ -5127,9 +5212,14 @@ void PrintObject::prepare_bridge_aware_cubic()
                     bool audit_matched = false;
                     bool ordinary_verified = false;
                     std::exception_ptr audit_error;
+                    SavedPilotRepairs previous_pilot_repairs;
                     try {
-                        ordinary_verified = check_changed_layers(changed, &candidate_key, &trial_budget,
-                            audit ? &*sparse : nullptr, &audit_matched);
+                        const auto verify = [&] {
+                            return check_changed_layers(changed, &candidate_key, &trial_budget,
+                                audit ? &*sparse : nullptr, &audit_matched);
+                        };
+                        ordinary_verified = canonical_cubic_pilot() ?
+                            retry_unused_partition_repairs(verify, &previous_pilot_repairs) : verify();
                     } catch (...) {
                         if (!audit) throw;
                         // Diagnostic generation/checks run only to challenge a
@@ -5147,6 +5237,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                     }
                     else {
                         m_bridge_aware_cubic_plans = std::move(previous);
+                        if (previous_pilot_repairs) attachments[0] = std::move(*previous_pilot_repairs);
                         demand_indices.swap(previous_indices);
                         emission_reuse.discard_candidate(changed);
                         ProfileScope profile(ProfilePhase::GenerateRollback);
@@ -5546,6 +5637,10 @@ void PrintObject::validate_bridge_aware_cubic() const
     if (geometry.canonical_cubic_pilot()) {
         const auto *p=geometry.bridge_aware_cubic_plan(0);
         if (!p || !p->parameters().canonical_phase || phases.size()!=1) throw SlicingError("Canonical pilot has no bound placement");
+        for (const Layer *layer:geometry.layers()) {
+            if (!layer->pilot_replay_proof) throw SlicingError("Canonical plane lacks completed attachment accounting");
+            BridgeAwareCubic::audit_pilot_plane(*layer,active_attachments(*layer),*layer->pilot_replay_proof);
+        }
         const auto &p0=*p->parameters().canonical_phase;
         if (phases[0].shift!=p0.shift || phases[0].plate_origin!=p0.plate_origin || phases[0].nozzle_offset!=p0.nozzle_offset)
             throw SlicingError("Canonical pilot placement changed: regenerate sparse paths");

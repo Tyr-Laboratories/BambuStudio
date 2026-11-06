@@ -32,6 +32,7 @@ namespace FillLightning {
 };
 
 namespace BridgeAwareCubic {
+    struct PilotReplayProof;
     class EmissionLedgerBuilder;
     class EmissionSnapshot;
 }
@@ -166,6 +167,7 @@ public:
     std::vector<std::shared_ptr<BridgeAwareCubic::EmissionLedgerBuilder>> bridge_aware_emission_builders;
     std::vector<std::shared_ptr<const BridgeAwareCubic::EmissionSnapshot>> bridge_aware_emission_snapshots;
     std::shared_ptr<BridgeAwareCubicValidation::WorkBudget> bridge_aware_emission_budget;
+    std::shared_ptr<const BridgeAwareCubic::PilotReplayProof> pilot_replay_proof;
 
     // BBS
     mutable ExPolygons          sharp_tails;
