@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,6 +85,37 @@ PreparedLowerPtr prepare_lower(const std::vector<Bead> &deposited,
                                double upper_print_z, float upper_height,
                                BridgeAwareCubicValidation::WorkBudget *budget = nullptr);
 
+// Optional identity for one complete ContactsOnly query, not a support proof.
+// Own the exact upper inputs and the ordered canonical lower sections used by
+// each positive segment. Unrelated sections need not match, but full prepared
+// status, plane and ordinary upper-input guards are checked on every lookup.
+// Capture and lookup share the caller's work budget; cap/allocation/validation
+// failure returns null/false and must fall back to ordinary verification with
+// that SAME remaining budget. Cancellation exceptions propagate unchanged.
+// The eventual proof adapter must additionally key demand, gap and phase, and
+// publish only after a complete passing span-only check. No cell proof follows
+// from matching this signature. Storage units include metadata, upper points,
+// segment records and owned section records, including spare vector capacity;
+// the signature owns no lower plan. Supply the live query-mask cache, if any,
+// for shared temporary-allocation admission; foreign caches are ineligible.
+struct QuerySignature;
+class QueryCache;
+using QuerySignaturePtr = std::shared_ptr<const QuerySignature>;
+using QuerySignatureCancel = std::function<void()>;
+QuerySignaturePtr capture_query_signature(const PreparedLower &prepared,
+                                           const ExtrusionPath &upper,
+                                           double upper_print_z, double xy_tolerance_mm,
+                                           BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+                                           size_t capacity_units = 8192,
+                                           const QuerySignatureCancel &cancel = {},
+                                           QueryCache *cache = nullptr);
+bool matches_query_signature(const QuerySignature &signature, const PreparedLower &prepared,
+                             const ExtrusionPath &upper, double upper_print_z, double xy_tolerance_mm,
+                             BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+                             const QuerySignatureCancel &cancel = {},
+                             QueryCache *cache = nullptr);
+size_t query_signature_units(const QuerySignature &signature) noexcept;
+
 struct QueryCacheData;
 struct QueryCacheStatistics {
     size_t hits = 0, misses = 0, evictions = 0, resident_units = 0;
@@ -108,6 +140,10 @@ private:
     friend SupportQuery footprint_for_support(const PreparedLower &, const ExtrusionPath &, double, double,
                                               BridgeAwareCubicValidation::WorkBudget *, QueryCache *);
     friend PathContact physical_sections(const PreparedLower &, BridgeAwareCubicValidation::WorkBudget *, QueryCache *);
+    friend QuerySignaturePtr capture_query_signature(const PreparedLower &, const ExtrusionPath &, double, double,
+        BridgeAwareCubicValidation::WorkBudget *, size_t, const QuerySignatureCancel &, QueryCache *);
+    friend bool matches_query_signature(const QuerySignature &, const PreparedLower &, const ExtrusionPath &, double, double,
+        BridgeAwareCubicValidation::WorkBudget *, const QuerySignatureCancel &, QueryCache *);
 };
 
 // The upper elevation and float height must exactly match the prepared key.

@@ -121,6 +121,7 @@ set(lisbslic3r_sources
     Fill/BridgeAwareCubicModelProofCache.hpp
     Fill/BridgeAwareCubicFailureReplay.hpp
     Fill/BridgeAwareCubicContainment.hpp
+    Fill/BridgeAwareCubicSpanProofCache.hpp
     Fill/BridgeAwareCubicOwnerBounds.hpp
     Fill/BridgeAwareCubicDependencies.cpp
     Fill/BridgeAwareCubicDependencies.hpp

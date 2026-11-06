@@ -11,6 +11,7 @@
 #include "Fill/BridgeAwareCubicDependencies.hpp"
 #include "Fill/BridgeAwareCubicSerialization.hpp"
 #include "Fill/BridgeAwareCubicModelProofCache.hpp"
+#include "Fill/BridgeAwareCubicSpanProofCache.hpp"
 #include "Fill/BridgeAwareCubicFailureReplay.hpp"
 #include "Fill/BridgeAwareCubicContainment.hpp"
 #include "Fill/BridgeAwareCubicCertificate.hpp"
@@ -73,6 +74,8 @@ struct ProfileState {
     uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
     uint64_t model_layer_proof_hits = 0, model_layer_proof_misses = 0, model_layer_proof_publications = 0;
     uint64_t model_layer_proof_vertices = 0, model_layer_proof_items = 0;
+    uint64_t span_proof_hits = 0, span_proof_misses = 0, span_proof_publications = 0, span_proof_evictions = 0;
+    uint64_t span_proof_entries = 0, span_proof_units = 0;
     uint64_t final_proof_hits = 0, final_proof_misses = 0, final_proof_publications = 0, final_proof_bytes = 0;
     bool full_trial_checks = false;
     bool truncated = false;
@@ -145,6 +148,12 @@ struct ProfileState {
                     << ",\"model_layer_proof_publications\":" << model_layer_proof_publications
                     << ",\"model_layer_proof_vertices\":" << model_layer_proof_vertices
                     << ",\"model_layer_proof_items\":" << model_layer_proof_items
+                    << ",\"span_proof_hits\":" << span_proof_hits
+                    << ",\"span_proof_misses\":" << span_proof_misses
+                    << ",\"span_proof_publications\":" << span_proof_publications
+                    << ",\"span_proof_evictions\":" << span_proof_evictions
+                    << ",\"span_proof_entries\":" << span_proof_entries
+                    << ",\"span_proof_units\":" << span_proof_units
                     << ",\"whole_support_queries\":" << whole_support_queries
                     << ",\"whole_support_proofs\":" << whole_support_proofs
                     << ",\"whole_support_segments\":" << whole_support_segments
@@ -919,6 +928,7 @@ struct TargetCheckContext {
     const std::vector<size_t> *frozen_indices = nullptr;
     std::optional<BridgeAwareCubic::ModelFailureReplay::Hint> *first_failure = nullptr;
     bool *probe_checked = nullptr;
+    BridgeAwareCubic::SpanProofCache *span_proofs = nullptr;
 };
 
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
@@ -1888,6 +1898,19 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
     BridgeAwareCubicValidation::WorkBudget local_budget;
     auto &budget = context && context->budget ? *context->budget : local_budget;
     const auto *probe = context && mode == TargetCheck::RejectTrial ? context->probe : nullptr;
+    auto *span_proofs = context && !probe && mode == TargetCheck::RejectTrial &&
+        !(active_profile && active_profile->full_trial_checks) ? context->span_proofs : nullptr;
+    const auto profile_span_proofs = [&] {
+        if (active_profile && span_proofs) {
+            const auto stats = span_proofs->statistics();
+            active_profile->span_proof_hits = stats.hits;
+            active_profile->span_proof_misses = stats.misses;
+            active_profile->span_proof_publications = stats.publications;
+            active_profile->span_proof_evictions = stats.evictions;
+            active_profile->span_proof_entries = stats.entries;
+            active_profile->span_proof_units = stats.units;
+        }
+    };
     if (context && context->probe_checked) *context->probe_checked = false;
     // The filter controls traversal only. All model groups remain present for
     // per-path selection and the full physical support-complement window.
@@ -2075,6 +2098,22 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     prepared_lower.clear();
                     lower_contact = BridgeAwareCubicContact::prepare_lower(prior_beads, upper_z, upper.height, &budget);
                 }
+                const ExPolygons &path_selection = cached_phase ? cached_phase->path_demands.at(frozen_index).at(index) :
+                    preserved_path_demands[target_index][index];
+                const auto span_kind = target.dependency ? BridgeAwareCubic::SpanProofCache::Kind::Construction :
+                    target.bridge_followup ? BridgeAwareCubic::SpanProofCache::Kind::BridgeFollowup :
+                    BridgeAwareCubic::SpanProofCache::Kind::Ineligible;
+                const bool reuse_span = span_proofs && span_kind != BridgeAwareCubic::SpanProofCache::Kind::Ineligible;
+                const BridgeAwareCubic::SpanProofCache::Query span_query{span_kind, phase, target.gap,
+                    target.path_widths[index], path_selection, *lower_contact, upper, upper_z, contact_queries.get()};
+                if (reuse_span) {
+                    // Re-discover all current contact candidates, including
+                    // material in formerly empty space, before reusing a fact
+                    // about this complete path and its full selection policy.
+                    const bool matched = span_proofs->matches(span_query, &budget, cancel);
+                    profile_span_proofs();
+                    if (matched) continue;
+                }
                 // A continuous contact line proves the path span, but it is
                 // not a physical wall bounding the independent model-cell
                 // obligation. Only span-only construction/follow-up targets
@@ -2117,8 +2156,6 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                                                     segment.centerline_support));
                     }
                     if (!contact.input_valid || !contact.completed || contact.segments.empty()) unsupported = {upper.polyline};
-                    const ExPolygons &path_selection = cached_phase ? cached_phase->path_demands.at(frozen_index).at(index) :
-                        preserved_path_demands[target_index][index];
                     const ExPolygons selected = intersection_ex(path_selection,
                         union_ex(offset(unsupported, scale_(.5 * target.path_widths[index]))));
                     if (target.bridge_followup || target.dependency || selected.empty() || !contact.input_valid || !contact.completed) {
@@ -2163,6 +2200,13 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                             checked = BridgeAwareCubicValidation::validate_prepared_contact_failures(*found->second,
                                 {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
                     }
+                }
+                if (reuse_span && checked.passed()) {
+                    // Only the actual complete span-only check above can
+                    // publish a fact. A later failed path in this trial does
+                    // not change the exact inputs of this local result.
+                    span_proofs->publish(span_query, checked, &budget, cancel);
+                    profile_span_proofs();
                 }
                 // Inspect only this path before moving its vectors. Rescanning
                 // the growing aggregate after every successful path would make
@@ -3191,6 +3235,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                 prepare_model_targets(*this, roofs);
             const auto model_proofs = prepare_model_proofs(*this, prepared_roofs.get(), roofs);
             BridgeAwareCubic::ModelFailureReplay model_replay;
+            BridgeAwareCubic::SpanProofCache span_proofs;
             size_t trials = 0;
             const auto changed_plan_layers = [&](const auto &previous, const auto &previous_indices) {
                 std::set<size_t> changed;
@@ -3325,7 +3370,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                 const PreparedModelView prepared_view{prepared_roofs.get(), frozen_indices, model_proofs.get()};
                 BridgeAwareCubicValidation::WorkBudget model_budget;
                 std::optional<BridgeAwareCubic::ModelFailureReplay::Hint> first_model_failure;
-                TargetCheckContext context{&model_budget, nullptr, &frozen_indices, &first_model_failure, nullptr};
+                TargetCheckContext context{&model_budget, nullptr, &frozen_indices, &first_model_failure, nullptr, &span_proofs};
                 const bool replay_enabled = candidate_key && mode == TargetCheck::RejectTrial;
                 const auto remember_failure = [&] {
                     if (replay_enabled && first_model_failure && model_replay.remember(*candidate_key, *first_model_failure) && active_profile)
@@ -3381,7 +3426,10 @@ void PrintObject::prepare_bridge_aware_cubic()
                     if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
                 if (!rejected.empty()) remember_failure();
                 else {
-                    rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers), nullptr, mode);
+                    TargetCheckContext construction_context;
+                    construction_context.span_proofs = &span_proofs;
+                    rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers), nullptr, mode,
+                        nullptr, &construction_context);
                     for (const Failure &failure : rejected)
                         if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
                     if (active_profile) active_profile->model_replay_entries = model_replay.size();

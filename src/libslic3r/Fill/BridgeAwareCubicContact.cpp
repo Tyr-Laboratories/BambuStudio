@@ -561,6 +561,22 @@ struct PreparedLower {
     SectionIndex index;
 };
 
+// Store values, never section indices or snapshot addresses. Canonical section
+// indices may shift when unrelated lower material changes. The Scalar radius
+// is compared as a number: long double may contain indeterminate padding.
+struct QuerySignature {
+    struct Section { Point a, b; Scalar radius; };
+    struct Segment { size_t original_index; std::vector<Section> sections; };
+    Points upper_points;
+    float width = 0.f, height = 0.f;
+    double mm3_per_mm = 0., upper_print_z = 0., tolerance = 0., contact_z = 0.;
+    ExtrusionRole role = erNone;
+    std::vector<Segment> segments;
+    size_t units = 0;
+};
+
+size_t query_signature_units(const QuerySignature &signature) noexcept { return signature.units; }
+
 struct QueryCacheData {
     using Key = std::tuple<size_t, Scalar, Scalar, double>;
     struct Entry { ExPolygons polygons; size_t units; };
@@ -915,6 +931,46 @@ bool prove_entire_path(PathContact &result, const PreparedLower &prepared, const
     return true;
 }
 
+// The only candidate enumeration used by ordinary contact generation and its
+// optional query identity. Both retain canonical merged-section order and the
+// exact original broad/narrow rejection predicates. A visitor may stop after
+// an identity mismatch; ordinary queries always visit every surviving pair.
+template<class Visit, class Poll>
+bool visit_query_sections(const PreparedLower &prepared, const Point &a, const Point &b,
+                          Scalar upper_radius, std::vector<size_t> &candidates,
+                          Budget &budget, Visit &&visit, Poll &&poll)
+{
+    const V u = V(b) - V(a);
+    const Scalar length = std::sqrt(dot(u, u));
+    const bool indexed = !prepared.index.empty();
+    budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+    poll();
+    if (indexed)
+        prepared.index.candidates(a, b, u, length, upper_radius, candidates, budget);
+    poll();
+    const size_t lower_count = indexed ? candidates.size() : prepared.sections.size();
+    for (size_t i = 0; i < lower_count; ++i) {
+        if ((i & 255) == 0) poll();
+        const size_t lower_index = indexed ? candidates[i] : i;
+        const LowerSection &lower = prepared.sections[lower_index];
+        budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+        budget.consume();
+        const Scalar reach = lower.radius + upper_radius + 4;
+        if (std::max(a.x(), b.x()) + reach < std::min(lower.a.x(), lower.b.x()) ||
+            std::min(a.x(), b.x()) - reach > std::max(lower.a.x(), lower.b.x()) ||
+            std::max(a.y(), b.y()) + reach < std::min(lower.a.y(), lower.b.y()) ||
+            std::min(a.y(), b.y()) - reach > std::max(lower.a.y(), lower.b.y()))
+            continue;
+        const V lower_delta = V(lower.b) - V(lower.a);
+        const Scalar lower_length = std::sqrt(dot(lower_delta, lower_delta));
+        if (separated_normal(a, u, length, lower.a, lower.b, reach, budget) ||
+            separated_normal(lower.a, lower_delta, lower_length, a, b, reach, budget))
+            continue;
+        if (!visit(lower_index, lower, length, lower_length)) return false;
+    }
+    return true;
+}
+
 void query_impl(PathContact &result, const PreparedLower &prepared, const ExtrusionPath &upper,
                 double upper_print_z, double xy_tolerance_mm, FootprintMode mode, Budget &budget)
 {
@@ -940,50 +996,215 @@ void query_impl(PathContact &result, const PreparedLower &prepared, const Extrus
     const Scalar upper_radius = .5L * snapped_section(upper, upper_print_z, result.contact_z) / SCALING_FACTOR;
     const Scalar reserve = xy_tolerance_mm / SCALING_FACTOR + 3.;
     if (mode == FootprintMode::Full) physical_impl(result, prepared, budget);
-    const bool indexed = !prepared.index.empty();
     std::vector<size_t> candidates;
     for (SegmentContact &segment : result.segments) {
         const Point &a = upper_points[segment.segment_index], &b = upper_points[segment.segment_index + 1];
         const V u = V(b) - V(a);
         const Scalar length = std::sqrt(dot(u, u));
         const V transverse(-u.y / length * upper_radius, u.x / length * upper_radius);
-        budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
-        if (indexed)
-            prepared.index.candidates(a, b, u, length, upper_radius, candidates, budget);
-        const size_t lower_count = indexed ? candidates.size() : prepared.sections.size();
-        for (size_t i = 0; i < lower_count; ++i) {
-            const LowerSection &lower = prepared.sections[indexed ? candidates[i] : i];
-            budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
-            budget.consume();
-            // Exact broad phase; a conservative maximum XY reach is enough.
-            const Scalar reach = lower.radius + upper_radius + 4;
-            if (std::max(a.x(), b.x()) + reach < std::min(lower.a.x(), lower.b.x()) ||
-                std::min(a.x(), b.x()) - reach > std::max(lower.a.x(), lower.b.x()) ||
-                std::max(a.y(), b.y()) + reach < std::min(lower.a.y(), lower.b.y()) ||
-                std::min(a.y(), b.y()) - reach > std::max(lower.a.y(), lower.b.y()))
-                continue;
-            const V lower_delta = V(lower.b) - V(lower.a);
-            const Scalar lower_length = std::sqrt(dot(lower_delta, lower_delta));
-            if (separated_normal(a, u, length, lower.a, lower.b, reach, budget) ||
-                separated_normal(lower.a, lower_delta, lower_length, a, b, reach, budget))
-                continue;
+        visit_query_sections(prepared, a, b, upper_radius, candidates, budget,
+          [&](size_t lower_index, const LowerSection &lower, Scalar, Scalar lower_length) {
             budget.category = BridgeAwareCubicValidation::WorkCategory::ContactMasks;
             // Both centreline endpoints can move, and both section
             // directions can rotate. Erode the convex contact region by
             // the corresponding support-function displacement bound.
             const double mask_reserve = xy_tolerance_mm *
                 double(2 + 4 * upper_radius / length + 4 * lower.radius / lower_length);
-            ExPolygons mask = contact_mask(indexed ? candidates[i] : i, lower, transverse, mask_reserve, budget);
+            ExPolygons mask = contact_mask(lower_index, lower, transverse, mask_reserve, budget);
             segment.centerline_support.insert(segment.centerline_support.end(),
                 std::make_move_iterator(mask.begin()), std::make_move_iterator(mask.end()));
             // An axis remains genuine material when a very thin positive
             // section loses its polygon mask to the rounding reserve.
             add_line_contact(a, b, lower, upper_radius, reserve, xy_tolerance_mm > 0., segment, budget);
-        }
+            return true;
+          }, [] {});
     }
 
 }
+
+struct SignatureUnavailable {};
+struct SignatureCanceled { std::exception_ptr exception; };
+
+// An optional acceleration failure must not swallow the caller's cancellation
+// exception, even if its type is also used for allocation/geometry failures.
+void signature_poll(const QuerySignatureCancel &cancel)
+{
+    if (cancel) {
+        try { cancel(); }
+        catch (...) { throw SignatureCanceled{std::current_exception()}; }
+    }
+}
+
+bool signature_arguments(const PreparedLower &prepared, const ExtrusionPath &upper,
+                         double upper_print_z, double tolerance, Budget &budget,
+                         QueryCacheData *cache)
+{
+    PathContact status;
+    if (!query_arguments(status, tolerance, FootprintMode::ContactsOnly) ||
+        !cache_matches(status, prepared, cache) ||
+        !prepared.status.input_valid || !prepared.status.completed ||
+        prepared.status.resource_limited || !prepared.status.failure_reason.empty())
+        return false;
+    // Run the ordinary guards freshly on every lookup. Nonempty fitting data
+    // is conservatively cache-ineligible even if its entries describe lines.
+    return upper_valid(status, upper, upper_print_z, budget) &&
+           upper.polyline.fitting_result.empty() &&
+           upper_print_z == prepared.upper_print_z && upper.height == prepared.upper_height;
+}
+
+void admit_signature(size_t count, size_t capacity, size_t &units, Budget &budget)
+{
+    if (count > capacity - units) throw SignatureUnavailable{};
+    budget.allocate(count);
+    units += count;
+}
+
+template<class T>
+void grow_signature(std::vector<T> &items, size_t item_units, size_t capacity,
+                    size_t &units, Budget &budget)
+{
+    if (items.size() != items.capacity()) return;
+    const size_t available = (capacity - units) / item_units;
+    if (available == 0) throw SignatureUnavailable{};
+    const size_t old_capacity = items.capacity();
+    const size_t growth = std::min(available, std::max(size_t(1), old_capacity));
+    admit_signature(growth * item_units, capacity, units, budget);
+    items.reserve(old_capacity + growth);
+    if (items.capacity() > old_capacity + growth)
+        admit_signature((items.capacity() - old_capacity - growth) * item_units, capacity, units, budget);
+}
+
+bool signature_upper_matches(const QuerySignature &signature, const PreparedLower &prepared,
+                             const ExtrusionPath &upper, double upper_print_z, double tolerance,
+                             Budget &budget, const QuerySignatureCancel &cancel)
+{
+    budget.consume(16); // Exact scalar/key and container metadata comparison.
+    if (signature.width != upper.width || signature.height != upper.height ||
+        signature.mm3_per_mm != upper.mm3_per_mm || signature.role != upper.role() ||
+        signature.upper_print_z != upper_print_z || signature.tolerance != tolerance ||
+        signature.contact_z != prepared.status.contact_z ||
+        signature.upper_points.size() != upper.polyline.points.size())
+        return false;
+    for (size_t i = 0; i < signature.upper_points.size(); ++i) {
+        if ((i & 255) == 0) signature_poll(cancel);
+        budget.consume();
+        if (signature.upper_points[i] != upper.polyline.points[i]) return false;
+    }
+    return true;
+}
 } // namespace
+
+QuerySignaturePtr capture_query_signature(const PreparedLower &prepared, const ExtrusionPath &upper,
+                                           double upper_print_z, double tolerance,
+                                           BridgeAwareCubicValidation::WorkBudget *shared,
+                                           size_t capacity_units, const QuerySignatureCancel &cancel,
+                                           QueryCache *cache)
+{
+    Budget budget(shared);
+    budget.vertices = prepared.admission_vertices;
+    QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
+    CacheScope cache_scope(budget, cache_data);
+    try {
+        signature_poll(cancel);
+        if (!signature_arguments(prepared, upper, upper_print_z, tolerance, budget, cache_data)) return {};
+        signature_poll(cancel);
+        const size_t capacity = std::min(capacity_units, max_vertices);
+        size_t units = 0;
+        admit_signature(16, capacity, units, budget); // All owned metadata/containers.
+        auto signature = std::make_shared<QuerySignature>();
+        const Points &points = upper.polyline.points;
+        admit_signature(points.size(), capacity, units, budget);
+        signature->upper_points = points;
+        if (signature->upper_points.capacity() > points.size())
+            admit_signature(signature->upper_points.capacity() - points.size(), capacity, units, budget);
+        signature->width = upper.width;
+        signature->height = upper.height;
+        signature->mm3_per_mm = upper.mm3_per_mm;
+        signature->role = upper.role();
+        signature->upper_print_z = upper_print_z;
+        signature->tolerance = tolerance;
+        signature->contact_z = prepared.status.contact_z;
+        const Scalar radius = .5L * snapped_section(upper, upper_print_z, signature->contact_z) / SCALING_FACTOR;
+        std::vector<size_t> candidates;
+        const auto poll = [&] { signature_poll(cancel); };
+        for (size_t i = 1; i < points.size(); ++i) {
+            poll();
+            budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+            budget.consume();
+            if (points[i - 1] == points[i]) continue;
+            // Admission includes spare vector capacity, not just used records.
+            grow_signature(signature->segments, 2, capacity, units, budget);
+            signature->segments.push_back({i - 1, {}});
+            auto &segment = signature->segments.back();
+            visit_query_sections(prepared, points[i - 1], points[i], radius, candidates, budget,
+                [&](size_t, const LowerSection &lower, Scalar, Scalar) {
+                    grow_signature(segment.sections, 3, capacity, units, budget);
+                    segment.sections.push_back({lower.a, lower.b, lower.radius});
+                    return true;
+                }, poll);
+        }
+        signature_poll(cancel);
+        signature->units = units;
+        return signature;
+    } catch (const SignatureCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const SignatureUnavailable &) {
+        return {};
+    } catch (const Limit &) {
+        return {};
+    } catch (const std::exception &) {
+        return {};
+    }
+}
+
+bool matches_query_signature(const QuerySignature &signature, const PreparedLower &prepared,
+                             const ExtrusionPath &upper, double upper_print_z, double tolerance,
+                             BridgeAwareCubicValidation::WorkBudget *shared,
+                             const QuerySignatureCancel &cancel, QueryCache *cache)
+{
+    Budget budget(shared);
+    budget.vertices = prepared.admission_vertices;
+    QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
+    CacheScope cache_scope(budget, cache_data);
+    try {
+        signature_poll(cancel);
+        if (!signature_arguments(prepared, upper, upper_print_z, tolerance, budget, cache_data) ||
+            !signature_upper_matches(signature, prepared, upper, upper_print_z, tolerance, budget, cancel))
+            return false;
+        const Points &points = upper.polyline.points;
+        const Scalar radius = .5L * snapped_section(upper, upper_print_z, prepared.status.contact_z) / SCALING_FACTOR;
+        std::vector<size_t> candidates;
+        size_t segment_index = 0;
+        const auto poll = [&] { signature_poll(cancel); };
+        for (size_t i = 1; i < points.size(); ++i) {
+            poll();
+            budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+            budget.consume();
+            if (points[i - 1] == points[i]) continue;
+            if (segment_index == signature.segments.size()) return false;
+            const auto &segment = signature.segments[segment_index++];
+            budget.consume();
+            if (segment.original_index != i - 1) return false;
+            size_t section_index = 0;
+            if (!visit_query_sections(prepared, points[i - 1], points[i], radius, candidates, budget,
+                [&](size_t, const LowerSection &lower, Scalar, Scalar) {
+                    budget.consume(3);
+                    if (section_index == segment.sections.size()) return false;
+                    const auto &expected = segment.sections[section_index++];
+                    return expected.a == lower.a && expected.b == lower.b && expected.radius == lower.radius;
+                }, poll) || section_index != segment.sections.size())
+                return false;
+        }
+        signature_poll(cancel);
+        return segment_index == signature.segments.size();
+    } catch (const SignatureCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const Limit &) {
+        return false;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
 
 PreparedLowerPtr prepare_lower(const std::vector<Bead> &deposited, double upper_print_z,
                                float upper_height, BridgeAwareCubicValidation::WorkBudget *shared)

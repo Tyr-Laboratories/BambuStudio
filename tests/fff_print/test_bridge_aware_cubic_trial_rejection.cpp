@@ -251,6 +251,11 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
             CAPTURE(counter);
             REQUIRE(result.counters.at(counter).get<size_t>() == 0);
         }
+        for (const char *counter : {"span_proof_hits", "span_proof_misses", "span_proof_publications",
+                                   "span_proof_evictions", "span_proof_entries", "span_proof_units"}) {
+            CAPTURE(counter);
+            REQUIRE(result.counters.at(counter).get<size_t>() == 0);
+        }
     } else {
         REQUIRE(result.counters.at("early_trial_rejections").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_cache_hits").get<size_t>() > 0);
@@ -271,6 +276,13 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
             CAPTURE(counter);
             REQUIRE(result.counters.at(counter).get<size_t>() > 0);
         }
+        REQUIRE(result.counters.at("span_proof_hits").get<size_t>() > 0);
+        REQUIRE(result.counters.at("span_proof_misses").get<size_t>() > 0);
+        REQUIRE(result.counters.at("span_proof_publications").get<size_t>() > 0);
+        REQUIRE(result.counters.at("span_proof_entries").get<size_t>() > 0);
+        REQUIRE(result.counters.at("span_proof_entries").get<size_t>() <= 20000);
+        REQUIRE(result.counters.at("span_proof_units").get<size_t>() > 0);
+        REQUIRE(result.counters.at("span_proof_units").get<size_t>() <= 200000);
     }
     return result;
 }
