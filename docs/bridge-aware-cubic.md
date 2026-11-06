@@ -71,16 +71,16 @@ The [official slicing benchmark procedure](bridge-aware-cubic-benchmark.md) docu
 
 ## Correctness checkpoint and outstanding performance gate
 
-The current application passes the full geometry suite (442 executions, 389,095 assertions). **All four fixtures fail the 2× slicing-time limit.** These are matched development runs against official 2.9.1.70, one pair per fixture without a warm-up. All eight CLI runs completed and passed the input, emitted-configuration and G-code checks.
+The full geometry suite passed 443 executions and 426,060 assertions. The build also passed 17 legacy CTest targets, 44 packaging tests, 70 benchmark-tool tests and the 260-assertion fixture writer. **All four fixtures exceed the 2× slicing-time limit.** The table gives one matched development pair per fixture against official 2.9.1.70, without a warm-up. All eight CLI runs passed the input, exported settings and G-code checks.
 
 | Fixture | Official regular Cubic | Bridge aware cubic | Ratio |
 | --- | ---: | ---: | ---: |
-| Small cube, 32 × 28 × 18 mm | 0.273 s | 9.590 s | 35.13× |
-| Large cube, 64 × 56 × 18 mm | 0.259 s | 148.325 s | 572.68× |
-| Rib | 0.256 s | 30.892 s | 120.67× |
-| Modifier | 0.270 s | 122.595 s | 454.06× |
+| Small cube, 32 × 28 × 18 mm | 0.305 s | 9.076 s | 29.76× |
+| Large cube, 64 × 56 × 18 mm | 0.270 s | 130.962 s | 485.04× |
+| Rib | 0.278 s | 31.888 s | 114.71× |
+| Modifier | 0.260 s | 122.716 s | 471.98× |
 
-Infill preparation alone takes 146.253 seconds on the large cube and 121.557 seconds on the modifier. The benchmark application is byte-identical to the full-suite build at `11f4aba1f`. The fixture writer passes 260 assertions after restoring the cube's empty machine scripts to the rib and modifier. All eight 3MF mesh members are byte-identical to their predecessors; part settings differ only by regenerated UUIDs. The cube project settings are unchanged; only the two machine scripts changed for the rib and modifier. No parser or configuration exception was added.
+Preparation now computes protection polygons only when sparse trimming restores material or a participating region enables infill combination. When needed, the polygons use the ordered model and construction footprints from final verification. Regression tests switch these consumers on and off, compare ordered geometry and deposition with an independent full recomputation, and verify a fresh slice against a reslice. All 117,963 executable G-code commands across the four fixtures matched the preceding feature build in order and content.
 
 The 6 November 2026 model-target reuse checkpoint passes the complete arm64 RelWithDebInfo application build, all 17 existing CTest targets, 44 packaging tests and 70 benchmark-tool tests. Bridge aware cubic passes 431 default cases across 433 executions, plus the small and large geometry qualifications and the exhaustive-versus-optimized comparison: 436 executions and 379,742 assertions in total. The three modifier-reslice sections run independently. Exact-name manifests, source inventory and XML results are tied to unchanged test executable SHA-256 `ae6f666052ac3e51e3c9b376334c8f991b7d680ca69f4eff7333544a2b4f5b7a`. The separate native fixture writer passes another 244 assertions and is excluded from those geometry totals.
 

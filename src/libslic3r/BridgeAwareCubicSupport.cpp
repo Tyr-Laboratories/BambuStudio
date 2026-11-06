@@ -4277,7 +4277,7 @@ const ExPolygons &PrintObject::bridge_aware_cubic_reservations(size_t layer_id, 
         m_bridge_aware_cubic_reservations[layer_id][region_id] : empty;
 }
 
-void PrintObject::prepare_bridge_aware_cubic()
+void PrintObject::prepare_bridge_aware_cubic(bool has_restored_sparse)
 {
     clear_bridge_aware_cubic_certificate();
     m_bridge_aware_cubic_plans.clear();
@@ -5106,43 +5106,70 @@ void PrintObject::prepare_bridge_aware_cubic()
                     }
                 }
             } while (accepted);
+            // Trimming consumes only the actual restored sparse fragments.
+            // Combination decides its layer windows later, so preserve the
+            // full reservation when it is enabled for any participating plan.
+            bool need_reservations = has_restored_sparse;
+            for (size_t r = 0; !need_reservations && r < num_printing_regions(); ++r)
+                need_reservations = bridge_aware_cubic_plan(r) != nullptr && printing_region(r).config().infill_combination.value;
+
+            const bool reference_reservations = need_reservations && active_profile && active_profile->full_trial_checks;
+            std::map<std::pair<size_t, size_t>, ExPolygons> selected;
+            const auto stage = [&](std::vector<Target> &targets) {
+                for (Target &target : targets) {
+                    throw_if_canceled();
+                    append(selected[{target.upper_layer - 1, target.supporting_region}], std::move(target.footprint));
+                }
+            };
             const auto final_phases = serialization_phases(*this, nullptr);
             {
                 ProfileScope profile(ProfilePhase::FinalProof);
                 final_proof_preamble(*this, *this, final_phases);
-                const auto final_model_targets = collect_targets(*this, false, false);
-                if (!same_model_targets(roofs, final_model_targets))
-                    throw SlicingError("Bridge aware cubic could not preserve the required model paths during final support reduction.", model_object()->id().id);
-                failures = check_targets(*this, final_model_targets);
-                if (failures.empty()) failures = check_targets(*this, collect_targets(*this, true, false));
+                {
+                    auto model = collect_targets(*this, false, false);
+                    if (!same_model_targets(roofs, model))
+                        throw SlicingError("Bridge aware cubic could not preserve the required model paths during final support reduction.", model_object()->id().id);
+                    failures = check_targets(*this, model);
+                    if (!failures.empty()) fail(*this, failures.front());
+                    if (need_reservations && !reference_reservations) stage(model);
+                }
+                auto construction = collect_targets(*this, true, false);
+                failures = check_targets(*this, construction);
                 if (!failures.empty()) fail(*this, failures.front());
+                if (need_reservations && !reference_reservations) stage(construction);
             }
-            // Reservation is separate from refinement demand. An added strand
-            // already supported by a retained parent face must not split that
-            // parent's otherwise coarse cells, but combination must retain the
-            // actual predecessor scaffold. Store complete supplying leaf cells.
-            m_bridge_aware_cubic_reservations.resize(m_layers.size());
-            for (auto &regions : m_bridge_aware_cubic_reservations)
-                regions.resize(num_printing_regions());
-            auto reserve = collect_targets(*this, false, false);
-            auto partition_support = collect_targets(*this, true, false);
-            reserve.insert(reserve.end(), std::make_move_iterator(partition_support.begin()),
-                           std::make_move_iterator(partition_support.end()));
-            std::map<std::pair<size_t, size_t>, ExPolygons> selected;
-            for (const Target &target : reserve)
-                append(selected[{target.upper_layer - 1, target.supporting_region}], target.footprint);
-            for (auto &entry : selected) {
-                const size_t layer_index = entry.first.first;
-                const size_t region_id = entry.first.second;
-                const auto *plan = bridge_aware_cubic_plan(region_id);
-                if (plan == nullptr) continue;
-                const ExPolygons footprint = union_ex(entry.second);
-                ExPolygons &reserved = m_bridge_aware_cubic_reservations[layer_index][region_id];
-                for (const auto &cell : plan->leaf_sections(m_layers[layer_index]->print_z))
-                    if (!intersection_ex(ExPolygon(cell.polygon), footprint).empty())
-                        reserved.emplace_back(cell.polygon);
-                reserved = union_ex(reserved);
+            if (need_reservations) {
+                // An already-supported added strand still needs its actual
+                // preceding scaffold protected from trimming or combination.
+                if (reference_reservations) {
+                    // Independent oracle: recollect both ordered target sets,
+                    // as before, instead of consuming the just-checked ones.
+                    {
+                        auto model = collect_targets(*this, false, false);
+                        stage(model);
+                    }
+                    auto construction = collect_targets(*this, true, false);
+                    stage(construction);
+                }
+                throw_if_canceled();
+                m_bridge_aware_cubic_reservations.resize(m_layers.size());
+                for (auto &regions : m_bridge_aware_cubic_reservations)
+                    regions.resize(num_printing_regions());
+                for (auto &entry : selected) {
+                    throw_if_canceled();
+                    const size_t layer_index = entry.first.first;
+                    const size_t region_id = entry.first.second;
+                    const auto *plan = bridge_aware_cubic_plan(region_id);
+                    if (plan == nullptr) continue;
+                    const ExPolygons footprint = union_ex(entry.second);
+                    ExPolygons &reserved = m_bridge_aware_cubic_reservations[layer_index][region_id];
+                    for (const auto &cell : plan->leaf_sections(m_layers[layer_index]->print_z))
+                        if (!intersection_ex(ExPolygon(cell.polygon), footprint).empty())
+                            reserved.emplace_back(cell.polygon);
+                    reserved = union_ex(reserved);
+                }
             }
+            throw_if_canceled();
             // Reservations are part of the owned state too. They do not alter
             // the just-proven emitted paths, and must be captured after their
             // final values are installed. Capture alone never asserts a proof.

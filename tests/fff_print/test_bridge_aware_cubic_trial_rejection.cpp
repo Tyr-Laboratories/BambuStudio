@@ -399,3 +399,127 @@ TEST_CASE("Bridge aware cubic early trial rejection preserves exhaustive final o
         }
     }
 }
+
+namespace {
+struct ScopedSparseTrimming {
+    const bool original = PrintObject::infill_only_where_needed;
+    ~ScopedSparseTrimming() { PrintObject::infill_only_where_needed = original; }
+};
+
+struct ReservationObservation {
+    Json rows = Json::array(), deposition = Json::array();
+    size_t polygons_stored = 0, planned_regions = 0, void_surfaces = 0;
+};
+
+ReservationObservation observe_reservations(const Print &print)
+{
+    ReservationObservation out;
+    const PrintObject &object = *print.get_object(size_t(0));
+    for (size_t r = 0; r < object.num_printing_regions(); ++r)
+        out.planned_regions += object.bridge_aware_cubic_plan(r) != nullptr;
+    for (size_t i = 0; i < object.layer_count(); ++i) {
+        Json reserved_rows = Json::array(), layer_rows = Json::array();
+        const Layer &layer = *object.get_layer(int(i));
+        for (size_t r = 0; r < layer.regions().size(); ++r) {
+            const auto &reservation = object.bridge_aware_cubic_reservations(i, r);
+            out.polygons_stored += reservation.size();
+            reserved_rows.push_back(polygons(reservation));
+            const LayerRegion &region = *layer.get_region(int(r));
+            Json surfaces = Json::array();
+            for (const Surface &surface : region.fill_surfaces.surfaces) {
+                out.void_surfaces += surface.surface_type == stInternalVoid;
+                surfaces.push_back({int(surface.surface_type), surface.thickness, surface.thickness_layers,
+                                    polygons(ExPolygons{surface.expolygon})});
+            }
+            layer_rows.push_back({{"surfaces",std::move(surfaces)}, {"walls",entity_snapshot(region.perimeters)},
+                                  {"fills",entity_snapshot(region.fills)}});
+        }
+        out.rows.push_back(std::move(reserved_rows));
+        out.deposition.push_back({{"z",layer.print_z},{"regions",std::move(layer_rows)}});
+    }
+    REQUIRE(out.planned_regions > 0);
+    return out;
+}
+
+void advance_reservation_fixture(Print &print, Model &model, const DynamicPrintConfig &config, bool check_invalidation)
+{
+    print.set_status_silent();
+    print.apply(model, config);
+    if (check_invalidation)
+        REQUIRE_FALSE(print.get_object(size_t(0))->is_step_done(posPrepareInfill));
+    REQUIRE_NOTHROW(print.process());
+    REQUIRE(print.get_object(size_t(0))->is_step_done(posPrepareInfill));
+}
+}
+
+TEST_CASE("Bridge aware operational reservations follow combination and the captured trim request",
+          "[BridgeAwareCubic][Integration][BACReservations]")
+{
+    ScopedSparseTrimming trim_guard;
+    PrintObject::infill_only_where_needed = false;
+    const bool test_trim = GENERATE(false, true);
+    CAPTURE(test_trim);
+    Model model;
+    ModelObject *part = model.add_object();
+    part->add_volume(TriangleMesh(its_make_cube(32.,28.,18.)));
+    if (test_trim) {
+        // One object has a closed roof that needs reservations, and a
+        // disconnected open-top island whose sparse interior can be trimmed.
+        TriangleMesh open_island(its_make_cube(16.,16.,6.));
+        open_island.translate(40.,0.,0.);
+        ModelVolume *island = part->add_volume(open_island);
+        island->config.set_key_value("top_shell_layers", new ConfigOptionInt(0));
+        island->config.set_key_value("top_shell_thickness", new ConfigOptionFloat(0.));
+    }
+    part->add_instance()->set_offset(Vec3d(80.,80.,0.));
+    DynamicPrintConfig off_config = trial_config();
+    off_config.set_deserialize_strict({{"infill_combination","0"}});
+    if (test_trim) off_config.set_deserialize_strict({{"bridge_aware_cubic_max_gap","20"}});
+    DynamicPrintConfig on_config = off_config;
+    if (test_trim) {
+        // The process-global internal trim flag has no setter/invalidation
+        // contract. A real gap edit explicitly invalidates preparation; the
+        // fresh comparison below has this same gap and trim flag.
+        on_config.set_deserialize_strict({{"bridge_aware_cubic_max_gap","20.01"}});
+    } else on_config.set_deserialize_strict({{"infill_combination","1"}});
+
+    Print updated;
+    updated.auto_assign_extruders(part);
+    advance_reservation_fixture(updated, model, off_config, false);
+    const auto disabled = observe_reservations(updated);
+    CHECK(disabled.polygons_stored == 0);
+
+    PrintObject::infill_only_where_needed = test_trim;
+    advance_reservation_fixture(updated, model, on_config, true);
+    const auto enabled = observe_reservations(updated);
+    REQUIRE(enabled.polygons_stored > 0);
+    if (test_trim) REQUIRE(enabled.void_surfaces > disabled.void_surfaces);
+
+    // Reference mode independently recollects model and construction
+    // targets. Compare every ordered contour/hole, then the actual prepared
+    // fill surfaces and deposited paths that consume those reservations.
+    {
+        TrialEnvironment environment;
+        const std::string diagnostics = environment.select(true, false);
+        Print fresh;
+        advance_reservation_fixture(fresh, model, on_config, false);
+        const auto reference = observe_reservations(fresh);
+        REQUIRE(bool(enabled.rows == reference.rows));
+        REQUIRE(bool(enabled.deposition == reference.deposition));
+        std::ifstream stream(diagnostics);
+        bool saw_reference = false;
+        for (std::string line; std::getline(stream,line);) {
+            const Json event = Json::parse(line);
+            if (event.at("record") == "total" && event.at("session") == "prepare")
+                saw_reference |= event.at("full_trial_checks").get<bool>();
+        }
+        REQUIRE(saw_reference);
+    }
+
+    PrintObject::infill_only_where_needed = false;
+    advance_reservation_fixture(updated, model, off_config, true);
+    const auto disabled_again = observe_reservations(updated);
+    CHECK(disabled_again.polygons_stored == 0);
+    CHECK(bool(disabled_again.rows == disabled.rows));
+    CHECK(bool(disabled_again.deposition == disabled.deposition));
+}

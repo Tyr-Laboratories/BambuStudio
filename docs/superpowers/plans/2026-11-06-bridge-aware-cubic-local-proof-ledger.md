@@ -242,6 +242,10 @@ Next measurements should distinguish actual empty roof selections and complete p
 
 The rib/modifier fixture generator now reapplies the cubes' empty machine start/end scripts after loading native family defaults. Both official preflights passed, followed by all eight CLI slices in a complete four-case development run. No geometry or audit rules changed. The corrected measurements are 9,590/273 ms (small), 148,325/259 ms (large), 30,892/256 ms (rib), and 122,595/270 ms (modifier). All ratios exceed 2×. Large-cube preparation alone takes 146.253 seconds. This scaling makes locality of the first-sweep and initial proofs a higher priority than further small constant-factor changes.
 
+Reservation polygons now depend on actual sparse restoration or an enabled participating combination region. The large-cube profile attributed 20.344 seconds to the previous reservation/snapshot block, including 0.002 seconds for the final proof snapshot. The complete candidate always checks both model and construction support. Fresh and incremental trim/combination runs match the full-recollection reference.
+
+The separately tested plane prototype compared six removals on actual fill masks per fixture. Fresh and incremental clipped edges, barriers and ownership matched on 504 small-cube, 504 large-cube and 384 blind-cavity component trials, with zero unavailable component trials. The cavity included 40 inset holes and 87 exact gaps. This establishes local editing of clipped geometry; a production emitter still requires actual extrusion, attachment, support and timing qualification.
+
 ### 4. Certify material separator cycles and local complete-cell checks
 
 **Files:** new `BridgeAwareCubicSeparators.hpp/.cpp`, `BridgeAwareCubicValidation.hpp/.cpp`, `BridgeAwareCubicSupport.cpp`, new `test_bridge_aware_cubic_separators.cpp`, existing cavity/modifier/variable-height tests.

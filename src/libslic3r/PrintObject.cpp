@@ -1095,6 +1095,7 @@ void PrintObject::prepare_infill()
         }
         layerm.fill_surfaces.surfaces = std::move(surfaces);
     };
+    bool has_restored_sparse = false;
     for (size_t layer_id = 0; layer_id < bridge_aware_trimmed_sparse.size(); ++layer_id) {
         m_print->throw_if_canceled();
         Layer *layer = m_layers[layer_id];
@@ -1109,12 +1110,13 @@ void PrintObject::prepare_infill()
                 if (surface.surface_type != stInternal && surface.surface_type != stInternalVoid)
                     non_sparse.push_back(surface.expolygon);
             restored = diff_ex(restored, non_sparse);
+            has_restored_sparse |= !restored.empty();
             retype_sparse(*layerm, restored, stInternalVoid, stInternal);
         }
     }
 
     // This also clears an obsolete plan when the pattern was deselected.
-    this->prepare_bridge_aware_cubic();
+    this->prepare_bridge_aware_cubic(has_restored_sparse);
     m_print->throw_if_canceled();
 
     for (size_t layer_id = 0; layer_id < bridge_aware_trimmed_sparse.size(); ++layer_id) {
@@ -1123,6 +1125,7 @@ void PrintObject::prepare_infill()
         for (size_t region_id = 0; region_id < layer->regions().size(); ++region_id) {
             LayerRegion *layerm = layer->get_region(int(region_id));
             ExPolygons &restored = bridge_aware_trimmed_sparse[layer_id][region_id];
+            if (restored.empty()) continue;
             if (const auto *plan = this->bridge_aware_cubic_plan(region_id))
                 restored = diff_ex(restored, bridge_aware_cubic_reserved_area(*plan, layer->print_z,
                     layerm->flow(frInfill), this->bridge_aware_cubic_reservations(layer_id, region_id)));

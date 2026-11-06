@@ -478,6 +478,8 @@ public:
     void 			clear_layers();
     const BridgeAwareCubic::Plan* bridge_aware_cubic_plan(size_t region_id) const;
     bool has_bridge_aware_cubic() const;
+    // Operational protection from sparse trimming/combination; empty if this
+    // preparation has neither consumer. Refinement geometry belongs to Plan.
     const ExPolygons& bridge_aware_cubic_reservations(size_t layer_id, size_t region_id) const;
     const Layer* 	get_layer(int idx) const { return m_layers[idx]; }
     Layer* 			get_layer(int idx) 		 { return m_layers[idx]; }
@@ -608,7 +610,7 @@ private:
 private:
     void make_perimeters();
     void prepare_infill();
-    void prepare_bridge_aware_cubic();
+    void prepare_bridge_aware_cubic(bool has_restored_sparse);
     void validate_bridge_aware_cubic() const;
     void clear_bridge_aware_cubic_certificate() const;
     void infill();
