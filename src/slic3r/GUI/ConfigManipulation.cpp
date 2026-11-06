@@ -711,7 +711,8 @@ void ConfigManipulation::update_print_fff_config(DynamicPrintConfig* config, con
     if (config->option<ConfigOptionPercent>("sparse_infill_density")->value == 100) {
         std::string  sparse_infill_pattern            = config->option<ConfigOptionEnum<InfillPattern>>("sparse_infill_pattern")->serialize();
         const auto  &top_fill_pattern_values = config->def()->get("top_surface_pattern")->enum_values;
-        bool correct_100p_fill = std::find(top_fill_pattern_values.begin(), top_fill_pattern_values.end(), sparse_infill_pattern) != top_fill_pattern_values.end();
+        bool correct_100p_fill = sparse_infill_pattern == "bridgeawarecubic" ||
+            std::find(top_fill_pattern_values.begin(), top_fill_pattern_values.end(), sparse_infill_pattern) != top_fill_pattern_values.end();
         if (!correct_100p_fill) {
             // get sparse_infill_pattern name from enum_labels for using this one at dialog_msg
             const ConfigOptionDef *fill_pattern_def = config->def()->get("sparse_infill_pattern");
@@ -941,11 +942,18 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     // Determine if the selected infill pattern supports multiline infill.
     InfillPattern pattern = config->opt_enum<InfillPattern>("sparse_infill_pattern");
 
+    const bool bridge_aware_cubic = have_infill &&
+        config->option<ConfigOptionPercent>("sparse_infill_density")->value < 100. && pattern == ipBridgeAwareCubic;
+    toggle_line("bridge_aware_cubic_max_gap", bridge_aware_cubic);
+    toggle_field("bridge_aware_cubic_max_gap", bridge_aware_cubic);
+
     bool support_multiline_infill = pattern == ipCubic || pattern == ipGrid || pattern == ipRectilinear || pattern == ipStars || pattern == ipAlignedRectilinear ||
                                     pattern == ipGyroid || pattern == ipHoneycomb || pattern == ipLightning || pattern == ip3DHoneycomb ||
                                     pattern == ipAdaptiveCubic || pattern == ipSupportCubic;
 
-    toggle_line("fill_multiline", have_infill && support_multiline_infill);
+    // Keep this field available to correct an inherited incompatible value; validation
+    // rejects multiline for Bridge aware cubic without silently changing the setting.
+    toggle_line("fill_multiline", (have_infill && support_multiline_infill) || bridge_aware_cubic);
     // Only allow configuration of open anchors if the anchoring is enabled.
     bool has_infill_anchors = have_infill && config->option<ConfigOptionFloatOrPercent>("sparse_infill_anchor_max")->value > 0;
     toggle_line("sparse_infill_anchor", has_infill_anchors);

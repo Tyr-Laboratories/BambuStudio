@@ -242,7 +242,8 @@ static t_config_enum_values s_keys_map_InfillPattern {
     { "lockedzag",          ipLockedZag },
     { "2dlattice",          ip2DLattice  },
     { "ironingarchimedeanspiral", ipIroningArchimedeanSpiral },
-    { "globalmonotonicline", ipGlobalMonotonicLine }
+    { "globalmonotonicline", ipGlobalMonotonicLine },
+    { "bridgeawarecubic",    ipBridgeAwareCubic }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(InfillPattern)
 
@@ -3240,6 +3241,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_values.push_back("archimedeanchords");
     def->enum_values.push_back("octagramspiral");
     def->enum_values.push_back("supportcubic");
+    def->enum_values.push_back("bridgeawarecubic");
     def->enum_values.push_back("lightning");
     def->enum_values.push_back("crosshatch");
     def->enum_values.push_back("zigzag");
@@ -3262,6 +3264,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("Archimedean Chords"));
     def->enum_labels.push_back(L("Octagram Spiral"));
     def->enum_labels.push_back(L("Support Cubic"));
+    def->enum_labels.push_back(L("Bridge aware cubic"));
     def->enum_labels.push_back(L("Lightning"));
     def->enum_labels.push_back(L("Cross Hatch"));
     def->enum_labels.push_back(L("Zig Zag"));
@@ -3269,6 +3272,17 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("Locked Zag"));
     def->enum_labels.push_back(L("2D Lattice"));
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipCubic));
+
+    def = this->add("bridge_aware_cubic_max_gap", coFloat);
+    def->label = L("Unsupported gap size");
+    def->category = L("Strength");
+    def->tooltip = L("Subdivides cubic infill below upcoming solid layers and walls to keep unsupported spans within this distance. "
+                     "Smaller values add material and print time near those features. "
+                     "Choose a distance your filament and bridge settings can print reliably.");
+    def->sidetext = L("mm");
+    def->min = SCALING_FACTOR;
+    def->max = double(std::numeric_limits<coord_t>::max()) * SCALING_FACTOR;
+    def->set_default_value(new ConfigOptionFloat(5.));
 
     def                = this->add("locked_skin_infill_pattern", coEnum);
     def->label         = L("Skin infill pattern");
@@ -9793,6 +9807,16 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
         error_message.emplace("sparse_infill_pattern", L("invalid value ") + cfg.sparse_infill_pattern.serialize());
     }
 
+    if (!bridge_aware_cubic_max_gap_is_valid(cfg.bridge_aware_cubic_max_gap.value)) {
+        error_message.emplace("bridge_aware_cubic_max_gap",
+            L("Unsupported gap size must be a finite positive distance representable by the infill geometry."));
+    }
+    if (cfg.sparse_infill_pattern.value == ipBridgeAwareCubic &&
+        cfg.sparse_infill_density.value > 0. && cfg.sparse_infill_density.value < 100. &&
+        cfg.fill_multiline.value > 1) {
+        error_message.emplace("fill_multiline", L("Bridge aware cubic requires Fill multiline to be 1."));
+    }
+
     // --top-fill-pattern
     if (! print_config_def.get("top_surface_pattern")->has_enum_value(cfg.top_surface_pattern.serialize())) {
         error_message.emplace("top_surface_pattern", L("invalid value ") + cfg.top_surface_pattern.serialize());
@@ -9814,6 +9838,7 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
 
     // --fill-density
     if (fabs(cfg.sparse_infill_density.value - 100.) < EPSILON &&
+        cfg.sparse_infill_pattern.value != ipBridgeAwareCubic &&
         ! print_config_def.get("top_surface_pattern")->has_enum_value(cfg.sparse_infill_pattern.serialize())) {
         // xgettext:no-c-format, no-boost-format
         error_message.emplace("sparse_infill_pattern", cfg.sparse_infill_pattern.serialize() + L(" doesn't work at 100% density "));

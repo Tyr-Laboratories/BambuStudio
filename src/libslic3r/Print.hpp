@@ -5,6 +5,7 @@
 #include "WallPainting.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/FillLightning.hpp"
+#include "Fill/BridgeAwareCubic.hpp"
 
 #include "BoundingBox.hpp"
 #include "ExtrusionEntityCollection.hpp"
@@ -474,6 +475,9 @@ public:
     size_t 			total_layer_count() const { return this->layer_count() + this->support_layer_count(); }
     size_t 			layer_count() const { return m_layers.size(); }
     void 			clear_layers();
+    const BridgeAwareCubic::Plan* bridge_aware_cubic_plan(size_t region_id) const;
+    bool has_bridge_aware_cubic() const;
+    const ExPolygons& bridge_aware_cubic_reservations(size_t layer_id, size_t region_id) const;
     const Layer* 	get_layer(int idx) const { return m_layers[idx]; }
     Layer* 			get_layer(int idx) 		 { return m_layers[idx]; }
     // Get a layer exactly at print_z.
@@ -603,6 +607,8 @@ private:
 private:
     void make_perimeters();
     void prepare_infill();
+    void prepare_bridge_aware_cubic();
+    void validate_bridge_aware_cubic() const;
     void infill();
     void ironing();
     void generate_support_material();
@@ -686,6 +692,8 @@ private:
     FillLightning::GeneratorPtr m_lightning_generator;
     // Imported toolpaths do not include the generators or pre-bridge surfaces needed for refill.
     bool m_cached_infill_dependencies_missing = false;
+    std::vector<std::unique_ptr<BridgeAwareCubic::Plan>> m_bridge_aware_cubic_plans;
+    std::vector<std::vector<ExPolygons>> m_bridge_aware_cubic_reservations;
 
     std::vector < VolumeSlices >            firstLayerObjSliceByVolume;
     std::vector<groupedVolumeSlices>        firstLayerObjSliceByGroups;

@@ -94,3 +94,11 @@ target_link_libraries(bridge_controls_tests test_common libslic3r slicer_test_su
 target_include_directories(bridge_controls_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/libslic3r)
 set_property(TARGET bridge_controls_tests PROPERTY FOLDER "tests")
 add_test(bridge_controls_tests bridge_controls_tests ${CATCH_EXTRA_ARGS})
+
+add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cubic_config.cpp
+    test_bridge_aware_cubic_geometry.cpp test_bridge_aware_cubic_validation.cpp
+    test_bridge_aware_cubic.cpp test_bridge_aware_cubic_modifiers.cpp
+    test_bridge_aware_cubic_repair.cpp)
+target_link_libraries(bridge_aware_cubic_tests test_common libslic3r slicer_test_support)
+set_property(TARGET bridge_aware_cubic_tests PROPERTY FOLDER "tests")
+add_test(bridge_aware_cubic_tests bridge_aware_cubic_tests ${CATCH_EXTRA_ARGS})

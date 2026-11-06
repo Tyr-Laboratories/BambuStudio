@@ -108,6 +108,12 @@ set(lisbslic3r_sources
     Fill/Fill3DHoneycomb.hpp
     Fill/FillAdaptive.cpp
     Fill/FillAdaptive.hpp
+    Fill/BridgeAwareCubic.cpp
+    Fill/BridgeAwareCubic.hpp
+    Fill/BridgeAwareCubicValidation.cpp
+    Fill/BridgeAwareCubicValidation.hpp
+    Fill/FillBridgeAwareCubic.hpp
+    BridgeAwareCubicSupport.cpp
     Fill/FillBase.cpp
     Fill/FillBase.hpp
     Fill/FillConcentric.cpp

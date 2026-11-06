@@ -21,6 +21,7 @@
 #include "Config.hpp"
 #include "Polygon.hpp"
 #include <atomic>
+#include <limits>
 #include <set>
 #include <boost/preprocessor/facilities/empty.hpp>
 #include <boost/preprocessor/punctuation/comma_if.hpp>
@@ -90,6 +91,7 @@ enum InfillPattern : int {
     ipHilbertCurve, ipArchimedeanChords, ipOctagramSpiral, ipSupportCubic, ipSupportBase, ipConcentricInternal,
     ipLightning, ipCrossHatch, ipZigZag, ipCrossZag,ipFloatingConcentric, ipLockedZag, ip2DLattice,
     ipIroningArchimedeanSpiral, ipGlobalMonotonicLine,
+    ipBridgeAwareCubic,
     ipCount,
 };
 
@@ -1124,6 +1126,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat, infill_lock_depth))
     ((ConfigOptionFloat, skin_infill_depth))
     ((ConfigOptionEnum<InfillPattern>, sparse_infill_pattern))
+    ((ConfigOptionFloat, bridge_aware_cubic_max_gap))
     ((ConfigOptionBool, conformal_infill))
     ((ConfigOptionEnum<ConformalStagger>, conformal_stagger))
     ((ConfigOptionInt, conformal_link_keep_layers))
@@ -1228,6 +1231,13 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                 embedding_wall_into_infill))
     ((ConfigOptionBool,                 alternate_extra_wall))
 )
+
+// A gap must survive conversion to the fixed-point coordinates used by infill geometry.
+inline bool bridge_aware_cubic_max_gap_is_valid(double gap)
+{
+    return std::isfinite(gap) && gap >= SCALING_FACTOR &&
+           gap <= double(std::numeric_limits<coord_t>::max()) * SCALING_FACTOR;
+}
 
 // Effective wall loop count for a layer. Spiral vase ignores alternate_extra_wall.
 inline int effective_wall_loops(const PrintRegionConfig &cfg, int layer_id, bool spiral_vase)

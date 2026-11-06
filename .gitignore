@@ -33,6 +33,9 @@ test.js
 .clangd
 dep_win_new
 compile_commands.json
+# Generated Python bytecode and local slicer execution results.
+__pycache__/
+/result.json
 .jira/
 .claude/settings.local.json
 **/node_modules/

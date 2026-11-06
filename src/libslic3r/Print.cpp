@@ -1325,6 +1325,36 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
     if (extruders.empty())
         return { L("No extrusions under current settings.") };
 
+    for (const PrintObject *object : m_objects) {
+        if (object->has_bridge_aware_cubic()) {
+            if (object->config().seam_gap.value != 0.)
+                return { L("Bridge aware cubic currently requires Seam gap = 0 because gap validation precedes seam placement.") };
+            for (const PrintRegion &region : object->all_regions()) {
+                const auto &config = region.config();
+                const bool scarf = config.override_filament_scarf_seam_setting.value ?
+                    config.seam_slope_type.value != SeamScarfType::None :
+                    std::any_of(m_config.filament_scarf_seam_type.values.begin(), m_config.filament_scarf_seam_type.values.end(),
+                                [](int value) { return value != int(SeamScarfType::None); });
+                if (scarf)
+                    return { L("Bridge aware cubic currently requires Scarf seam type = None because gap validation precedes scarf generation.") };
+            }
+        }
+        for (const PrintRegion &region : object->all_regions()) {
+            const auto &config = region.config();
+            if (config.sparse_infill_pattern != ipBridgeAwareCubic ||
+                config.sparse_infill_density.value <= 0. || config.sparse_infill_density.value >= 100.)
+                continue;
+            if (config.sparse_infill_density.value < 0.00011)
+                return { L("Bridge aware cubic sparse infill density is too small to construct a representable lattice. Increase Sparse infill density.") };
+            if (!bridge_aware_cubic_max_gap_is_valid(config.bridge_aware_cubic_max_gap.value))
+                return { L("Bridge aware cubic requires a positive, finite Unsupported gap size within the slicer's coordinate range.") };
+            if (config.fill_multiline.value != 1)
+                return { L("Bridge aware cubic requires Multiline to be set to 1.") };
+            if (config.conformal_infill.value)
+                return { L("Bridge aware cubic does not support Conformal infill. Disable Conformal infill to use this pattern.") };
+        }
+    }
+
     if (extruders.size() > 1) {
         auto ret = check_multi_filament_valid(*this);
         if (!ret.string.empty())
@@ -1957,6 +1987,13 @@ std::map<ObjectID, unsigned int> getObjectExtruderMap(const Print& print) {
 // Slicing process, running at a background thread.
 void Print::process(std::unordered_map<std::string, long long>* slice_time, bool use_cache)
 {
+    // Direct cache-mode callers must rebuild the construction plan too.
+    if (use_cache)
+        for (PrintObject *object : m_objects)
+            if (object->has_bridge_aware_cubic()) {
+                object->invalidate_step(posSlice);
+                use_cache = false;
+            }
     long long start_time = 0, end_time = 0;
     m_slice_time = slice_time;
     ScopeGuard reset_slice_time([this]() { m_slice_time = nullptr; });
@@ -5198,6 +5235,13 @@ int Print::export_cached_data(const std::string& directory, int& obj_cnt_exporte
 
 int Print::load_cached_data(const std::string& directory)
 {
+    // Cached extrusion files do not contain the demand hierarchy or its
+    // construction dependencies. Rebuild this pattern before certifying it.
+    for (const PrintObject *object : m_objects)
+        if (object->has_bridge_aware_cubic()) {
+            BOOST_LOG_TRIVIAL(info) << "Bridge aware cubic requires a fresh support plan; ignoring extrusion cache.";
+            return CLI_IMPORT_CACHE_DATA_CAN_NOT_USE;
+        }
     int ret = 0;
     boost::filesystem::path directory_path(directory);
 

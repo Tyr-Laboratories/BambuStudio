@@ -16,6 +16,7 @@
 #include "TriangleMeshSlicer.hpp"
 #include "Utils.hpp"
 #include "Fill/FillAdaptive.hpp"
+#include "Fill/BridgeAwareCubic.hpp"
 #include "Fill/FillRadialZigZag.hpp"
 #include "Fill/FillLightning.hpp"
 #include "Format/STL.hpp"
@@ -851,12 +852,46 @@ void refine_fill_surfaces_for_zero_gap_contact(LayerRegion &layerm, const ExPoly
     layerm.fill_surfaces.surfaces = std::move(out);
 }
 
+ExPolygons bridge_aware_cubic_reserved_area(const BridgeAwareCubic::Plan &plan, double z,
+                                          const Flow &flow, const ExPolygons &support_reservations)
+{
+    ExPolygons reserved = plan.refinement_area(z);
+    append(reserved, support_reservations);
+    std::vector<const BridgeAwareCubic::Demand *> demands;
+    for (const BridgeAwareCubic::Demand &demand : plan.demands())
+        if (std::abs(demand.z - z) <= EPSILON)
+            demands.push_back(&demand);
+    if (!demands.empty()) {
+        // Bulk cells that already meet the gap still supply real support.
+        // Preserve their complete sections, including closing walls outside
+        // the demand footprint, even when no subdivision was necessary.
+        for (const BridgeAwareCubic::LeafSection &section : plan.leaf_sections(z)) {
+            const ExPolygon cell(section.polygon);
+            for (const auto *demand : demands)
+                if (!intersection_ex(cell, demand->footprint).empty()) {
+                    reserved.push_back(cell);
+                    break;
+                }
+        }
+    }
+    // Fill generation insets a surface by up to half its spacing. Preserve
+    // that displacement plus the actual supporting bead radius, so an
+    // artificial trimming boundary cannot delete an inherited closing wall.
+    // Callers intersect this margin with existing eligible sparse material.
+    const double margin = 0.5 * (std::max(double(plan.parameters().flow_spacing), double(flow.spacing())) + flow.width());
+    return offset_ex(reserved, scale_(margin) + SCALED_EPSILON);
+}
+
 } // namespace
 
 void PrintObject::prepare_infill()
 {
     if (! this->set_started(posPrepareInfill))
         return;
+    // Bridge reconstruction below may request sparse previews before the new
+    // demand solve. Never expose a previous solve's plan to those previews.
+    m_bridge_aware_cubic_plans.clear();
+    m_bridge_aware_cubic_reservations.clear();
     const bool record_prepare_infill_time = m_print->m_slice_time != nullptr;
     const long long prepare_infill_begin_time =
         record_prepare_infill_time ? Slic3r::Utils::get_current_milliseconds_time_monotonic() : 0;
@@ -967,6 +1002,29 @@ void PrintObject::prepare_infill()
     if (m_config.interlocking_beam.value)
         discover_shell_for_perimeters();
     reset_slice_surfaces(slice_surfaces_cpy);
+
+    const bool bridge_aware_cubic = this->has_bridge_aware_cubic();
+    // Keep the exact sparse domains that trimming is allowed to remove. The
+    // planner needs these while constructing transitions, but only its reserved
+    // domains survive the final trimming pass. Pre-existing voids are excluded.
+    std::vector<std::vector<ExPolygons>> bridge_aware_trimmed_sparse;
+    if (bridge_aware_cubic && PrintObject::infill_only_where_needed) {
+        bridge_aware_trimmed_sparse.resize(m_layers.size());
+        for (size_t layer_id = 0; layer_id < m_layers.size(); ++layer_id) {
+            m_print->throw_if_canceled();
+            Layer *layer = m_layers[layer_id];
+            bridge_aware_trimmed_sparse[layer_id].resize(layer->regions().size());
+            for (size_t region_id = 0; region_id < layer->regions().size(); ++region_id) {
+                const LayerRegion *layerm = layer->get_region(int(region_id));
+                const PrintRegionConfig &config = layerm->region().config();
+                if (config.sparse_infill_pattern == ipBridgeAwareCubic &&
+                    config.sparse_infill_density > 0. && config.sparse_infill_density < 100.)
+                    for (const Surface &surface : layerm->fill_surfaces.surfaces)
+                        if (surface.surface_type == stInternal)
+                            bridge_aware_trimmed_sparse[layer_id][region_id].push_back(surface.expolygon);
+            }
+        }
+    }
     // Only active if config->infill_only_where_needed. This step trims the sparse infill,
     // so it acts as an internal support. It maintains all other infill types intact.
     // Here the internal surfaces and perimeters have to be supported by the sparse infill.
@@ -1010,11 +1068,73 @@ void PrintObject::prepare_infill()
     this->add_internal_bridge_layers(original_sparse);
     m_print->throw_if_canceled();
 
+    if (bridge_aware_cubic) {
+        // Sub-top classification chooses the actual upper fill pattern. Freeze
+        // that choice before collecting emitted-path demand for the plan.
+        this->discover_sub_top_surfaces();
+        m_print->throw_if_canceled();
+    }
+
+    const auto retype_sparse = [](LayerRegion &layerm, const ExPolygons &area,
+                                  SurfaceType from, SurfaceType to) {
+        if (area.empty())
+            return;
+        Surfaces surfaces;
+        for (const Surface &surface : layerm.fill_surfaces.surfaces) {
+            if (surface.surface_type != from) {
+                surfaces.push_back(surface);
+                continue;
+            }
+            for (ExPolygon &polygon : diff_ex(surface.expolygon, area))
+                surfaces.emplace_back(surface, std::move(polygon));
+            for (ExPolygon &polygon : intersection_ex(surface.expolygon, area)) {
+                surfaces.emplace_back(surface, std::move(polygon));
+                surfaces.back().surface_type = to;
+            }
+        }
+        layerm.fill_surfaces.surfaces = std::move(surfaces);
+    };
+    for (size_t layer_id = 0; layer_id < bridge_aware_trimmed_sparse.size(); ++layer_id) {
+        m_print->throw_if_canceled();
+        Layer *layer = m_layers[layer_id];
+        for (size_t region_id = 0; region_id < layer->regions().size(); ++region_id) {
+            LayerRegion *layerm = layer->get_region(int(region_id));
+            ExPolygons &restored = bridge_aware_trimmed_sparse[layer_id][region_id];
+            if (restored.empty())
+                continue;
+            restored = intersection_ex(layerm->fill_surfaces.filter_by_type(stInternalVoid), restored);
+            ExPolygons non_sparse;
+            for (const Surface &surface : layerm->fill_surfaces.surfaces)
+                if (surface.surface_type != stInternal && surface.surface_type != stInternalVoid)
+                    non_sparse.push_back(surface.expolygon);
+            restored = diff_ex(restored, non_sparse);
+            retype_sparse(*layerm, restored, stInternalVoid, stInternal);
+        }
+    }
+
+    // This also clears an obsolete plan when the pattern was deselected.
+    this->prepare_bridge_aware_cubic();
+    m_print->throw_if_canceled();
+
+    for (size_t layer_id = 0; layer_id < bridge_aware_trimmed_sparse.size(); ++layer_id) {
+        m_print->throw_if_canceled();
+        Layer *layer = m_layers[layer_id];
+        for (size_t region_id = 0; region_id < layer->regions().size(); ++region_id) {
+            LayerRegion *layerm = layer->get_region(int(region_id));
+            ExPolygons &restored = bridge_aware_trimmed_sparse[layer_id][region_id];
+            if (const auto *plan = this->bridge_aware_cubic_plan(region_id))
+                restored = diff_ex(restored, bridge_aware_cubic_reserved_area(*plan, layer->print_z,
+                    layerm->flow(frInfill), this->bridge_aware_cubic_reservations(layer_id, region_id)));
+            retype_sparse(*layerm, restored, stInternal, stInternalVoid);
+        }
+    }
+
     // combine fill surfaces to honor the "infill every N layers" option
     this->combine_infill();
     m_print->throw_if_canceled();
 
-    this->discover_sub_top_surfaces();
+    if (!bridge_aware_cubic)
+        this->discover_sub_top_surfaces();
     m_print->throw_if_canceled();
 
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
@@ -1205,6 +1325,7 @@ void PrintObject::infill()
         );
         m_print->throw_if_canceled();
         FillRadialZigZag::reset_n_lock();
+        this->validate_bridge_aware_cubic();
         BOOST_LOG_TRIVIAL(debug) << "Filling layers in parallel - end";
         /*  we could free memory now, but this would make this step not idempotent
         ### $_->fill_surfaces->clear for map @{$_->regions}, @{$object->layers};
@@ -1338,19 +1459,25 @@ void PrintObject::generate_support_material()
 
 void PrintObject::simplify_extrusion_path()
 {
+    // A support certificate covers exact swept paths. Simplification and arc
+    // fitting can displace both the supporting partitions and upper walls, so
+    // retain their certified geometry until those operations can be certified.
+    const bool preserve_bridge_aware_paths = this->has_bridge_aware_cubic();
     if (this->set_started(posSimplifyWall)) {
         m_print->set_status(75, L("Optimizing toolpath"));
         BOOST_LOG_TRIVIAL(debug) << "Simplify wall extrusion path of object in parallel - start";
         //BBS: walls
-        tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this](const tbb::blocked_range<size_t>& range) {
-                for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
-                    m_print->throw_if_canceled();
-                    m_layers[layer_idx]->simplify_wall_extrusion_path();
+        if (!preserve_bridge_aware_paths) {
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, m_layers.size()),
+                [this](const tbb::blocked_range<size_t>& range) {
+                    for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+                        m_print->throw_if_canceled();
+                        m_layers[layer_idx]->simplify_wall_extrusion_path();
+                    }
                 }
-            }
-        );
+            );
+        }
         m_print->throw_if_canceled();
         BOOST_LOG_TRIVIAL(debug) << "Simplify wall extrusion path of object in parallel - end";
         this->set_done(posSimplifyWall);
@@ -1360,15 +1487,17 @@ void PrintObject::simplify_extrusion_path()
         m_print->set_status(75, L("Optimizing toolpath"));
         BOOST_LOG_TRIVIAL(debug) << "Simplify infill extrusion path of object in parallel - start";
         //BBS: infills
-        tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, m_layers.size()),
-            [this](const tbb::blocked_range<size_t>& range) {
-                for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
-                    m_print->throw_if_canceled();
-                    m_layers[layer_idx]->simplify_infill_extrusion_path();
+        if (!preserve_bridge_aware_paths) {
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, m_layers.size()),
+                [this](const tbb::blocked_range<size_t>& range) {
+                    for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
+                        m_print->throw_if_canceled();
+                        m_layers[layer_idx]->simplify_infill_extrusion_path();
+                    }
                 }
-            }
-        );
+            );
+        }
         m_print->throw_if_canceled();
         BOOST_LOG_TRIVIAL(debug) << "Simplify infill extrusion path of object in parallel - end";
         this->set_done(posSimplifyInfill);
@@ -1390,6 +1519,7 @@ void PrintObject::simplify_extrusion_path()
         BOOST_LOG_TRIVIAL(debug) << "Simplify extrusion path of support in parallel - end";
         this->set_done(posSimplifySupportPath);
     }
+    this->validate_bridge_aware_cubic();
 }
 
 std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> PrintObject::prepare_adaptive_infill_data(
@@ -1519,7 +1649,19 @@ bool PrintObject::invalidate_state_by_config_options(
 
     std::vector<PrintObjectStep> steps;
     bool invalidated = false;
+    const auto selects_bridge_aware_cubic = [](const ConfigOptionResolver &config) {
+        const auto *pattern = config.option<ConfigOptionEnum<InfillPattern>>("sparse_infill_pattern");
+        return pattern != nullptr && pattern->value == ipBridgeAwareCubic;
+    };
+    const bool bridge_aware_cubic = this->has_bridge_aware_cubic() ||
+        selects_bridge_aware_cubic(old_config) || selects_bridge_aware_cubic(new_config);
     for (const t_config_option_key &opt_key : opt_keys) {
+        // G-code seam transformations can alter walls supplying certified
+        // anchors, including walls owned by a nonparticipating region.
+        if (bridge_aware_cubic &&
+            (opt_key == "seam_gap" || opt_key == "override_filament_scarf_seam_setting" ||
+             opt_key == "seam_slope_type" || opt_key == "apply_scarf_seam_on_circles"))
+            steps.emplace_back(posPrepareInfill);
         if (   opt_key == "brim_width"
             || opt_key == "brim_object_gap"
             || opt_key == "brim_type"
@@ -1706,6 +1848,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "ensure_vertical_shell_thickness"
             || opt_key == "bridge_angle"
             || opt_key == "internal_bridge_layers"
+            || opt_key == "bridge_aware_cubic_max_gap"
             //BBS
         ) {
             steps.emplace_back(posPrepareInfill);
@@ -1724,7 +1867,9 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "top_surface_line_width"
             || opt_key == "initial_layer_line_width"
             || opt_key == "detect_floating_vertical_shell") {
-            steps.emplace_back(posInfill);
+            // These alter actual target paths or supports, which are inputs to
+            // this pattern's immutable refinement plan.
+            steps.emplace_back(bridge_aware_cubic ? posPrepareInfill : posInfill);
         } else if (opt_key == "sparse_infill_pattern"
                    || opt_key == "conformal_infill"
                    || opt_key == "conformal_stagger"
@@ -1745,6 +1890,10 @@ bool PrintObject::invalidate_state_by_config_options(
                    || opt_key == "locked_skin_infill_pattern"
                    || opt_key == "locked_skeleton_infill_pattern") {
             steps.emplace_back(posPrepareInfill);
+            if (opt_key == "sparse_infill_pattern" && bridge_aware_cubic)
+                // A previous pattern may already have simplified or arc-fitted
+                // the stored walls. Rebuild them before collecting new demand.
+                steps.emplace_back(posPerimeters);
         } else if (opt_key == "sparse_infill_density") {
             // One likely wants to reslice only when switching between zero infill to simulate boolean difference (subtracting volumes),
             // normal infill and 100% (solid) infill.
@@ -3955,6 +4104,7 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
 static const char *s_modifier_ignored_infill_keys[] = {
     "sparse_infill_density",
     "sparse_infill_pattern",
+    "bridge_aware_cubic_max_gap",
     "conformal_infill",
     "conformal_stagger",
     "conformal_link_keep_layers",
@@ -4070,11 +4220,14 @@ PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &defau
     clamp_exturder_to_default_protect0(config.sparse_infill_filament, num_extruders);
     clamp_exturder_to_default_protect0(config.wall_filament, num_extruders);
     clamp_exturder_to_default_protect0(config.solid_infill_filament, num_extruders);
-    if (config.sparse_infill_density.value < 0.00011f)
+    if (config.sparse_infill_density.value < 0.00011f &&
+        !(config.sparse_infill_pattern == ipBridgeAwareCubic && config.sparse_infill_density.value > 0.))
         // Switch of infill for very low infill rates, also avoid division by zero in infill generator for these very low rates.
         // See GH issue #5910.
         config.sparse_infill_density.value = 0;
     else
+        // Keep positive Bridge aware cubic values for explicit validation;
+        // silently disabling the pattern would discard its requested gap bound.
         config.sparse_infill_density.value = std::min(config.sparse_infill_density.value, 100.);
     // Very small fuzzy_skin_point_distance value may cause infinite recursion, and a near-zero thickness doesn't generate anything anyway.
     // Check here even if `fuzzy_skin == None` because that setting allows painting and the type may get reset later (but `Disabled_fuzzy` will not).
@@ -4578,6 +4731,16 @@ void PrintObject::combine_infill()
             // Start looping from the second layer and intersect the current intersection with it.
             for (size_t i = 1; i < layerms.size(); ++ i)
                 intersection = intersection_ex(layerms[i]->fill_surfaces.filter_by_type(stInternal), intersection);
+            ExPolygons bridge_aware_reserved;
+            if (const auto *plan = this->bridge_aware_cubic_plan(region_id)) {
+                for (size_t i = layer_idx + 1 - num_layers; i <= layer_idx; ++i) {
+                    const LayerRegion *layerm = m_layers[i]->regions()[region_id];
+                    append(bridge_aware_reserved, bridge_aware_cubic_reserved_area(*plan, m_layers[i]->print_z,
+                        layerm->flow(frInfill), this->bridge_aware_cubic_reservations(i, region_id)));
+                }
+                if (bridge_aware_reserved.size() > 1)
+                    bridge_aware_reserved = union_ex(bridge_aware_reserved);
+            }
             double area_threshold = layerms.front()->infill_area_threshold();
             if (! intersection.empty() && area_threshold > 0.)
                 intersection.erase(std::remove_if(intersection.begin(), intersection.end(),
@@ -4604,8 +4767,17 @@ void PrintObject::combine_infill()
                   region.config().sparse_infill_pattern == ipLine          ||
                   region.config().sparse_infill_pattern == ipHoneycomb) ? 1.5f : 0.5f) *
                     layerms.back()->flow(frSolidInfill).scaled_width();
+            if (!bridge_aware_reserved.empty()) {
+                // Combination removes a clearance halo as well as its own
+                // domain. Keep that halo outside every reserved support plane.
+                intersection = diff_ex(intersection, offset_ex(bridge_aware_reserved, clearance_offset));
+                if (intersection.empty())
+                    continue;
+            }
             for (ExPolygon &expoly : intersection)
                 polygons_append(intersection_with_clearance, offset(expoly, clearance_offset));
+            if (!bridge_aware_reserved.empty())
+                intersection_with_clearance = diff(intersection_with_clearance, to_polygons(bridge_aware_reserved));
             for (LayerRegion *layerm : layerms) {
                 Polygons internal = to_polygons(std::move(layerm->fill_surfaces.filter_by_type(stInternal)));
                 layerm->fill_surfaces.remove_type(stInternal);
