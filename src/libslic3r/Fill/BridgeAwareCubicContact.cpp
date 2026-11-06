@@ -701,7 +701,14 @@ ExPolygons contact_mask(size_t lower_index, const LowerSection &lower, V transve
     if (!std::isfinite(transverse.x) || !std::isfinite(transverse.y) || !std::isfinite(mask_reserve))
         throw Limit{LimitKind::Coordinates};
     QueryCacheData *cache = budget.cache;
-    const QueryCacheData::Key key{lower_index, transverse.x, transverse.y, mask_reserve};
+    // Negating the computed transverse only swaps each c+T/c-T corner pair.
+    // Integer rounding and the sorted convex hull therefore produce the same
+    // ordered mask, including signed-zero components. Normalize the key only;
+    // keep the exact reserve and all geometry/line-contact calculations intact.
+    const bool reverse_key = transverse.x < 0 || (transverse.x == 0 && transverse.y < 0);
+    const QueryCacheData::Key key{lower_index,
+        reverse_key ? -transverse.x : transverse.x,
+        reverse_key ? -transverse.y : transverse.y, mask_reserve};
     if (cache != nullptr) {
         budget.consume();
         const auto found = cache->entries.find(key);

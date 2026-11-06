@@ -216,13 +216,23 @@ The isolated small diagnostic admits one 46,082-byte identity, reuses it on all 
 
 **Release gate remains failed:** one warm-up plus three measured official small-fixture pairs produce feature times 9,830/9,867/9,925 ms and official times 264/265/256 ms. Median ratio is 37.375×; worst pair is 38.770×. Both executables finish successfully and source/executable hashes remain unchanged; the harness correctly rejects qualification. Construction target assembly reuse is still unimplemented. No merge, installed-app replacement or release handoff follows this result.
 
-### 3F. Normalize exact contact-mask key direction — next bounded candidate
+### 3F. Normalize exact contact-mask key direction — implemented
 
 The existing mask generator includes both `corner + transverse` and `corner - transverse`, then rounds and sorts their convex hull. Negating the already-computed finite transverse vector swaps these inputs, including signed zeros that round to the same integer. Canonicalizing only its sign in the cache key can therefore reuse the identical mask for opposite upper traversal. Keep mask generation, raw reserve identity, line witnesses, output copies and allocation admission unchanged. Do not approximate angles or replace Clipper's offset algorithm.
 
-- [ ] Require warmed opposite-direction cache reuse and complete output equality against an uncached query in the current direction. Cover zero/positive lower radius, signed-zero components, diagonal/near-parallel inputs, half-grid rounding, coordinate bounds and memory-pressure ownership transfer.
-- [ ] Apply key-only sign normalization after finite guards. Keep exact reserve changes as misses and every line-contact witness freshly computed.
-- [ ] Run focused Contact/admission tests, complete output parity, the regression suite and isolated timing before retaining the change. Measure any gain; the earlier sampled `inner_hull` share bounds even its complete removal to an approximately 1.27× overall speedup, so this smaller change cannot by itself meet the release gate.
+- [x] Require warmed opposite-direction cache reuse and complete output equality against an uncached query in the current direction. Cover zero/positive lower radius, signed-zero components, diagonal/near-parallel inputs, half-grid rounding, coordinate bounds and memory-pressure ownership transfer.
+- [x] Apply key-only sign normalization after finite guards. Keep exact reserve changes as misses and every line-contact witness freshly computed.
+- [x] Run focused Contact/admission tests, complete output parity, the regression suite and isolated timing.
+
+Before the change, the four new cases failed only at the reuse assertions (160 failures, 2,275 prerequisites passed). After the change, the 75-case focused group passes 43,184 assertions. Exhaustive output parity passes 13,627 assertions. The full application build, 17 legacy targets, 44 packaging tests, 70 benchmark-tool tests and the 244-assertion fixture writer pass. The complete geometry suite passes 440 executions and 382,177 assertions.
+
+With one warm-up and three measured small-cube pairs, the feature median is 9,780 ms (range 9,754–9,865 ms) versus 270 ms for official Cubic: 36.222× median and 36.629× worst pair. The preceding feature median was 9,867 ms. These overlapping diagnostic samples do not establish a general speedup. The isolated profile reports 9.459 seconds preparation and 6.599 seconds coarsening, with unchanged decisions. The 2× release condition remains unmet.
+
+### 3G. Test known collapse failures before generating unrelated layers — candidate
+
+The small profile repeats 56 rejected candidates. Its remembered model path reproduces the failure in all 56 cases, but the current loop regenerates all changed layers first. Investigate a rejection-only probe of the actual trial deposition immediately below that path. A candidate that changes required model targets is already inadmissible; a candidate preserving them cannot pass a complete, current physical counterexample for one of those targets. The original whole-layer path remains necessary for every pass, unavailable proof or unsupported generation dependency.
+
+Before enabling partial generation, establish that the probed deposition equals what the full route produces, including prior-layer reads, mutable surfaces, path replay and emission state. Preserve rollback, budgets, cancellation and full physical-domain checks. Compare every diagnostic shortcut with the original trial and final outputs. Even eliminating the entire coarsening sweep would leave about 2.86 seconds of preparation on this fixture, so initial repair and final verification also need architectural improvements.
 
 ### 4. Certify material separator cycles and local complete-cell checks
 

@@ -1362,3 +1362,182 @@ TEST_CASE("Bridge aware whole-path proof retains combined resident and output ad
     CHECK_FALSE(rejected.contact.completed);
     CHECK(rejected.contact.resource_limited);
 }
+
+
+namespace {
+void same_mask_sign_contact(const Contact::PathContact &actual, const Contact::PathContact &expected)
+{
+    same_contact(actual, expected);
+    // The existing helper compares contours and exact line witnesses. Include
+    // every mask hole too, so reuse requires complete ordered output equality.
+    for (size_t i = 0; i < actual.segments.size(); ++i)
+        for (size_t j = 0; j < actual.segments[i].centerline_support.size(); ++j) {
+            const auto &a = actual.segments[i].centerline_support[j];
+            const auto &e = expected.segments[i].centerline_support[j];
+            REQUIRE(a.holes.size() == e.holes.size());
+            for (size_t k = 0; k < a.holes.size(); ++k)
+                CHECK(a.holes[k].points == e.holes[k].points);
+        }
+}
+
+void require_reverse_mask_reuse(const Contact::PreparedLowerPtr &prepared, ExtrusionPath upper,
+                                double tolerance, Contact::FootprintMode mode)
+{
+    Contact::QueryCache cache(prepared);
+    const auto forward = Contact::footprint(*prepared, upper, .4, tolerance, mode);
+    REQUIRE(forward.input_valid);
+    REQUIRE(forward.completed);
+    same_mask_sign_contact(Contact::footprint(*prepared, upper, .4, tolerance, mode, nullptr, &cache), forward);
+    const auto warmed = cache.statistics();
+    REQUIRE(warmed.misses > 0);
+    REQUIRE(warmed.resident_units > 0);
+    REQUIRE(warmed.evictions == 0);
+
+    upper.reverse();
+    // A reversed path has its own arclength/anchor coordinates. Compare with
+    // an independently computed query in THIS orientation, not with forward.
+    const auto reverse = Contact::footprint(*prepared, upper, .4, tolerance, mode);
+    REQUIRE(reverse.input_valid);
+    REQUIRE(reverse.completed);
+    same_mask_sign_contact(Contact::footprint(*prepared, upper, .4, tolerance, mode, nullptr, &cache), reverse);
+    CHECK(cache.statistics().hits > warmed.hits);
+    CHECK(cache.statistics().misses == warmed.misses);
+    CHECK(cache.statistics().evictions == warmed.evictions);
+    CHECK(cache.statistics().resident_units == warmed.resident_units);
+}
+}
+
+TEST_CASE("Bridge aware mask sign keys reuse exact reverse queries across rounded geometry",
+          "[BridgeAwareCubic][Contact][MaskSign]")
+{
+    const int geometry = GENERATE(0, 1, 2, 3, 4, 5);
+    const float lower_width = GENERATE(.2f, .45f);
+    const double tolerance = GENERATE(0., .0001);
+    const auto mode = GENERATE(Contact::FootprintMode::ContactsOnly, Contact::FootprintMode::Full);
+    INFO("geometry=" << geometry << ", lower_width=" << lower_width << ", tolerance=" << tolerance);
+    auto lower = bead({{-6., 0.}, {6., 0.}}, lower_width, .2f);
+    auto upper = bead({{-5., 0.}, {5., 0.}});
+    if (geometry == 1) {
+        lower.polyline.points = {Point(0, -600000), Point(0, 600000)};
+        upper.polyline.points = {Point(0, -500000), Point(0, 500000)};
+    } else if (geometry == 2) {
+        lower.polyline.points = {Point(-600001, -600001), Point(600001, 600001)};
+        upper.polyline.points = {Point(-500000, -500000), Point(500000, 500000)};
+    } else if (geometry == 3) {
+        // Almost parallel axes retain both small nonzero transverse components.
+        upper.polyline.points = {Point(-500000, 1), Point(500000, 2)};
+    } else if (geometry >= 4) {
+        // Adjacent float widths put the upper transverse displacement on
+        // opposite sides of half a coordinate unit, at negative/positive Y.
+        upper.width = geometry == 4 ? .20001f : std::nextafter(.20001f, 1.f);
+        const double radius_units = .5 * (double(upper.width) - double(upper.height)) / SCALING_FACTOR;
+        if (geometry == 4) REQUIRE(radius_units < .5);
+        else REQUIRE(radius_units > .5);
+        REQUIRE(std::abs(radius_units - .5) < .01);
+        const coord_t y = geometry == 4 ? -200007 : 200007;
+        lower.polyline.points = {Point(-600003, y), Point(600003, y)};
+        upper.polyline.points = {Point(-500003, y), Point(500003, y)};
+    }
+    // Horizontal and vertical directions produce the signed-zero components;
+    // a circular lower top has radius zero but still produces cacheable masks.
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    require_reverse_mask_reuse(prepared, upper, tolerance, mode);
+}
+
+TEST_CASE("Bridge aware mask sign keys retain exact output near coordinate bounds",
+          "[BridgeAwareCubic][Contact][MaskSign]")
+{
+    const int sign = GENERATE(-1, 1);
+    const float lower_width = GENERATE(.2f, .45f);
+    const coord_t safe_limit = std::numeric_limits<coord_t>::max() / 4;
+    const coord_t origin = sign * (safe_limit - 1000000);
+    auto lower = bead({{-6., -2.}, {6., 2.}}, lower_width, .2f);
+    auto upper = bead({{-5., -1.}, {5., 1.}});
+    lower.polyline.points = {Point(origin - 600000, origin - 200000),
+                             Point(origin + 600000, origin + 200000)};
+    upper.polyline.points = {Point(origin - 500000, origin - 166666),
+                             Point(origin + 500000, origin + 166666)};
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    require_reverse_mask_reuse(prepared, upper, 0., Contact::FootprintMode::Full);
+}
+
+TEST_CASE("Bridge aware reverse mask hits transfer ownership at the actual admission boundary",
+          "[BridgeAwareCubic][Contact][MaskSign]")
+{
+    const auto lower = bead({{-1., 0.}, {11., 0.}});
+    auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    const auto baseline = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    REQUIRE(baseline.input_valid);
+    REQUIRE(baseline.completed);
+    REQUIRE_FALSE(baseline.segments.empty());
+    REQUIRE_FALSE(baseline.segments.front().centerline_support.empty());
+    size_t output_units = baseline.segments.size();
+    for (const auto &segment : baseline.segments) {
+        output_units += segment.line_contacts.size();
+        for (const auto &polygon : segment.centerline_support) {
+            output_units += polygon.contour.points.size();
+            for (const auto &hole : polygon.holes) output_units += hole.points.size();
+        }
+    }
+    const size_t prepared_units = Contact::prepared_lower_contact_units(*prepared);
+    REQUIRE(prepared_units + output_units + 2 < 200000);
+    Contact::QueryCache cache(prepared);
+    same_mask_sign_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly,
+                                             nullptr, &cache), baseline);
+    const auto warmed = cache.statistics();
+    REQUIRE(warmed.resident_units > 0);
+
+    upper.reverse();
+    upper.polyline.points.resize(200000 - prepared_units - output_units, upper.polyline.points.back());
+    const auto expected = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    REQUIRE(expected.input_valid);
+    REQUIRE(expected.completed);
+    same_mask_sign_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly,
+                                             nullptr, &cache), expected);
+    CHECK(cache.statistics().hits > warmed.hits);
+    CHECK(cache.statistics().misses == warmed.misses);
+    CHECK(cache.statistics().evictions > warmed.evictions);
+    CHECK(cache.statistics().resident_units == 0);
+
+    upper.polyline.points.push_back(upper.polyline.points.back());
+    const auto uncached_rejected = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    const auto cached_rejected = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly,
+                                                    nullptr, &cache);
+    CHECK_FALSE(uncached_rejected.completed);
+    CHECK(uncached_rejected.resource_limited);
+    CHECK_FALSE(cached_rejected.completed);
+    CHECK(cached_rejected.resource_limited);
+}
+
+TEST_CASE("Bridge aware mask sign reuse preserves exact reserve identity",
+          "[BridgeAwareCubic][Contact][MaskSign]")
+{
+    const auto lower = bead({{-1., 0.}, {11., 0.}});
+    auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    Contact::QueryCache cache(prepared);
+    const auto query = [&](const ExtrusionPath &path, double tolerance) {
+        const auto expected = Contact::footprint(*prepared, path, .4, tolerance, Contact::FootprintMode::ContactsOnly);
+        REQUIRE(expected.input_valid);
+        REQUIRE(expected.completed);
+        same_mask_sign_contact(Contact::footprint(*prepared, path, .4, tolerance, Contact::FootprintMode::ContactsOnly,
+                                                 nullptr, &cache), expected);
+    };
+    query(upper, .0001);
+    const auto warmed = cache.statistics();
+    REQUIRE(warmed.misses > 0);
+    upper.reverse();
+    query(upper, .0001);
+    CHECK(cache.statistics().hits > warmed.hits);
+    CHECK(cache.statistics().misses == warmed.misses);
+
+    const auto reused = cache.statistics();
+    auto shorter = upper;
+    shorter.polyline.points.back() = Point::new_scale(5., 0.);
+    query(shorter, .0001); // Same transverse, different length-dependent reserve.
+    CHECK(cache.statistics().misses > reused.misses);
+    const auto shortened = cache.statistics();
+    query(upper, .0002);
+    CHECK(cache.statistics().misses > shortened.misses);
+}
