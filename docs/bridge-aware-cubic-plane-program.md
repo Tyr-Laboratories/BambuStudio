@@ -14,3 +14,18 @@ The four focused cases passed 4,079 assertions, including rollback, cancellation
 | Assertions | 533,521 | 1,446,102 |
 
 Logical work counts are not elapsed time or predicted slicing speedups. The baseline scan still constructs the program per elevation. Across 90 unmodified layers the outer axes matched the legacy broad reference in both geometry and order (3,590 small; 11,433 large). Of 1,990 / 6,870 interior vertices, 1,575 / 5,771 lay off the corresponding rounded straight chord. A material clip must therefore operate on the actual canonical edges. Outer-endpoint equality alone is insufficient to replace the legacy generator.
+
+## Clipping to the actual fill domain
+
+The diagnostic captures each filler call's overlap-adjusted surface and actual inset material, then compares six sampled removals against freshly rebuilt canonical fragments. It compares exact crossing events, material breaks, rounded points and owners. A shared observer lease keeps concurrent fill calls safe during observer removal. The production emitter still supplies the extrusion paths in these experiments.
+
+| Measured across six removals | Small cube | Large cube | Blind cavity |
+| --- | ---: | ---: | ---: |
+| Actual fill components | 84 | 84 | 64 |
+| Compared component trials | 504 | 504 | 384 |
+| Unavailable component trials | 0 | 0 | 0 |
+| Changed component trials | 186 | 164 | 123 |
+| Removed fragments / baseline fragment visits | 916 / 23,376 | 1,024 / 90,168 | 500 / 11,820 |
+| Changed rows / baseline row visits | 862 / 7,560 | 821 / 15,534 | 417 / 4,452 |
+
+All 1,392 incremental comparisons matched fresh geometry. The cavity exercised 40 holes in inset components and 87 exact gaps. Ten focused raw, clipping and lease cases passed 4,247 assertions. The comparison establishes the clipping and ownership behavior of these samples. G-code deposition and the end-to-end timing gate require separate qualification for a generator that consumes these fragments.

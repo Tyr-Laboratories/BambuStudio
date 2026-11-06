@@ -4,6 +4,10 @@
 #include "libslic3r/Fill/BridgeAwareCubicContact.hpp"
 #include "libslic3r/Fill/BridgeAwareCubic.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicStrands.hpp"
+#include "libslic3r/Fill/BridgeAwareCubicDomainProbe.hpp"
+#include <mutex>
+#include <numeric>
+#include <optional>
 #include "libslic3r/Fill/BridgeAwareCubicSerialization.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicValidation.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
@@ -1299,3 +1303,375 @@ TEST_CASE("Canonical raw plane program matches actual qualification Plan collaps
 TEST_CASE("Canonical raw plane program matches actual qualification Plan collapse updates - large",
           "[.][BACCanonicalRealPlan][BACCanonicalRealPlanLarge]")
 { canonical_plan_diagnostic::qualify(64.,56.,"large"); }
+
+namespace canonical_fill_diagnostic {
+namespace BAC = Slic3r::BridgeAwareCubic;
+using namespace canonical_plan_diagnostic;
+struct Call {
+    std::shared_ptr<const void> plan_identity;
+    size_t emitter = 0, mixed_paths = 0, mixed_segments = 0;
+    double z = 0., width = 0.;
+    bool missing_inset = false;
+    ExPolygons overlap, allowed;
+};
+struct LayerCalls { size_t units = 0; bool unavailable = false; std::vector<Call> calls; };
+class Capture final : public BAC::DomainProbe {
+public:
+    // Own only numeric runtime identities; a delayed unrelated invocation
+    // must never dereference the old target Print or PrintObject.
+    const ObjectID target_print, target_object;
+    std::mutex mutex;
+    std::map<const Layer *, LayerCalls> layers;
+    size_t units = 0, work_left = 50000000, begins = 0;
+    bool overflow = false;
+    explicit Capture(const PrintObject &o):target_print(o.print()->id()),target_object(o.id()) {}
+    bool begin_layer(const Layer &layer) override {
+        const auto *candidate = layer.object(); // belongs to the live caller
+        if (!candidate || candidate->id() != target_object || !candidate->print() ||
+            candidate->print()->id() != target_print) return false;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (overflow) return false;
+        try {
+            if (!layers.count(&layer) && layers.size() == 128) { overflow = true; return false; }
+            auto &r = layers[&layer]; units -= r.units; r = {}; ++begins;
+        } catch (const std::bad_alloc &) { overflow = true; return false; }
+        return true;
+    }
+    void surface(const Layer &layer,size_t region,const BAC::Plan &plan,double z,double width,
+        const ExPolygons &overlap,const ExPolygons *allowed,const Polylines &output) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto found = layers.find(&layer);
+        if (overflow || found == layers.end() || found->second.unavailable) return;
+        auto &row = found->second;
+        const auto decline = [&] { units -= row.units; row = {}; row.unavailable = true; };
+        // Logical records/vertices only; the observer does not claim a total
+        // native allocator/RSS bound. Old generations are destroyed at begin.
+        size_t need = 16;
+        const auto admit = [&](size_t n) {
+            if (n > 250000 - need || n > work_left) return false;
+            need += n; work_left -= n; return true;
+        };
+        const auto shape_units = [&](const ExPolygons &ps) {
+            if (!admit(ps.size())) return false;
+            for (const auto &p : ps) {
+                if (!admit(p.contour.size()) || !admit(p.holes.size())) return false;
+                for (const auto &h : p.holes) if (!admit(h.size())) return false;
+            }
+            return true;
+        };
+        if (row.calls.size() == 128 || !admit(output.size()) || !shape_units(overlap) ||
+            (allowed && !shape_units(*allowed)) || need > 250000-units) { decline(); return; }
+        try {
+            Call call; call.plan_identity = plan.immutable_identity(); call.emitter=region; call.z=z; call.width=width;
+            call.mixed_paths = output.size();
+            for (const auto &p : output) if (p.size() > 0) call.mixed_segments += p.size()-1;
+            call.overlap=overlap; call.missing_inset=allowed==nullptr; if (allowed) call.allowed=*allowed;
+            row.calls.push_back(std::move(call)); row.units += need; units += need;
+        } catch (const std::bad_alloc &) { decline(); }
+    }
+};
+struct Install {
+    std::shared_ptr<BAC::DomainProbe> installed;
+    explicit Install(std::shared_ptr<BAC::DomainProbe> probe) : installed(std::move(probe)) {
+        if (!installed) throw std::invalid_argument("Cannot install a null fill-domain observer");
+        std::shared_ptr<BAC::DomainProbe> empty;
+        if (!std::atomic_compare_exchange_strong_explicit(&BAC::diagnostic_domain_probe,&empty,installed,
+                std::memory_order_acq_rel,std::memory_order_acquire))
+            throw std::logic_error("A fill-domain observer is already installed");
+    }
+    Install(const Install &) = delete;
+    Install &operator=(const Install &) = delete;
+    ~Install() {
+        auto expected=installed;
+        // Remove only this scope's registration; never clear another owner.
+        std::atomic_compare_exchange_strong_explicit(&BAC::diagnostic_domain_probe,&expected,
+            std::shared_ptr<BAC::DomainProbe>{},std::memory_order_acq_rel,std::memory_order_acquire);
+    }
+};
+using Key = std::tuple<int64_t,bool,int64_t,bool,BAC::CellId>;
+Key key(const BAC::StrandAtom &a) { return {a.first.slot,a.first.shifted,a.last.slot,a.last.shifted,a.owner}; }
+using Fraction = std::pair<int64_t,int64_t>;
+using Edge = std::tuple<Key,Fraction,Fraction,size_t,XY,XY>;
+using CRun = std::vector<Edge>;
+using CRows = std::vector<CRun>;
+using CImage = std::map<Plane,CRows>;
+using Wide = boost::multiprecision::int256_t;
+int compare(const Fraction &a,const Fraction &b) {
+    const Wide diff=Wide(a.first)*b.second-Wide(b.first)*a.second;
+    return diff < 0 ? -1 : diff > 0 ? 1 : 0;
+}
+struct Inventory {
+    size_t fragments=0,stationary=0,material_components_used=0,raw_stationary=0;
+    size_t positive_gaps=0,coincident_gap_ends=0,different_material_splits=0;
+};
+struct Incidence { size_t run, ordinal; XY a,b; };
+using Incidences = std::map<Key,Incidence>;
+Incidences incidence(const BAC::StrandProgram &raw,const Plane &p,Budget &budget,Inventory *inv) {
+    Incidences out; size_t id=0;
+    for (const auto &r:raw.runs(p,budget)) {
+        REQUIRE(r.points.size()==r.atoms.size()+1);
+        for (size_t i=0;i<r.atoms.size();++i) {
+            REQUIRE(out.emplace(key(r.atoms[i]),Incidence{id,i,{r.points[i].x(),r.points[i].y()},
+                {r.points[i+1].x(),r.points[i+1].y()}}).second);
+            if (inv) inv->raw_stationary += r.points[i]==r.points[i+1];
+        }
+        ++id;
+    }
+    return out;
+}
+template<class View> CRows clip_rows(const View &view,const BAC::StrandProgram &raw,
+    const Plane &p,size_t component_count,Budget &budget,Inventory *inv=nullptr) {
+    CRows out; const auto sources=incidence(raw,p,budget,inv);
+    std::optional<Edge> previous; size_t previous_run=0;
+    std::set<size_t> used_components;
+    for (const auto &r:view.runs(p,budget)) {
+        REQUIRE_FALSE(r.atoms.empty()); REQUIRE(r.points.size()==r.atoms.size()+1);
+        auto &dst=out.emplace_back();
+        for (size_t i=0;i<r.atoms.size();++i) {
+            const auto &a=r.atoms[i]; const Key k=key(a.source);
+            const Fraction f{a.first.numerator,a.first.denominator},l{a.last.numerator,a.last.denominator};
+            REQUIRE(f.second>0); REQUIRE(l.second>0); REQUIRE(f.first>=0); REQUIRE(l.first<=l.second);
+            REQUIRE(std::gcd(f.first,f.second)==1); REQUIRE(std::gcd(l.first,l.second)==1); REQUIRE(compare(f,l)<0);
+            REQUIRE(a.material_component < component_count);
+            const auto src=sources.find(k); REQUIRE(src!=sources.end());
+            XY begin{r.points[i].x(),r.points[i].y()},end{r.points[i+1].x(),r.points[i+1].y()};
+            Edge e{k,f,l,a.material_component,begin,end};
+            if (previous) {
+                const auto &v=*previous; const auto &old=sources.at(std::get<0>(v));
+                const bool same_source=std::get<0>(v)==k, same_raw_run=old.run==src->second.run;
+                const bool same_part=a.material_component==std::get<3>(v);
+                const bool consecutive=same_raw_run && old.ordinal+1==src->second.ordinal;
+                const bool prev_at_end=std::get<2>(v)==Fraction(1,1), now_at_start=f==Fraction(0,1);
+                const bool connected=same_source ? compare(std::get<2>(v),f)==0 : consecutive && prev_at_end && now_at_start;
+                if (i) {
+                    REQUIRE(same_part); REQUIRE(connected); REQUIRE(std::get<5>(v)==begin);
+                } else if (inv && same_raw_run) {
+                    const bool forward_gap=same_source ? compare(std::get<2>(v),f)<0 :
+                        old.ordinal<src->second.ordinal && (!consecutive||!prev_at_end||!now_at_start);
+                    if (forward_gap) { ++inv->positive_gaps; inv->coincident_gap_ends+=std::get<5>(v)==begin; }
+                    if (!same_part) ++inv->different_material_splits;
+                    REQUIRE(previous_run!=out.size()-1);
+                }
+            }
+            if (inv) { ++inv->fragments; inv->stationary+=begin==end; used_components.insert(a.material_component); }
+            dst.push_back(e); previous=std::move(e); previous_run=out.size()-1;
+        }
+    }
+    if (inv) inv->material_components_used+=used_components.size();
+    return out;
+}
+template<class View> CImage clip_image(const View &view,const BAC::StrandProgram &raw,
+                                        size_t component_count,Budget &budget,Inventory *inv=nullptr) {
+    CImage out;
+    for (const auto &p:view.planes(budget)) {
+        auto rows=clip_rows(view,raw,p,component_count,budget,inv);
+        REQUIRE_FALSE(rows.empty()); REQUIRE(out.emplace(p,std::move(rows)).second);
+    }
+    return out;
+}
+template<class View> void update_clip(CImage &img,const View &view,const BAC::StrandProgram &raw,
+    const std::set<Plane> &touched,size_t component_count,Budget &budget) {
+    for (const auto &p:touched) {
+        auto rows=clip_rows(view,raw,p,component_count,budget);
+        if (rows.empty()) img.erase(p); else img[p]=std::move(rows);
+    }
+}
+struct Locality {
+    size_t base_edges=0,trial_edges=0, removed_edges=0,added_edges=0;
+    size_t base_runs=0,trial_runs=0,removed_runs=0,added_runs=0;
+    size_t base_rows=0,trial_rows=0,touched_rows=0,changed_rows=0;
+    size_t compared=0,changed_domains=0,unavailable_geometry=0;
+    void count(const CImage &a,const CImage &b,size_t touched) {
+        ++compared; changed_domains+=a!=b; touched_rows+=touched;
+        base_rows+=a.size(); trial_rows+=b.size();
+        std::set<Plane> all; for (const auto &x:a) all.insert(x.first); for (const auto &x:b) all.insert(x.first);
+        const CRows empty;
+        for (const auto &p:all) {
+            auto x=a.find(p),y=b.find(p); const auto &old=x==a.end()?empty:x->second, &now=y==b.end()?empty:y->second;
+            base_runs+=old.size(); trial_runs+=now.size();
+            for(const auto &r:old) base_edges+=r.size(); for(const auto &r:now) trial_edges+=r.size();
+            if(old==now) continue;
+            ++changed_rows; const auto runs=diff_counts(old,now); removed_runs+=runs.first; added_runs+=runs.second;
+            std::vector<Edge> first,last; for(const auto &r:old) first.insert(first.end(),r.begin(),r.end());
+            for(const auto &r:now) last.insert(last.end(),r.begin(),r.end());
+            const auto edges=diff_counts(std::move(first),std::move(last)); removed_edges+=edges.first; added_edges+=edges.second;
+        }
+    }
+    Json json() const { return {{"compared_domain_trials",compared},{"changed_domain_trials",changed_domains},
+        {"unavailable_domain_trials",unavailable_geometry},{"fragment_counts",{base_edges,trial_edges,removed_edges,added_edges}},
+        {"run_counts",{base_runs,trial_runs,removed_runs,added_runs}},{"row_counts",{base_rows,trial_rows,touched_rows,changed_rows}}}; }
+};
+void qualify_clip(const std::string &kind)
+{
+    ExportWorkspace workspace;
+    const bool cavity=kind=="cavity",large=kind=="large";
+    auto cfg=export_config();
+    Model model; auto *m=model.add_object(); m->name="BAC actual fill domains " + kind;
+    m->add_volume(TriangleMesh(its_make_cube(cavity?28.:large?64.:32.,cavity?24.:large?56.:28.,cavity?14.:18.)));
+    m->add_instance()->set_offset(Vec3d(80.,80.,0.));
+    if(cavity) {
+        // Same physical input as the HoleClosure acceptance test, including
+        // the real negative-volume bore and its 12%/17-degree sparse policy.
+        TriangleMesh bore(its_make_cube(3.,3.,9.)); bore.translate(12.5,10.5,-.5);
+        m->add_volume(bore)->set_type(ModelVolumeType::NEGATIVE_VOLUME);
+        cfg.clear(); cfg.apply(static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
+        cfg.set_deserialize_strict({{"layer_height","0.2"},{"initial_layer_print_height","0.2"},
+            {"sparse_infill_density","12%"},{"sparse_infill_pattern","bridgeawarecubic"},{"bridge_aware_cubic_max_gap","5"},
+            {"infill_direction","17"},{"top_shell_layers","3"},{"top_shell_thickness","0"},{"bottom_shell_layers","3"},
+            {"bottom_shell_thickness","0"},{"wall_loops","2"},{"wall_generator","classic"},{"detect_narrow_internal_solid_infill","0"},
+            {"brim_type","no_brim"},{"enable_arc_fitting","0"},{"thick_bridges","0"},{"bridge_flow","1"},{"fill_multiline","1"},{"seam_gap","0"}});
+    }
+    Print print; print.set_status_silent(); print.auto_assign_extruders(m); print.apply(model,cfg);
+    const auto &object=*print.get_object(size_t(0)); auto owned_capture=std::make_shared<Capture>(object);
+    auto &capture=*owned_capture;
+    { Install observer(owned_capture); print.process(); } // Target fill jobs have joined; foreign leases cannot match its unique IDs.
+    REQUIRE_FALSE(capture.overflow); REQUIRE(object.layers().size()<=128); REQUIRE(object.num_printing_regions()==1);
+    const auto *base=object.bridge_aware_cubic_plan(0); REQUIRE(base!=nullptr);
+    const auto identity=base->immutable_identity(); const auto active=owners(*base); REQUIRE_FALSE(active.empty());
+    REQUIRE(base->statistics().nodes<=100000); REQUIRE(active.size()<=2048);
+    const std::vector<BAC::CellId> ids(active.begin(),active.end());
+    const size_t trials=std::min<size_t>(6,ids.size());
+    Budget budget; budget.work_left=50000000; budget.max_records=200000;
+    Locality total; Inventory inventory;
+    size_t missing_layers=0,declined_layers=0,surface_calls=0,stale_calls=0,missing_inset=0,empty_inset=0,
+        empty_overlaps=0,surfaces=0,overlap_holes=0,allowed_components=0,allowed_holes=0,actual_paths=0,actual_segments=0,
+        more_than_one_surface=0,more_than_one_allowed=0,solid_calls=0,closure_calls=0,attachment_calls=0;
+    std::map<std::string,size_t> reasons;
+    for(size_t ti=0;ti<trials;++ti) {
+        const auto id=ids[trials==1?0:ti*(ids.size()-1)/(trials-1)];
+        const auto trial=base->collapsed(id); const auto survive=owners(trial);
+        REQUIRE(std::includes(active.begin(),active.end(),survive.begin(),survive.end()));
+        std::vector<BAC::CellId> remove;
+        std::set_difference(active.begin(),active.end(),survive.begin(),survive.end(),std::back_inserter(remove));
+        REQUIRE(std::find(remove.begin(),remove.end(),id)!=remove.end());
+        const size_t start=total.compared,start_base=total.base_edges,start_remove=total.removed_edges,start_add=total.added_edges;
+        for(const Layer *layer:object.layers()) {
+            auto layer_capture=capture.layers.find(layer);
+            if(layer_capture==capture.layers.end()) { if(!ti) ++missing_layers; continue; }
+            if(layer_capture->second.unavailable) { if(!ti) ++declined_layers; continue; }
+            size_t ordinal=0;
+            for(const Call &call:layer_capture->second.calls) {
+                ++ordinal; if(!ti) ++surface_calls;
+                if(call.emitter!=0 || call.z!=layer->print_z || !(call.width>0.) || !std::isfinite(call.width) || call.plan_identity!=identity) {
+                    if(!ti) ++stale_calls; continue;
+                }
+                if(call.missing_inset) { if(!ti) ++missing_inset; continue; }
+                if(!ti) {
+                    actual_paths+=call.mixed_paths; actual_segments+=call.mixed_segments;
+                    surfaces+=call.overlap.size(); allowed_components+=call.allowed.size();
+                    empty_overlaps+=call.overlap.empty(); empty_inset+=call.allowed.empty();
+                    more_than_one_surface+=call.overlap.size()>1; more_than_one_allowed+=call.allowed.size()>1;
+                    for(const auto &x:call.overlap) overlap_holes+=x.holes.size();
+                    for(const auto &x:call.allowed) allowed_holes+=x.holes.size();
+                    solid_calls+=!base->solid_sections(call.z).empty(); closure_calls+=base->has_closures(call.z);
+                    bool attached=false; base->visit_attachments(call.z,[&](const auto &){attached=true;return false;});
+                    attachment_calls+=attached;
+                }
+                for(size_t component=0;component<call.overlap.size();++component) {
+                    CAPTURE(ti,id.depth,id.address[0],id.address[1],id.address[2],call.z,ordinal,component);
+                    const auto &surface=call.overlap[component];
+                    auto raw=base->strand_program(call.z,budget);
+                    std::optional<BAC::ClippedStrands> view;
+                    try { view=raw.clipped(surface,call.allowed,budget); }
+                    catch(const std::domain_error &e) {
+                        ++total.unavailable_geometry;
+                        if(reasons.size()<16 || reasons.count(e.what())) ++reasons[e.what()];
+                        continue; // No partial view, no representation switch, no physical certificate.
+                    }
+                    auto before=clip_image(*view,raw,call.allowed.size(),budget,ti==0?&inventory:nullptr);
+                    std::set<Plane> touched; std::vector<BAC::CellId> live;
+                    for(const auto &who:remove) if(raw.contains_owner(who,budget)) {
+                        live.push_back(who); auto v=raw.set_owner(who,false,budget); touched.insert(v.begin(),v.end());
+                    }
+                    auto updated=before; update_clip(updated,*view,raw,touched,call.allowed.size(),budget);
+                    const auto fresh_raw=trial.strand_program(call.z,budget);
+                    // A positive baseline catalog contains the surviving atoms;
+                    // never hide an unexpected failure after an owner removal.
+                    const auto fresh_view=fresh_raw.clipped(surface,call.allowed,budget);
+                    const auto fresh=clip_image(fresh_view,fresh_raw,call.allowed.size(),budget);
+                    REQUIRE(bool(updated==fresh)); REQUIRE(bool(clip_image(*view,raw,call.allowed.size(),budget)==fresh));
+                    total.count(before,fresh,touched.size());
+                    std::set<Plane> restore;
+                    for(auto it=live.rbegin();it!=live.rend();++it) {
+                        auto v=raw.set_owner(*it,true,budget); restore.insert(v.begin(),v.end());
+                    }
+                    update_clip(updated,*view,raw,restore,call.allowed.size(),budget);
+                    REQUIRE(bool(updated==before)); REQUIRE(bool(clip_image(*view,raw,call.allowed.size(),budget)==before));
+                }
+            }
+        }
+        std::cout<<"BAC_CANONICAL_CLIP_TRIAL "<<Json({{"fixture",kind},{"trial",ti},{"cell_depth",id.depth},{"cell_address",id.address},
+            {"removed_split_ids",remove.size()},{"compared_domains",total.compared-start},{"base_fragments",total.base_edges-start_base},
+            {"removed_fragments",total.removed_edges-start_remove},{"added_fragments",total.added_edges-start_add}}).dump()<<'\n';
+    }
+    Json report={{"fixture",kind},{"scope","actual filler masks, canonical partition atoms only; no emitted support verdict"},
+        {"layer_generation_begins",capture.begins},{"last_generation_surface_calls",surface_calls},{"missing_layer_begin",missing_layers},
+        {"capture_quota_declined_layers",declined_layers},{"stale_or_incompatible_calls",stale_calls},
+        {"missing_inset_calls",missing_inset},{"empty_inset_calls",empty_inset},{"empty_overlap_calls",empty_overlaps},
+        {"overlap_components",surfaces},{"overlap_holes",overlap_holes},{"inset_components",allowed_components},{"inset_holes",allowed_holes},
+        {"multi_overlap_calls",more_than_one_surface},{"multi_inset_calls",more_than_one_allowed},
+        {"baseline_solid_calls",solid_calls},{"baseline_closure_calls",closure_calls},{"baseline_attachment_calls",attachment_calls},
+        {"actual_legacy_mixed_paths",actual_paths},{"actual_legacy_mixed_segments",actual_segments},
+        {"baseline_clipped_atoms",inventory.fragments},{"baseline_clipped_stationary",inventory.stationary},
+        {"raw_stationary_on_nonempty_rows",inventory.raw_stationary},{"observed_exact_gaps",inventory.positive_gaps},
+        {"coincident_gap_ends",inventory.coincident_gap_ends},{"different_material_splits",inventory.different_material_splits},
+        {"checked_clipped_locality",total.json()},{"active_cells",ids.size()},{"sampled_trials",trials},
+        {"unavailable_geometry_reasons",reasons},{"work_used",50000000-budget.work_left}};
+    std::cout<<"BAC_CANONICAL_CLIP_SUMMARY "<<report.dump()<<std::endl;
+    REQUIRE(surface_calls>0); REQUIRE(surfaces>0); REQUIRE(total.compared>0); REQUIRE(inventory.fragments>0);
+    REQUIRE(total.changed_domains>0); REQUIRE(total.removed_edges>0); REQUIRE(total.changed_rows<=total.touched_rows);
+    if(cavity) { REQUIRE(allowed_holes>0); REQUIRE(overlap_holes>0); }
+}
+}
+TEST_CASE("Canonical clipped planes match actual small qualification fill domain edits", "[.][BACCanonicalRealClip][BACCanonicalRealClipSmall]")
+{ canonical_fill_diagnostic::qualify_clip("small"); }
+TEST_CASE("Canonical clipped planes match actual large qualification fill domain edits", "[.][BACCanonicalRealClip][BACCanonicalRealClipLarge]")
+{ canonical_fill_diagnostic::qualify_clip("large"); }
+TEST_CASE("Canonical clipped planes match real blind cavity fill domain edits", "[.][BACCanonicalRealClip][BACCanonicalRealClipCavity]")
+{ canonical_fill_diagnostic::qualify_clip("cavity"); }
+
+TEST_CASE("Actual fill domain observer leases survive uninstall and reject nested installations",
+          "[.][BACCanonicalDomainProbeLease]")
+{
+    using canonical_fill_diagnostic::Capture;
+    using canonical_fill_diagnostic::Install;
+    using Probe=Slic3r::BridgeAwareCubic::DomainProbe;
+    const auto make_object=[](Print &print,Model &model) {
+        auto *m=model.add_object();
+        m->add_volume(TriangleMesh(its_make_cube(3.,3.,3.)));
+        m->add_instance()->set_offset(Vec3d(80.,80.,0.));
+        print.set_status_silent(); print.auto_assign_extruders(m); print.apply(model,export_config());
+        return print.get_object(size_t(0));
+    };
+    Model foreign_model; Print foreign_print;
+    auto *foreign=make_object(foreign_print,foreign_model);
+    auto *foreign_layer=foreign->add_layer(0,.2,.2,.1);
+    auto replacement=std::make_shared<Capture>(*foreign);
+    std::weak_ptr<Probe> original;
+    std::shared_ptr<Probe> delayed;
+    {
+        Model target_model; Print target_print;
+        auto *target=make_object(target_print,target_model);
+        auto capture=std::make_shared<Capture>(*target); original=capture;
+        {
+            Install active(capture);
+            // Equivalent to a caller pausing immediately after make_fills' load.
+            delayed=std::atomic_load_explicit(&Slic3r::BridgeAwareCubic::diagnostic_domain_probe,std::memory_order_acquire);
+            REQUIRE(delayed==capture);
+            REQUIRE_THROWS_AS(Install{replacement},std::logic_error);
+            REQUIRE(std::atomic_load(&Slic3r::BridgeAwareCubic::diagnostic_domain_probe)==capture);
+        }
+        REQUIRE_FALSE(std::atomic_load(&Slic3r::BridgeAwareCubic::diagnostic_domain_probe));
+    } // Original target Print, target PrintObject, and caller-owned capture are gone.
+    REQUIRE_FALSE(original.expired());
+    {
+        Install active(replacement);
+        REQUIRE_FALSE(delayed->begin_layer(*foreign_layer));
+        REQUIRE(replacement->begin_layer(*foreign_layer));
+        REQUIRE(replacement->begins==1);
+        delayed.reset();
+        REQUIRE(original.expired());
+        REQUIRE(std::atomic_load(&Slic3r::BridgeAwareCubic::diagnostic_domain_probe)==replacement);
+    }
+    REQUIRE_FALSE(std::atomic_load(&Slic3r::BridgeAwareCubic::diagnostic_domain_probe));
+}

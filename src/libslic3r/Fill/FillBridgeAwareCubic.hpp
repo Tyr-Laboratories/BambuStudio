@@ -3,6 +3,7 @@
 
 #include "FillRectilinear.hpp"
 #include "BridgeAwareCubic.hpp"
+#include "BridgeAwareCubicDomainProbe.hpp"
 #include "BridgeAwareCubicEmissionLedger.hpp"
 #include "BridgeAwareCubicValidation.hpp"
 #include "../ClipperUtils.hpp"
@@ -21,6 +22,8 @@ public:
     const BridgeAwareCubic::Plan *plan = nullptr;
     const ExPolygons *material_domain = nullptr;
     double extrusion_width = 0.;
+    BridgeAwareCubic::DomainProbe *domain_probe = nullptr;
+    const Layer *probe_layer = nullptr;
     BridgeAwareCubic::EmissionLedgerBuilder *emission_builder = nullptr;
     BridgeAwareCubicValidation::WorkBudget *emission_budget = nullptr;
 
@@ -251,7 +254,8 @@ private:
         // Ordinary Cubic adds boundary anchors after its half-spacing inset.
         // These complete partition faces need their straight ends to reach the
         // actual fill boundary instead, so they join the deposited inner wall.
-        for (const ExPolygon &domain : offset_ex(surface->expolygon, scale_(overlap))) {
+        ExPolygons overlap_components = offset_ex(surface->expolygon, scale_(overlap));
+        for (const ExPolygon &domain : overlap_components) {
             if (m_capture) {
                 const size_t remaining = m_limit - m_used;
                 const size_t units = remaining > sizeof(BridgeAwareCubic::TaggedLineBatch) ?
@@ -264,6 +268,7 @@ private:
                 append(result, std::move(tagged.paths));
             } else append(result, plan->lines(z, domain));
         }
+        if (!domain_probe) ExPolygons{}.swap(overlap_components); // Original temporary lifetime.
         // Two perpendicular half-density families preserve one nominal layer
         // volume while closing the long top-plane slots of parallel solid
         // fill. Their masks remain construction obligations: the final verifier
@@ -291,8 +296,13 @@ private:
         }
         // A fill boundary can also be a real exterior or cavity, including
         // models without perimeters. Keep the whole bead inside that material.
-        if (material_domain != nullptr)
-            result = clip_material(result, offset_ex(*material_domain, -scale_(.5 * extrusion_width)));
+        if (material_domain != nullptr) {
+            const ExPolygons allowed = offset_ex(*material_domain, -scale_(.5 * extrusion_width));
+            result = clip_material(result, allowed);
+            if (domain_probe) domain_probe->surface(*probe_layer, lock_region_id, *plan, z, extrusion_width,
+                                                    overlap_components, &allowed, result);
+        } else if (domain_probe) domain_probe->surface(*probe_layer, lock_region_id, *plan, z, extrusion_width,
+                                                      overlap_components, nullptr, result);
         optional_capture([&] { retain_paths(result); });
         return result;
     }

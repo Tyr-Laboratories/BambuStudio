@@ -686,11 +686,15 @@ void Layer::set_outlook_range(LockRegionParam &lock_param){
         }
     }
 }
+std::shared_ptr<BridgeAwareCubic::DomainProbe> BridgeAwareCubic::diagnostic_domain_probe;
+
 // friend to Layer
 void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive::Octree* support_fill_octree,
                       FillLightning::Generator* lightning_generator, bool capture_emissions,
                       const std::vector<size_t> *retained_emission_bytes)
 {
+    auto domain_probe = std::atomic_load_explicit(&BridgeAwareCubic::diagnostic_domain_probe, std::memory_order_acquire);
+    if (domain_probe && !domain_probe->begin_layer(*this)) domain_probe.reset();
     BridgeAwareCubic::begin_layer_emissions(*this, capture_emissions, retained_emission_bytes);
 	for (LayerRegion *layerm : m_regions)
 		layerm->fills.clear();
@@ -727,6 +731,9 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
             if (surface_fill.region_id < bridge_aware_emission_builders.size())
                 cubic->emission_builder = bridge_aware_emission_builders[surface_fill.region_id].get();
             cubic->emission_budget = bridge_aware_emission_budget.get();
+            // f is synchronous and dies before this invocation releases its lease.
+            cubic->domain_probe = domain_probe.get();
+            cubic->probe_layer = this;
         }
         if (surface_fill.params.pattern == ipZigZag) {
             if (f->layer_id % 2 == 0)

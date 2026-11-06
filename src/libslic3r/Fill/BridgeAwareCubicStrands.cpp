@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 
@@ -167,7 +168,7 @@ struct StrandProgram::Impl {
 
 StrandProgram::StrandProgram(double z, double bulk_edge, const Vec3d &origin, const Matrix3d &frame,
                              const std::vector<Refinement> &refinements, std::function<void()> cancel,
-                             StrandBudget &budget) : impl(std::make_unique<Impl>(std::move(cancel)))
+                             StrandBudget &budget) : impl(std::make_shared<Impl>(std::move(cancel)))
 { impl->build(z, bulk_edge, origin, frame, refinements, budget); }
 StrandProgram::~StrandProgram() = default;
 StrandProgram::StrandProgram(StrandProgram &&) noexcept = default;
@@ -243,5 +244,246 @@ std::vector<StrandPlane> StrandProgram::set_owner(const CellId &id, bool active,
     }
     owner.active = active;
     return touched;
+}
+namespace strand_clip {
+using Wide = boost::multiprecision::int128_t;
+using F = StrandFraction;
+constexpr size_t none = std::numeric_limits<size_t>::max();
+constexpr int64_t coord_limit = std::numeric_limits<int32_t>::max() / 4;
+
+// Endpoints are within +/-2^29, so integer differences <2^30, determinants
+// <2^61 and mediant denominators <2^62. An orientation against a rational
+// point needs <125 bits. No floating point decides an interval or an XY tie.
+void check_xy(const Point &p) {
+    if (p.x() < -coord_limit || p.x() > coord_limit || p.y() < -coord_limit || p.y() > coord_limit)
+        throw std::out_of_range("Canonical strand clipping coordinate exceeds exact kernel range");
+}
+struct I { int64_t x,y; };
+I delta(const Point &b, const Point &a) { return {int64_t(b.x())-a.x(),int64_t(b.y())-a.y()}; }
+int64_t cross(I a,I b) { return a.x*b.y-a.y*b.x; }
+F fraction(int64_t n,int64_t d) {
+    if (d<0) { n=-n; d=-d; }
+    const int64_t divisor=std::gcd(n,d);
+    return {n/divisor,d/divisor};
+}
+bool less(F a,F b) { return Wide(a.numerator)*b.denominator < Wide(b.numerator)*a.denominator; }
+F interior(F a,F b) { return {a.numerator+b.numerator,a.denominator+b.denominator}; } // strict mediant
+struct Q { Wide x,y; int64_t d; };
+Q at(const Point &a,const Point &b,F t) {
+    const I v=delta(b,a);
+    return {Wide(a.x())*t.denominator+Wide(v.x)*t.numerator,
+            Wide(a.y())*t.denominator+Wide(v.y)*t.numerator,t.denominator};
+}
+struct Box { int64_t x0,y0,x1,y1;
+    bool meets(const Point &a,const Point &b)const { return std::max(a.x(),b.x())>=x0 && std::min(a.x(),b.x())<=x1 &&
+        std::max(a.y(),b.y())>=y0 && std::min(a.y(),b.y())<=y1; }
+    bool meets(const Q &p)const { return p.x>=Wide(x0)*p.d && p.x<=Wide(x1)*p.d && p.y>=Wide(y0)*p.d && p.y<=Wide(y1)*p.d; }
+};
+// During construction attribute all live logical records, including temporary
+// cut arrays, to one cap. Work already spent is never refunded.
+struct Memory { Work &w; size_t live=0;
+    void take(size_t n) { w.records(live,n); }
+    struct Temp { Memory &m; size_t count=0;
+        explicit Temp(Memory &mem):m(mem){} ~Temp(){m.live-=count;}
+        void take(size_t n=1){m.take(n);count+=n;}
+        Temp(const Temp&)=delete; Temp& operator=(const Temp&)=delete;
+    };
+};
+struct Ring {const Polygon *polygon;Box bounds;};
+struct Region { Ring outer; std::vector<Ring> holes; };
+Ring ring(const Polygon &p,Memory::Temp &space) {
+    if(p.size()<3)throw std::invalid_argument("Canonical clip mask ring has fewer than three points");
+    space.take(p.size()+1);
+    Box box{coord_limit,coord_limit,-coord_limit,-coord_limit}; Wide twice_area=0;
+    for(size_t i=0;i<p.size();++i) {
+        space.m.w.charge(); const auto &a=p.points[i], &b=p.points[(i+1)%p.size()]; check_xy(a);
+        box.x0=std::min<int64_t>(box.x0,a.x()); box.x1=std::max<int64_t>(box.x1,a.x());
+        box.y0=std::min<int64_t>(box.y0,a.y()); box.y1=std::max<int64_t>(box.y1,a.y());
+        twice_area+=Wide(a.x())*b.y()-Wide(a.y())*b.x();
+    }
+    if(twice_area==0)throw std::invalid_argument("Canonical clip mask has zero signed area");
+    return {&p,box};
+}
+Region region(const ExPolygon &p,Memory::Temp &space) {
+    Region r{ring(p.contour,space),{}}; space.take(p.holes.size()); r.holes.reserve(p.holes.size());
+    for(const auto &h:p.holes)r.holes.push_back(ring(h,space));
+    return r;
+}
+struct Hit { bool strict=false, closed=false, half=false; };
+Hit locate(const Ring &r,const Q &p,Work &w) {
+    w.charge(); if(!r.bounds.meets(p))return {};
+    bool boundary=false, inside=false;
+    const auto &points=r.polygon->points;
+    for(size_t i=0;i<points.size();++i) {
+        w.charge();const Point &a=points[i],&b=points[(i+1)%points.size()];const I v=delta(b,a);
+        const Wide ay=Wide(a.y())*p.d,by=Wide(b.y())*p.d;
+        const Wide det=Wide(v.x)*(p.y-ay)-Wide(v.y)*(p.x-Wide(a.x())*p.d);
+        if(det==0 && p.x>=Wide(std::min(a.x(),b.x()))*p.d && p.x<=Wide(std::max(a.x(),b.x()))*p.d &&
+           p.y>=std::min(ay,by) && p.y<=std::max(ay,by))boundary=true;
+        // Symbolic (+eps,+eps^2) breaks vertex/edge ties identically for
+        // neighboring surfaces. No finite tolerance dilates either mask.
+        const int sign=det>0?1:det<0?-1:v.y<0?1:v.y>0?-1:v.x>0?1:v.x<0?-1:0;
+        if ((ay<=p.y && by>p.y && sign>0) || (by<=p.y && ay>p.y && sign<0))inside=!inside;
+    }
+    return {!boundary&&inside,boundary||inside,inside};
+}
+Hit locate(const Region &r,const Q &p,Work &w) {
+    Hit h=locate(r.outer,p,w);if(!h.closed)return {};
+    for(const auto &ring:r.holes){const Hit hole=locate(ring,p,w); h.strict &= !hole.closed; h.closed &= !hole.strict; h.half &= !hole.half;}
+    return h;
+}
+void intersections(const Ring &ring,const Point &a,const Point &b,std::vector<F> &events,Memory::Temp &space) {
+    auto &w=space.m.w; w.charge(); if(!ring.bounds.meets(a,b))return;
+    const I d=delta(b,a);
+    const auto add=[&](int64_t n,int64_t den){if(den<0){n=-n;den=-den;}if(n>=0&&n<=den){space.take();events.push_back(fraction(n,den));}};
+    const auto &points=ring.polygon->points;
+    for(size_t i=0;i<points.size();++i) {
+        w.charge(); const Point &p=points[i],&q=points[(i+1)%points.size()]; const I v=delta(q,p), r=delta(p,a);
+        int64_t den=cross(d,v), t=cross(r,v), u=cross(r,d);
+        if(den!=0){if(den<0){den=-den;t=-t;u=-u;}if(u>=0&&u<=den)add(t,den);}
+        else if(u==0){ // Collinear boundary: both projected ends are events.
+            if(d.x!=0){add(r.x,d.x);add(int64_t(q.x())-a.x(),d.x);}
+            else {add(r.y,d.y);add(int64_t(q.y())-a.y(),d.y);}
+        }
+    }
+}
+void intersections(const Region &r,const Point &a,const Point &b,std::vector<F> &events,Memory::Temp &space) {
+    if(!r.outer.bounds.meets(a,b))return;
+    intersections(r.outer,a,b,events,space);for(const auto &h:r.holes)intersections(h,a,b,events,space);
+}
+void sorted_events(std::vector<F> &e,Work &w) {
+    std::sort(e.begin(),e.end(),[&](F a,F b){w.charge();return less(a,b);});
+    e.erase(std::unique(e.begin(),e.end(),[&](F a,F b){w.charge();return a==b;}),e.end());
+}
+struct Part { F lo,hi; size_t material; bool join_a,join_b; };
+struct Fragment { ClippedStrandAtom atom; Point a,b; bool join_a,join_b; };
+struct Masks {
+    const Region &surface; const std::vector<Region> &materials;
+    size_t component(const Q &p,const std::vector<size_t> &relevant,Work &w)const {
+        size_t first=none, half=none, count=0, strict=0, halves=0;
+        for(size_t id:relevant){const Hit hit=locate(materials[id],p,w);if(!hit.closed)continue;
+            if(first==none)first=id; ++count; strict+=hit.strict;
+            if(hit.half){half=id;++halves;}}
+        if(count<2)return first;
+        if(strict||halves>1)throw std::domain_error("Canonical clip requires nonoverlapping normalized material components");
+        return half==none?first:half;
+    }
+    bool joins(const Q &p,size_t id,Work &w)const { return locate(surface,p,w).strict && locate(materials[id],p,w).strict; }
+};
+
+struct Round { Point p; Wide error; };
+struct Rounds { std::array<Round,4> values; size_t count=0; };
+Rounds choices(const Q &p) {
+    const auto axis=[&](const Wide &n){const Wide d=p.d;Wide q=n/d;if(n%d<0)--q;
+        const int64_t a=q.convert_to<int64_t>();return std::pair<int64_t,int64_t>{a,a+(n%d!=0)};};
+    const auto xs=axis(p.x),ys=axis(p.y);Rounds out;
+    for(int64_t x=xs.first;x<=xs.second;++x)for(int64_t y=ys.first;y<=ys.second;++y){
+        const Wide dx=Wide(x)*p.d-p.x,dy=Wide(y)*p.d-p.y;
+        out.values[out.count++]={Point(coord_t(x),coord_t(y)),dx*dx+dy*dy};}
+    return out;
+}
+// Recheck the entire proposed integer segment, not just its endpoints. A
+// rounded boundary can cross an arbitrarily narrow hole even when both ends
+// lie in allowed material. Requiring exact midpoint coverage of every event
+// interval proves there is no positive gap. A new interior boundary touch
+// introduced by rounding needs a barrier: decline that candidate rather than
+// publishing an unmarked join. Original exact touches were already split.
+bool rounded_inside(const Point &a,const Point &b,const Masks &m,size_t id,Memory &mem) {
+    const auto in_closure=[&](const Point &p){const auto q=at(p,p,{0,1});return locate(m.surface,q,mem.w).closed&&locate(m.materials[id],q,mem.w).closed;};
+    if(!in_closure(a)||!in_closure(b))return false;
+    if(a==b)return true;
+    Memory::Temp scratch(mem);scratch.take(2);std::vector<F> cuts{{0,1},{1,1}};
+    intersections(m.surface,a,b,cuts,scratch);intersections(m.materials[id],a,b,cuts,scratch);sorted_events(cuts,mem.w);
+    for(size_t i=1;i<cuts.size();++i){
+        if(i+1<cuts.size() && !m.joins(at(a,b,cuts[i]),id,mem.w))return false;
+        const auto q=at(a,b,interior(cuts[i-1],cuts[i]));
+        if(!locate(m.surface,q,mem.w).half||!locate(m.materials[id],q,mem.w).closed)return false;}
+    return true;
+}
+std::pair<Point,Point> rounded_part(const Point &a,const Point &b,const Part &part,const Masks &m,Memory &mem) {
+    const auto l=choices(at(a,b,part.lo)),r=choices(at(a,b,part.hi));
+    // An unchanged exact subsegment already underwent the interval proof.
+    if(l.count==1&&r.count==1)return {l.values[0].p,r.values[0].p};
+    struct Pair {size_t a,b;}; std::array<Pair,16> pairs; size_t count=0;
+    for(size_t i=0;i<l.count;++i)for(size_t j=0;j<r.count;++j){
+        // Lexicographic minimization of endpoint rounding error; the fixed
+        // denominators for each endpoint make raw squared residuals comparable
+        // within that endpoint. This needs no floating-point tie breaker.
+        pairs[count++]={i,j};}
+    std::sort(pairs.begin(),pairs.begin()+count,[&](const Pair &u,const Pair &v){mem.w.charge();
+        const Round &a0=l.values[u.a],&a1=l.values[v.a],&b0=r.values[u.b],&b1=r.values[v.b];
+        if(a0.error!=a1.error)return a0.error<a1.error;
+        if(b0.error!=b1.error)return b0.error<b1.error;
+        return std::tie(u.a,u.b)<std::tie(v.a,v.b);});
+    const I d=delta(b,a);
+    for(size_t i=0;i<count;++i){mem.w.charge();const Point &x=l.values[pairs[i].a].p,&y=r.values[pairs[i].b].p;
+        const I e=delta(y,x);if(x!=y && d.x*e.x+d.y*e.y<=0)continue;
+        if(rounded_inside(x,y,m,part.material,mem))return {x,y};}
+    throw std::domain_error("Canonical clip has no legal floor/ceil rounding for a positive source fragment");
+}
+
+template<class Emit> void clip_atom(const Point &a,const Point &b,const StrandAtom &source,const Masks &m,Memory &mem,Emit &&emit) {
+    check_xy(a);check_xy(b);mem.w.charge();if(!m.surface.outer.bounds.meets(a,b))return;
+    Memory::Temp scratch(mem);std::vector<size_t> relevant;
+    for(size_t id=0;id<m.materials.size();++id){mem.w.charge();if(m.materials[id].outer.bounds.meets(a,b)){scratch.take();relevant.push_back(id);}}
+    if(relevant.empty())return;
+    if(a==b){const Q p=at(a,b,{0,1});if(!locate(m.surface,p,mem.w).half)return;
+        const size_t id=m.component(p,relevant,mem.w);if(id==none)return; const bool join=m.joins(p,id,mem.w);
+        emit(Fragment{{source,{0,1},{1,1},id},a,b,join,join});return;}
+    scratch.take(2);std::vector<F> cuts{{0,1},{1,1}};
+    intersections(m.surface,a,b,cuts,scratch);for(size_t id:relevant)intersections(m.materials[id],a,b,cuts,scratch);
+    sorted_events(cuts,mem.w);std::vector<Part> parts;
+    for(size_t i=1;i<cuts.size();++i){mem.w.charge();const F lo=cuts[i-1],hi=cuts[i]; const Q q=at(a,b,interior(lo,hi));
+        if(!locate(m.surface,q,mem.w).half)continue;
+        const size_t id=m.component(q,relevant,mem.w);if(id==none)continue;
+        bool join_a=m.joins(at(a,b,lo),id,mem.w),join_b=m.joins(at(a,b,hi),id,mem.w);
+        if(!parts.empty() && parts.back().material==id && parts.back().hi==lo && parts.back().join_b && join_a){parts.back().hi=hi;parts.back().join_b=join_b;}
+        else{scratch.take();parts.push_back({lo,hi,id,join_a,join_b});}}
+    for(const Part &p:parts){const auto xy=rounded_part(a,b,p,m,mem);emit(Fragment{{source,p.lo,p.hi,p.material},xy.first,xy.second,p.join_a,p.join_b});}
+}
+} // namespace strand_clip
+
+struct ClippedStrands::Impl {
+    std::shared_ptr<const StrandProgram::Impl> raw;
+    std::map<StrandPlane,std::vector<strand_clip::Fragment>> rows;
+    bool active(const CellId &id,Work &w)const {w.lookup(raw->owners.size());return raw->owners.at(id).active;}
+};
+ClippedStrands StrandProgram::clipped(const ExPolygon &surface,const ExPolygons &allowed,StrandBudget &budget)const {
+    using namespace strand_clip;
+    Work w(budget,impl->cancel);Memory mem{w};Memory::Temp input(mem);
+    auto out=std::make_shared<ClippedStrands::Impl>();out->raw=impl;
+    if(allowed.empty())return ClippedStrands(std::move(out));
+    const Region s=region(surface,input);std::vector<Region> material;input.take(allowed.size());material.reserve(allowed.size());
+    for(const auto &p:allowed)material.push_back(region(p,input));const Masks masks{s,material};
+    for(const auto &entry:impl->rows){w.charge();const auto &r=entry.second;
+        auto a=r.active.begin(),d=r.dormant.begin();std::vector<Fragment> parts;
+        while(a!=r.active.end()||d!=r.dormant.end()){
+            const auto &e=d==r.dormant.end() || (a!=r.active.end()&&a->first<d->first)?*a++:*d++;
+            clip_atom(*e.second.a,*e.second.b,StrandAtom{e.first,e.second.last,e.second.owner},masks,mem,[&](Fragment part){
+                mem.take(3);parts.push_back(std::move(part));});}
+        if(!parts.empty()){mem.take(1);w.lookup(out->rows.size());out->rows.emplace(entry.first,std::move(parts));}}
+    return ClippedStrands(std::move(out));
+}
+std::vector<StrandPlane> ClippedStrands::planes(StrandBudget &budget)const {
+    Work w(budget,impl->raw->cancel);std::vector<StrandPlane> out;size_t records=0;
+    for(const auto &e:impl->rows){w.charge();for(const auto &f:e.second)if(impl->active(f.atom.source.owner,w)){
+        w.records(records);out.push_back(e.first);break;}}
+    return out;
+}
+std::vector<ClippedStrandRun> ClippedStrands::runs(const StrandPlane &plane,StrandBudget &budget)const {
+    using namespace strand_clip;
+    Work w(budget,impl->raw->cancel);w.lookup(impl->rows.size());const auto row=impl->rows.find(plane);
+    std::vector<ClippedStrandRun> result;if(row==impl->rows.end())return result;
+    size_t records=0;const Fragment *previous=nullptr;
+    for(const auto &f:row->second){w.charge();if(!impl->active(f.atom.source.owner,w))continue;
+        // Connectivity is decided before looking at integer endpoints. Retain
+        // all source/material gaps even if two rounded endpoints coincide.
+        bool join=previous && previous->join_b && f.join_a && previous->atom.material_component==f.atom.material_component;
+        if(join){const auto &p=previous->atom,&c=f.atom;
+            join=((p.source.owner==c.source.owner && p.source.first==c.source.first && p.last==c.first) ||
+                  (p.source.last==c.source.first && p.last==F{1,1} && c.first==F{0,1})) && previous->b==f.a;}
+        if(!join){w.records(records,2);result.emplace_back();result.back().points.push_back(f.a);}
+        w.records(records,2);result.back().atoms.push_back(f.atom);result.back().points.push_back(f.b);previous=&f;}
+    return result;
 }
 }} // namespace Slic3r::BridgeAwareCubic

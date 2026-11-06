@@ -362,7 +362,7 @@ enum class ProfilePhase {
     CollectModel, CollectConstruction, CheckModel, CheckConstruction, CheckMixed,
     PrepareModelTargets, CompareFinalProof, CaptureFinalProof, FinalProof, Sweep,
     ConstructionSections, ConstructionMatch, ConstructionOwners, ConstructionAdd, ModelReplay,
-    ModelInputCapture, ModelInputMatch, Count
+    ModelInputCapture, ModelInputMatch, ReservationsAndSnapshot, Count
 };
 
 struct ProfileMetric {
@@ -563,7 +563,7 @@ struct ProfileState {
                     "check_model", "check_construction", "check_mixed", "prepare_model_targets", "compare_final_proof",
                     "capture_final_proof", "final_proof", "coarsening_sweep", "construction_sections",
                     "construction_match", "construction_owners", "construction_add", "model_failure_replay",
-                    "model_input_capture", "model_input_match"};
+                    "model_input_capture", "model_input_match", "reservations_and_snapshot"};
                 bool first = true;
                 for (size_t i = 0; i < metrics.size(); ++i) {
                     const auto &metric = metrics[i];
@@ -5117,6 +5117,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                 if (failures.empty()) failures = check_targets(*this, collect_targets(*this, true, false));
                 if (!failures.empty()) fail(*this, failures.front());
             }
+            ProfileScope reservation_profile(ProfilePhase::ReservationsAndSnapshot);
             // Reservation is separate from refinement demand. An added strand
             // already supported by a retained parent face must not split that
             // parent's otherwise coarse cells, but combination must retain the

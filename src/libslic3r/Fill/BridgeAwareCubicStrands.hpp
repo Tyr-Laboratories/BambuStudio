@@ -35,6 +35,29 @@ struct StrandRun {
     std::vector<StrandAtom> atoms;
 };
 
+struct StrandFraction {
+    int64_t numerator = 0, denominator = 1;
+    bool operator==(const StrandFraction &o) const { return numerator == o.numerator && denominator == o.denominator; }
+};
+struct ClippedStrandAtom {
+    StrandAtom source;
+    // Exact reduced parameters on the original rounded integer atom, not the
+    // changing run chord. Positive source intervals may round to a stationary edge.
+    StrandFraction first, last;
+    size_t material_component = 0;
+};
+struct ClippedStrandRun { Points points; std::vector<ClippedStrandAtom> atoms; };
+class ClippedStrands {
+public:
+    std::vector<StrandPlane> planes(StrandBudget &) const;
+    std::vector<ClippedStrandRun> runs(const StrandPlane &, StrandBudget &) const;
+private:
+    friend class StrandProgram;
+    struct Impl;
+    explicit ClippedStrands(std::shared_ptr<const Impl> p) : impl(std::move(p)) {}
+    std::shared_ptr<const Impl> impl;
+};
+
 class StrandProgram {
 public:
     ~StrandProgram();
@@ -45,13 +68,19 @@ public:
     std::vector<StrandPlane> planes(StrandBudget &) const;
     std::vector<StrandRun> runs(const StrandPlane &, StrandBudget &) const;
     bool contains_owner(const CellId &, StrandBudget &) const;
+    // One actual overlap-adjusted sparse component, and the already inset
+    // allowed center domains for its complete bead width (empty permits none).
+    // Copies of the immutable clipped view observe this catalog's owner edits;
+    // externally synchronize edits/reads. This supplies no physical certificate.
+    ClippedStrands clipped(const ExPolygon &surface, const ExPolygons &allowed_centers, StrandBudget &) const;
     // Remove or restore a catalog owner, touching at most three rows. Unknown
     // owners throw out_of_range. Exceptions leave the previous program intact.
     std::vector<StrandPlane> set_owner(const CellId &, bool active, StrandBudget &);
 private:
     friend class Plan;
+    friend class ClippedStrands;
     struct Impl;
-    std::unique_ptr<Impl> impl;
+    std::shared_ptr<Impl> impl;
     StrandProgram(double z, double bulk_edge, const Vec3d &origin, const Matrix3d &to_world,
                   const std::vector<Refinement> &, std::function<void()> cancel, StrandBudget &);
 };
