@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -122,6 +124,7 @@ public:
     const std::vector<Token> *expected_tokens;
     bool *inside_cancel;
     bool ok = true;
+    bool trace_miss = false, traced_miss = false;
 };
 
 void value(Stream &out, double v) { out.scalar(v); }
@@ -165,6 +168,10 @@ template<class Config> void config(Stream &out, const Config &config)
         if (option == nullptr) return out.decline();
         out.scalar(int(option->type()));
         out.boolean(option->nullable());
+        // On a value mismatch, bytes still points to the start of the
+        // failed scalar. Retain the option value start independently.
+        const size_t value_begin = out.bytes;
+        const bool reached_value = out.ok;
         switch (option->type()) {
         case coFloat: case coPercent: out.scalar(option->getFloat()); break;
         case coInt: case coEnum: out.scalar(option->getInt()); break;
@@ -186,6 +193,31 @@ template<class Config> void config(Stream &out, const Config &config)
         case coPointsGroups: option_vector<Vec2ds>(out, *option); break;
         case coIntsGroups: option_vector<std::vector<int>>(out, *option); break;
         default: return out.decline();
+        }
+        if (!out.ok && out.trace_miss && !out.traced_miss) {
+            out.traced_miss = true;
+            const char *scope = std::is_same<Config, PrintConfig>::value ? "PrintConfig" :
+                                std::is_same<Config, PrintObjectConfig>::value ? "PrintObjectConfig" : "PrintRegionConfig";
+            // Report names only for arbitrary config options. Restrict
+            // value reporting to the two known integer mapping fields; no
+            // machine snippets, credentials or other user data are emitted.
+            if (reached_value && option->type() == coInts &&
+                (key == "filament_map_2" || key == "filament_nozzle_map") &&
+                value_begin <= out.expected->size() && out.expected->size() - value_begin >= sizeof(uint64_t)) {
+                uint64_t old_size = 0;
+                std::memcpy(&old_size, out.expected->data() + value_begin, sizeof(old_size));
+                const auto *now = dynamic_cast<const ConfigOptionVector<int> *>(option);
+                if (now && old_size == 1 && now->values.size() == 1 &&
+                    out.expected->size() - value_begin - sizeof(old_size) >= sizeof(int)) {
+                    int old_value = 0;
+                    std::memcpy(&old_value, out.expected->data() + value_begin + sizeof(old_size), sizeof(old_value));
+                    std::fprintf(stderr, "BAC_CERT_FIRST_MISS scope=%s key=%s type=coInts index=0 previous=%d current=%d byte=%zu\n",
+                        scope, key.c_str(), old_value, now->values.front(), out.bytes);
+                    return;
+                }
+            }
+            std::fprintf(stderr, "BAC_CERT_FIRST_MISS scope=%s key=%s option_type=%d part=%s byte=%zu\n",
+                scope, key.c_str(), int(option->type()), reached_value ? "value" : "metadata", out.bytes);
         }
     }
 }
@@ -429,15 +461,27 @@ bool DepositionStateSnapshot::matches(const PrintObject &geometry, const PrintOb
     const std::vector<SerializedXY> &phases, const Cancel &cancel) const
 {
     if (cancel) cancel();
-    if (!phase_guard(phases, m_impl->limits)) return false;
+    const char *setting = std::getenv("BAC_TRACE_FINAL_PROOF_MISS");
+    const bool trace = setting && setting[0] == '1' && setting[1] == '\0';
+    if (!phase_guard(phases, m_impl->limits)) {
+        if (trace) std::fprintf(stderr, "BAC_CERT_FIRST_MISS scope=phase_admission\n");
+        return false;
+    }
     for (const auto &phase : phases) {
         if (cancel) cancel();
         if (std::none_of(m_impl->phases.begin(), m_impl->phases.end(),
-                [&](const SerializedXY &retained) { return same_phase(phase, retained); })) return false;
+                [&](const SerializedXY &retained) { return same_phase(phase, retained); })) {
+            if (trace) std::fprintf(stderr, "BAC_CERT_FIRST_MISS scope=phase_subset\n");
+            return false;
+        }
     }
     Stream compare(Stream::Mode::Compare, m_impl->limits, cancel, nullptr, nullptr, &m_impl->bytes, &m_impl->tokens);
+    compare.trace_miss = trace;
     compare.item(m_impl->phases.size());
     state(compare, geometry, caller);
+    if (trace && !compare.ok && !compare.traced_miss)
+        std::fprintf(stderr, "BAC_CERT_FIRST_MISS scope=nonoption_or_admission byte=%zu token=%zu\n",
+            compare.bytes, compare.token_count);
     return compare.ok;
 }
 

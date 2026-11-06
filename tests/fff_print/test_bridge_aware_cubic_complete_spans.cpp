@@ -2,6 +2,7 @@
 
 #include "libslic3r/Fill/BridgeAwareCubicContact.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicValidation.hpp"
+#include "libslic3r/Fill/BridgeAwareCubicProofShadow.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -383,4 +384,51 @@ TEST_CASE("Complete contact spans accept an empty collection without inventing c
     CHECK(result.void_cells.empty());
     CHECK(result.max_unsupported_mm == 0.);
     CHECK(result.max_void_diameter_mm == 0.);
+}
+
+TEST_CASE("Proof shadow distinguishes actual line support from mask-only support",
+          "[BridgeAwareCubic][ProofShadow]")
+{
+    namespace S = BridgeAwareCubic::ProofShadow;
+    const auto line = path({{0., 0.}, {4., 0.}});
+    auto c = masked(line, {rectangle(-1., -1., 5., 1.)});
+    REQUIRE(complete(line, c, 4.1, 0.).passed());
+    size_t work = 1000000;
+    const auto noop = [] {};
+    CHECK(S::lines(line, c, 4.1, work, noop) == S::Outcome::Fail);
+    ExtrusionPath upper(erInternalInfill, .08, .45f, .2f); upper.polyline = line;
+    ExtrusionPath left(erPerimeter, .08, .2f, .2f), right = left;
+    left.polyline = path({{0., -1.}, {0., 1.}}); right.polyline = path({{4., -1.}, {4., 1.}});
+    const auto prep = Contact::prepare_lower({{&left,.2},{&right,.2}}, .4, upper.height);
+    c = Contact::footprint(*prep, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    REQUIRE(c.input_valid); REQUIRE(c.completed);
+    CHECK(S::lines(line, c, 4.1, work, noop) == S::Outcome::Pass);
+    CHECK(S::lines(line, c, 4., work, noop) == S::Outcome::Fail);
+    CHECK(work < 1000000);
+    size_t exhausted = 0;
+    CHECK(S::lines(line, c, 4.1, exhausted, noop) == S::Outcome::Unavailable);
+    CHECK_THROWS_AS(S::lines(line, c, 4.1, work, [] { throw std::runtime_error("shadow canceled"); }), std::runtime_error);
+    c.resource_limited = true;
+    CHECK(S::lines(line, c, 4.1, work, noop) == S::Outcome::Unavailable);
+}
+
+TEST_CASE("Proof shadow only labels fully observed valid empty layer visits",
+          "[BridgeAwareCubic][ProofShadow]")
+{
+    namespace S = BridgeAwareCubic::ProofShadow;
+    S::Row r;
+    Validation::Result pass;
+    { S::Layer v{&r, false}; v.begin(3, 2); v.note(true, pass, S::Clock::now()); v.note(true, pass, S::Clock::now()); }
+    { S::Layer v{&r, false}; v.begin(3, 2); v.note(true, pass, S::Clock::now()); }
+    { S::Layer v{&r, false}; v.begin(3, 1); v.note(false, pass, S::Clock::now()); }
+    { S::Layer v{&r, true}; v.begin(3, 1); v.note(true, pass, S::Clock::now()); }
+    { S::Layer v{&r, false}; v.begin(3, 1); Validation::Result bad; bad.completed = false; v.note(true, bad, S::Clock::now()); }
+    { S::Layer v{&r, false, false}; v.begin(3, 1); v.note(true, pass, S::Clock::now()); }
+    CHECK(r.layer_unqualified == 1);
+    CHECK(r.layer_empty == 1);
+    CHECK(r.layer_unknown == 2);
+    CHECK(r.layer_nonempty == 1);
+    CHECK(r.layer_probe == 1);
+    CHECK(r.direct_empty_pass == 5);
+    CHECK(r.direct_invalid == 1);
 }

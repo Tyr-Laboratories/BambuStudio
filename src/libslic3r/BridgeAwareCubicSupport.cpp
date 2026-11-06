@@ -17,6 +17,7 @@
 #include "Fill/BridgeAwareCubicFailureReplay.hpp"
 #include "Fill/BridgeAwareCubicContainment.hpp"
 #include "Fill/BridgeAwareCubicCertificate.hpp"
+#include "Fill/BridgeAwareCubicProofShadow.hpp"
 #include "Fill/BridgeAwareCubicOwnerBounds.hpp"
 
 #include <algorithm>
@@ -349,6 +350,7 @@ ModelCollectionInputs::Usage ModelCollectionInputs::capture_peak_usage() const n
 namespace {
 namespace Dependency = BridgeAwareCubic::Dependencies;
 namespace Contact = BridgeAwareCubicContact;
+namespace Shadow = BridgeAwareCubic::ProofShadow;
 
 // Opt-in, aggregate-only profiling. Set BAC_PROFILE_FILE to a unique JSONL
 // destination; BAC_PROFILE_STAGE is an optional caller label (e.g. export).
@@ -412,6 +414,7 @@ struct ProfileState {
     bool full_trial_checks = false;
     bool audit_emission_collection = false;
     bool audit_contact_epochs = false;
+    std::unique_ptr<Shadow::Metrics> shadow;
     bool audit_complete_spans = false;
     bool audit_sparse_rejections = false;
     bool truncated = false;
@@ -577,6 +580,7 @@ struct ProfileState {
                         << ",\"upper_segment_slots\":" << metric.upper_segments << ",\"lower_segment_slots\":" << metric.lower_segments << '}';
                 }
                 out << ']';
+                if (shadow) shadow->write(out);
             }
             out << "}\n";
         } catch (...) { /* Diagnostics must not change slicing or exception flow. */ }
@@ -607,6 +611,11 @@ public:
                 state->audit_sparse_rejections = audit[0] == '1' && audit[1] == '\0';
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_COMPLETE_SPANS"))
                 state->audit_complete_spans = audit[0] == '1' && audit[1] == '\0';
+            if (const char *flag = std::getenv("BAC_PROFILE_SHADOW_PROOFS"); flag && std::string_view(flag) == "1") {
+                try { state->shadow = std::make_unique<Shadow::Metrics>(); }
+                catch (const std::bad_alloc &) { /* Preserve all ordinary profiling/reference flags. */ }
+                if (state->shadow && std::string_view(session) == "validate") state->shadow->stage = Shadow::Stage::Export;
+            }
             static std::atomic<uint64_t> sequence{0};
             state->sequence = ++sequence;
             if (const char *stage = std::getenv("BAC_PROFILE_STAGE"))
@@ -660,16 +669,22 @@ class ProfileSweep {
     ProfileState *state = active_profile;
     ProfileScope timing{ProfilePhase::Sweep};
     ProfileState::Clock::time_point started;
+    Shadow::Stage saved_shadow_stage = Shadow::Stage::Initial;
     uint64_t number, trials = 0, accepted = 0, rejected = 0, repeated = 0, closures = 0;
 public:
     explicit ProfileSweep(uint64_t number) : number(number) {
         if (state) {
             started = ProfileState::Clock::now();
+            if (state->shadow) {
+                saved_shadow_stage = state->shadow->stage;
+                state->shadow->stage = number == 1 ? Shadow::Stage::FirstSweep : Shadow::Stage::LaterSweep;
+            }
             trials = state->trials; accepted = state->accepted; rejected = state->rejected;
             repeated = state->repeated; closures = state->closure_trials;
         }
     }
     ~ProfileSweep() {
+        if (state && state->shadow) state->shadow->stage = saved_shadow_stage;
         if (state) state->write("sweep", uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
             ProfileState::Clock::now() - started).count()), number, state->trials - trials,
             state->accepted - accepted, state->rejected - rejected, state->repeated - repeated,
@@ -2939,6 +2954,8 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
     BridgeAwareCubicValidation::WorkBudget local_budget;
     auto &budget = context && context->budget ? *context->budget : local_budget;
     const auto *probe = context && mode == TargetCheck::RejectTrial ? context->probe : nullptr;
+    auto *shadow = active_profile ? active_profile->shadow.get() : nullptr;
+    auto *shadow_row = shadow ? &shadow->at() : nullptr;
     auto *span_proofs = context && !probe && mode == TargetCheck::RejectTrial &&
         !(active_profile && active_profile->full_trial_checks) ? context->span_proofs : nullptr;
     auto *contact_epochs = span_proofs ? context->contact_epochs : nullptr;
@@ -3033,6 +3050,9 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
         std::unique_ptr<BridgeAwareCubicContact::QueryCache> contact_queries;
         std::optional<BridgeAwareCubic::SpanProofCache::EpochContext> span_epoch;
         bool epoch_attempted = false;
+        Shadow::Layer shadow_layer{shadow_row, probe != nullptr, shadow &&
+            (shadow->stage == Shadow::Stage::Final || shadow->stage == Shadow::Stage::Export ||
+             (context && context->frozen_indices))};
         // The source pointers and budget outlive the transaction. Publication
         // is possible only after every ordered frozen group on this layer has
         // passed; a partial view or rejected path cannot produce a cache hit.
@@ -3044,6 +3064,19 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
         for (size_t target_index = 0; target_index < targets.size(); ++target_index) {
             if (probe && probe->target != target_index) continue;
             const Target &target = targets[target_index];
+            if (shadow && shadow_layer.id != target.upper_layer) {
+                size_t expected = 0;
+                bool enumerated = true;
+                for (size_t j = target_index; j < targets.size() && targets[j].upper_layer == target.upper_layer; ++j) {
+                    if (j - target_index >= 4096 || !shadow->remaining) { enumerated = false; break; }
+                    --shadow->remaining;
+                    if ((j - target_index) % 256 == 0) cancel();
+                    if (!targets[j].dependency && !targets[j].bridge_followup)
+                        expected += targets[j].paths.size();
+                }
+                shadow_layer.begin(target.upper_layer, enumerated ? expected : std::max(expected, size_t(1)));
+                shadow_layer.unknown = !enumerated;
+            }
             const size_t frozen_index = complete_frozen_probe ? target_index :
                 cached_phase ? prepared_model->frozen_indices.at(target_index) : 0;
             if (object.print()->canceled()) throw CanceledException();
@@ -3126,6 +3159,10 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                 // A source path made entirely of repeated points emits no
                 // segment and supplies neither a demand nor support.
                 if (upper.polyline.size() < 2) continue;
+                const bool shadow_direct = shadow && !target.dependency && !target.bridge_followup;
+                const auto shadow_started = shadow ? Shadow::Clock::now() : Shadow::Clock::time_point{};
+                if (shadow_direct) ++shadow_row->direct_started;
+                bool shadow_selected_empty = false;
                 profile.upper(upper.polyline.size() - 1);
                 const double upper_z = deposition_z(*object.layers()[target.upper_layer]);
                 BridgeAwareCubicContact::PreparedLowerPtr lower_contact;
@@ -3178,7 +3215,10 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     // every unavailable/changed identity retains that fallback.
                     const bool matched = span_proofs->matches(span_query, &budget, cancel);
                     profile_span_proofs();
-                    if (matched) continue;
+                    if (matched) {
+                        if (shadow) ++shadow_row->span_preproved;
+                        continue;
+                    }
                 }
                 // A continuous contact line proves the path span, but it is
                 // not a physical wall bounding the independent model-cell
@@ -3240,6 +3280,7 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     if (!contact.input_valid || !contact.completed || contact.segments.empty()) unsupported = {upper.polyline};
                     const ExPolygons selected = intersection_ex(path_selection,
                         union_ex(offset(unsupported, scale_(.5 * target.path_widths[index]))));
+                    if (shadow_direct) shadow_selected_empty = selected.empty();
                     if (target.bridge_followup || target.dependency || selected.empty() || !contact.input_valid || !contact.completed) {
                         // Construction and follow-up paths require actual prior
                         // anchors and bounded complete air runs. They do not turn
@@ -3247,6 +3288,7 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                         checked = BridgeAwareCubicValidation::validate_contacts({}, contact.physical_footprint,
                             {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
                     } else {
+                        Shadow::Timer cell_time{shadow_direct ? &shadow_row->direct_cell_ns : nullptr};
                         // Raw occupied material is independent of upper direction
                         // at the same selected contact plane. Reuse only immutable
                         // geometry from this exact lower layer and output phase.
@@ -3281,6 +3323,34 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                         else
                             checked = BridgeAwareCubicValidation::validate_prepared_contact_failures(*found->second,
                                 {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                    }
+                }
+                if (shadow_direct) {
+                    if (contact.input_valid && contact.completed && !contact.resource_limited && contact.failure_reason.empty())
+                        shadow_layer.note(shadow_selected_empty, checked, shadow_started);
+                    else {
+                        shadow_layer.unknown = true;
+                        ++shadow_row->direct_invalid;
+                    }
+                } else if (shadow) {
+                    if (support_query.entire_path_supported) ++shadow_row->span_shortcut;
+                    else if (!checked.input_valid || !checked.completed || checked.resource_limited)
+                        ++shadow_row->line_unknown;
+                    else {
+                        const auto reference_ns = Shadow::ns(shadow_started);
+                        Shadow::Timer line_time{&shadow_row->line_ns};
+                        const auto proof = Shadow::lines(upper.polyline, contact, target.gap, shadow->remaining, cancel);
+                        switch (proof) {
+                        case Shadow::Outcome::Pass:
+                            ++shadow_row->line_pass; shadow_row->line_pass_reference_ns += reference_ns;
+                            if (!checked.passed()) ++shadow_row->line_pass_reference_fail;
+                            break;
+                        case Shadow::Outcome::Fail:
+                            ++shadow_row->line_fail; shadow_row->line_fail_reference_ns += reference_ns;
+                            if (checked.passed()) ++shadow_row->line_fail_reference_pass;
+                            break;
+                        case Shadow::Outcome::Unavailable: ++shadow_row->line_unknown; break;
+                        }
                     }
                 }
                 if (audit_complete_span) {
@@ -5109,6 +5179,7 @@ void PrintObject::prepare_bridge_aware_cubic()
             const auto final_phases = serialization_phases(*this, nullptr);
             {
                 ProfileScope profile(ProfilePhase::FinalProof);
+                Shadow::RestoreStage final_shadow{active_profile ? active_profile->shadow.get() : nullptr, Shadow::Stage::Final};
                 final_proof_preamble(*this, *this, final_phases);
                 const auto final_model_targets = collect_targets(*this, false, false);
                 if (!same_model_targets(roofs, final_model_targets))
