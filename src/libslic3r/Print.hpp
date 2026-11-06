@@ -478,6 +478,13 @@ public:
     void 			clear_layers();
     const BridgeAwareCubic::Plan* bridge_aware_cubic_plan(size_t region_id) const;
     bool has_bridge_aware_cubic() const;
+    // Experimental, synchronous opt-in before process(); never a cache-admission policy.
+    void request_canonical_cubic_pilot() {
+        if (!m_layers.empty() || !m_bridge_aware_cubic_plans.empty())
+            throw std::logic_error("Canonical cubic pilot must be selected before slicing");
+        m_canonical_cubic_pilot = true;
+    }
+    bool canonical_cubic_pilot() const noexcept { return m_canonical_cubic_pilot; }
     const ExPolygons& bridge_aware_cubic_reservations(size_t layer_id, size_t region_id) const;
     const Layer* 	get_layer(int idx) const { return m_layers[idx]; }
     Layer* 			get_layer(int idx) 		 { return m_layers[idx]; }
@@ -694,6 +701,7 @@ private:
     FillLightning::GeneratorPtr m_lightning_generator;
     // Imported toolpaths do not include the generators or pre-bridge surfaces needed for refill.
     bool m_cached_infill_dependencies_missing = false;
+    bool m_canonical_cubic_pilot = false;
     std::vector<std::unique_ptr<BridgeAwareCubic::Plan>> m_bridge_aware_cubic_plans;
     std::vector<std::vector<ExPolygons>> m_bridge_aware_cubic_reservations;
     // Exact owned state from a complete successful proof; shared callers use

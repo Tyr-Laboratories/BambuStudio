@@ -4,6 +4,8 @@
 #include "../BoundingBox.hpp"
 #include "../ExPolygon.hpp"
 #include "../Polyline.hpp"
+#include "BridgeAwareCubicSerialization.hpp"
+#include <optional>
 
 #include <cstddef>
 #include <array>
@@ -79,6 +81,7 @@ struct Parameters {
     // Solid regions are construction obligations, not deposited material.
     // The consuming filler/validator must construct and certify them.
     bool allow_solid_fallback = false;
+    std::optional<SerializedXY> canonical_phase; // immutable pilot placement, absent in normal slicing
 };
 
 struct Statistics {
@@ -159,6 +162,7 @@ public:
     Polylines lines(double z, const ExPolygon &domain) const;
     // Raw added partition strands, before clipping, flow and physical validation.
     StrandProgram strand_program(double z, StrandBudget &budget) const;
+    Polylines inherited_bulk(double z, const ExPolygon &domain) const;
     // Optional provenance for the identical lines() geometry and order.
     // Metadata admission is bounded by capacity_units (at most 200000,
     // measured in sizeof(Point) storage units) and 20000 records. Whole vector

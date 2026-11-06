@@ -29,3 +29,9 @@ The diagnostic captures each filler call's overlap-adjusted surface and actual i
 | Changed rows / baseline row visits | 862 / 7,560 | 821 / 15,534 | 417 / 4,452 |
 
 All 1,392 incremental comparisons matched fresh geometry. The cavity exercised 40 holes in inset components and 87 exact gaps. Ten focused raw, clipping and lease cases passed 4,247 assertions. The comparison establishes the clipping and ownership behavior of these samples. G-code deposition and the end-to-end timing gate require separate qualification for a generator that consumes these fragments.
+
+## First emitted roof
+
+An opt-in, single-region generator now emits clipped partition runs as sparse paths. Each moving edge retains its source cell. Generated endpoints, including repaired terminals, participate in ordinary construction, coarsening and final support checks. This first experiment regenerates whole layers so that later incremental-generation changes can be compared with a complete reference.
+
+The 32 × 28 × 18 mm cube with a 5 mm gap produced 2,626 actual partition paths from 3,896 source atoms and seven attachment records. The exported roof passed the existing contact, closed-opening, unsupported-run and E-per-moving-distance checks (34,777 assertions). The no-generator control failed at the required generator-selection check. This result covers one placement, layer height and relative-E mode. Expanding the experiment requires independent checks for orphan attachment records, cross-role duplicate material and post-rounding containment.

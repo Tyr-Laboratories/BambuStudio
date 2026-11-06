@@ -994,6 +994,10 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
 		params.resolution = resolution;
 		params.use_arachne = false;
 		params.layer_height = layerm.layer()->height;
+        if (surface_fill.params.pattern==ipBridgeAwareCubic) {
+            const auto *p=static_cast<FillBridgeAwareCubic *>(f.get())->plan;
+            if (p && p->parameters().canonical_phase) params.flow=surface_fill.params.flow;
+        }
 		params.conformal = surface_fill.params.conformal_infill;
 		params.conformal_stagger = surface_fill.params.conformal_stagger;
 		params.conformal_link_keep_layers = surface_fill.params.conformal_link_keep_layers;

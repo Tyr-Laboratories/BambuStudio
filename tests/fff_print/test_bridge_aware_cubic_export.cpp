@@ -1,6 +1,8 @@
 #include <catch2/catch.hpp>
 
 #include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/Fill/BridgeAwareCubicPilot.hpp"
+#include "libslic3r/Fill/BridgeAwareCubicAttachment.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicContact.hpp"
 #include "libslic3r/Fill/BridgeAwareCubic.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicStrands.hpp"
@@ -409,17 +411,8 @@ TEST_CASE("Bridge aware cubic export observer preserves the exact decimal XY gri
     CHECK(delta.cast<double>().norm() * SCALING_FACTOR == Approx(std::hypot(15.023, 15.023)).margin(1e-12));
 }
 
-TEST_CASE("Bridge aware cubic exported coordinates retain roof gaps and preview support geometry",
-          "[BridgeAwareCubic][Integration][Export]")
+static void observe_real_roof_export(bool translated, double layer_height, bool relative_e, bool pilot)
 {
-    // The fractional placement exercises serialization after instance and
-    // plate translation, including rounding phases absent from local paths.
-    // Retain the four placement/height cases and add one full absolute-E
-    // certificate check, rather than duplicating the geometry matrix.
-    const auto [translated, layer_height, relative_e] = GENERATE(
-        std::make_tuple(false, .2, true), std::make_tuple(true, .2, true),
-        std::make_tuple(false, .2004, true), std::make_tuple(true, .2004, true),
-        std::make_tuple(true, .2004, false));
     CAPTURE(translated, layer_height, relative_e);
     ExportWorkspace workspace;
     auto config = export_config();
@@ -439,7 +432,52 @@ TEST_CASE("Bridge aware cubic exported coordinates retain roof gaps and preview 
     print.auto_assign_extruders(model_object);
     print.apply(model, config);
     if (translated) print.set_plate_origin(Vec3d(11.00013, 7.00029, 0.));
+    auto *object = const_cast<PrintObject *>(print.get_object(size_t(0)));
+    if (pilot) object->request_canonical_cubic_pilot();
     REQUIRE_NOTHROW(print.process());
+    if (pilot) {
+        const auto *plan = object->bridge_aware_cubic_plan(0);
+        REQUIRE(plan != nullptr);
+        REQUIRE(plan->parameters().canonical_phase.has_value());
+        size_t paths = 0, atoms = 0, attachments = 0, matched_attachments = 0, preview_checked = 0;
+        double added_mm3 = 0.;
+        const auto inspect = [&](auto &&self, const ExtrusionEntity &entity, const auto &visit) -> void {
+            if (const auto *p = dynamic_cast<const ExtrusionPath *>(&entity)) visit(*p);
+            else if (const auto *c = dynamic_cast<const ExtrusionEntityCollection *>(&entity))
+                for (const auto *child : c->entities) self(self, *child, visit);
+        };
+        for (const Layer *layer : object->layers()) {
+            const auto active=plan->attachments(layer->print_z);
+            attachments += active.size();
+            for (const auto &entry:active) {
+                const auto resolved=BridgeAwareCubicAttachment::resolve_chain(entry.original,entry.width,entry.height,entry.emitting_region,active);
+                if (resolved.applied_indices.empty()) continue;
+                bool emitted=false;
+                const auto match=[&](const ExtrusionPath &p){emitted|=p.width==entry.width && p.height==entry.height && p.polyline==resolved.polyline;};
+                for (const LayerRegion *r:layer->regions()) {visit_paths(r->perimeters,match);visit_paths(r->fills,match);}
+                matched_attachments+=emitted;
+            }
+            Polylines emitted_partitions;
+            for (const LayerRegion *region : layer->regions()) inspect(inspect, region->fills, [&](const ExtrusionPath &path) {
+                if (const auto *course = dynamic_cast<const BridgeAwareCubic::PilotPath *>(&path); course && course->partition()) {
+                    emitted_partitions.push_back(path.polyline);
+                    ++paths; atoms += course->source.atoms.size(); added_mm3 += unscale<double>(path.length()) * path.mm3_per_mm;
+                }
+            });
+            if (!preview_checked && !emitted_partitions.empty()) {
+                auto preview=layer->generate_sparse_infill_polylines_for_anchoring(nullptr,nullptr,nullptr);
+                for (const auto &line:emitted_partitions) {
+                    auto i=std::find(preview.begin(),preview.end(),line);
+                    REQUIRE(i!=preview.end());preview.erase(i);++preview_checked;
+                }
+            }
+        }
+        CAPTURE(paths, atoms, attachments, matched_attachments, preview_checked, added_mm3);
+        REQUIRE(matched_attachments>0); REQUIRE(preview_checked>0);
+        REQUIRE(paths > 0); REQUIRE(atoms >= paths); REQUIRE(attachments > 0); REQUIRE(added_mm3 > 0.);
+        std::cout << "BAC_ACTUAL_CANONICAL paths=" << paths << " atoms=" << atoms << " attachments=" << attachments
+                  << " partition_preview_mm3=" << added_mm3 << std::endl;
+    }
     GCodeProcessorResult preview;
     std::string filename;
     REQUIRE_NOTHROW(filename = print.export_gcode((workspace.path / "roof.gcode").string(), &preview));
@@ -571,6 +609,25 @@ TEST_CASE("Bridge aware cubic exported coordinates retain roof gaps and preview 
     // At least one tested source edge changes length enough on the output grid
     // to reject the former source-length E calculation by a wide margin.
     REQUIRE(volume_rounding_witnesses > 0);
+}
+
+TEST_CASE("Bridge aware cubic exported coordinates retain roof gaps and preview support geometry",
+          "[BridgeAwareCubic][Integration][Export]")
+{
+    // The fractional placement exercises serialization after instance and
+    // plate translation, including rounding phases absent from local paths.
+    // Retain the four placement/height cases and add one full absolute-E
+    // certificate check, rather than duplicating the geometry matrix.
+    const auto [translated, layer_height, relative_e] = GENERATE(
+        std::make_tuple(false, .2, true), std::make_tuple(true, .2, true),
+        std::make_tuple(false, .2004, true), std::make_tuple(true, .2004, true),
+        std::make_tuple(true, .2004, false));
+    observe_real_roof_export(translated, layer_height, relative_e, false);
+}
+
+TEST_CASE("Canonical pilot actually prints and certifies the small roof", "[.][BACCanonicalGenerationSmall]")
+{
+    observe_real_roof_export(false, .2, true, true);
 }
 
 TEST_CASE("Bridge aware cubic export retains ordinary fitted arcs in a mixed print",
@@ -1674,4 +1731,20 @@ TEST_CASE("Actual fill domain observer leases survive uninstall and reject neste
         REQUIRE(std::atomic_load(&Slic3r::BridgeAwareCubic::diagnostic_domain_probe)==replacement);
     }
     REQUIRE_FALSE(std::atomic_load(&Slic3r::BridgeAwareCubic::diagnostic_domain_probe));
+}
+
+TEST_CASE("Canonical generation keeps ownership and splits at stationary source atoms", "[BACCanonicalGenerationUnit]")
+{
+    using namespace BridgeAwareCubic;
+    const CellId a{{1,2,3},1}, b{{2,2,3},1};
+    ClippedStrandRun run;
+    run.points = {Point(0,0),Point(100,0),Point(101,0),Point(200,0),Point(300,0)};
+    for (int i=0; i<4; ++i) run.atoms.push_back({{{i,false},{i+1,false},i<2?a:b},{0,1},{1,1},0});
+    const auto out = pilot_courses({0,1,1},run,SerializedXY{});
+    REQUIRE(out.size()==2); REQUIRE(out[0].points==Points{Point(0,0),Point(100,0)});
+    REQUIRE(out[1].points==Points{Point(101,0),Point(200,0),Point(300,0)});
+    REQUIRE(out[0].atoms.size()==1); REQUIRE(out[1].atoms.size()==2);
+    REQUIRE(out[0].atoms.front().source.owner==a); REQUIRE(out[1].atoms.front().source.owner==b);
+    run.points={Point(100,0),Point(101,0)};run.atoms.resize(1);
+    REQUIRE(pilot_courses({0,1,1},run,SerializedXY{}).empty());
 }

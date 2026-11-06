@@ -1014,8 +1014,15 @@ StrandProgram Plan::strand_program(double z, StrandBudget &budget) const
         m_impl->has_elevation(z) ? m_impl->refinements : empty, m_impl->parameters.throw_if_canceled, budget);
 }
 
+Polylines Plan::inherited_bulk(double z, const ExPolygon &domain) const
+{
+    m_impl->cancel();
+    return m_impl->has_elevation(z) ? m_impl->bulk(z, domain) : Polylines{};
+}
+
 Polylines Plan::lines(double z, const ExPolygon &domain) const
 {
+    if (parameters().canonical_phase) throw std::logic_error("Canonical pilot requires actual scoped surface and material masks");
     m_impl->cancel();
     if (!m_impl->has_elevation(z))
         return {};
@@ -1041,6 +1048,7 @@ TaggedLineBatch Plan::tagged_lines(double z, const ExPolygon &domain, size_t cap
         unavailable.paths = lines(z, domain);
         return unavailable;
     };
+    if (parameters().canonical_phase) throw std::logic_error("Legacy tagged lines are not canonical pilot output");
     // Initial provenance consumers cannot yet prove the solid/closure output
     // and attachment policy as one emitter. Keep their ordinary path intact.
     if (capacity_units == 0 || !solid_area(z).empty()) return ordinary();
@@ -1092,6 +1100,7 @@ ReferenceLineBatch Plan::reference_lines(double z, const BoundingBox &bounds, si
                                        BridgeAwareCubicValidation::WorkBudget *budget) const
 {
     m_impl->cancel();
+    if (parameters().canonical_phase) return {}; // legacy optional descriptor cannot certify this representation
     const bool in_range = m_impl->has_elevation(z);
     if (!bounds.defined || bounds.min.x() >= bounds.max.x() || bounds.min.y() >= bounds.max.y()) return {};
     // Match the consumer's safe integer domain before any native clipping;
@@ -1152,6 +1161,7 @@ ReferenceLineBatch Plan::reference_lines(double z, const BoundingBox &bounds, si
 
 Polylines Plan::refinement_lines(double z, const ExPolygon &domain) const
 {
+    if (parameters().canonical_phase) throw std::logic_error("Canonical pilot requires actual scoped surface and material masks");
     m_impl->cancel();
     if (!m_impl->has_elevation(z)) return {};
     const ExPolygons solid = solid_area(z);
@@ -1171,6 +1181,7 @@ Polylines Plan::partition_lines(const CellId &owner, double z, const ExPolygon &
 
 std::vector<std::pair<CellId, Polylines>> Plan::partition_lines(double z, const ExPolygon &domain) const
 {
+    if (parameters().canonical_phase) throw std::logic_error("Canonical pilot requires actual scoped surface and material masks");
     m_impl->cancel();
     if (!m_impl->has_elevation(z)) return {};
     const ExPolygons solid = solid_area(z);

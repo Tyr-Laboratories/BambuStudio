@@ -3,6 +3,8 @@
 
 #include "FillRectilinear.hpp"
 #include "BridgeAwareCubic.hpp"
+#include "BridgeAwareCubicPilot.hpp"
+#include "BridgeAwareCubicAttachment.hpp"
 #include "BridgeAwareCubicDomainProbe.hpp"
 #include "BridgeAwareCubicEmissionLedger.hpp"
 #include "BridgeAwareCubicValidation.hpp"
@@ -46,6 +48,30 @@ public:
     void fill_surface_extrusion(const Surface *surface, const FillParams &params, ExtrusionEntitiesPtr &out) override
     {
         clear_capture();
+        if (plan && plan->parameters().canonical_phase) {
+            if (emission_builder) emission_builder->decline();
+            if (params.use_arachne || !params.using_internal_flow || params.extrusion_role!=erInternalInfill)
+                throw std::domain_error("Canonical pilot requires ordinary sparse flow");
+            // The native fill converter preserves flow, role, ordering and reversal.
+            // Bind EVERY produced child (including bulk) before returning it.
+            std::vector<BridgeAwareCubic::PilotCourse> courses;
+            auto generated = canonical_surface(surface, &courses);
+            if (generated.empty()) return;
+            auto collection = std::make_unique<ExtrusionEntityCollection>();
+            collection->no_sort = no_sort();
+            extrusion_entities_append_paths(collection->entities,std::move(generated),params.extrusion_role,
+                params.flow.mm3_per_mm(),params.flow.width(),params.flow.height());
+            if (collection->entities.size()!=courses.size()) throw std::logic_error("Canonical path conversion lost a source");
+            for (size_t i=0;i<courses.size();++i) {
+                auto *before = dynamic_cast<ExtrusionPath *>(collection->entities[i]);
+                if (!before || typeid(*before)!=typeid(ExtrusionPath) || before->polyline.points!=courses[i].points)
+                    throw std::logic_error("Canonical path conversion changed its geometry");
+                auto path = std::make_unique<BridgeAwareCubic::PilotPath>(*before,std::move(courses[i]),plan->immutable_identity());
+                if (!params.can_reverse) path->set_reverse();
+                delete before; collection->entities[i]=path.release();
+            }
+            out.push_back(collection.get()); collection.release(); return;
+        }
         const size_t before = out.size();
         m_capture = emission_builder != nullptr && plan != nullptr && !params.use_arachne;
         if (emission_builder != nullptr && !m_capture) emission_builder->decline();
@@ -243,12 +269,44 @@ private:
             decline_capture();
     }
 
+    Polylines canonical_surface(const Surface *surface, std::vector<BridgeAwareCubic::PilotCourse> *sources)
+    {
+        using namespace BridgeAwareCubic;
+        if (!material_domain || !std::isfinite(extrusion_width) || !(extrusion_width>0.) ||
+            surface->surface_type!=stInternal || plan->has_closures(z) || !plan->solid_area(z).empty())
+            throw std::domain_error("Canonical pilot requires a sparse surface with known bead centers and no active closure or saturation");
+        const auto overlaps=offset_ex(surface->expolygon,scale_(overlap));
+        const auto centers=offset_ex(*material_domain,-scale_(.5*extrusion_width));
+        Polylines bulk;
+        for (const auto &component:overlaps) append(bulk,plan->inherited_bulk(z,component));
+        Polylines out=intersection_pl(bulk,centers);
+        if (sources) for (const auto &line:out) sources->push_back({{},line.points,{}});
+        StrandBudget budget;
+        auto raw=plan->strand_program(z,budget);
+        for (const auto &component:overlaps) {
+            auto clipped=raw.clipped(component,centers,budget);
+            for (const auto &plane:clipped.planes(budget)) for (const auto &run:clipped.runs(plane,budget))
+                for (auto &course:pilot_courses(plane,run,*plan->parameters().canonical_phase)) {
+                    if (out.size()>=budget.max_records) throw std::length_error("Canonical pilot surface path limit");
+                    out.emplace_back(course.points);
+                    if (sources) sources->push_back(std::move(course));
+                }
+        }
+        return out;
+    }
     Polylines fill_surface_impl(const Surface *surface, const FillParams &params)
     {
         // The preliminary bridge-direction pass runs before support demand is
         // known. It uses the identical ordinary Cubic lattice as the plan.
         if (plan == nullptr)
             return FillCubic::fill_surface(surface, params);
+        if (plan->parameters().canonical_phase) {
+            auto paths=canonical_surface(surface,nullptr);
+            const auto active=plan->attachments(z);
+            for (auto &line:paths) line=BridgeAwareCubicAttachment::resolve_chain(line,extrusion_width,
+                params.flow.height(),lock_region_id,active).polyline;
+            return paths;
+        }
 
         Polylines result;
         // Ordinary Cubic adds boundary anchors after its half-spacing inset.
