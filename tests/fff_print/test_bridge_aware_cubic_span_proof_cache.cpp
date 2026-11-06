@@ -160,6 +160,7 @@ TEST_CASE("Bridge aware span cache refuses malformed keys without replacing vali
             std::numeric_limits<coord_t>::max() / 4 + 1;
         if (invalid == 12) changed.demand.front().contour.points.resize(200001, Point(0, 0));
         CHECK_FALSE(cache.matches(changed.query()));
+        CHECK_FALSE(Cache::valid_policy(changed.query()));
         // A default Result cannot override malformed query admission.
         CHECK_FALSE(cache.publish(changed.query(), Validation::Result{}));
         CHECK(cache.matches(fixture.query()));
@@ -265,4 +266,36 @@ TEST_CASE("Bridge aware span cache falls back without publishing partial or canc
     }), std::bad_alloc);
     CHECK(interrupted.statistics().entries == 0);
     CHECK(interrupted.statistics().units == 0);
+}
+
+TEST_CASE("Complete span probe policy guards preserve budgets and cached facts", "[BridgeAwareCubic][CompleteSpans][SpanProofCache]")
+{
+    Fixture fixture;
+    Cache cache;
+    REQUIRE(cache.publish(fixture.query(), fixture.check()));
+    const auto before = cache.statistics();
+    Validation::WorkBudget work;
+    const size_t initial = work.remaining_work;
+    REQUIRE(Cache::valid_policy(fixture.query(), &work));
+    const size_t used = initial - work.remaining_work;
+    REQUIRE(used > 0);
+    Validation::WorkBudget exact{used};
+    CHECK(Cache::valid_policy(fixture.query(), &exact));
+    CHECK(exact.remaining_work == 0);
+    Validation::WorkBudget insufficient{used - 1};
+    CHECK_FALSE(Cache::valid_policy(fixture.query(), &insufficient));
+    CHECK(insufficient.remaining_work == 0);
+    size_t polls = 0;
+    struct PolicyCanceled {};
+    CHECK_THROWS_AS(Cache::valid_policy(fixture.query(), nullptr, [&] {
+        if (++polls == 2) throw PolicyCanceled{};
+    }), PolicyCanceled);
+    const auto after = cache.statistics();
+    CHECK(after.entries == before.entries);
+    CHECK(after.units == before.units);
+    CHECK(after.hits == before.hits);
+    CHECK(after.misses == before.misses);
+    CHECK(after.publications == before.publications);
+    CHECK(cache.matches(fixture.query()));
+    CHECK_FALSE(Cache::valid_policy(fixture.query(Cache::Kind::Ineligible)));
 }

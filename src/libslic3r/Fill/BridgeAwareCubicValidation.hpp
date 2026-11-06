@@ -97,6 +97,22 @@ Result validate_contacts(const ExPolygons &material_domain,
                          const std::vector<BridgeAwareCubicContact::PathContact> &contacts,
                          WorkBudget *budget = nullptr);
 
+// Sufficient positive span-only result for EVERY unsupported run of EVERY
+// complete required path, with implicit whole-path demand. Uses the same exact
+// contact intervals, path-order anchoring, uncertainty and gap guards as the
+// contact verifier above. No demand polygons or physical-cell geometry are
+// selected, created or certified; void_cells and max_void_diameter_mm stay empty
+// and zero. A complete passing result implies the span decision for any demand
+// subset, but a failure need not fail a selected subset. Callers still validate
+// their demand inputs and independently satisfy every physical-cell obligation.
+// Contacts correspond one-to-one to full paths, including original positive
+// segment indices. Shared work exhaustion remains incomplete, never a proof.
+Result validate_complete_contact_spans(const Polylines &required_paths,
+                                      double max_gap_mm,
+                                      double geometry_tolerance_mm,
+                                      const std::vector<BridgeAwareCubicContact::PathContact> &contacts,
+                                      WorkBudget *budget = nullptr);
+
 // Immutable contact-mode cell geometry. Cache only for exactly the same
 // deposited physical material, domain and contact plane; invalidate whenever
 // emitted paths change. Selection and the requested gap are never cached.

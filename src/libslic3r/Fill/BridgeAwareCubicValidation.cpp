@@ -939,14 +939,18 @@ bool Result::passed() const
     return true;
 }
 
+enum class PathDemandMode { Selected, Complete };
+
 static Result validate_impl(const ExPolygons &material_domain, const ExPolygons &deposited_support,
                 const Polylines &required_paths, const ExPolygons &demand,
                 double max_gap_mm, double geometry_tolerance_mm,
                 const std::vector<BridgeAwareCubicContact::PathContact> *contacts,
                 WorkBudget *shared = nullptr, const PreparedGeometry *prepared = nullptr,
-                bool report_passing_cells = true, bool preserve_cell_maximum = false)
+                bool report_passing_cells = true, bool preserve_cell_maximum = false,
+                PathDemandMode path_demand = PathDemandMode::Selected)
 {
     Result result;
+    const bool whole_path = path_demand == PathDemandMode::Complete;
     if (prepared != nullptr && (!prepared->status.input_valid || !prepared->status.completed))
         return prepared->status;
     const double tolerance = std::max(geometry_tolerance_mm, SCALING_FACTOR);
@@ -1029,7 +1033,7 @@ static Result validate_impl(const ExPolygons &material_domain, const ExPolygons 
             }
         }
     }
-    if (demand.empty())
+    if (!whole_path && demand.empty())
         return result;
 
     const Scalar permitted = max_gap_mm - tolerance;
@@ -1044,8 +1048,11 @@ static Result validate_impl(const ExPolygons &material_domain, const ExPolygons 
             guard_boolean(deposited_support, {}, budget);
             support = union_ex(deposited_support);
         }
-        guard_boolean(demand, {}, budget);
-        const ExPolygons selection = union_ex(demand);
+        ExPolygons selection;
+        if (!whole_path) {
+            guard_boolean(demand, {}, budget);
+            selection = union_ex(demand);
+        }
         if (prepared == nullptr && !material_domain.empty()) {
             guard_boolean(material_domain, {}, budget);
             domain = union_ex(material_domain);
@@ -1067,7 +1074,8 @@ static Result validate_impl(const ExPolygons &material_domain, const ExPolygons 
                 const Scalar length = std::sqrt(dot(delta, delta)) * SCALING_FACTOR;
                 if (length == 0)
                     continue;
-                segment_intervals(a, b, segments.size(), demand_set, true, demanded, budget);
+                if (!whole_path)
+                    segment_intervals(a, b, segments.size(), demand_set, true, demanded, budget);
                 segments.push_back({a, b, length, total, i - 1});
                 total += length;
             }
@@ -1076,7 +1084,7 @@ static Result validate_impl(const ExPolygons &material_domain, const ExPolygons 
                 result.failure_reason = "Required path has no positive-length extrusion.";
                 return result;
             }
-            if (demanded.empty())
+            if (!whole_path && demanded.empty())
                 continue;
             for (size_t i = 0; i < segments.size(); ++i) {
                 if (contacts == nullptr)
@@ -1109,7 +1117,7 @@ static Result validate_impl(const ExPolygons &material_domain, const ExPolygons 
             }
             const auto add_run = [&](const PathPosition &begin, const PathPosition &end, bool left_anchor, bool right_anchor,
                                      double left_uncertainty, double right_uncertainty) {
-                if (!(begin < end) || !selected(begin, end, demanded))
+                if (!(begin < end) || (!whole_path && !selected(begin, end, demanded)))
                     return;
                 const Scalar nominal_length = local_arclength(begin, end, segments, budget);
                 double uncertainty = left_uncertainty + right_uncertainty;
@@ -1152,6 +1160,10 @@ static Result validate_impl(const ExPolygons &material_domain, const ExPolygons 
             }
             add_run(cursor, finish, left_anchor, false, cursor_uncertainty, 0.);
         }
+
+        // A complete-path result concerns spans only. It never selects,
+        // constructs, measures or certifies a physical void cell.
+        if (whole_path) return result;
 
         const auto record_cell = [&](VoidCell measured) {
             measured.exceeds_gap = measured.diameter_mm > permitted;
@@ -1224,6 +1236,14 @@ Result validate_contacts(const ExPolygons &material_domain, const ExPolygons &de
 {
     return validate_impl(material_domain, deposited_support, required_paths, demand,
                          max_gap_mm, geometry_tolerance_mm, &contacts, budget);
+}
+
+Result validate_complete_contact_spans(const Polylines &required_paths, double max_gap_mm,
+    double geometry_tolerance_mm, const std::vector<BridgeAwareCubicContact::PathContact> &contacts,
+    WorkBudget *budget)
+{
+    return validate_impl({}, {}, required_paths, {}, max_gap_mm, geometry_tolerance_mm,
+                         &contacts, budget, nullptr, true, false, PathDemandMode::Complete);
 }
 
 Result validate_prepared_contacts(const PreparedGeometry &prepared,

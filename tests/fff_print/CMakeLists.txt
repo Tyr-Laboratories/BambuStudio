@@ -97,6 +97,7 @@ add_test(bridge_controls_tests bridge_controls_tests ${CATCH_EXTRA_ARGS})
 
 add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cubic_config.cpp
     test_bridge_aware_cubic_geometry.cpp test_bridge_aware_cubic_validation.cpp
+    test_bridge_aware_cubic_complete_spans.cpp
     test_bridge_aware_cubic_tagged_lines.cpp
     test_bridge_aware_cubic_emission_collection.cpp
     test_bridge_aware_cubic_emission_ledger.cpp

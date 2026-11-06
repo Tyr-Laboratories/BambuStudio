@@ -158,6 +158,23 @@ The small diagnostic restores 2,574 snapshots with zero mismatches and skips pro
 
 A raw-section separator proposal remains unimplemented. Strict cycle coverage in the continuous union of input sections does not yet prove a surviving material collar after the oracle's rounded closed-polygon union/difference. A closed-operation inclusion proof or a witness checked against the actual current oracle union is required before such a shortcut may accept a trial. The earlier open-path rounding bound is not sufficient.
 
+### 3C. Skip selected geometry after a complete-path positive span proof
+
+The post-3B main-thread sample attributes 754 of 3,445 samples to unsupported-selection clipping/offset/union/intersection, versus 166 to complete physical preparation. This is a partial diagnostic sample, not a complete wall-time forecast. It justified a smaller span-only increment before separator work.
+
+- [x] Add an explicit whole-path mode to the existing contact verifier, retaining the same input guards, exact support intervals, arclength, anchoring, uncertainty, gap reserve and closed seam.
+- [x] Restrict the positive shortcut to eligible coarsening construction/follow-up span checks. Validate bounded current policy; a complete passing check of every actual run implies acceptance of its selected subset. Any other result retains the original selected check and consumed work. Physical-cell, repair, exhaustive, final and export checks remain unchanged.
+- [x] Audit every positive shortcut against fresh original selected validation, treating an incomplete reference as audit failure. Preserve exact final Plans and emitted output in the existing parity qualification.
+- [x] Add regression tests for anchored bridges, floating/one-sided runs, joints, repeats, reversal, seams, mask holes/boundaries, uncertainty, invalid input and resource bounds. Demonstrate whole-path failure while a selected subset passes, and verify policy admission leaves cached facts unchanged.
+- [x] Run the complete build, relevant focused tests, full feature/qualification suite, legacy/tooling tests and isolated official development pair.
+
+RED verification fails all 17 new verifier cases and the missing positive-probe parity assertion. GREEN focused verification passes 147 cases / 47,991 assertions. Full verification passes 417 unique defaults / 419 default executions plus three hidden qualifications: 422 executions / 379,504 assertions. The complete application build, 17 legacy targets, 44 packaging tests, 70 benchmark-tool tests and separate 244-assertion fixture writer pass. Runtime/test source is tied to test executable SHA-256 `35c28c52ec9dbfaaffe9e0238cea3451c4a91d852dd48a5d04e405690baefab9`.
+
+The small diagnostic records 51,399 complete-path probes and 51,399 positives, retaining 159 trials, 47 acceptances and 112 rejections. Preparation is 10.011 seconds, with model/construction checks at 4.067/1.873 seconds. The isolated official development pair measures 10,251/292 ms (35.106×). Material and final Plans remain unchanged. The 2× gate remains unmet; this is an incremental improvement, not release qualification.
+
+The shortcut proves physical span acceptance using valid bounded input policy. It does not assert that the skipped selected-polygon operation would have produced valid within-cap output: that geometry is not constructed. Every performed operation retains its existing bounds, and an encountered incomplete result cannot publish a fact.
+
+
 ### 4. Certify material separator cycles and local complete-cell checks
 
 **Files:** new `BridgeAwareCubicSeparators.hpp/.cpp`, `BridgeAwareCubicValidation.hpp/.cpp`, `BridgeAwareCubicSupport.cpp`, new `test_bridge_aware_cubic_separators.cpp`, existing cavity/modifier/variable-height tests.

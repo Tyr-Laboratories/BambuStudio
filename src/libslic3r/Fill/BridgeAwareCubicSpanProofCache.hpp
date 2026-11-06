@@ -185,6 +185,27 @@ public:
         return false;
     }
 
+    // Bounded eligibility for an optional stronger whole-path span probe.
+    // Reuse the exact policy guards without publishing or mutating facts.
+    // This does not validate upper/contact geometry or predict the size or
+    // validity of a selected Boolean result that has not been constructed.
+    static bool valid_policy(const Query &query, BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+                             const Cancel &cancel = {})
+    {
+        Work work(budget, cancel);
+        try {
+            work.poll();
+            (void)describe(query, work);
+            work.poll();
+            return true;
+        } catch (const Canceled &canceled) {
+            std::rethrow_exception(canceled.exception);
+        } catch (const Unavailable &) {
+        } catch (const std::bad_alloc &) {
+        }
+        return false;
+    }
+
     bool matches(const Query &query, BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
                  const Cancel &cancel = {})
     {
@@ -224,8 +245,10 @@ public:
         ++m_statistics.misses;
         return false;
     }
-    // The caller must supply the ACTUAL complete span-only validation result
-    // for precisely this Query, with zero contact and validation tolerances.
+    // The caller must supply an ACTUAL complete span-only validation result
+    // for this Query, with zero contact and validation tolerances. A completed
+    // positive check of EVERY run on the same complete upper path is sufficient
+    // for its demand subset; a nonpassing stronger result is never publishable.
     // Result has no input provenance: its flags alone do not turn a default,
     // generic or independent cell result into evidence for this path.
     // A later failed path in the same trial does not invalidate this local fact.

@@ -80,6 +80,8 @@ struct ProfileState {
     uint64_t emission_collection_audits = 0;
     std::array<std::pair<const char *, uint64_t>, 32> emission_capture_reasons{};
     uint64_t whole_support_queries = 0, whole_support_proofs = 0, whole_support_segments = 0;
+    uint64_t complete_span_queries = 0, complete_span_proofs = 0, complete_span_audits = 0;
+    uint64_t complete_span_audit_mismatches = 0;
     uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
     uint64_t model_layer_proof_hits = 0, model_layer_proof_misses = 0, model_layer_proof_publications = 0;
     uint64_t model_layer_proof_vertices = 0, model_layer_proof_items = 0;
@@ -93,6 +95,7 @@ struct ProfileState {
     bool full_trial_checks = false;
     bool audit_emission_collection = false;
     bool audit_contact_epochs = false;
+    bool audit_complete_spans = false;
     bool truncated = false;
     std::string file, stage;
     const char *session;
@@ -199,6 +202,10 @@ struct ProfileState {
                     << ",\"span_epoch_audit_mismatches\":" << span_epoch_audit_mismatches
                     << ",\"span_epoch_raw_checks\":" << span_epoch_raw_checks
                     << ",\"contact_epoch_peak_slots\":" << contact_epoch_peak_slots
+                    << ",\"complete_span_queries\":" << complete_span_queries
+                    << ",\"complete_span_proofs\":" << complete_span_proofs
+                    << ",\"complete_span_audits\":" << complete_span_audits
+                    << ",\"complete_span_audit_mismatches\":" << complete_span_audit_mismatches
                     << ",\"whole_support_queries\":" << whole_support_queries
                     << ",\"whole_support_proofs\":" << whole_support_proofs
                     << ",\"whole_support_segments\":" << whole_support_segments
@@ -257,6 +264,8 @@ public:
                 state->audit_emission_collection = audit[0] == '1' && audit[1] == '\0';
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_CONTACT_EPOCHS"))
                 state->audit_contact_epochs = audit[0] == '1' && audit[1] == '\0';
+            if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_COMPLETE_SPANS"))
+                state->audit_complete_spans = audit[0] == '1' && audit[1] == '\0';
             static std::atomic<uint64_t> sequence{0};
             state->sequence = ++sequence;
             if (const char *stage = std::getenv("BAC_PROFILE_STAGE"))
@@ -2697,6 +2706,22 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     break;
                 }
                 BridgeAwareCubicValidation::Result checked;
+                bool complete_span_proved = false;
+                // Only a positive proof for every run can bypass construction
+                // of the selected subset. Failure of this stricter scope says
+                // nothing about that subset: retain the original check below
+                // with the same already-consumed allowance. Direct roofs,
+                // repair, final/export and exhaustive checks never use it.
+                if (reuse_span && !support_query.entire_path_supported &&
+                    BridgeAwareCubic::SpanProofCache::valid_policy(span_query, &budget, cancel)) {
+                    if (active_profile) ++active_profile->complete_span_queries;
+                    checked = BridgeAwareCubicValidation::validate_complete_contact_spans(
+                        {upper.polyline}, target.gap, 0., {contact}, &budget);
+                    complete_span_proved = checked.passed();
+                    if (complete_span_proved && active_profile) ++active_profile->complete_span_proofs;
+                }
+                const bool audit_complete_span = complete_span_proved && active_profile &&
+                    active_profile->audit_complete_spans;
                 if (support_query.entire_path_supported) {
                     // Contact proved every original segment continuously
                     // supported at the common plane. Keep the validator's
@@ -2704,7 +2729,7 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     // an empty air selection or unrelated physical cells.
                     checked = BridgeAwareCubicValidation::validate_contacts({}, {},
                         {upper.polyline}, {}, target.gap, 0., {contact}, &budget);
-                } else {
+                } else if (!complete_span_proved || audit_complete_span) {
                     Polylines unsupported;
                     for (const auto &segment : contact.segments) {
                         const size_t i = segment.segment_index;
@@ -2755,6 +2780,15 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                         else
                             checked = BridgeAwareCubicValidation::validate_prepared_contact_failures(*found->second,
                                 {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                    }
+                }
+                if (audit_complete_span) {
+                    ++active_profile->complete_span_audits;
+                    // An incomplete reference cannot certify an audit hit.
+                    // Result::passed includes both input validity and completion.
+                    if (!checked.passed()) {
+                        ++active_profile->complete_span_audit_mismatches;
+                        throw std::runtime_error("Bridge aware cubic complete-span audit failed against selected validation.");
                     }
                 }
                 if (reuse_span && checked.passed()) {
