@@ -11,6 +11,7 @@
 #include "Fill/BridgeAwareCubicDependencies.hpp"
 #include "Fill/BridgeAwareCubicSerialization.hpp"
 #include "Fill/BridgeAwareCubicModelProofCache.hpp"
+#include "Fill/BridgeAwareCubicModelCollection.hpp"
 #include "Fill/BridgeAwareCubicSpanProofCache.hpp"
 #include "Fill/BridgeAwareCubicEmissionLedger.hpp"
 #include "Fill/BridgeAwareCubicFailureReplay.hpp"
@@ -24,6 +25,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <type_traits>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -37,6 +40,312 @@
 #include <tuple>
 
 namespace Slic3r {
+namespace BridgeAwareCubic {
+// Only explicit scalar values and ordered points enter the byte stream. No
+// padding, live pointers, Plan identities or support verdicts are retained.
+struct ModelCollectionInputs::Impl {
+    struct Unavailable {};
+    struct Different {};
+    struct Canceled { std::exception_ptr exception; };
+    struct Range { size_t begin = 0, end = 0; };
+    struct Work {
+        BridgeAwareCubicValidation::WorkBudget local;
+        BridgeAwareCubicValidation::WorkBudget *budget;
+        const Cancel &cancel;
+        size_t since_poll = 0;
+        Work(BridgeAwareCubicValidation::WorkBudget *given, const Cancel &callback)
+            : budget(given ? given : &local), cancel(callback) {}
+        void poll() const {
+            if (cancel) try { cancel(); } catch (...) { throw Canceled{std::current_exception()}; }
+        }
+        void charge(size_t amount = 1) {
+            if (amount > budget->remaining_work) throw Unavailable{};
+            budget->remaining_work -= amount;
+            budget->charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)] += amount;
+            since_poll += amount;
+            if (since_poll >= 128) { since_poll = 0; poll(); }
+        }
+    };
+    enum class Mode { Count, Write, Compare };
+    struct Stream {
+        Impl &owner;
+        Work &work;
+        Mode mode;
+        size_t position = 0, end = 0;
+        const unsigned char *compared = nullptr;
+        void bytes(const void *value, size_t size) {
+            work.charge();
+            if (mode == Mode::Count) {
+                if (size > owner.limits.bytes || position > owner.limits.bytes - size) throw Unavailable{};
+                position += size;
+                owner.admit(position, 0);
+                return;
+            }
+            if (size > end - position) {
+                if (mode == Mode::Compare) throw Different{};
+                throw Unavailable{};
+            }
+            if (mode == Mode::Compare) {
+                if (std::memcmp(compared + position, value, size) != 0) throw Different{};
+            } else std::memcpy(owner.data.get() + position, value, size);
+            position += size;
+        }
+        template<class T> void scalar(T value) {
+            static_assert(std::is_arithmetic_v<T> || std::is_enum_v<T>, "Only explicit scalar encodings");
+            if constexpr (std::is_floating_point_v<T>) if (!std::isfinite(value)) throw Unavailable{};
+            bytes(&value, sizeof(value));
+        }
+        void items(size_t amount = 1) {
+            work.charge(amount);
+            if (mode == Mode::Count) {
+                if (amount > owner.limits.items - owner.usage.items) throw Unavailable{};
+                owner.usage.items += amount;
+                owner.admit(position, 0);
+            }
+        }
+        void points(const Points &points) {
+            scalar(points.size());
+            if (mode == Mode::Count) {
+                if (points.size() > owner.limits.vertices - owner.usage.vertices) throw Unavailable{};
+                owner.usage.vertices += points.size();
+                owner.admit(position, 0);
+            }
+            for (const Point &point : points) { scalar(point.x()); scalar(point.y()); }
+        }
+        void polygon(const ExPolygon &polygon) {
+            items(1 + polygon.holes.size());
+            points(polygon.contour.points);
+            scalar(polygon.holes.size());
+            for (const Polygon &hole : polygon.holes) points(hole.points);
+        }
+    };
+    Limits limits;
+    Usage usage;
+    size_t rows_count = 0, context_end = 0, data_size = 0, fixed_bytes = 0, scratch_peak = 0, scratch_items_peak = 0;
+    std::unique_ptr<Range[]> rows;
+    std::unique_ptr<unsigned char[]> data;
+
+    void admit(size_t encoded, size_t scratch, size_t scratch_items = 0) const {
+        const auto fits = [](size_t cap, size_t a, size_t b) { return a <= cap && b <= cap - a; };
+        if (!fits(limits.vertices, limits.other_retained.vertices, usage.vertices) ||
+            !fits(limits.items, limits.other_retained.items, usage.items) ||
+            !fits(limits.bytes, limits.other_retained.bytes, fixed_bytes)) throw Unavailable{};
+        if (scratch_items > limits.items - limits.other_retained.items - usage.items) throw Unavailable{};
+        size_t remaining = limits.bytes - limits.other_retained.bytes - fixed_bytes;
+        if (encoded > remaining || scratch > remaining - encoded) throw Unavailable{};
+    }
+    static void binding(const PrintObject &object, const Layer &layer, size_t region, Work &work) {
+        work.charge();
+        if (layer.object() != &object || region >= object.num_printing_regions() ||
+            layer.get_region(int(region))->layer() != &layer ||
+            &layer.get_region(int(region))->region() != &object.printing_region(region)) throw Unavailable{};
+    }
+    static void context(const PrintObject &object, Stream &stream) {
+        stream.work.poll();
+        stream.scalar(object.layers().size());
+        stream.scalar(object.num_printing_regions());
+        for (const Layer *layer : object.layers()) {
+            stream.items();
+            if (!layer || layer->object() != &object) throw Unavailable{};
+            stream.scalar(layer->print_z);
+            stream.scalar(layer->regions().size());
+            for (size_t r = 0; r < layer->regions().size(); ++r) {
+                binding(object, *layer, r, stream.work);
+                stream.items();
+                const LayerRegion &region = *layer->get_region(int(r));
+                const auto &config = region.region().config();
+                stream.scalar(config.sparse_infill_pattern.value);
+                stream.scalar(config.sparse_infill_density.value);
+                stream.scalar(config.bridge_aware_cubic_max_gap.value);
+                stream.scalar(region.fill_surfaces.surfaces.size());
+                for (const Surface &surface : region.fill_surfaces.surfaces) {
+                    stream.items();
+                    stream.scalar(surface.surface_type);
+                    stream.scalar(surface.bridge_followup);
+                    stream.polygon(surface.expolygon);
+                }
+                stream.scalar(region.slices.surfaces.size());
+                for (const Surface &surface : region.slices.surfaces) {
+                    stream.items();
+                    stream.polygon(surface.expolygon);
+                }
+            }
+        }
+    }
+    template<class Visitor> static void walk(const ExtrusionEntity &entity, bool free_only,
+                                              Visitor &visitor, Work &work, size_t depth = 0) {
+        work.charge();
+        if (depth >= 64) throw Unavailable{};
+        if (typeid(entity) == typeid(ExtrusionPath)) {
+            const auto &path = static_cast<const ExtrusionPath &>(entity);
+            if (!path.is_force_no_extrusion() && path.mm3_per_mm > 0. && path.polyline.size() >= 2)
+                visitor(path);
+        } else if (typeid(entity) == typeid(ExtrusionEntityCollection)) {
+            for (const ExtrusionEntity *child : static_cast<const ExtrusionEntityCollection &>(entity).entities) {
+                if (!child) throw Unavailable{};
+                walk(*child, free_only, visitor, work, depth + 1);
+            }
+        } else if (typeid(entity) == typeid(ExtrusionMultiPath)) {
+            if (!free_only) for (const auto &path : static_cast<const ExtrusionMultiPath &>(entity).paths)
+                walk(path, false, visitor, work, depth + 1);
+        } else if (typeid(entity) == typeid(ExtrusionLoop)) {
+            if (!free_only) for (const auto &path : static_cast<const ExtrusionLoop &>(entity).paths)
+                walk(path, false, visitor, work, depth + 1);
+        } else throw Unavailable{};
+    }
+    static void path_value(const ExtrusionPath &path, Stream &stream) {
+        if (!path.polyline.fitting_result.empty()) throw Unavailable{};
+        stream.items();
+        stream.scalar(path.role()); stream.scalar(path.width); stream.scalar(path.height);
+        stream.scalar(path.mm3_per_mm); stream.scalar(path.is_force_no_extrusion());
+        stream.scalar(path.can_reverse());
+        stream.scalar(path.get_customize_flag());
+        stream.scalar(path.get_cooling_node()); stream.scalar(path.overhang_degree);
+        stream.scalar(path.curve_degree); stream.scalar(path.smooth_speed);
+        stream.points(path.polyline.points);
+    }
+    void model_layer(const Layer &layer, Stream &stream) {
+        stream.work.poll();
+        for (size_t r = 0; r < layer.regions().size(); ++r) {
+            const auto &region = *layer.get_region(int(r));
+            // Preserve actual free-set membership, including a path occurring
+            // through more than one tree route. Pointers are temporary only.
+            size_t free_count = 0;
+            auto count = [&](const ExtrusionPath &) {
+                stream.work.charge();
+                if (++free_count > 20000) throw Unavailable{};
+            };
+            walk(region.fills, true, count, stream.work);
+            const size_t scratch = free_count ? free_count * sizeof(const ExtrusionPath *) + 64 : 0;
+            scratch_peak = std::max(scratch_peak, scratch);
+            scratch_items_peak = std::max(scratch_items_peak, free_count);
+            admit(stream.mode == Mode::Count ? stream.position : data_size, scratch, free_count);
+            std::unique_ptr<const ExtrusionPath *[]> free;
+            if (free_count) free.reset(new const ExtrusionPath *[free_count]);
+            size_t filled = 0;
+            auto remember = [&](const ExtrusionPath &path) {
+                stream.work.charge();
+                if (filled == free_count) throw Unavailable{};
+                free[filled++] = &path;
+            };
+            walk(region.fills, true, remember, stream.work);
+            if (filled != free_count) throw Unavailable{};
+            const auto less = [&](const ExtrusionPath *a, const ExtrusionPath *b) {
+                stream.work.charge();
+                return std::less<const ExtrusionPath *>{}(a, b);
+            };
+            if (free_count > 1) std::sort(free.get(), free.get() + free_count, less);
+            auto model = [&](const ExtrusionPath &path) {
+                if (path.role() == erInternalInfill || path.role() == erIroning) return;
+                stream.scalar(uint8_t(1));
+                stream.scalar(r);
+                const bool free_ended = free_count && std::binary_search(free.get(), free.get() + free_count, &path, less);
+                stream.scalar(free_ended);
+                path_value(path, stream);
+            };
+            walk(region.perimeters, false, model, stream.work);
+            walk(region.fills, false, model, stream.work);
+        }
+        stream.scalar(uint8_t(0)); // Empty rows and ordered stream termination.
+    }
+};
+
+ModelCollectionInputs::ModelCollectionInputs(std::unique_ptr<const Impl> impl) : m_impl(std::move(impl)) {}
+ModelCollectionInputs::~ModelCollectionInputs() = default;
+std::unique_ptr<const ModelCollectionInputs> ModelCollectionInputs::capture(
+    const PrintObject &object, const Limits &limits, BridgeAwareCubicValidation::WorkBudget *budget, const Cancel &cancel)
+{
+    Impl::Work work(budget, cancel);
+    try {
+        work.poll(); work.charge();
+        const size_t rows = object.layers().size();
+        if (rows > 20000 || limits.other_retained.bytes > limits.bytes ||
+            limits.other_retained.vertices > limits.vertices || limits.other_retained.items > limits.items)
+            throw Impl::Unavailable{};
+        const size_t fixed = sizeof(ModelCollectionInputs) + sizeof(Impl) + 192 + rows * sizeof(Impl::Range);
+        const size_t byte_cap = std::min(limits.bytes, size_t(512 * 1024));
+        if (limits.other_retained.bytes > byte_cap || fixed > byte_cap - limits.other_retained.bytes ||
+            limits.other_retained.items > std::min(limits.items, size_t(20000)) ||
+            rows + 2 > std::min(limits.items, size_t(20000)) - limits.other_retained.items ||
+            limits.other_retained.vertices > std::min(limits.vertices, size_t(200000))) throw Impl::Unavailable{};
+        auto state = std::make_unique<Impl>();
+        state->limits = limits;
+        state->limits.bytes = std::min(limits.bytes, size_t(512 * 1024));
+        state->limits.vertices = std::min(limits.vertices, size_t(200000));
+        state->limits.items = std::min(limits.items, size_t(20000));
+        state->rows_count = rows;
+        state->fixed_bytes = fixed;
+        state->usage.items = rows + 2;
+        state->admit(0, 0);
+        if (rows) state->rows.reset(new Impl::Range[rows]);
+        Impl::Stream count{*state, work, Impl::Mode::Count};
+        Impl::context(object, count);
+        state->context_end = count.position;
+        for (size_t layer = 1; layer < rows; ++layer) {
+            state->rows[layer].begin = count.position;
+            state->model_layer(*object.layers()[layer], count);
+            state->rows[layer].end = count.position;
+        }
+        state->data_size = count.position;
+        state->admit(state->data_size, state->scratch_peak, state->scratch_items_peak);
+        state->usage.bytes = state->fixed_bytes + state->data_size;
+        state->data.reset(new unsigned char[state->data_size]);
+        Impl::Stream write{*state, work, Impl::Mode::Write, 0, state->data_size};
+        Impl::context(object, write);
+        if (write.position != state->context_end) throw Impl::Unavailable{};
+        for (size_t layer = 1; layer < rows; ++layer) {
+            state->model_layer(*object.layers()[layer], write);
+            if (write.position != state->rows[layer].end) throw Impl::Unavailable{};
+        }
+        work.poll();
+        return std::unique_ptr<const ModelCollectionInputs>(new ModelCollectionInputs(std::move(state)));
+    } catch (const Impl::Canceled &canceled) { std::rethrow_exception(canceled.exception); }
+      catch (const Impl::Unavailable &) {} catch (const std::bad_alloc &) {} catch (const std::length_error &) {}
+    return {};
+}
+ModelCollectionInputs::Match ModelCollectionInputs::matches(
+    const PrintObject &object, const std::set<size_t> &checked, BridgeAwareCubicValidation::WorkBudget *budget, const Cancel &cancel) const
+{
+    Impl::Work work(budget, cancel);
+    try {
+        work.poll(); work.charge();
+        if (!m_impl) throw Impl::Unavailable{};
+        for (size_t layer : checked) {
+            work.charge();
+            if (layer == 0 || layer >= object.layers().size() || layer >= m_impl->rows_count) throw Impl::Unavailable{};
+        }
+        // The only mutable calculation is scratch high-water accounting. Keep
+        // it in a local view; the retained identity itself remains immutable.
+        Impl view;
+        view.limits = m_impl->limits; view.usage = m_impl->usage;
+        view.fixed_bytes = m_impl->fixed_bytes; view.data_size = m_impl->data_size;
+        Impl::Stream compare{view, work, Impl::Mode::Compare, 0, m_impl->context_end, m_impl->data.get()};
+        Impl::context(object, compare);
+        if (compare.position != m_impl->context_end) throw Impl::Different{};
+        for (size_t layer : checked) {
+            compare.position = m_impl->rows[layer].begin;
+            compare.end = m_impl->rows[layer].end;
+            view.model_layer(*object.layers()[layer], compare);
+            if (compare.position != compare.end) throw Impl::Different{};
+        }
+        work.poll();
+        return Match::Equal;
+    } catch (const Impl::Canceled &canceled) { std::rethrow_exception(canceled.exception); }
+      catch (const Impl::Different &) { return Match::Different; }
+      catch (const Impl::Unavailable &) {} catch (const std::bad_alloc &) {} catch (const std::length_error &) {}
+    return Match::Unavailable;
+}
+ModelCollectionInputs::Usage ModelCollectionInputs::owned_usage() const noexcept
+{ return m_impl ? m_impl->usage : Usage{}; }
+ModelCollectionInputs::Usage ModelCollectionInputs::capture_peak_usage() const noexcept
+{
+    if (!m_impl) return {};
+    Usage peak = m_impl->usage;
+    peak.bytes += m_impl->scratch_peak;
+    peak.items += m_impl->scratch_items_peak;
+    return peak;
+}
+} // namespace BridgeAwareCubic
 namespace {
 namespace Dependency = BridgeAwareCubic::Dependencies;
 namespace Contact = BridgeAwareCubicContact;
@@ -52,7 +361,8 @@ enum class ProfilePhase {
     GenerateFull, GenerateChanged, GenerateRollback,
     CollectModel, CollectConstruction, CheckModel, CheckConstruction, CheckMixed,
     PrepareModelTargets, CompareFinalProof, CaptureFinalProof, FinalProof, Sweep,
-    ConstructionSections, ConstructionMatch, ConstructionOwners, ConstructionAdd, ModelReplay, Count
+    ConstructionSections, ConstructionMatch, ConstructionOwners, ConstructionAdd, ModelReplay,
+    ModelInputCapture, ModelInputMatch, Count
 };
 
 struct ProfileMetric {
@@ -83,6 +393,10 @@ struct ProfileState {
     uint64_t complete_span_queries = 0, complete_span_proofs = 0, complete_span_audits = 0;
     uint64_t complete_span_audit_mismatches = 0;
     uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
+    uint64_t model_input_hits = 0, model_input_misses = 0, model_input_unavailable = 0, model_input_audits = 0;
+    uint64_t model_input_captures = 0, model_input_capture_declines = 0, model_input_bytes = 0;
+    uint64_t model_input_prepared_bytes = 0, model_input_combined_bytes = 0, model_input_capture_peak_bytes = 0;
+    uint64_t model_input_combined_vertices = 0, model_input_combined_items = 0;
     uint64_t model_layer_proof_hits = 0, model_layer_proof_misses = 0, model_layer_proof_publications = 0;
     uint64_t model_layer_proof_vertices = 0, model_layer_proof_items = 0;
     uint64_t span_proof_hits = 0, span_proof_misses = 0, span_proof_publications = 0, span_proof_evictions = 0;
@@ -181,6 +495,18 @@ struct ProfileState {
                     << ",\"full_trial_checks\":" << (full_trial_checks ? "true" : "false")
                     << ",\"model_cache_hits\":" << model_cache_hits << ",\"model_cache_fallbacks\":" << model_cache_fallbacks
                     << ",\"model_cache_vertices\":" << model_cache_vertices << ",\"model_cache_items\":" << model_cache_items
+                    << ",\"model_input_hits\":" << model_input_hits
+                    << ",\"model_input_misses\":" << model_input_misses
+                    << ",\"model_input_unavailable\":" << model_input_unavailable
+                    << ",\"model_input_audits\":" << model_input_audits
+                    << ",\"model_input_captures\":" << model_input_captures
+                    << ",\"model_input_capture_declines\":" << model_input_capture_declines
+                    << ",\"model_input_bytes\":" << model_input_bytes
+                    << ",\"model_input_prepared_bytes\":" << model_input_prepared_bytes
+                    << ",\"model_input_combined_bytes\":" << model_input_combined_bytes
+                    << ",\"model_input_capture_peak_bytes\":" << model_input_capture_peak_bytes
+                    << ",\"model_input_combined_vertices\":" << model_input_combined_vertices
+                    << ",\"model_input_combined_items\":" << model_input_combined_items
                     << ",\"model_layer_proof_hits\":" << model_layer_proof_hits
                     << ",\"model_layer_proof_misses\":" << model_layer_proof_misses
                     << ",\"model_layer_proof_publications\":" << model_layer_proof_publications
@@ -224,7 +550,8 @@ struct ProfileState {
                     "generate_full", "generate_changed", "generate_rollback", "collect_model", "collect_construction",
                     "check_model", "check_construction", "check_mixed", "prepare_model_targets", "compare_final_proof",
                     "capture_final_proof", "final_proof", "coarsening_sweep", "construction_sections",
-                    "construction_match", "construction_owners", "construction_add", "model_failure_replay"};
+                    "construction_match", "construction_owners", "construction_add", "model_failure_replay",
+                    "model_input_capture", "model_input_match"};
                 bool first = true;
                 for (size_t i = 0; i < metrics.size(); ++i) {
                     const auto &metric = metrics[i];
@@ -901,10 +1228,12 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                                     const std::set<size_t> *selected_layers = nullptr,
                                     ConstructionCollection construction = ConstructionCollection::Reference,
                                     BridgeAwareCubic::EmissionCollectionAudit *audit = nullptr,
-                                    EmissionReuseContext *reuse = nullptr)
+                                    EmissionReuseContext *reuse = nullptr,
+                                    BridgeAwareCubicValidation::WorkBudget *supplied_budget = nullptr)
 {
     std::vector<Target> targets;
-    BridgeAwareCubicValidation::WorkBudget contact_budget;
+    BridgeAwareCubicValidation::WorkBudget local_budget;
+    auto &contact_budget = supplied_budget ? *supplied_budget : local_budget;
     ProfileScope profile(dependencies ? ProfilePhase::CollectConstruction : ProfilePhase::CollectModel, &contact_budget);
     const auto &layers = object.layers();
     const BoundingBox bounds = object.bounding_box();
@@ -2319,6 +2648,84 @@ struct PreparedModelView {
     const std::vector<size_t> &frozen_indices;
     BridgeAwareCubic::ModelLayerProofCache *proofs = nullptr;
 };
+
+std::unique_ptr<const BridgeAwareCubic::ModelCollectionInputs> prepare_model_collection_inputs(
+    const PrintObject &object, const PreparedModelTargets *prepared)
+{
+    using Inputs = BridgeAwareCubic::ModelCollectionInputs;
+    if (!prepared) return {};
+    BridgeAwareCubicValidation::WorkBudget budget;
+    ProfileScope profile(ProfilePhase::ModelInputCapture, &budget);
+    Inputs::Limits limits;
+    auto &usage = limits.other_retained;
+    struct Unavailable {};
+    const auto charge = [&](size_t amount = 1) {
+        if (object.print()->canceled()) throw CanceledException();
+        if (amount > budget.remaining_work) throw Unavailable{};
+        budget.remaining_work -= amount;
+        budget.charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)] += amount;
+    };
+    const auto add = [](size_t &value, size_t amount) {
+        if (amount > std::numeric_limits<size_t>::max() - value) throw Unavailable{};
+        value += amount;
+    };
+    const auto allocation = [&](size_t capacity, size_t size, bool vertices = false) {
+        charge();
+        if (capacity > std::numeric_limits<size_t>::max() / size) throw Unavailable{};
+        add(usage.bytes, capacity * size);
+        if (capacity) add(usage.bytes, 64); // Conservative allocator backing.
+        if (vertices) { add(usage.vertices, capacity); add(usage.items, 1); }
+        else add(usage.items, capacity);
+    };
+    const auto polygons = [&](const ExPolygons &polygons) {
+        allocation(polygons.capacity(), sizeof(ExPolygon));
+        for (const ExPolygon &polygon : polygons) {
+            allocation(polygon.contour.points.capacity(), sizeof(Point), true);
+            allocation(polygon.holes.capacity(), sizeof(Polygon));
+            for (const Polygon &hole : polygon.holes) allocation(hole.points.capacity(), sizeof(Point), true);
+        }
+    };
+    try {
+        usage.bytes = sizeof(PreparedModelTargets) + 64;
+        usage.items = 1;
+        allocation(prepared->phases.capacity(), sizeof(PreparedModelTargets::Phase));
+        for (const auto &phase : prepared->phases) {
+            allocation(phase.path_demands.capacity(), sizeof(std::vector<ExPolygons>));
+            for (const auto &group : phase.path_demands) {
+                allocation(group.capacity(), sizeof(ExPolygons));
+                for (const auto &demand : group) polygons(demand);
+            }
+            allocation(phase.extrusions.capacity(), sizeof(ExtrusionPaths));
+            for (const auto &group : phase.extrusions) {
+                allocation(group.capacity(), sizeof(ExtrusionPath));
+                for (const auto &path : group) {
+                    allocation(path.polyline.points.capacity(), sizeof(Point), true);
+                    allocation(path.polyline.fitting_result.capacity(), sizeof(decltype(path.polyline.fitting_result)::value_type));
+                }
+            }
+            allocation(phase.layer_demands.size(), sizeof(decltype(phase.layer_demands)::value_type) + 64);
+            for (const auto &demand : phase.layer_demands) polygons(demand.second);
+        }
+        if (active_profile) active_profile->model_input_prepared_bytes = usage.bytes;
+        auto result = Inputs::capture(object, limits, &budget,
+            [&] { if (object.print()->canceled()) throw CanceledException(); });
+        if (active_profile) {
+            if (result) {
+                ++active_profile->model_input_captures;
+                const auto own = result->owned_usage();
+                active_profile->model_input_bytes = own.bytes;
+                active_profile->model_input_combined_bytes = own.bytes + usage.bytes;
+                active_profile->model_input_capture_peak_bytes = result->capture_peak_usage().bytes + usage.bytes;
+                active_profile->model_input_combined_vertices = own.vertices + usage.vertices;
+                active_profile->model_input_combined_items = own.items + usage.items;
+            } else ++active_profile->model_input_capture_declines;
+        }
+        return result;
+    } catch (const Unavailable &) {
+        if (active_profile) ++active_profile->model_input_capture_declines;
+        return {};
+    }
+}
 
 std::unique_ptr<BridgeAwareCubic::ModelLayerProofCache> prepare_model_proofs(
     const PrintObject &object, const PreparedModelTargets *snapshot, const std::vector<Target> &targets)
@@ -4036,6 +4443,7 @@ void PrintObject::prepare_bridge_aware_cubic()
             // paths and the next layer's contacts, not every layer in the part.
             const auto prepared_roofs = active_profile && active_profile->full_trial_checks ? nullptr :
                 prepare_model_targets(*this, roofs);
+            const auto model_inputs = prepare_model_collection_inputs(*this, prepared_roofs.get());
             const auto model_proofs = prepare_model_proofs(*this, prepared_roofs.get(), roofs);
             BridgeAwareCubic::ModelFailureReplay model_replay;
             BridgeAwareCubic::SpanProofCache span_proofs;
@@ -4164,7 +4572,84 @@ void PrintObject::prepare_bridge_aware_cubic()
                         selected.push_back(roofs[index]);
                         frozen_indices.push_back(index);
                     }
-                const auto actual = collect_targets(*this, false, false, &checked_layers);
+                BridgeAwareCubicValidation::WorkBudget collection_budget;
+                bool reuse_model_targets = false;
+                if (model_inputs) {
+                    ProfileScope input_profile(ProfilePhase::ModelInputMatch, &collection_budget);
+                    const auto matched = model_inputs->matches(*this, checked_layers, &collection_budget,
+                        [&] { throw_if_canceled(); });
+                    reuse_model_targets = matched == BridgeAwareCubic::ModelCollectionInputs::Match::Equal;
+                    if (active_profile) {
+                        if (reuse_model_targets) ++active_profile->model_input_hits;
+                        else if (matched == BridgeAwareCubic::ModelCollectionInputs::Match::Different)
+                            ++active_profile->model_input_misses;
+                        else ++active_profile->model_input_unavailable;
+                    }
+                }
+                std::vector<Target> recollected;
+                const auto &actual = reuse_model_targets ? selected :
+                    (recollected = collect_targets(*this, false, false, &checked_layers,
+                        ConstructionCollection::Reference, nullptr, nullptr, &collection_budget));
+                if (reuse_model_targets && active_profile && active_profile->audit_emission_collection) {
+                    const auto reference = collect_targets(*this, false, false, &checked_layers,
+                        ConstructionCollection::Reference, nullptr, nullptr, &collection_budget);
+                    // Pre-admit the complete comparison, including nested
+                    // rings, paths and owner vectors. This audit shares the
+                    // capture/reference allowance and cannot report success
+                    // after exhausting it. No geometry is copied to count it.
+                    const auto charge_audit = [&](size_t count, size_t factor = 1) {
+                        throw_if_canceled();
+                        if (count > collection_budget.remaining_work / factor)
+                            throw std::logic_error("Bridge aware cubic model input audit exhausted its comparison budget.");
+                        const size_t work = count * factor;
+                        collection_budget.remaining_work -= work;
+                        collection_budget.charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)] += work;
+                    };
+                    const auto audit_polygons = [&](const ExPolygons &polygons) {
+                        charge_audit(polygons.size(), 4);
+                        for (const auto &polygon : polygons) {
+                            charge_audit(polygon.contour.points.size(), 4);
+                            charge_audit(polygon.holes.size(), 4);
+                            for (const auto &hole : polygon.holes) charge_audit(hole.points.size(), 4);
+                        }
+                    };
+                    const auto audit_targets = [&](const std::vector<Target> &targets) {
+                        charge_audit(targets.size(), 32);
+                        for (const Target &target : targets) {
+                            charge_audit(target.paths.size(), 4);
+                            for (const auto &path : target.paths) charge_audit(path.points.size(), 4);
+                            charge_audit(target.path_widths.size());
+                            charge_audit(target.emitting_regions.size());
+                            charge_audit(target.free_ended.size());
+                            charge_audit(target.solid_cuts.size());
+                            charge_audit(target.producers.size(), 2);
+                            for (const auto &owners : target.producers) charge_audit(owners.size(), 8);
+                            audit_polygons(target.footprint);
+                            charge_audit(target.path_footprints.size(), 2);
+                            for (const auto &demand : target.path_footprints) audit_polygons(demand);
+                            charge_audit(target.extrusions.size(), 24);
+                            for (const auto &path : target.extrusions) charge_audit(path.polyline.points.size(), 4);
+                        }
+                    };
+                    audit_targets(selected);
+                    audit_targets(reference);
+                    bool equal = same_model_targets(selected, reference);
+                    // The normal rejection predicate intentionally concerns
+                    // physical model inputs. This audit additionally compares
+                    // every copied path metadata field without changing that
+                    // production predicate on a cache miss.
+                    for (size_t group = 0; equal && group < selected.size(); ++group)
+                        for (size_t path = 0; equal && path < selected[group].extrusions.size(); ++path) {
+                            const auto &a = selected[group].extrusions[path], &b = reference[group].extrusions[path];
+                            equal = a.can_reverse() == b.can_reverse() && a.get_customize_flag() == b.get_customize_flag() &&
+                                a.get_cooling_node() == b.get_cooling_node() && a.overhang_degree == b.overhang_degree &&
+                                a.curve_degree == b.curve_degree && a.smooth_speed == b.smooth_speed;
+                        }
+                    if (!equal)
+                        throw std::logic_error("Bridge aware cubic model input reuse differed from complete target collection.");
+                    throw_if_canceled();
+                    ++active_profile->model_input_audits;
+                }
                 const auto reject_model = [&] {
                     // No reference/projection is requested during generation
                     // or model checks. This trial never reached classification.

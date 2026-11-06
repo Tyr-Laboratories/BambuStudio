@@ -246,6 +246,10 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
             CAPTURE(counter);
             REQUIRE(result.counters.at(counter).get<size_t>() == 0);
         }
+        for (const char *counter : {"model_input_hits", "model_input_audits", "model_input_captures", "model_input_bytes"}) {
+            CAPTURE(counter);
+            REQUIRE(result.counters.at(counter).get<size_t>() == 0);
+        }
         for (const char *counter : {"model_replay_probes", "model_replay_rejections", "model_replay_passes",
                                    "model_replay_unavailable", "model_replay_stores", "model_replay_entries"}) {
             CAPTURE(counter);
@@ -276,6 +280,14 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
         REQUIRE(result.counters.at("model_cache_vertices").get<size_t>() <= 200000);
         REQUIRE(result.counters.at("model_cache_items").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_cache_items").get<size_t>() <= 20000);
+        REQUIRE(result.counters.at("model_input_captures").get<size_t>() == 1);
+        REQUIRE(result.counters.at("model_input_hits").get<size_t>() > 0);
+        REQUIRE(result.counters.at("model_input_audits") == result.counters.at("model_input_hits"));
+        REQUIRE(result.counters.at("model_input_bytes").get<size_t>() > 0);
+        REQUIRE(result.counters.at("model_input_combined_bytes").get<size_t>() <= 512 * 1024);
+        REQUIRE(result.counters.at("model_input_capture_peak_bytes").get<size_t>() <= 512 * 1024);
+        REQUIRE(result.counters.at("model_input_combined_vertices").get<size_t>() <= 200000);
+        REQUIRE(result.counters.at("model_input_combined_items").get<size_t>() <= 20000);
         // A remembered failure only proposes a new physical check. Exercise
         // both that check and a newly verified rejection on this real fixture.
         REQUIRE(result.counters.at("model_replay_probes").get<size_t>() > 0);
