@@ -18,6 +18,9 @@ namespace Slic3r { namespace BridgeAwareCubicValidation { struct WorkBudget; }}
 
 namespace Slic3r { namespace BridgeAwareCubic {
 
+class StrandProgram;
+struct StrandBudget;
+
 // Stable only within one lattice's bounds/origin, spacing, density and angle.
 struct CellId {
     std::array<int64_t, 3> address {{ 0, 0, 0 }};
@@ -154,6 +157,8 @@ public:
     // No same-layer anchoring order is promised. The deposition verifier must
     // establish previous-layer support or impose its own dependency ordering.
     Polylines lines(double z, const ExPolygon &domain) const;
+    // Raw added partition strands, before clipping, flow and physical validation.
+    StrandProgram strand_program(double z, StrandBudget &budget) const;
     // Optional provenance for the identical lines() geometry and order.
     // Metadata admission is bounded by capacity_units (at most 200000,
     // measured in sizeof(Point) storage units) and 20000 records. Whole vector

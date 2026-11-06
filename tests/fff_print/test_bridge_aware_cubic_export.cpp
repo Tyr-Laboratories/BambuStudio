@@ -3,6 +3,7 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicContact.hpp"
 #include "libslic3r/Fill/BridgeAwareCubic.hpp"
+#include "libslic3r/Fill/BridgeAwareCubicStrands.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicSerialization.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicValidation.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
@@ -13,6 +14,7 @@
 #include "libslic3r/Utils.hpp"
 
 #include <boost/filesystem.hpp>
+#include <boost/multiprecision/cpp_int.hpp>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -1026,3 +1028,274 @@ TEST_CASE("Bridge aware cubic writes native CLI benchmark fixtures", "[.][BACBen
     REQUIRE(output.good());
     std::cout << "BAC_BENCHMARK_FIXTURES manifest=" << manifest_path << " archives=8 slicing_performed=0" << std::endl;
 }
+
+// A diagnostic on actual certified qualification Plan states. No canonical
+// point is installed in a PrintObject, passed to Contact, or sent to export.
+namespace canonical_plan_diagnostic {
+namespace BAC = Slic3r::BridgeAwareCubic;
+using Plane = BAC::StrandPlane;
+using Budget = BAC::StrandBudget;
+using Atom = std::tuple<int64_t, bool, int64_t, bool, BAC::CellId, coord_t, coord_t, coord_t, coord_t>;
+using Run = std::vector<Atom>;
+using Rows = std::vector<Run>;
+using Image = std::map<Plane, Rows>;
+using OwnerSet = std::set<BAC::CellId>;
+using XY = std::pair<coord_t, coord_t>;
+using Axis = std::pair<XY, XY>;
+using Json = nlohmann::json;
+struct Counts {
+    size_t base_faces = 0, trial_faces = 0, removed_faces = 0, added_faces = 0;
+    size_t base_runs = 0, trial_runs = 0, removed_runs = 0, added_runs = 0;
+    size_t base_planes = 0, trial_planes = 0, touched_planes = 0, changed_planes = 0;
+    size_t evaluated_layers = 0, changed_layers = 0, rollback_checks = 0;
+    size_t toggle_kernel_units = 0, fresh_kernel_units = 0, restore_kernel_units = 0;
+    void add(const Counts &x) {
+        base_faces+=x.base_faces; trial_faces+=x.trial_faces; removed_faces+=x.removed_faces; added_faces+=x.added_faces;
+        base_runs+=x.base_runs; trial_runs+=x.trial_runs; removed_runs+=x.removed_runs; added_runs+=x.added_runs;
+        base_planes+=x.base_planes; trial_planes+=x.trial_planes; touched_planes+=x.touched_planes; changed_planes+=x.changed_planes;
+        evaluated_layers+=x.evaluated_layers; changed_layers+=x.changed_layers; rollback_checks+=x.rollback_checks;
+        toggle_kernel_units+=x.toggle_kernel_units; fresh_kernel_units+=x.fresh_kernel_units; restore_kernel_units+=x.restore_kernel_units;
+    }
+    void publish(Json &j) const {
+        j["faces"] = {{"base",base_faces},{"trial",trial_faces},{"removed",removed_faces},{"added",added_faces}};
+        j["runs"] = {{"base",base_runs},{"trial",trial_runs},{"removed",removed_runs},{"added",added_runs}};
+        j["planes"] = {{"base",base_planes},{"trial",trial_planes},{"touched",touched_planes},{"changed",changed_planes}};
+        j["logical_kernel_work_not_elapsed_time"] = {{"toggle_plus_changed_rows",toggle_kernel_units},{"fresh_full_program_plus_rows",fresh_kernel_units},{"restore_plus_changed_rows",restore_kernel_units}};
+        j["layers"] = {{"evaluated",evaluated_layers},{"changed",changed_layers},{"rollback_checks",rollback_checks}};
+    }
+};
+
+OwnerSet owners(const BAC::Plan &plan)
+{
+    OwnerSet out;
+    for (const auto &r : plan.refinements()) if (!r.solid) out.insert(r.id);
+    return out;
+}
+Rows rows(const BAC::StrandProgram &program, const Plane &plane, Budget &budget)
+{
+    Rows out;
+    for (const auto &r : program.runs(plane, budget)) {
+        REQUIRE_FALSE(r.atoms.empty());
+        REQUIRE(r.points.size() == r.atoms.size() + 1);
+        auto &row = out.emplace_back();
+        row.reserve(r.atoms.size());
+        for (size_t i = 0; i < r.atoms.size(); ++i) {
+            const auto &a = r.atoms[i];
+            const Point &p = r.points[i], &q = r.points[i + 1];
+            row.emplace_back(a.first.slot, a.first.shifted, a.last.slot, a.last.shifted, a.owner,
+                             p.x(), p.y(), q.x(), q.y());
+        }
+    }
+    return out;
+}
+Image image(const BAC::StrandProgram &program, Budget &budget)
+{
+    Image result;
+    for (const auto &plane : program.planes(budget)) {
+        auto values = rows(program, plane, budget);
+        REQUIRE_FALSE(values.empty());
+        REQUIRE(result.emplace(plane, std::move(values)).second);
+    }
+    return result;
+}
+// Reassemble ONLY rows listed by the incremental program. This independently
+// checks both its touched-plane list and exact ordered run/owner materialization.
+void update(Image &result, const BAC::StrandProgram &program, const std::set<Plane> &changed, Budget &budget)
+{
+    for (const auto &p : changed) {
+        auto value = rows(program, p, budget);
+        if (value.empty()) result.erase(p); else result[p] = std::move(value);
+    }
+}
+template<class T> std::pair<size_t, size_t> diff_counts(std::vector<T> a, std::vector<T> b)
+{
+    std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+    size_t x = 0, y = 0, common = 0;
+    while (x < a.size() && y < b.size()) {
+        if (a[x] < b[y]) ++x; else if (b[y] < a[x]) ++y; else { ++x; ++y; ++common; }
+    }
+    return {a.size() - common, b.size() - common};
+}
+void count_delta(const Image &base, const Image &fresh, size_t touched, Counts &c)
+{
+    ++c.evaluated_layers;
+    c.base_planes += base.size(); c.trial_planes += fresh.size(); c.touched_planes += touched;
+    std::set<Plane> planes;
+    for (const auto &e : base) planes.insert(e.first);
+    for (const auto &e : fresh) planes.insert(e.first);
+    const Rows empty;
+    bool changed = false;
+    for (const auto &p : planes) {
+        auto x = base.find(p), y = fresh.find(p);
+        const auto &a = x == base.end() ? empty : x->second;
+        const auto &b = y == fresh.end() ? empty : y->second;
+        c.base_runs += a.size(); c.trial_runs += b.size();
+        for (const auto &r : a) c.base_faces += r.size();
+        for (const auto &r : b) c.trial_faces += r.size();
+        if (a == b) continue;
+        changed = true; ++c.changed_planes;
+        const auto runs = diff_counts(a, b);
+        c.removed_runs += runs.first; c.added_runs += runs.second;
+        std::vector<Atom> af, bf;
+        for (const auto &r : a) af.insert(af.end(), r.begin(), r.end());
+        for (const auto &r : b) bf.insert(bf.end(), r.begin(), r.end());
+        const auto faces = diff_counts(std::move(af), std::move(bf));
+        c.removed_faces += faces.first; c.added_faces += faces.second;
+    }
+    c.changed_layers += changed;
+}
+// The existing broad reference retains the ORIGINAL raw partition sources,
+// even ones clipped outside the bounding rectangle. Compare oriented outer
+// endpoints; internal bends/barriers are separate, never silently suppressed.
+struct Legacy {
+    size_t compared = 0, unavailable = 0, canonical = 0, old = 0, only_new = 0, only_old = 0;
+    size_t order_different = 0, atoms = 0, stationary = 0, bends = 0, internal_vertices = 0;
+    void inspect(const BAC::Plan &plan, const Image &im, double z, const BoundingBox &box,
+                 Slic3r::BridgeAwareCubicValidation::WorkBudget &budget) {
+        std::vector<Axis> now, before;
+        for (const auto &plane : im) for (const auto &r : plane.second) {
+            const XY first{std::get<5>(r.front()), std::get<6>(r.front())};
+            const XY last{std::get<7>(r.back()), std::get<8>(r.back())};
+            if (first != last) now.emplace_back(first, last);
+            using Wide = boost::multiprecision::int256_t;
+            for (size_t i = 0; i < r.size(); ++i) {
+                const auto &a = r[i]; ++atoms;
+                stationary += std::get<5>(a) == std::get<7>(a) && std::get<6>(a) == std::get<8>(a);
+                if (i + 1 == r.size()) continue;
+                ++internal_vertices;
+                const Wide dx = Wide(last.first) - first.first, dy = Wide(last.second) - first.second;
+                bends += dx * (Wide(std::get<8>(a)) - first.second) != dy * (Wide(std::get<7>(a)) - first.first);
+            }
+        }
+        const auto actual = plan.reference_lines(z, box, 200000, &budget);
+        if (!actual.complete) { ++unavailable; return; }
+        ++compared;
+        for (const auto &source : actual.sources) {
+            REQUIRE(source.kind == BAC::LineSource::Kind::Partition);
+            before.push_back({{source.canonical_a.x(), source.canonical_a.y()}, {source.canonical_b.x(), source.canonical_b.y()}});
+        }
+        canonical += now.size(); old += before.size(); order_different += now != before;
+        const auto delta = diff_counts(std::move(before), std::move(now));
+        only_old += delta.first; only_new += delta.second;
+    }
+    Json json() const { return {{"compared_layers",compared},{"unavailable_layers",unavailable},{"canonical_nonstationary_outer_axes",canonical},
+        {"legacy_outer_axes",old},{"canonical_only_axes",only_new},{"legacy_only_axes",only_old},{"ordered_axis_sequence_changed_layers",order_different},
+        {"all_raw_atoms",atoms},{"stationary_atoms",stationary},{"internal_vertices",internal_vertices},{"off_outer_chord_vertices",bends}}; }
+};
+
+void qualify(double width, double depth, const char *name)
+{
+    ExportWorkspace workspace;
+    auto config = export_config(); // Same settings as BACQualification, including 5% base density and G=5.
+    Model model;
+    auto *m = model.add_object();
+    m->name = std::string("BAC qualification ") + name + " bridgeawarecubic";
+    m->add_volume(TriangleMesh(its_make_cube(width, depth, 18.)));
+    m->add_instance()->set_offset(Vec3d(80., 80., 0.));
+    Print print;
+    print.set_status_silent(); print.auto_assign_extruders(m); print.apply(model, config);
+    print.process(); // All production decisions and actual deposition precede this diagnostic.
+    const PrintObject &object = *print.get_object(size_t(0));
+    REQUIRE(object.layers().size() <= 128);
+    REQUIRE(object.num_printing_regions() == 1);
+    const BAC::Plan *plan = object.bridge_aware_cubic_plan(0);
+    REQUIRE(plan != nullptr);
+    REQUIRE(plan->statistics().nodes <= 100000);
+    const auto active = owners(*plan);
+    REQUIRE_FALSE(active.empty()); REQUIRE(active.size() <= 2048);
+    const std::vector<BAC::CellId> ids(active.begin(), active.end());
+    // Deliberately bounded, stratified over actual depth/address-order. The
+    // report states the denominator. Trials are independent counterfactuals,
+    // never presumed valid/irreducible or installed into the certified object.
+    const size_t count = std::min<size_t>(12, ids.size());
+    Budget budget; budget.work_left = 50000000; budget.max_records = 200000;
+    Slic3r::BridgeAwareCubicValidation::WorkBudget reference_budget;
+    Legacy legacy;
+    Counts total;
+    size_t solid_layers = 0, closure_layers = 0, attachment_layers = 0, plain_layers = 0;
+    for (size_t t = 0; t < count; ++t) {
+        const auto id = ids[count == 1 ? 0 : t * (ids.size() - 1) / (count - 1)];
+        const BAC::Plan trial = plan->collapsed(id);
+        const auto survivors = owners(trial);
+        REQUIRE(std::includes(active.begin(),active.end(),survivors.begin(),survivors.end()));
+        std::vector<BAC::CellId> removed;
+        std::set_difference(active.begin(),active.end(),survivors.begin(),survivors.end(),std::back_inserter(removed));
+        REQUIRE(std::find(removed.begin(),removed.end(),id) != removed.end());
+        Counts changed;
+        for (const auto *layer : object.layers()) {
+            const double z = layer->print_z;
+            CAPTURE(t, id.depth, id.address[0], id.address[1], id.address[2], z);
+            if (!t) {
+                const bool has_solid = !plan->solid_sections(z).empty(), has_closure = plan->has_closures(z);
+                bool has_attachment = false;
+                plan->visit_attachments(z, [&](const auto &) { has_attachment = true; return false; });
+                solid_layers += has_solid; closure_layers += has_closure; attachment_layers += has_attachment;
+                plain_layers += !has_solid && !has_closure && !has_attachment;
+            }
+            auto program = plan->strand_program(z, budget);
+            const auto before = image(program, budget);
+            if (!t) legacy.inspect(*plan, before, z, object.bounding_box(), reference_budget);
+            const auto before_toggle = budget.work_left;
+            std::set<Plane> touched;
+            std::vector<BAC::CellId> live;
+            for (const auto &owner : removed) if (program.contains_owner(owner, budget)) {
+                live.push_back(owner);
+                const auto changes = program.set_owner(owner, false, budget);
+                REQUIRE(changes.size() <= 3);
+                touched.insert(changes.begin(), changes.end());
+            }
+            Image incremental = before;
+            update(incremental, program, touched, budget);
+            changed.toggle_kernel_units += before_toggle - budget.work_left;
+            const auto before_fresh = budget.work_left;
+            const auto rebuilt = trial.strand_program(z, budget);
+            const auto fresh = image(rebuilt, budget);
+            changed.fresh_kernel_units += before_fresh - budget.work_left;
+            // Compare full ordered plane/run/atom records and all integer
+            // breakpoints; sizes, hashes or unchanged outer endpoints alone
+            // cannot establish toggle equality.
+            REQUIRE(bool(incremental == fresh));
+            REQUIRE(bool(image(program,budget) == fresh));
+            count_delta(before, fresh, touched.size(), changed);
+            const auto before_restore = budget.work_left;
+            std::set<Plane> restored;
+            for (auto it = live.rbegin(); it != live.rend(); ++it) {
+                const auto changes = program.set_owner(*it, true, budget);
+                restored.insert(changes.begin(),changes.end());
+            }
+            update(incremental, program, restored, budget);
+            changed.restore_kernel_units += before_restore - budget.work_left;
+            REQUIRE(bool(incremental == before));
+            REQUIRE(bool(image(program,budget) == before));
+            ++changed.rollback_checks;
+        }
+        total.add(changed);
+        Json result = {{"fixture",name},{"trial",t},{"cell_depth",id.depth},{"cell_address",id.address},
+            {"removed_split_owners",removed.size()},{"remaining_split_owners",survivors.size()}};
+        changed.publish(result);
+        std::cout << "BAC_CANONICAL_RAW_TRIAL " << result.dump() << '\n';
+    }
+    REQUIRE(total.changed_layers > 0);
+    REQUIRE(total.removed_faces > 0);
+    REQUIRE(total.changed_planes <= total.touched_planes);
+    REQUIRE(total.rollback_checks == count * object.layers().size());
+    REQUIRE(legacy.compared > 0);
+    REQUIRE(legacy.old > 0);
+    Json summary = {{"fixture",name},{"qualification", "raw geometry only; not a deposited-material certificate"},
+        {"actual_layers",object.layers().size()},{"available_split_ids",ids.size()},{"sampled_split_ids",count},
+        {"baseline_guard_layers",{{"solid",solid_layers},{"closure",closure_layers},{"attachment",attachment_layers},
+            {"no_active_payload",plain_layers}}}, {"legacy_broad_reference",legacy.json()},
+        {"strand_total_work_used",50000000-budget.work_left},{"reference_work_used",50000000-reference_budget.remaining_work},
+        {"actual_deposition_changed",false}};
+    total.publish(summary);
+    std::cout << "BAC_CANONICAL_RAW_SUMMARY " << summary.dump() << std::endl;
+}
+} // namespace canonical_plan_diagnostic
+
+TEST_CASE("Canonical raw plane program matches actual qualification Plan collapse updates - small",
+          "[.][BACCanonicalRealPlan][BACCanonicalRealPlanSmall]")
+{ canonical_plan_diagnostic::qualify(32.,28.,"small"); }
+
+TEST_CASE("Canonical raw plane program matches actual qualification Plan collapse updates - large",
+          "[.][BACCanonicalRealPlan][BACCanonicalRealPlanLarge]")
+{ canonical_plan_diagnostic::qualify(64.,56.,"large"); }

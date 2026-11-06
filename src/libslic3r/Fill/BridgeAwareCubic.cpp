@@ -1,3 +1,4 @@
+#include "BridgeAwareCubicStrands.hpp"
 #include "BridgeAwareCubic.hpp"
 #include "BridgeAwareCubicClipMask.hpp"
 #include "BridgeAwareCubicValidation.hpp"
@@ -1004,6 +1005,14 @@ Plan::Plan(std::shared_ptr<const Impl> implementation) : m_impl(std::move(implem
 Plan::~Plan() = default;
 Plan::Plan(Plan&&) noexcept = default;
 Plan& Plan::operator=(Plan&&) noexcept = default;
+
+StrandProgram Plan::strand_program(double z, StrandBudget &budget) const
+{
+    m_impl->cancel();
+    static const std::vector<Refinement> empty;
+    return StrandProgram(z, m_impl->bulk_edge, m_impl->origin, m_impl->to_world,
+        m_impl->has_elevation(z) ? m_impl->refinements : empty, m_impl->parameters.throw_if_canceled, budget);
+}
 
 Polylines Plan::lines(double z, const ExPolygon &domain) const
 {
