@@ -148,7 +148,8 @@ SCENARIO( "TriangleMesh: slice behavior.") {
             }
             THEN( "The area of the returned polygons is correct.") {
                 for (size_t i = 0U; i < z.size(); i++) {
-                    REQUIRE(result.at(i).at(0).area() == 20.0*20/(std::pow(SCALING_FACTOR,2)));
+                    REQUIRE(result.at(i).at(0).area() * SCALING_FACTOR * SCALING_FACTOR ==
+                            Approx(20.0 * 20.0).epsilon(1e-12));
                 }
             }
         }

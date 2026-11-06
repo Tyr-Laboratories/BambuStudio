@@ -5,9 +5,11 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Exception.hpp"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/Preset.hpp"
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 
 using namespace Slic3r;
 
@@ -182,12 +184,95 @@ TEST_CASE("Bridge aware cubic rejects export transformations outside its geometr
 {
     auto model = bridge_aware_cube();
     auto config = bridge_aware_config();
-    SECTION("seam clipping") { config.set_deserialize_strict({{"seam_gap", "10%"}}); }
+    std::string expected_error;
+    SECTION("seam clipping") {
+        config.set_deserialize_strict({{"seam_gap", "10%"}});
+        expected_error = "Seam gap";
+    }
+    SECTION("spiral vase with an active sparse object override") {
+        config.set_deserialize_strict({{"spiral_mode", "1"}});
+        // The global spiral preset normalizes sparse density to zero. A model
+        // override is applied afterwards and can reactivate incompatible BAC.
+        model.objects.front()->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(5.));
+        expected_error = "Spiral vase";
+    }
     SECTION("scarf override") {
         config.set_deserialize_strict({{"override_filament_scarf_seam_setting", "1"}, {"seam_slope_type", "all"}});
+        expected_error = "Scarf";
     }
     Print print;
-    REQUIRE_THROWS_AS(slice(print, model, config), SlicingError);
+    print.set_status_silent();
+    print.auto_assign_extruders(model.objects.front());
+    print.apply(model, config);
+    REQUIRE(print.get_object(size_t(0))->has_bridge_aware_cubic());
+    REQUIRE_THAT(print.validate().string, Catch::Contains(expected_error));
+    REQUIRE_THROWS_AS(print.process(), SlicingError);
+}
+
+TEST_CASE("Spiral vase normalizes bridge aware cubic to inactive sparse infill",
+          "[BridgeAwareCubic][Integration][ExportGuards]")
+{
+    auto model = bridge_aware_cube();
+    auto config = bridge_aware_config();
+    config.set_deserialize_strict({{"spiral_mode", "1"}});
+    Print print;
+    REQUIRE_NOTHROW(slice(print, model, config));
+    const PrintObject *object = print.get_object(size_t(0));
+    REQUIRE(print.config().spiral_mode.value);
+    REQUIRE_FALSE(object->has_bridge_aware_cubic());
+    for (const PrintRegion &region : object->all_regions())
+        REQUIRE(region.config().sparse_infill_density.value == 0.);
+    REQUIRE(sparse_length(print) == 0.);
+}
+
+TEST_CASE("Active bridge aware cubic requires one finite shared nozzle offset",
+          "[BridgeAwareCubic][Integration][ExportGuards][NozzleOffsets]")
+{
+    const std::string variant = GENERATE("equal", "different", "nan", "infinite");
+    CAPTURE(variant);
+    Vec2d first(.125, -.25), second = first;
+    if (variant == "different") second.x() += .5;
+    else if (variant == "nan") first.x() = second.x() = std::numeric_limits<double>::quiet_NaN();
+    else if (variant == "infinite") first.y() = second.y() = std::numeric_limits<double>::infinity();
+
+    auto model = bridge_aware_cube();
+    auto config = bridge_aware_config();
+    config.set_key_value("extruder_offset", new ConfigOptionPoints{first, second});
+    Print print;
+    print.set_status_silent();
+    print.auto_assign_extruders(model.objects.front());
+    print.apply(model, config);
+    REQUIRE(print.config().extruder_offset.values.size() == 2);
+    REQUIRE(print.get_object(size_t(0))->has_bridge_aware_cubic());
+
+    if (variant == "equal") {
+        REQUIRE(print.validate().string.empty());
+        REQUIRE_NOTHROW(print.process());
+        REQUIRE(sparse_length(print) > 0.);
+    } else {
+        REQUIRE_THAT(print.validate().string, Catch::Contains("identical extruder offsets"));
+        REQUIRE_THROWS_WITH(print.process(), Catch::Contains("identical nozzle XY offsets"));
+    }
+}
+
+TEST_CASE("Nozzle offset restriction applies only to active bridge aware cubic",
+          "[BridgeAwareCubic][Integration][ExportGuards][NozzleOffsets]")
+{
+    const std::string mode = GENERATE("ordinary cubic", "zero density", "solid density");
+    CAPTURE(mode);
+    auto model = bridge_aware_cube();
+    auto config = bridge_aware_config();
+    if (mode == "ordinary cubic") config.set_deserialize_strict({{"sparse_infill_pattern", "cubic"}});
+    else config.set_deserialize_strict({{"sparse_infill_density", mode == "zero density" ? "0%" : "100%"}});
+    config.set_key_value("extruder_offset", new ConfigOptionPoints{Vec2d(.125, -.25), Vec2d(.625, -.25)});
+    Print print;
+    print.set_status_silent();
+    print.auto_assign_extruders(model.objects.front());
+    print.apply(model, config);
+    REQUIRE(print.config().extruder_offset.values.size() == 2);
+    REQUIRE_FALSE(print.get_object(size_t(0))->has_bridge_aware_cubic());
+    REQUIRE(print.validate().string.find("Bridge aware cubic") == std::string::npos);
+    REQUIRE_NOTHROW(print.process());
 }
 
 TEST_CASE("Bridge aware cubic refuses extrusion caches without a support plan",
@@ -214,4 +299,102 @@ TEST_CASE("Bridge aware cubic checks sparse bridge follow-up layers",
     REQUIRE_THROWS_WITH(slice(print, model, config),
         Catch::Matchers::Contains("Bridge Layer Density") &&
         Catch::Matchers::Contains("follow-up bridge layer"));
+}
+
+namespace {
+
+DynamicPrintConfig mixed_sublayer_guard_config()
+{
+    auto config = DynamicPrintConfig::full_print_config();
+    config.apply(bridge_aware_config());
+    config.set_num_filaments(3);
+    const auto &defaults = FullPrintConfig::defaults();
+    // Match the complete filament fixtures used by test_printgcode.cpp:
+    // set_num_filaments alone does not cover every per-filament profile array.
+    for (const std::string &key : Preset::filament_options()) {
+        if (key.find("compatible_") == 0) continue;
+        ConfigOption *option = config.option(key);
+        if (option != nullptr && option->is_vector())
+            static_cast<ConfigOptionVectorBase *>(option)->resize(3, defaults.option(key));
+    }
+    config.set_key_value("filament_self_index", new ConfigOptionInts{1, 2, 3});
+    config.set_key_value("filament_map", new ConfigOptionInts{1, 1, 1});
+    config.set_key_value("filament_volume_map", new ConfigOptionInts{int(nvtStandard), int(nvtStandard), int(nvtStandard)});
+    config.set_key_value("flush_volumes_matrix", new ConfigOptionFloats(std::vector<double>(9, 0.)));
+    config.set_key_value("filament_is_mixed", new ConfigOptionBools{false, false, true});
+    config.set_key_value("filament_mixed_components", new ConfigOptionStrings{"", "", "1,2"});
+    config.set_key_value("filament_mixed_sublayer_ratios", new ConfigOptionStrings{"", "", "0.5,0.5"});
+    config.set_deserialize_strict({{"enable_mixed_color_sublayer", "1"},
+        {"override_filament_scarf_seam_setting", "1"}, {"seam_slope_type", "none"},
+        {"apply_scarf_seam_on_circles", "0"}});
+    return config;
+}
+
+} // namespace
+
+TEST_CASE("Bridge aware cubic rejects mixed sublayers assigned to enabled model roles",
+          "[BridgeAwareCubic][Integration][ExportGuards][MixedSublayers]")
+{
+    const std::string assignment = GENERATE("object", "wall_filament", "sparse_infill_filament", "solid_infill_filament", "gradient");
+    CAPTURE(assignment);
+    auto model = bridge_aware_cube();
+    auto config = mixed_sublayer_guard_config();
+    auto *model_object = model.objects.front();
+    model_object->config.set("extruder", assignment == "object" || assignment == "gradient" ? 3 : 1);
+    if (assignment == "wall_filament" || assignment == "sparse_infill_filament" || assignment == "solid_infill_filament")
+        model_object->config.set(assignment, 3);
+    if (assignment == "gradient") {
+        config.set_key_value("filament_mixed_gradient", new ConfigOptionBools{false, false, true});
+        config.set_key_value("filament_mixed_gradient_range", new ConfigOptionStrings{"", "", "0.1,0.9"});
+    }
+    Print print;
+    print.set_status_silent();
+    print.auto_assign_extruders(model_object);
+    print.apply(model, config);
+    const PrintObject *object = print.get_object(size_t(0));
+    REQUIRE(object->has_bridge_aware_cubic());
+    const auto error = print.validate();
+    REQUIRE_THAT(error.string, Catch::Contains("Mixed color sublayer"));
+    CHECK(error.opt_key == "enable_mixed_color_sublayer");
+    CHECK(error.object == object);
+    CHECK(object->layer_count() == 0);
+}
+
+TEST_CASE("Bridge aware cubic mixed sublayer guard follows enabled object roles",
+          "[BridgeAwareCubic][Integration][ExportGuards][MixedSublayers]")
+{
+    const std::string mode = GENERATE("disabled sublayers", "unused mixed slot", "ordinary cubic",
+        "zero density", "solid density", "ordinary neighboring object", "disabled wall role");
+    CAPTURE(mode);
+    auto model = bridge_aware_cube();
+    auto config = mixed_sublayer_guard_config();
+    auto *model_object = model.objects.front();
+    model_object->config.set("extruder", 3);
+    if (mode == "disabled sublayers")
+        config.set_deserialize_strict({{"enable_mixed_color_sublayer", "0"}});
+    else if (mode == "ordinary cubic")
+        config.set_deserialize_strict({{"sparse_infill_pattern", "cubic"}});
+    else if (mode == "zero density" || mode == "solid density")
+        config.set_deserialize_strict({{"sparse_infill_density", mode == "zero density" ? "0%" : "100%"}});
+    else {
+        model_object->config.set("extruder", 1);
+        if (mode == "ordinary neighboring object") {
+            auto *ordinary = model.add_object();
+            ordinary->name = "Ordinary object with mixed sublayers";
+            ordinary->config.set("extruder", 3);
+            ordinary->config.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<InfillPattern>(ipCubic));
+            ordinary->add_volume(TriangleMesh(its_make_cube(16., 16., 18.)));
+            ordinary->add_instance()->set_offset(Vec3d(140., 80., 0.));
+        } else if (mode == "disabled wall role") {
+            model_object->config.set("wall_filament", 3);
+            model_object->config.set("wall_loops", 0);
+        }
+    }
+    Print print;
+    print.set_status_silent();
+    for (ModelObject *object : model.objects) print.auto_assign_extruders(object);
+    print.apply(model, config);
+    const auto error = print.validate();
+    CAPTURE(error.string);
+    REQUIRE(error.string.empty());
 }

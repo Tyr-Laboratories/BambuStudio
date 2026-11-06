@@ -30,6 +30,31 @@ public:
         // actual fill boundary instead, so they join the deposited inner wall.
         for (const ExPolygon &domain : offset_ex(surface->expolygon, scale_(overlap)))
             append(result, plan->lines(z, domain));
+        // Two perpendicular half-density families preserve one nominal layer
+        // volume while closing the long top-plane slots of parallel solid
+        // fill. Their masks remain construction obligations: the final verifier
+        // checks every emitted line and its preceding-layer support.
+        std::array<FillAlignedRectilinear, 2> solid;
+        for (size_t family = 0; family < solid.size(); ++family) {
+            solid[family].copy_fill_data(this);
+            solid[family].spacing = params.flow.spacing();
+            solid[family].angle = float(plan->parameters().angle + family * .5 * PI);
+        }
+        FillParams solid_params = params;
+        solid_params.density = .5f;
+        solid_params.multiline = 1;
+        solid_params.dont_adjust = true;
+        solid_params.anchor_length = solid_params.anchor_length_max = 0.f;
+        for (const ExPolygon &domain : intersection_ex(plan->solid_area(z),
+                 offset_ex(surface->expolygon, scale_(overlap)))) {
+            Surface patch = *surface;
+            patch.expolygon = domain;
+            // This internal construction follows the cubic lattice directions;
+            // a model bridge hint must not override both families to one angle.
+            patch.bridge_angle = -1.;
+            for (FillAlignedRectilinear &family : solid)
+                append(result, family.fill_surface(&patch, solid_params));
+        }
         // A fill boundary can also be a real exterior or cavity, including
         // models without perimeters. Keep the whole bead inside that material.
         if (material_domain != nullptr)

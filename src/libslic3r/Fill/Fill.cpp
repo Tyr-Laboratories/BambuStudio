@@ -12,6 +12,7 @@
 #include "FillBase.hpp"
 #include "FillRectilinear.hpp"
 #include "FillBridgeAwareCubic.hpp"
+#include "BridgeAwareCubicSupport.hpp"
 #include "FillLightning.hpp"
 #include "FillConcentricInternal.hpp"
 #include "FillConcentric.hpp"
@@ -94,7 +95,20 @@ struct SurfaceFillParams
 #define RETURN_COMPARE_NON_EQUAL(KEY) if (this->KEY < rhs.KEY) return true; if (this->KEY > rhs.KEY) return false;
 #define RETURN_COMPARE_NON_EQUAL_TYPED(TYPE, KEY) if (TYPE(this->KEY) < TYPE(rhs.KEY)) return true; if (TYPE(this->KEY) > TYPE(rhs.KEY)) return false;
 
-		// Sort first by decreasing bridging angle, so that the bridges are processed with priority when trimming one layer by the other.
+		// Bridges retain priority over other surfaces. Within that class, BAC
+        // region ownership precedes mutable bridge angles: a trial rotation
+        // must not reorder the safety clipping of an untouched neighbor.
+        // Ordinary regions all share the sentinel key, retaining their
+        // existing angle order. These unconditional keys also keep mixed
+        // BAC/ordinary comparisons transitive.
+        const bool bridge_class = this->bridge_angle >= 0.f;
+        const bool rhs_bridge_class = rhs.bridge_angle >= 0.f;
+        if (bridge_class != rhs_bridge_class) return bridge_class;
+        if (bridge_class) {
+            RETURN_COMPARE_NON_EQUAL(bridge_aware_region);
+        }
+
+		// Sort by decreasing angle within a stable bridge ownership class.
 		if (this->bridge_angle > rhs.bridge_angle) return true;
 		if (this->bridge_angle < rhs.bridge_angle) return false;
 
@@ -865,6 +879,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 	        collection.entities.push_back(thin_fill->clone());
 	    }
 
+    // Modifier-interface partitions have one region owner and must be emitted
+    // once, after all surface groups. Saved endpoint attachments are replayed
+    // here so regeneration and the final deposited paths share one geometry.
+    BridgeAwareCubic::apply_layer_paths(*this);
+
 #ifndef NDEBUG
 	for (LayerRegion *layerm : m_regions)
 	    for (size_t i = 0; i < layerm->fills.entities.size(); ++ i)
@@ -988,6 +1007,7 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
 		}
 	}
 
+    append(sparse_infill_polylines, BridgeAwareCubic::layer_closure_lines(*this));
 	return sparse_infill_polylines;
 }
 

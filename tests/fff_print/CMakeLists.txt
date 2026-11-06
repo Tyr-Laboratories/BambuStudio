@@ -36,7 +36,7 @@ add_executable(support_material_on_wipe_tower_tests
 	test_data.hpp
 	test_support_material_on_wipe_tower.cpp
 	)
-target_link_libraries(support_material_on_wipe_tower_tests test_common libslic3r
+target_link_libraries(support_material_on_wipe_tower_tests test_common libslic3r slicer_test_support
 	libcurl
 	OpenSSL::SSL OpenSSL::Crypto
 )
@@ -52,7 +52,7 @@ add_executable(periodic_modifier_tests
 	test_data.hpp
 	test_periodic_modifier.cpp
 	)
-target_link_libraries(periodic_modifier_tests test_common libslic3r
+target_link_libraries(periodic_modifier_tests test_common libslic3r slicer_test_support
 	libcurl
 	OpenSSL::SSL OpenSSL::Crypto
 )
@@ -98,7 +98,12 @@ add_test(bridge_controls_tests bridge_controls_tests ${CATCH_EXTRA_ARGS})
 add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cubic_config.cpp
     test_bridge_aware_cubic_geometry.cpp test_bridge_aware_cubic_validation.cpp
     test_bridge_aware_cubic.cpp test_bridge_aware_cubic_modifiers.cpp
-    test_bridge_aware_cubic_repair.cpp)
+    test_bridge_aware_cubic_repair.cpp test_bridge_aware_cubic_acceptance.cpp
+    test_bridge_aware_cubic_export.cpp test_bridge_aware_cubic_attachment.cpp
+    test_bridge_aware_cubic_interfaces.cpp test_bridge_aware_cubic_contact.cpp
+    test_bridge_aware_cubic_dependencies.cpp test_bridge_aware_cubic_writer.cpp
+    test_bridge_aware_cubic_layer_grouping.cpp
+    test_gcode_z_parsing.cpp)
 target_link_libraries(bridge_aware_cubic_tests test_common libslic3r slicer_test_support)
 set_property(TARGET bridge_aware_cubic_tests PROPERTY FOLDER "tests")
 add_test(bridge_aware_cubic_tests bridge_aware_cubic_tests ${CATCH_EXTRA_ARGS})

@@ -20,17 +20,17 @@
 
 using namespace Slic3r;
 
-static double area(const sla::RasterBase::PixelDim &pxd)
+static double area(const sla::PixelDim &pxd)
 {
     return pxd.w_mm * pxd.h_mm;
 }
 
 static Slic3r::sla::RasterGrayscaleAA create_raster(
-    const sla::RasterBase::Resolution &res,
+    const sla::Resolution &res,
     double                             disp_w = 100.,
     double                             disp_h = 100.)
 {
-    sla::RasterBase::PixelDim pixdim{disp_w / res.width_px, disp_h / res.height_px};
+    sla::PixelDim pixdim{disp_w / res.width_px, disp_h / res.height_px};
     
     auto bb = BoundingBox({0, 0}, {scaled(disp_w), scaled(disp_h)});
     sla::RasterBase::Trafo trafo;
@@ -87,6 +87,15 @@ static ExPolygons circle_with_hole(double r, Point center = {0, 0}) {
 static const Vec2i W4x4 = {4, 4};
 static const Vec2i W2x2 = {2, 2};
 
+static size_t white_pixel_count(const sla::RasterGrayscaleAA &raster)
+{
+    size_t count = 0;
+    for (size_t row = 0; row < raster.resolution().height_px; ++row)
+        for (size_t col = 0; col < raster.resolution().width_px; ++col)
+            count += raster.read_pixel(col, row) == 255;
+    return count;
+}
+
 template<class Rst>
 static void test_expolys(Rst &&             rst,
                          const ExPolygons & ref,
@@ -107,7 +116,7 @@ static void test_expolys(Rst &&             rst,
     svg.Close();
     
     double max_rel_err = 0.1;
-    sla::RasterBase::PixelDim pxd = rst.pixel_dimensions();
+    sla::PixelDim pxd = rst.pixel_dimensions();
     double max_abs_err = area(pxd) * scaled(1.) * scaled(1.);
     
     BoundingBox ref_bb;
@@ -175,20 +184,21 @@ TEST_CASE("Fully covered raster should result in a rectangle", "[MarchingSquares
 
 TEST_CASE("4x4 raster with one ring", "[MarchingSquares]") {
     
-    sla::RasterBase::PixelDim pixdim{1, 1};
+    sla::PixelDim pixdim{1, 1};
     
     // We need one additional row and column to detect edges
     sla::RasterGrayscaleAA rst{{4, 4}, pixdim, {}, agg::gamma_threshold(.5)};
     
-    // Draw a triangle from individual pixels
-    rst.draw(square(1., {0500000, 0500000}));
-    rst.draw(square(1., {1500000, 0500000}));
-    rst.draw(square(1., {2500000, 0500000}));
+    // Draw six pixels in millimeters so the fixture follows SCALING_FACTOR.
+    rst.draw(square(1., {scaled<coord_t>(0.5), scaled<coord_t>(0.5)}));
+    rst.draw(square(1., {scaled<coord_t>(1.5), scaled<coord_t>(0.5)}));
+    rst.draw(square(1., {scaled<coord_t>(2.5), scaled<coord_t>(0.5)}));
     
-    rst.draw(square(1., {1500000, 1500000}));
-    rst.draw(square(1., {2500000, 1500000}));
+    rst.draw(square(1., {scaled<coord_t>(1.5), scaled<coord_t>(1.5)}));
+    rst.draw(square(1., {scaled<coord_t>(2.5), scaled<coord_t>(1.5)}));
     
-    rst.draw(square(1., {2500000, 2500000}));
+    rst.draw(square(1., {scaled<coord_t>(2.5), scaled<coord_t>(2.5)}));
+    REQUIRE(white_pixel_count(rst) == 6);
     
     std::fstream out("4x4.png", std::ios::out);
     out << rst.encode(sla::PNGRasterEncoder{});
@@ -205,21 +215,22 @@ TEST_CASE("4x4 raster with one ring", "[MarchingSquares]") {
 
 TEST_CASE("4x4 raster with two rings", "[MarchingSquares]") {
     
-    sla::RasterBase::PixelDim pixdim{1, 1};
+    sla::PixelDim pixdim{1, 1};
     
     // We need one additional row and column to detect edges
     sla::RasterGrayscaleAA rst{{5, 5}, pixdim, {}, agg::gamma_threshold(.5)};
     
     SECTION("Ambiguous case with 'ac' square") {
         
-        // Draw a triangle from individual pixels
-        rst.draw(square(1., {3500000, 2500000}));
-        rst.draw(square(1., {3500000, 3500000}));
-        rst.draw(square(1., {2500000, 3500000}));
+        // Draw six pixels in millimeters so the fixture follows SCALING_FACTOR.
+        rst.draw(square(1., {scaled<coord_t>(3.5), scaled<coord_t>(2.5)}));
+        rst.draw(square(1., {scaled<coord_t>(3.5), scaled<coord_t>(3.5)}));
+        rst.draw(square(1., {scaled<coord_t>(2.5), scaled<coord_t>(3.5)}));
         
-        rst.draw(square(1., {2500000, 1500000}));
-        rst.draw(square(1., {1500000, 1500000}));
-        rst.draw(square(1., {1500000, 2500000}));
+        rst.draw(square(1., {scaled<coord_t>(2.5), scaled<coord_t>(1.5)}));
+        rst.draw(square(1., {scaled<coord_t>(1.5), scaled<coord_t>(1.5)}));
+        rst.draw(square(1., {scaled<coord_t>(1.5), scaled<coord_t>(2.5)}));
+        REQUIRE(white_pixel_count(rst) == 6);
         
         std::fstream out("4x4_ac.png", std::ios::out);
         out << rst.encode(sla::PNGRasterEncoder{});
@@ -236,14 +247,15 @@ TEST_CASE("4x4 raster with two rings", "[MarchingSquares]") {
     
     SECTION("Ambiguous case with 'bd' square") {
         
-        // Draw a triangle from individual pixels
-        rst.draw(square(1., {3500000, 1500000}));
-        rst.draw(square(1., {3500000, 2500000}));
-        rst.draw(square(1., {2500000, 1500000}));
+        // Draw six pixels in millimeters so the fixture follows SCALING_FACTOR.
+        rst.draw(square(1., {scaled<coord_t>(3.5), scaled<coord_t>(1.5)}));
+        rst.draw(square(1., {scaled<coord_t>(3.5), scaled<coord_t>(2.5)}));
+        rst.draw(square(1., {scaled<coord_t>(2.5), scaled<coord_t>(1.5)}));
         
-        rst.draw(square(1., {1500000, 2500000}));
-        rst.draw(square(1., {1500000, 3500000}));
-        rst.draw(square(1., {2500000, 3500000}));
+        rst.draw(square(1., {scaled<coord_t>(1.5), scaled<coord_t>(2.5)}));
+        rst.draw(square(1., {scaled<coord_t>(1.5), scaled<coord_t>(3.5)}));
+        rst.draw(square(1., {scaled<coord_t>(2.5), scaled<coord_t>(3.5)}));
+        REQUIRE(white_pixel_count(rst) == 6);
         
         std::fstream out("4x4_bd.png", std::ios::out);
         out << rst.encode(sla::PNGRasterEncoder{});
@@ -321,7 +333,7 @@ static void recreate_object_from_rasters(const std::string &objname, float lh) {
     
     std::vector<ExPolygons> layers = slice_mesh_ex(mesh.its, grid(float(bb.min.z()) + lh, float(bb.max.z()), lh));
     
-    sla::RasterBase::Resolution res{2560, 1440};
+    sla::Resolution res{2560, 1440};
     double                      disp_w = 120.96;
     double                      disp_h = 68.04;
 

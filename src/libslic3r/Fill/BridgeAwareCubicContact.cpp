@@ -1,0 +1,704 @@
+#include "BridgeAwareCubicContact.hpp"
+#include "BridgeAwareCubicValidation.hpp"
+
+#include "../ClipperUtils.hpp"
+#include "../Geometry/ConvexHull.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <exception>
+#include <limits>
+#include <numeric>
+#include <tuple>
+
+namespace Slic3r { namespace BridgeAwareCubicContact {
+
+namespace {
+using Scalar = long double;
+constexpr coord_t coordinate_limit = std::numeric_limits<coord_t>::max() / 4;
+constexpr size_t max_vertices = 200000;
+constexpr size_t max_work = 50000000;
+constexpr int64_t interval_denominator = 1000000000000000LL;
+
+enum class LimitKind { LocalWork, AggregateWork, Vertices, Coordinates };
+struct Limit {
+    LimitKind kind = LimitKind::LocalWork;
+    size_t used = 0, requested = 0;
+};
+struct Budget {
+    size_t work = 0, vertices = 0;
+    BridgeAwareCubicValidation::WorkBudget *aggregate = nullptr;
+    BridgeAwareCubicValidation::WorkCategory category = BridgeAwareCubicValidation::WorkCategory::ContactInput;
+    explicit Budget(BridgeAwareCubicValidation::WorkBudget *shared = nullptr) : aggregate(shared) {}
+    void consume(size_t n = 1)
+    {
+        if (aggregate != nullptr && n > aggregate->remaining_work) {
+            aggregate->unspent_at_limit = aggregate->remaining_work;
+            aggregate->rejected_request = n;
+            aggregate->remaining_work = 0;
+            throw Limit{LimitKind::AggregateWork};
+        }
+        if (n > max_work - work)
+            throw Limit{LimitKind::LocalWork, work, n};
+        work += n;
+        if (aggregate != nullptr) {
+            aggregate->remaining_work -= n;
+            aggregate->charged_work[size_t(category)] += n;
+        }
+    }
+    void allocate(size_t n)
+    {
+        if (n > max_vertices - vertices)
+            throw Limit{LimitKind::Vertices, vertices, n};
+        consume(n);
+        vertices += n;
+    }
+};
+struct V {
+    Scalar x, y;
+    explicit V(const Point &p) : x(p.x()), y(p.y()) {}
+    V(Scalar x_, Scalar y_) : x(x_), y(y_) {}
+};
+V operator+(V a, V b) { return {a.x + b.x, a.y + b.y}; }
+V operator-(V a, V b) { return {a.x - b.x, a.y - b.y}; }
+V operator*(V a, Scalar s) { return {a.x * s, a.y * s}; }
+Scalar dot(V a, V b) { return a.x * b.x + a.y * b.y; }
+int64_t idot(V a, V b) { return int64_t(a.x) * int64_t(b.x) + int64_t(a.y) * int64_t(b.y); }
+int64_t icross(V a, V b) { return int64_t(a.x) * int64_t(b.y) - int64_t(a.y) * int64_t(b.x); }
+
+bool dimensions(double width, double height, double top)
+{
+    return std::isfinite(width) && std::isfinite(height) && std::isfinite(top) &&
+           width >= height && height > 0. && width < double(coordinate_limit) * SCALING_FACTOR &&
+           std::abs(top) < double(coordinate_limit) * SCALING_FACTOR && top - height < top;
+}
+
+bool valid_path(const ExtrusionPath &path, double top, Budget &budget,
+                bool permit_unmodeled_lower = false, bool *positive_xy = nullptr,
+                const char **invalid_reason = nullptr)
+{
+    const auto reject = [&](const char *reason) {
+        if (invalid_reason != nullptr)
+            *invalid_reason = reason;
+        return false;
+    };
+    const double model_width = permit_unmodeled_lower ? std::max(path.width, path.height) : path.width;
+    if (!dimensions(model_width, path.height, top) || !std::isfinite(path.width) || path.width <= 0.)
+        return reject("dimensions or elevation do not define a finite supported bead section.");
+    if (!std::isfinite(path.mm3_per_mm) || path.mm3_per_mm <= 0.)
+        return reject("extrusion amount must be finite and positive.");
+    if (path.is_force_no_extrusion())
+        return reject("path explicitly suppresses extrusion.");
+    if (path.polyline.points.size() < 2)
+        return reject("path has fewer than two XY vertices.");
+    budget.allocate(path.polyline.points.size());
+    bool positive = false;
+    const Points &points = path.polyline.points;
+    for (size_t i = 0; i < points.size(); ++i) {
+        const Point &p = points[i];
+        if (p.x() < -coordinate_limit || p.x() > coordinate_limit ||
+            p.y() < -coordinate_limit || p.y() > coordinate_limit)
+            return reject("XY coordinate exceeds the supported geometry range.");
+        positive |= i > 0 && p != points[i - 1];
+    }
+    for (const PathFittingData &fit : path.polyline.fitting_result)
+        if (fit.path_type == EMovePathType::Arc_move_cw || fit.path_type == EMovePathType::Arc_move_ccw)
+            return reject("fitted arc requires segmented geometry.");
+    if (positive_xy != nullptr)
+        *positive_xy = positive;
+    return positive || permit_unmodeled_lower || reject("path has no positive-length XY segment.");
+}
+
+// Only representation uncertainty of a float height and double Z arithmetic.
+// This is independent of the user-facing XY geometry tolerance.
+double z_roundoff(float height, double top)
+{
+    return .5 * double(std::nextafter(height, std::numeric_limits<float>::infinity()) - height) +
+           8. * std::numeric_limits<double>::epsilon() * std::max(1., std::abs(top));
+}
+
+double snapped_section(const ExtrusionPath &path, double top, double z)
+{
+    const double bottom = top - path.height;
+    const double error = z_roundoff(path.height, top);
+    if (std::abs(z - top) <= error || std::abs(z - bottom) <= error)
+        return double(path.width) - double(path.height);
+    return section_width_mm(path.width, path.height, top, z);
+}
+
+Point rounded(V p)
+{
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) ||
+        std::abs(p.x) > coordinate_limit - 4 || std::abs(p.y) > coordinate_limit - 4)
+        throw Limit{LimitKind::Coordinates};
+    return Point(coord_t(std::llround(p.x)), coord_t(std::llround(p.y)));
+}
+
+// Rounding a vertex moves it at most sqrt(1/2) coordinate units. Eroding the
+// convex rounded hull by three units therefore leaves an inner approximation.
+// Negative offset of this one convex polygon has bounded complexity.
+ExPolygons inner_hull(const std::vector<V> &corners, double reserve_mm, Budget &budget)
+{
+    // These convex inputs contain at most eight vertices. Charge their bounded
+    // intersection work before entering the hull/offset operations.
+    budget.consume(corners.size() * corners.size());
+    Points points;
+    points.reserve(corners.size());
+    for (V corner : corners)
+        points.push_back(rounded(corner));
+    Polygon hull = Geometry::convex_hull(std::move(points));
+    if (hull.points.size() < 3 || hull.area() <= 0.)
+        return {};
+    const double erosion = reserve_mm / SCALING_FACTOR + 3.;
+    float rounded_erosion = float(erosion);
+    if (double(rounded_erosion) < erosion)
+        rounded_erosion = std::nextafter(rounded_erosion, std::numeric_limits<float>::infinity());
+    ExPolygons result = offset_ex(hull, -rounded_erosion, ClipperLib::jtMiter);
+    for (const ExPolygon &polygon : result)
+        budget.allocate(polygon.contour.points.size());
+    return result;
+}
+
+struct LowerSection {
+    Point a, b;
+    Scalar radius;
+    std::vector<V> corners;
+    std::tuple<int64_t, int64_t, int64_t, Scalar> line_key() const
+    {
+        int64_t dx = int64_t(b.x()) - a.x(), dy = int64_t(b.y()) - a.y();
+        const int64_t divisor = std::gcd(dx, dy);
+        dx /= divisor;
+        dy /= divisor;
+        return {dx, dy, dx * int64_t(a.y()) - dy * int64_t(a.x()), radius};
+    }
+};
+
+bool point_less(const Point &a, const Point &b)
+{
+    return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y());
+}
+
+// A real shared butt seam has no air gap. Merge exact collinear intervals
+// before rounding so the numerical reserve cannot manufacture a gap there.
+// Nonzero gaps, even below the reserve, are never merged.
+void merge_collinear_sections(std::vector<LowerSection> &sections, Budget &budget)
+{
+    for (auto &section : sections)
+        if (point_less(section.b, section.a))
+            std::swap(section.a, section.b);
+    budget.consume(sections.size() * size_t(2 + std::ceil(std::log2(std::max(size_t(1), sections.size())))));
+    std::sort(sections.begin(), sections.end(), [](const LowerSection &a, const LowerSection &b) {
+        const auto first = a.line_key(), second = b.line_key();
+        return first < second || (first == second && point_less(a.a, b.a));
+    });
+    size_t count = 0;
+    for (auto &section : sections) {
+        if (count > 0 && sections[count - 1].line_key() == section.line_key() &&
+            !point_less(sections[count - 1].b, section.a)) {
+            if (point_less(sections[count - 1].b, section.b))
+                sections[count - 1].b = section.b;
+        } else {
+            if (&sections[count] != &section)
+                sections[count] = std::move(section);
+            ++count;
+        }
+    }
+    sections.resize(count);
+}
+
+std::vector<V> rectangle_corners(const Point &a, const Point &b, Scalar radius)
+{
+    const V delta = V(b) - V(a);
+    const Scalar length = std::sqrt(dot(delta, delta));
+    const V transverse(-delta.y / length * radius, delta.x / length * radius);
+    return {V(a) + transverse, V(a) - transverse, V(b) - transverse, V(b) + transverse};
+}
+
+// A necessary contact condition: both finite axes must reach each other's
+// normal strip. Their actual cross-sections fit inside radius-sum strips, so
+// separation proves that neither a mask nor a finite contact line can meet the
+// upper segment. Keep the existing four-unit reach reserve, and retain every
+// numerically ambiguous pair. This never changes the physical cell material.
+bool separated_normal(const Point &origin, V direction, Scalar length,
+                      const Point &a, const Point &b, Scalar reach, Budget &budget)
+{
+    budget.consume();
+    const Scalar first = Scalar(icross(direction, V(a) - V(origin)));
+    const Scalar second = Scalar(icross(direction, V(b) - V(origin)));
+    const Scalar limit = reach * length;
+    const Scalar error = 64 * std::numeric_limits<Scalar>::epsilon() *
+                         (std::abs(first) + std::abs(second) + std::abs(limit) + 1);
+    return std::min(first, second) > limit + error || std::max(first, second) < -limit - error;
+}
+
+// Clip a line parameter s to lo <= value + slope*s <= hi.
+bool slab(Scalar value, Scalar slope, Scalar lo, Scalar hi, Scalar &begin, Scalar &end)
+{
+    if (slope == 0)
+        return value >= lo && value <= hi;
+    Scalar first = (lo - value) / slope, last = (hi - value) / slope;
+    if (first > last) std::swap(first, last);
+    begin = std::max(begin, first);
+    end = std::min(end, last);
+    return begin < end;
+}
+
+void add_line_contact(const Point &upper_a, const Point &upper_b, const LowerSection &lower,
+                      Scalar upper_radius, Scalar reserve, bool require_rounding_reserve,
+                      SegmentContact &result, Budget &budget)
+{
+    const V u = V(upper_b) - V(upper_a), v = V(lower.b) - V(lower.a);
+    const V relative = V(lower.a) - V(upper_a);
+    const int64_t uu = idot(u, u), uv = idot(u, v), ur = idot(u, relative);
+    const Scalar length_u = std::sqrt(Scalar(uu)), length_v = std::sqrt(dot(v, v));
+    const int64_t cross_r = icross(u, relative), cross_v = icross(u, v);
+    if (upper_radius == 0) {
+        // Two tangent circular axes have a finite common line only when
+        // collinear. Their ordinary crossing is one physical point.
+        if (require_rounding_reserve || cross_r != 0 || cross_v != 0)
+            return;
+        int64_t a = ur, b = ur + uv;
+        if (a > b) std::swap(a, b);
+        a = std::max(int64_t(0), a);
+        b = std::min(uu, b);
+        if (a < b && Scalar(b - a) / length_u > 2 * reserve) {
+            budget.allocate(1);
+            result.line_contacts.push_back({a, uu, b, uu});
+        }
+        return;
+    }
+    const Scalar radius = upper_radius - reserve;
+    if (radius <= 0)
+        return;
+    const auto add_transverse_anchor = [&] {
+        if (!require_rounding_reserve || cross_v == 0 || upper_radius <= 3 * reserve)
+            return;
+        int64_t denominator = cross_v;
+        int64_t numerator = icross(relative, v), lower_numerator = -cross_r;
+        if (denominator < 0) {
+            denominator = -denominator;
+            numerator = -numerator;
+            lower_numerator = -lower_numerator;
+        }
+        if (numerator <= 0 || numerator >= denominator || lower_numerator <= 0 || lower_numerator >= denominator)
+            return;
+        // Each emitted endpoint may move by reserve. The change in each unit
+        // direction is bounded by 4*reserve/length. This lower bound on the
+        // crossing sine then bounds intersection movement by 2*reserve/sine.
+        // Reserving that movement at BOTH original segments, plus three more
+        // reserves, retains a finite lower-line witness inside the actual
+        // upper flat after endpoint and angle perturbations.
+        const Scalar sine = std::abs(Scalar(cross_v)) / (length_u * length_v);
+        const Scalar sine_lower = sine - 4 * reserve / length_u - 4 * reserve / length_v;
+        if (sine_lower <= 0)
+            return;
+        const Scalar margin = 2 * reserve / sine_lower + 3 * reserve;
+        const Scalar t = Scalar(numerator) / denominator;
+        const Scalar s = Scalar(lower_numerator) / denominator;
+        if (std::min(t, 1 - t) * length_u <= margin || std::min(s, 1 - s) * length_v <= margin)
+            return;
+        budget.allocate(1);
+        result.line_contacts.push_back({numerator, denominator, numerator, denominator,
+                                        double(2 * reserve / sine_lower * SCALING_FACTOR)});
+    };
+    Scalar begin = 0, end = 1;
+    if (!slab(Scalar(cross_r) / length_u, Scalar(cross_v) / length_u,
+              -radius, radius, begin, end))
+        return;
+    if (uv == 0) {
+        // The lower line lies along one upper transverse section. Its finite
+        // physical contact length certifies this exact arclength event.
+        if (require_rounding_reserve) {
+            if (upper_radius <= 3 * reserve)
+                return;
+            begin = 0;
+            end = 1;
+            if (!slab(Scalar(cross_r) / length_u, Scalar(cross_v) / length_u,
+                      -upper_radius + 3 * reserve, upper_radius - 3 * reserve, begin, end) ||
+                (end - begin) * length_v <= 6 * reserve)
+                return;
+        }
+        // The midpoint of the reserved lower witness stays inside both real
+        // segments after endpoint perturbation. The upper direction can move
+        // by 4*r/L, so include its effect on the transverse witness position.
+        const Scalar longitudinal_margin = require_rounding_reserve ?
+            (5 * reserve + 4 * reserve * upper_radius / length_u) * length_u : 0.;
+        const bool within = require_rounding_reserve ?
+            Scalar(ur) > longitudinal_margin && Scalar(uu - ur) > longitudinal_margin :
+            ur >= 0 && ur <= uu;
+        if (within && (end - begin) * length_v > 2 * reserve) {
+            budget.allocate(1);
+            const double uncertainty = require_rounding_reserve ?
+                double((2 * reserve + 4 * reserve * upper_radius / length_u) * SCALING_FACTOR) : 0.;
+            result.line_contacts.push_back({ur, uu, ur, uu, uncertainty});
+        }
+        return;
+    }
+    if (require_rounding_reserve) {
+        // Positive projected support is represented by an inward contact mask
+        // in the caller. Keep uncertain witnesses as isolated anchors so their
+        // location bounds are never mistaken for a guaranteed support span.
+        add_transverse_anchor();
+        return;
+    }
+    Scalar a = (Scalar(ur) + Scalar(uv) * begin) / Scalar(uu);
+    Scalar b = (Scalar(ur) + Scalar(uv) * end) / Scalar(uu);
+    if (a > b) std::swap(a, b);
+    if (require_rounding_reserve) {
+        // A nonzero projected contact interval must also survive independent
+        // endpoint-coordinate rounding along the upper extrusion direction.
+        a += reserve / length_u;
+        b -= reserve / length_u;
+    }
+    // Clamp in upper parameter space. Reconstructing an exact endpoint by
+    // subtracting large projected positions could create a spurious tiny tail.
+    a = std::max(Scalar(0), a);
+    b = std::min(Scalar(1), b);
+    if (a >= b || (b - a) * Scalar(uu) / std::abs(Scalar(uv)) * length_v <= 2 * reserve) {
+        // Near-perpendicular contact is still a finite physical line, even
+        // when its longitudinal projection is smaller than the XY reserve.
+        // Certify its exact centreline crossing with a perturbation bound.
+        add_transverse_anchor();
+        return;
+    }
+    // These bounds have a geometric reserve above. Round inward again when
+    // representing irrational slab intersections as exact rational events.
+    const int64_t first = std::max(int64_t(0), int64_t(std::ceil(a * interval_denominator)));
+    const int64_t last = std::min(interval_denominator, int64_t(std::floor(b * interval_denominator)));
+    if (first < last) {
+        budget.allocate(1);
+        result.line_contacts.push_back({first, interval_denominator, last, interval_denominator});
+    } else
+        add_transverse_anchor();
+}
+} // namespace
+
+double section_width_mm(double width, double height, double print_z, double z)
+{
+    if (!dimensions(width, height, print_z) || !std::isfinite(z))
+        return std::numeric_limits<double>::quiet_NaN();
+    const double bottom = print_z - height;
+    if (z < bottom || z > print_z)
+        return 0.;
+    return width - height + 2. * std::sqrt(std::max(0., (z - bottom) * (print_z - z)));
+}
+
+// No input path pointers survive preparation. The status object has no output
+// geometry; unsuccessful factories discard every partially prepared section.
+struct PreparedLower {
+    double upper_print_z = 0.;
+    float upper_height = 0.f;
+    size_t deposited_paths = 0;
+    size_t admission_vertices = 0;
+    bool sections_prepared = false;
+    PathContact status;
+    std::vector<LowerSection> sections;
+};
+
+namespace {
+void describe_limit(PathContact &result, const Limit &limit, const Budget &budget,
+                    const PreparedLower &prepared)
+{
+    result.completed = false;
+    result.resource_limited = true;
+    switch (limit.kind) {
+    case LimitKind::AggregateWork:
+        result.failure_reason = "Bridge aware cubic contact generation exceeded its aggregate geometry work limit; verification is incomplete. " +
+            budget.aggregate->describe_work(budget.category) + " Current contact call charged=" + std::to_string(budget.work) +
+            ", upper_segments=" + std::to_string(result.segments.size()) +
+            ", deposited_paths=" + std::to_string(prepared.deposited_paths) + ", prepared_lower_sections=" +
+            (prepared.sections_prepared ? std::to_string(prepared.sections.size()) : "not_prepared") + ".";
+        break;
+    case LimitKind::LocalWork:
+        result.failure_reason = "Bead contact geometry exceeded its local work limit (used " + std::to_string(limit.used) +
+            ", requested " + std::to_string(limit.requested) + ", limit " + std::to_string(max_work) + "); verification is incomplete.";
+        break;
+    case LimitKind::Vertices:
+        result.failure_reason = "Bead contact geometry exceeded its vertex allocation limit (used " + std::to_string(limit.used) +
+            ", requested " + std::to_string(limit.requested) + ", limit " + std::to_string(max_vertices) + "); verification is incomplete.";
+        break;
+    case LimitKind::Coordinates:
+        result.failure_reason = "Bead contact geometry exceeds its finite coordinate bound; verification is incomplete.";
+        break;
+    }
+
+}
+
+bool query_arguments(PathContact &result, double tolerance, FootprintMode mode)
+{
+    if (!std::isfinite(tolerance) || tolerance < 0. ||
+        tolerance >= double(coordinate_limit) * SCALING_FACTOR ||
+        (mode != FootprintMode::Full && mode != FootprintMode::ContactsOnly)) {
+        result.input_valid = false;
+        result.failure_reason = "Contact tolerance, footprint mode or deposited path count is invalid.";
+        return false;
+    }
+    return true;
+}
+
+bool upper_valid(PathContact &result, const ExtrusionPath &upper, double top, Budget &budget)
+{
+    const char *reason = nullptr;
+    if (valid_path(upper, top, budget, false, nullptr, &reason))
+        return true;
+    result.input_valid = false;
+    result.failure_reason = std::string("Upper bead ") + reason;
+    return false;
+}
+
+void prepare_impl(PreparedLower &prepared, const std::vector<Bead> &deposited, Budget &budget)
+{
+    PathContact &result = prepared.status;
+    const double upper_print_z = prepared.upper_print_z;
+    const float upper_height = prepared.upper_height;
+    if (deposited.size() > max_vertices || !dimensions(upper_height, upper_height, upper_print_z)) {
+        result.input_valid = false;
+        result.failure_reason = "Contact preparation height, elevation or deposited path count is invalid.";
+        return;
+    }
+    const size_t initial_vertices = budget.vertices;
+    double lower_top = -std::numeric_limits<double>::infinity();
+    std::vector<bool> usable(deposited.size(), false);
+    for (size_t i = 0; i < deposited.size(); ++i) {
+        const Bead &bead = deposited[i];
+        bool positive_xy = false;
+        const char *reason = "path is absent.";
+        if (bead.path == nullptr || !valid_path(*bead.path, bead.print_z, budget, true, &positive_xy, &reason)) {
+            result.input_valid = false;
+            result.failure_reason = std::string("A deposited bead ") + reason;
+            return;
+        }
+        // Validate even future, out-of-plane and unmodeled deposition first.
+        usable[i] = positive_xy && bead.path->width >= bead.path->height;
+        if (usable[i] && bead.print_z < upper_print_z)
+            lower_top = std::max(lower_top, bead.print_z);
+    }
+    // Keep the validated input admission baseline as well as owned geometry.
+    // It is not charged again as work, but cached queries must obey the same
+    // combined lower-input/upper-input/output limit as the uncached wrapper.
+    prepared.admission_vertices = budget.vertices - initial_vertices;
+    const double upper_bottom = upper_print_z - upper_height;
+    result.contact_z = upper_bottom;
+    if (!std::isfinite(lower_top) || upper_bottom > lower_top + z_roundoff(upper_height, upper_print_z))
+        return;
+    if (std::abs(upper_bottom - lower_top) <= z_roundoff(upper_height, upper_print_z))
+        result.contact_z = lower_top;
+    else {
+        double shallowest = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < deposited.size(); ++i)
+            if (usable[i] && deposited[i].print_z == lower_top)
+                shallowest = std::min(shallowest, double(deposited[i].path->height));
+        result.contact_z = lower_top - .5 * std::min(lower_top - upper_bottom, shallowest);
+    }
+    budget.category = BridgeAwareCubicValidation::WorkCategory::ContactSections;
+    for (size_t i = 0; i < deposited.size(); ++i) {
+        const Bead &bead = deposited[i];
+        if (!usable[i] || bead.print_z >= upper_print_z ||
+            result.contact_z < bead.print_z - bead.path->height - z_roundoff(bead.path->height, bead.print_z) ||
+            result.contact_z > bead.print_z + z_roundoff(bead.path->height, bead.print_z))
+            continue;
+        const Scalar radius = .5L * snapped_section(*bead.path, bead.print_z, result.contact_z) / SCALING_FACTOR;
+        const Points &points = bead.path->polyline.points;
+        for (size_t j = 1; j < points.size(); ++j) {
+            budget.consume();
+            if (points[j] == points[j - 1]) continue;
+            budget.allocate(2); // Both owned axis vertices.
+            prepared.sections.push_back({points[j - 1], points[j], radius > 3. ? radius : 0., {}});
+        }
+    }
+    merge_collinear_sections(prepared.sections, budget);
+    prepared.sections_prepared = true;
+    // Retain the existing cumulative admission, including merged axis records,
+    // and explicitly account for every owned corner in cached queries.
+    for (LowerSection &section : prepared.sections)
+        if (section.radius > 0) {
+            budget.allocate(4);
+            section.corners = rectangle_corners(section.a, section.b, section.radius);
+        }
+    prepared.admission_vertices = budget.vertices - initial_vertices;
+}
+
+void query_impl(PathContact &result, const PreparedLower &prepared, const ExtrusionPath &upper,
+                double upper_print_z, double xy_tolerance_mm, FootprintMode mode, Budget &budget)
+{
+    if (!prepared.status.input_valid || !prepared.status.completed) {
+        result = prepared.status;
+        return;
+    }
+    if (upper_print_z != prepared.upper_print_z || upper.height != prepared.upper_height) {
+        result.input_valid = false;
+        result.failure_reason = "Upper bead elevation or height does not match the prepared lower sections.";
+        return;
+    }
+    result.contact_z = prepared.status.contact_z;
+    result.coordinate_uncertainty_mm = xy_tolerance_mm;
+    const Points &upper_points = upper.polyline.points;
+    for (size_t i = 1; i < upper_points.size(); ++i)
+        if (upper_points[i] != upper_points[i - 1]) {
+            budget.allocate(1);
+            result.segments.push_back({i - 1, {}, {}});
+        }
+    if (prepared.sections.empty())
+        return;
+    const Scalar upper_radius = .5L * snapped_section(upper, upper_print_z, result.contact_z) / SCALING_FACTOR;
+    const Scalar reserve = xy_tolerance_mm / SCALING_FACTOR + 3.;
+    budget.category = BridgeAwareCubicValidation::WorkCategory::ContactSections;
+    for (const LowerSection &section : prepared.sections) {
+        if (section.radius > 0) {
+            if (mode == FootprintMode::ContactsOnly)
+                continue;
+            ExPolygons material = inner_hull(section.corners, 0., budget);
+            for (ExPolygon &polygon : material) {
+                // Both original axis endpoints belong to the real butt
+                // rectangle. Their hull with an inner convex section is
+                // still inside that rectangle, and preserves the actual
+                // common vertex at near-collinear path joins. This only
+                // repairs physical wall topology; contact masks below
+                // retain their complete anchoring/rounding reserve.
+                Points points = polygon.contour.points;
+                points.push_back(section.a);
+                points.push_back(section.b);
+                budget.allocate(2);
+                polygon.contour = Geometry::convex_hull(std::move(points));
+            }
+            result.physical_footprint.insert(result.physical_footprint.end(),
+                std::make_move_iterator(material.begin()), std::make_move_iterator(material.end()));
+        } else if (mode == FootprintMode::Full) {
+            // Its axis is still genuine material. Keeping an axis loses
+            // tiny area conservatively instead of inflating it.
+            budget.allocate(2);
+            result.physical_lines.emplace_back(Points{section.a, section.b});
+        }
+    }
+    for (SegmentContact &segment : result.segments) {
+        const Point &a = upper_points[segment.segment_index], &b = upper_points[segment.segment_index + 1];
+        const V u = V(b) - V(a);
+        const Scalar length = std::sqrt(dot(u, u));
+        const V transverse(-u.y / length * upper_radius, u.x / length * upper_radius);
+        for (const LowerSection &lower : prepared.sections) {
+            budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+            budget.consume();
+            // Exact broad phase; a conservative maximum XY reach is enough.
+            const Scalar reach = lower.radius + upper_radius + 4;
+            if (std::max(a.x(), b.x()) + reach < std::min(lower.a.x(), lower.b.x()) ||
+                std::min(a.x(), b.x()) - reach > std::max(lower.a.x(), lower.b.x()) ||
+                std::max(a.y(), b.y()) + reach < std::min(lower.a.y(), lower.b.y()) ||
+                std::min(a.y(), b.y()) - reach > std::max(lower.a.y(), lower.b.y()))
+                continue;
+            const V lower_delta = V(lower.b) - V(lower.a);
+            const Scalar lower_length = std::sqrt(dot(lower_delta, lower_delta));
+            if (separated_normal(a, u, length, lower.a, lower.b, reach, budget) ||
+                separated_normal(lower.a, lower_delta, lower_length, a, b, reach, budget))
+                continue;
+            budget.category = BridgeAwareCubicValidation::WorkCategory::ContactMasks;
+            std::vector<V> corners;
+            corners.reserve(8);
+            if (lower.radius == 0) {
+                corners = {V(lower.a) + transverse, V(lower.a) - transverse,
+                           V(lower.b) + transverse, V(lower.b) - transverse};
+            } else {
+                for (V corner : lower.corners) {
+                    corners.push_back(corner + transverse);
+                    corners.push_back(corner - transverse);
+                }
+            }
+            // Both centreline endpoints can move, and both section
+            // directions can rotate. Erode the convex contact region by
+            // the corresponding support-function displacement bound.
+            const double mask_reserve = xy_tolerance_mm *
+                double(2 + 4 * upper_radius / length + 4 * lower.radius / lower_length);
+            ExPolygons mask = inner_hull(corners, mask_reserve, budget);
+            segment.centerline_support.insert(segment.centerline_support.end(),
+                std::make_move_iterator(mask.begin()), std::make_move_iterator(mask.end()));
+            // An axis remains genuine material when a very thin positive
+            // section loses its polygon mask to the rounding reserve.
+            add_line_contact(a, b, lower, upper_radius, reserve, xy_tolerance_mm > 0., segment, budget);
+        }
+    }
+
+}
+} // namespace
+
+PreparedLowerPtr prepare_lower(const std::vector<Bead> &deposited, double upper_print_z,
+                               float upper_height, BridgeAwareCubicValidation::WorkBudget *shared)
+{
+    auto prepared = std::make_shared<PreparedLower>();
+    prepared->upper_print_z = upper_print_z;
+    prepared->upper_height = upper_height;
+    prepared->deposited_paths = deposited.size();
+    Budget budget(shared);
+    try {
+        prepare_impl(*prepared, deposited, budget);
+    } catch (const Limit &limit) {
+        describe_limit(prepared->status, limit, budget, *prepared);
+    } catch (const std::exception &error) {
+        prepared->status.completed = false;
+        prepared->status.failure_reason = std::string("Bead contact geometry failed: ") + error.what();
+    }
+    if (!prepared->status.input_valid || !prepared->status.completed) {
+        std::vector<LowerSection>().swap(prepared->sections);
+        prepared->admission_vertices = 0;
+    }
+    return prepared;
+}
+
+PathContact footprint(const PreparedLower &prepared, const ExtrusionPath &upper,
+                      double upper_print_z, double xy_tolerance_mm, FootprintMode mode,
+                      BridgeAwareCubicValidation::WorkBudget *shared)
+{
+    PathContact result;
+    Budget budget(shared);
+    budget.vertices = prepared.admission_vertices;
+    try {
+        if (!query_arguments(result, xy_tolerance_mm, mode))
+            return result;
+        // A failed snapshot supplies no usable evidence. Preserve its precise
+        // cause even when preparation exhausted the shared work allowance.
+        if (!prepared.status.input_valid || !prepared.status.completed)
+            return prepared.status;
+        if (!upper_valid(result, upper, upper_print_z, budget))
+            return result;
+        query_impl(result, prepared, upper, upper_print_z, xy_tolerance_mm, mode, budget);
+    } catch (const Limit &limit) {
+        describe_limit(result, limit, budget, prepared);
+    } catch (const std::exception &error) {
+        result.completed = false;
+        result.failure_reason = std::string("Bead contact geometry failed: ") + error.what();
+    }
+    return result;
+}
+
+PathContact footprint(const std::vector<Bead> &deposited, const ExtrusionPath &upper,
+                      double upper_print_z, double xy_tolerance_mm, FootprintMode mode,
+                      BridgeAwareCubicValidation::WorkBudget *shared)
+{
+    // Keep the uncached entry point's upper-first validation and use exactly
+    // the same preparation/query operations and shared work charges.
+    PathContact result;
+    PreparedLower prepared;
+    prepared.upper_print_z = upper_print_z;
+    prepared.upper_height = upper.height;
+    prepared.deposited_paths = deposited.size();
+    Budget budget(shared);
+    try {
+        if (!query_arguments(result, xy_tolerance_mm, mode))
+            return result;
+        if (deposited.size() > max_vertices) {
+            result.input_valid = false;
+            result.failure_reason = "Contact tolerance, footprint mode or deposited path count is invalid.";
+            return result;
+        }
+        if (!upper_valid(result, upper, upper_print_z, budget))
+            return result;
+        prepare_impl(prepared, deposited, budget);
+        query_impl(result, prepared, upper, upper_print_z, xy_tolerance_mm, mode, budget);
+    } catch (const Limit &limit) {
+        describe_limit(result, limit, budget, prepared);
+    } catch (const std::exception &error) {
+        result.completed = false;
+        result.failure_reason = std::string("Bead contact geometry failed: ") + error.what();
+    }
+    return result;
+}
+
+}} // namespace Slic3r::BridgeAwareCubicContact

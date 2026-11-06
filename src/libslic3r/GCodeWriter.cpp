@@ -15,6 +15,44 @@
 
 namespace Slic3r {
 
+namespace {
+constexpr std::array<int64_t, 13> decimal_scales{
+    1, 10, 100, 1000, 10000, 100000, 1000000, 10000000,
+    100000000, 1000000000, 10000000000LL, 100000000000LL, 1000000000000LL};
+
+int64_t rounded_axis_value(double value, size_t digits)
+{
+    if (digits >= decimal_scales.size())
+        throw std::invalid_argument("Unsupported G-code coordinate precision");
+    const double rounded = std::round(value * double(decimal_scales[digits]));
+    // The upper double representation of INT64_MAX is 2^63, outside int64_t.
+    if (!std::isfinite(rounded) || rounded < double(std::numeric_limits<int64_t>::min()) ||
+        rounded >= double(std::numeric_limits<int64_t>::max()))
+        throw std::out_of_range("Non-finite or out-of-range G-code coordinate");
+    return int64_t(rounded);
+}
+}
+
+double GCodeWriter::serialized_z(double z, bool bridge_aware_cubic)
+{
+    const size_t digits = bridge_aware_cubic ? BRIDGE_AWARE_CUBIC_Z_EXPORT_DIGITS : STANDARD_Z_EXPORT_DIGITS;
+    return double(rounded_axis_value(z, digits)) / double(decimal_scales[digits]);
+}
+
+size_t GCodeWriter::e_export_digits() const
+{
+    return bridge_aware_cubic_z_precision() ? BRIDGE_AWARE_CUBIC_E_EXPORT_DIGITS : GCodeFormatter::E_EXPORT_DIGITS;
+}
+
+double GCodeWriter::serialized_xy_distance(const Vec2d &point) const
+{
+    const double dx = double(rounded_axis_value(point.x() - m_x_offset, GCodeFormatter::XYZF_EXPORT_DIGITS)) -
+        double(rounded_axis_value(m_pos.x() - m_x_offset, GCodeFormatter::XYZF_EXPORT_DIGITS));
+    const double dy = double(rounded_axis_value(point.y() - m_y_offset, GCodeFormatter::XYZF_EXPORT_DIGITS)) -
+        double(rounded_axis_value(m_pos.y() - m_y_offset, GCodeFormatter::XYZF_EXPORT_DIGITS));
+    return std::hypot(dx, dy) / double(decimal_scales[GCodeFormatter::XYZF_EXPORT_DIGITS]);
+}
+
 const bool GCodeWriter::full_gcode_comment = false;
 const double GCodeWriter::slope_threshold = 3 * PI / 180;
 
@@ -71,6 +109,7 @@ void GCodeWriter::set_extruders(std::vector<unsigned int> extruder_ids)
     std::sort(extruder_ids.begin(), extruder_ids.end());
     m_curr_extruder_id = -1;
     m_current_process_config_idx = 0;
+    m_last_emitted_e.fill(0);
     std::fill(m_curr_filament_extruder.begin(), m_curr_filament_extruder.end(), nullptr);
     m_filament_extruders.clear();
     m_filament_extruders.reserve(extruder_ids.size());
@@ -369,6 +408,8 @@ std::string GCodeWriter::reset_e(bool force)
     }
 
     if (!this->config.use_relative_e_distances) {
+        if (m_curr_extruder_id >= 0)
+            m_last_emitted_e.at(m_curr_extruder_id) = 0;
         std::ostringstream gcode;
         gcode << "G92 E0";
         //BBS
@@ -378,6 +419,20 @@ std::string GCodeWriter::reset_e(bool force)
     } else {
         return "";
     }
+}
+
+std::string GCodeWriter::synchronize_extrusion_for_deposition()
+{
+    if (!bridge_aware_cubic_z_precision())
+        return {};
+    // Custom code may alter either the coordinate or the extrusion mode.
+    // Reestablish both immediately before the commands being certified.
+    if (config.use_relative_e_distances)
+        return "M83\n";
+    std::string reset = reset_e(true);
+    if (reset.empty())
+        throw std::invalid_argument("Bridge aware cubic absolute extrusion requires a firmware flavor supporting G92 E0.");
+    return "M82\n" + reset;
 }
 
 std::string GCodeWriter::update_progress(unsigned int num, unsigned int tot, bool allow_100) const
@@ -655,7 +710,7 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
                 Vec2d temp = delta_no_z.normalized() * delta(2) / tan(GCodeWriter::slope_threshold);
                 Vec3d slope_top_point = Vec3d(temp(0), temp(1), delta(2)) + source;
                 GCodeG1Formatter w0;
-                w0.emit_xyz(slope_top_point);
+                w0.emit_xyz(slope_top_point, z_export_digits());
                 w0.emit_f(this->config.travel_speed.get_at(m_current_process_config_idx) * 60.0);
                 //BBS
                 w0.emit_comment(GCodeWriter::full_gcode_comment, "slope lift Z");
@@ -670,7 +725,7 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
         {
             GCodeG1Formatter w0;
             if (this->is_current_position_clear()) {
-                w0.emit_xyz(target);
+                w0.emit_xyz(target, z_export_digits());
                 w0.emit_f(this->config.travel_speed.get_at(m_current_process_config_idx) * 60.0);
                 w0.emit_comment(GCodeWriter::full_gcode_comment, comment);
                 xy_z_move = w0.string();
@@ -691,7 +746,8 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
         m_lifted -= (point(2) - nominal_z);
         // In case that z_hop == layer_height we could end up with almost zero in_m_lifted
         // and a retract could be skipped
-        if (std::abs(m_lifted) < EPSILON)
+        if (bridge_aware_cubic_z_precision() ? serialized_z(m_pos.z() - m_lifted, true) == serialized_z(m_pos.z(), true) :
+                                              std::abs(m_lifted) < EPSILON)
             m_lifted = 0.;
         //BBS
         this->set_current_position_clear(true);
@@ -718,7 +774,7 @@ std::string GCodeWriter::travel_to_xyz(const Vec3d &point, const std::string &co
         out_string = w.string() + _travel_to_z(point_on_plate.z(), comment);
     } else {
         GCodeG1Formatter w;
-        w.emit_xyz(point_on_plate);
+        w.emit_xyz(point_on_plate, z_export_digits());
         w.emit_f(this->config.travel_speed.get_at(m_current_process_config_idx) * 60.0);
         w.emit_comment(GCodeWriter::full_gcode_comment, comment);
         out_string = w.string();
@@ -737,7 +793,8 @@ std::string GCodeWriter::travel_to_z(double z, const std::string &comment)
     if (!this->will_move_z(z)) {
         double nominal_z = m_pos(2) - m_lifted;
         m_lifted -= (z - nominal_z);
-        if (std::abs(m_lifted) < EPSILON)
+        if (bridge_aware_cubic_z_precision() ? serialized_z(m_pos.z() - m_lifted, true) == serialized_z(m_pos.z(), true) :
+                                              std::abs(m_lifted) < EPSILON)
             m_lifted = 0.;
         return "";
     }
@@ -759,7 +816,7 @@ std::string GCodeWriter::_travel_to_z(double z, const std::string &comment, bool
         speed = this->config.prime_tower_lift_speed.value; // lift speed
     }
     GCodeG1Formatter w;
-    w.emit_z(z);
+    w.emit_z(z, z_export_digits());
     w.emit_f(speed * 60.0);
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
@@ -778,7 +835,7 @@ std::string GCodeWriter::_spiral_travel_to_z(double z, const Vec2d &ij_offset, c
     }
     std::string output = "G17\n";
     GCodeG2G3Formatter w(true);
-    w.emit_z(z);
+    w.emit_z(z, z_export_digits());
     w.emit_ij(ij_offset);
     w.emit_string(" P1 ");
     w.emit_f(speed * 60.0);
@@ -788,6 +845,13 @@ std::string GCodeWriter::_spiral_travel_to_z(double z, const Vec2d &ij_offset, c
 
 bool GCodeWriter::will_move_z(double z) const
 {
+    if (bridge_aware_cubic_z_precision()) {
+        const double target = serialized_z(z, true);
+        const double current = serialized_z(m_pos.z(), true);
+        if (m_lifted > 0.)
+            return target < serialized_z(m_pos.z() - m_lifted, true) || target > current;
+        return target != current;
+    }
     /* If target Z is lower than current Z but higher than nominal Z
         we don't perform an actual Z move. */
     if (m_lifted > 0) {
@@ -803,8 +867,34 @@ bool GCodeWriter::will_move_z(double z) const
     return true;
 }
 
-std::string GCodeWriter::extrude_to_xy(const Vec2d &point, double dE, const std::string &comment, bool force_no_extrusion)
+void GCodeWriter::check_deposition(const Vec2d &point, double dE) const
 {
+    if (!bridge_aware_cubic_z_precision())
+        return;
+    const bool xy_changes =
+        rounded_axis_value(point.x() - m_x_offset, GCodeFormatter::XYZF_EXPORT_DIGITS) !=
+            rounded_axis_value(m_pos.x() - m_x_offset, GCodeFormatter::XYZF_EXPORT_DIGITS) ||
+        rounded_axis_value(point.y() - m_y_offset, GCodeFormatter::XYZF_EXPORT_DIGITS) !=
+            rounded_axis_value(m_pos.y() - m_y_offset, GCodeFormatter::XYZF_EXPORT_DIGITS);
+    if (!xy_changes)
+        return;
+    const double next_e = config.use_relative_e_distances ? dE : filament()->E() + dE;
+    const int64_t emitted_e = rounded_axis_value(next_e, e_export_digits());
+    const int64_t previous_e = config.use_relative_e_distances ? 0 : m_last_emitted_e.at(m_curr_extruder_id);
+    if (emitted_e <= previous_e)
+        throw std::invalid_argument("Bridge aware cubic cannot certify an XY deposition move without positive serialized extrusion.");
+}
+
+void GCodeWriter::record_emitted_e(double e)
+{
+    if (bridge_aware_cubic_z_precision())
+        m_last_emitted_e.at(m_curr_extruder_id) = rounded_axis_value(e, e_export_digits());
+}
+
+std::string GCodeWriter::extrude_to_xy(const Vec2d &point, double dE, const std::string &comment, bool force_no_extrusion, bool check_deposition)
+{
+    if (check_deposition && !force_no_extrusion)
+        this->check_deposition(point, dE);
     m_pos(0) = point(0);
     m_pos(1) = point(1);
 
@@ -816,8 +906,10 @@ std::string GCodeWriter::extrude_to_xy(const Vec2d &point, double dE, const std:
 
     GCodeG1Formatter w;
     w.emit_xy(point_on_plate);
-    if (!force_no_extrusion)
-        w.emit_e(filament()->E());
+    if (!force_no_extrusion) {
+        w.emit_e(filament()->E(), e_export_digits());
+        record_emitted_e(filament()->E());
+    }
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
     return set_extrude_acceleration() + w.string();
@@ -826,8 +918,10 @@ std::string GCodeWriter::extrude_to_xy(const Vec2d &point, double dE, const std:
 //BBS: generate G2 or G3 extrude which moves by arc
 //point is end point which means X and Y axis
 //center_offset is I and J axis
-std::string GCodeWriter::extrude_arc_to_xy(const Vec2d& point, const Vec2d& center_offset, double dE, const bool is_ccw, const std::string& comment, bool force_no_extrusion)
+std::string GCodeWriter::extrude_arc_to_xy(const Vec2d& point, const Vec2d& center_offset, double dE, const bool is_ccw, const std::string& comment, bool force_no_extrusion, bool check_deposition)
 {
+    if (check_deposition && !force_no_extrusion)
+        this->check_deposition(point, dE);
     m_pos(0) = point(0);
     m_pos(1) = point(1);
     if (!force_no_extrusion)
@@ -838,15 +932,19 @@ std::string GCodeWriter::extrude_arc_to_xy(const Vec2d& point, const Vec2d& cent
     GCodeG2G3Formatter w(is_ccw);
     w.emit_xy(point_on_plate);
     w.emit_ij(center_offset);
-    if (!force_no_extrusion)
-        w.emit_e(filament()->E());
+    if (!force_no_extrusion) {
+        w.emit_e(filament()->E(), e_export_digits());
+        record_emitted_e(filament()->E());
+    }
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
     return set_extrude_acceleration() + w.string();
 }
 
-std::string GCodeWriter::extrude_to_xyz(const Vec3d &point, double dE, const std::string &comment, bool force_no_extrusion)
+std::string GCodeWriter::extrude_to_xyz(const Vec3d &point, double dE, const std::string &comment, bool force_no_extrusion, bool check_deposition)
 {
+    if (check_deposition && !force_no_extrusion)
+        this->check_deposition(point.head<2>(), dE);
     m_pos = point;
     m_lifted = 0;
     if (!force_no_extrusion)
@@ -856,9 +954,11 @@ std::string GCodeWriter::extrude_to_xyz(const Vec3d &point, double dE, const std
     Vec3d point_on_plate = { point(0) - m_x_offset, point(1) - m_y_offset, point(2) };
 
     GCodeG1Formatter w;
-    w.emit_xyz(point_on_plate);
-    if (!force_no_extrusion)
-        w.emit_e(filament()->E());
+    w.emit_xyz(point_on_plate, z_export_digits());
+    if (!force_no_extrusion) {
+        w.emit_e(filament()->E(), e_export_digits());
+        record_emitted_e(filament()->E());
+    }
     //BBS
     w.emit_comment(GCodeWriter::full_gcode_comment, comment);
     return set_extrude_acceleration() + w.string();
@@ -899,7 +999,8 @@ std::string GCodeWriter::_retract(double length, double restart_extra, const std
         else {
             //BBS
             GCodeG1Formatter w;
-            w.emit_e(filament()->E());
+            w.emit_e(filament()->E(), e_export_digits());
+            record_emitted_e(filament()->E());
             w.emit_f(filament()->retract_speed() * 60.);
             //BBS
             w.emit_comment(GCodeWriter::full_gcode_comment, comment);
@@ -929,7 +1030,8 @@ std::string GCodeWriter::unretract(float extra_retract)
             //BBS
             // use G1 instead of G0 because G0 will blend the restart with the previous travel move
             GCodeG1Formatter w;
-            w.emit_e(filament()->E()+extra_retract);
+            w.emit_e(filament()->E()+extra_retract, e_export_digits());
+            record_emitted_e(filament()->E()+extra_retract);
             w.emit_f(filament()->deretract_speed() * 60.);
             //BBS
             w.emit_comment(GCodeWriter::full_gcode_comment, " ; unretract");
@@ -1079,12 +1181,10 @@ bool GCodeWriter::need_toolchange(unsigned int filament_id)const
 }
 
 void GCodeFormatter::emit_axis(const char axis, const double v, size_t digits) {
-    assert(digits <= 9);
-    static constexpr const std::array<int, 10> pow_10{1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
+    const int64_t v_int = rounded_axis_value(v, digits);
     *ptr_err.ptr++ = ' '; *ptr_err.ptr++ = axis;
 
     char *base_ptr = this->ptr_err.ptr;
-    auto  v_int    = int64_t(std::round(v * pow_10[digits]));
     // Older stdlib on macOS doesn't support std::from_chars at all, so it is used boost::spirit::karma::generate instead of it.
     // That is a little bit slower than std::to_chars but not much.
 #ifdef __APPLE__
@@ -1131,8 +1231,8 @@ void GCodeFormatter::emit_axis(const char axis, const double v, size_t digits) {
         // Numbers may differ when rounding at exactly or very close to 0.5 due to numerical issues when scaling the double to an integer.
         // Thus the complex assert.
 //        assert(v1 == v2);
-        assert(std::abs(v1 - v) * pow_10[digits] < 0.50001);
-        assert(std::abs(v2 - v) * pow_10[digits] < 0.50001);
+        assert(std::abs(v1 - v) * decimal_scales[digits] < 0.50001);
+        assert(std::abs(v2 - v) * decimal_scales[digits] < 0.50001);
     }
 #endif // NDEBUG
 }

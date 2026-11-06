@@ -1,11 +1,13 @@
 #include <catch2/catch.hpp>
 
+#include "libslic3r/Fill/BridgeAwareCubicContact.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicValidation.hpp"
 
 #include <cmath>
 #include <limits>
 
 using namespace Slic3r;
+namespace Contact = Slic3r::BridgeAwareCubicContact;
 namespace Validation = Slic3r::BridgeAwareCubicValidation;
 
 namespace {
@@ -309,11 +311,29 @@ TEST_CASE("Bridge aware validation reports work exhaustion as incomplete", "[Bri
     ExPolygons support;
     for (int i = 0; i < 400; ++i)
         support.push_back(rectangle(2. * i, 0., 2. * i + 1., 2.));
-    const Polylines paths(1000, path({{.5, 1.}, {798.5, 1.}}));
-    const auto result = Validation::validate({}, support, paths, {rectangle(0., 0., 800., 2.)}, 1000., .001);
+    Contact::PathContact contact;
+    contact.segments.push_back({0, support, {}});
+    const auto validate = [&](Validation::WorkBudget &budget) {
+        return Validation::validate_contacts({}, {}, {path({{.5, 1.}, {798.5, 1.}})},
+            {rectangle(0., 0., 800., 2.)}, 1000., .001, {contact}, &budget);
+    };
+    // Use an explicitly insufficient allowance for real crossing queries,
+    // rather than requiring an inefficient implementation to spend 50M work.
+    // Calibration keeps the guard meaningful as exact lookups improve.
+    Validation::WorkBudget probe;
+    const size_t initial_work = probe.remaining_work;
+    const auto complete = validate(probe);
+    REQUIRE(complete.passed());
+    REQUIRE(complete.unsupported_runs.size() == 399);
+    const size_t required_work = initial_work - probe.remaining_work;
+    REQUIRE(required_work > 1);
+    Validation::WorkBudget limited{required_work / 2};
+    const auto result = validate(limited);
     CHECK(result.input_valid);
     CHECK_FALSE(result.completed);
-    CHECK_FALSE(result.failure_reason.empty());
+    CHECK(result.resource_limited);
+    CHECK(limited.remaining_work == 0);
+    CHECK(result.failure_reason.find("aggregate geometry work limit") != std::string::npos);
     CHECK_FALSE(result.passed());
 }
 
@@ -383,4 +403,390 @@ TEST_CASE("Bridge aware validation does not analyze uncertain support outside de
     CHECK(result.unsupported_runs.empty());
     CHECK(result.completed);
     CHECK(result.passed());
+}
+
+TEST_CASE("Bridge aware prepared geometry selects complete cells for each demand", "[BridgeAwareCubic][Validation]")
+{
+    const ExPolygons domain{rectangle(0., 0., 12., 4.)};
+    const ExPolygons support{rectangle(0., 0., 12., .25), rectangle(0., 3.75, 12., 4.),
+                            rectangle(0., 0., .25, 4.), rectangle(11.75, 0., 12., 4.),
+                            rectangle(4.75, .25, 5.25, 3.75)};
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    REQUIRE(prepared);
+
+    const auto left = Validation::validate_prepared_contacts(*prepared, {},
+        {rectangle(1., 1., 1.1, 1.1)}, 8., .001, {});
+    REQUIRE(left.input_valid);
+    REQUIRE(left.completed);
+    REQUIRE(left.void_cells.size() == 1);
+    CHECK(left.void_cells.front().closed);
+    CHECK(left.void_cells.front().diameter_mm == Approx(std::sqrt(32.5)));
+    CHECK(left.max_void_diameter_mm == Approx(std::sqrt(32.5)));
+    CHECK(left.passed());
+
+    const auto right = Validation::validate_prepared_contacts(*prepared, {},
+        {rectangle(9., 1., 9.1, 1.1)}, 8., .001, {});
+    REQUIRE(right.input_valid);
+    REQUIRE(right.completed);
+    REQUIRE(right.void_cells.size() == 1);
+    CHECK(right.void_cells.front().closed);
+    CHECK(right.void_cells.front().diameter_mm == Approx(std::sqrt(54.5)));
+    CHECK(right.max_void_diameter_mm == Approx(std::sqrt(54.5)));
+    CHECK(right.passed());
+}
+
+TEST_CASE("Bridge aware prepared geometry applies each call's gap", "[BridgeAwareCubic][Validation]")
+{
+    const auto prepared = Validation::prepare_geometry({rectangle(0., 0., 5., 5.)}, frame(5.));
+    REQUIRE(prepared);
+    const ExPolygons demand{rectangle(.6, .6, .7, .7)};
+
+    const auto loose = Validation::validate_prepared_contacts(*prepared, {}, demand, 6., .001, {});
+    REQUIRE(loose.completed);
+    REQUIRE(loose.void_cells.size() == 1);
+    CHECK(loose.passed());
+
+    const auto tight = Validation::validate_prepared_contacts(*prepared, {}, demand, 5., .001, {});
+    REQUIRE(tight.completed);
+    REQUIRE(tight.void_cells.size() == 1);
+    CHECK(tight.void_cells.front().diameter_mm == Approx(std::sqrt(32.)));
+    CHECK(tight.void_cells.front().exceeds_gap);
+    CHECK_FALSE(tight.passed());
+
+    const auto loose_again = Validation::validate_prepared_contacts(*prepared, {}, demand, 6., .001, {});
+    CHECK(loose_again.completed);
+    CHECK(loose_again.passed());
+}
+
+TEST_CASE("Bridge aware contact validation shares work limits across calls", "[BridgeAwareCubic][Validation]")
+{
+    const bool use_prepared = GENERATE(false, true);
+    const ExPolygons domain{rectangle(0., 0., 5., 5.)};
+    const ExPolygons support = frame(5.);
+    const ExPolygons demand{rectangle(.6, .6, .7, .7)};
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    REQUIRE(prepared);
+    const auto validate = [&](Validation::WorkBudget &budget) {
+        if (use_prepared)
+            return Validation::validate_prepared_contacts(*prepared, {}, demand, 6., .001, {}, &budget);
+        return Validation::validate_contacts(domain, support, {}, demand, 6., .001, {}, &budget);
+    };
+
+    // Calibrate one successful call without tying the regression to a private
+    // operation count. The shared allowance covers one call but not two.
+    Validation::WorkBudget probe;
+    const size_t initial_work = probe.remaining_work;
+    REQUIRE(validate(probe).passed());
+    const size_t one_call = initial_work - probe.remaining_work;
+    REQUIRE(one_call > 0);
+    Validation::WorkBudget shared{one_call + one_call / 2};
+    const auto first = validate(shared);
+    REQUIRE(first.completed);
+    REQUIRE(first.passed());
+    CHECK(shared.remaining_work < one_call);
+
+    const auto second = validate(shared);
+    CHECK(second.input_valid);
+    CHECK_FALSE(second.completed);
+    CHECK(second.resource_limited);
+    CHECK(shared.remaining_work == 0);
+    CHECK_FALSE(second.passed());
+    CHECK(second.failure_reason.find("work") != std::string::npos);
+    CHECK(second.failure_reason.find("limit") != std::string::npos);
+}
+
+TEST_CASE("Bridge aware contact validation skips unused raw support unions without a domain", "[BridgeAwareCubic][Validation]")
+{
+    ExPolygons raw_support;
+    for (int i = 0; i < 2000; ++i) {
+        raw_support.push_back(rectangle(i * .02, 0., i * .02 + .01, 40.));
+        raw_support.push_back(rectangle(0., i * .02, 40., i * .02 + .01));
+    }
+    const Polylines upper{path({{0., 0.}, {10., 0.}})};
+    Contact::PathContact contact;
+    contact.segments.push_back({0, {rectangle(-1., -1., 11., 1.)}, {}});
+    const auto result = Validation::validate_contacts({}, raw_support, upper,
+        {rectangle(-1., -1., 11., 1.)}, 1., .001, {contact});
+    CHECK(result.input_valid);
+    CHECK(result.completed);
+    CHECK(result.unsupported_runs.empty());
+    CHECK(result.void_cells.empty());
+    CHECK(result.passed());
+}
+
+TEST_CASE("Bridge aware contact validation still validates unused raw support geometry", "[BridgeAwareCubic][Validation]")
+{
+    const Polylines upper{path({{0., 0.}, {10., 0.}})};
+    Contact::PathContact contact;
+    contact.segments.push_back({0, {rectangle(-1., -1., 11., 1.)}, {}});
+    ExPolygons invalid;
+    SECTION("Invalid contour") {
+        invalid.emplace_back(Polygon({Point(0, 0), Point(1, 0)}));
+    }
+    SECTION("Unsafe coordinate") {
+        invalid.emplace_back(Polygon({Point(0, 0), Point(std::numeric_limits<coord_t>::max(), 0), Point(0, 1)}));
+    }
+    const auto result = Validation::validate_contacts({}, invalid, upper,
+        {rectangle(-1., -1., 11., 1.)}, 1., .001, {contact});
+    CHECK_FALSE(result.input_valid);
+    CHECK_FALSE(result.passed());
+    CHECK_FALSE(result.failure_reason.empty());
+}
+
+TEST_CASE("Bridge aware contact validation bounds disjoint-hole classification work", "[BridgeAwareCubic][Validation]")
+{
+    auto mask = rectangle(0., 0., 40., 40.);
+    const double pi = std::acos(-1.);
+    for (size_t i = 0; i < 100; ++i) {
+        const double x = 10. + 3. * double(i % 10);
+        const double y = 10. + 3. * double(i / 10);
+        Polygon hole;
+        for (size_t vertex = 0; vertex < 32; ++vertex) {
+            const double angle = 2. * pi * double(vertex) / 32.;
+            hole.points.emplace_back(coord_t(std::llround((x + .75 * std::cos(angle)) / SCALING_FACTOR)),
+                                     coord_t(std::llround((y + .75 * std::sin(angle)) / SCALING_FACTOR)));
+        }
+        hole.make_clockwise();
+        mask.holes.push_back(std::move(hole));
+    }
+    Contact::PathContact contact;
+    contact.segments.push_back({0, {mask}, {}});
+
+    // The 3,204 mask vertices require input validation and one boundary scan.
+    // This allowance also covers hole bounds, but not another full scan of
+    // every remote hole merely to classify the supported path's midpoint.
+    Validation::WorkBudget budget{8000};
+    const auto supported = Validation::validate_contacts({}, {}, {path({{1., 1.}, {2., 1.}})},
+        {rectangle(.5, .5, 2.5, 1.5)}, 1., .001, {contact}, &budget);
+    REQUIRE(supported.input_valid);
+    REQUIRE(supported.completed);
+    CHECK_FALSE(supported.resource_limited);
+    CHECK(supported.unsupported_runs.empty());
+    CHECK(supported.passed());
+    CHECK(budget.remaining_work > 0);
+    CHECK(budget.remaining_work < 8000);
+
+    // The first hole has a horizontal diameter of 1.5 mm. Its containing
+    // bounds must still trigger the exact hole test rather than grant support.
+    const Polyline crossing_path(Points{Point(900000, 1000000), Point(1100000, 1000000)});
+    const auto crossing = Validation::validate_contacts({}, {}, {crossing_path},
+        {rectangle(8.5, 9.5, 11.5, 10.5)}, 1., .001, {contact});
+    REQUIRE(crossing.input_valid);
+    REQUIRE(crossing.completed);
+    REQUIRE(crossing.unsupported_runs.size() == 1);
+    CHECK(crossing.unsupported_runs.front().kind == Validation::UnsupportedRunKind::TwoEndedBridge);
+    CHECK(crossing.unsupported_runs.front().length_mm == Approx(1.5));
+    CHECK(crossing.unsupported_runs.front().exceeds_gap);
+    CHECK_FALSE(crossing.passed());
+}
+
+TEST_CASE("Bridge aware indexed rings preserve boundary and vertex predicates", "[BridgeAwareCubic][Validation]")
+{
+    const auto subdivided_rectangle = [](coord_t low, coord_t high) {
+        Polygon ring;
+        const coord_t step = (high - low) / 32;
+        for (coord_t i = 0; i < 32; ++i) ring.points.emplace_back(low + i * step, low);
+        for (coord_t i = 0; i < 32; ++i) ring.points.emplace_back(high, low + i * step);
+        for (coord_t i = 0; i < 32; ++i) ring.points.emplace_back(high - i * step, high);
+        for (coord_t i = 0; i < 32; ++i) ring.points.emplace_back(low, high - i * step);
+        return ring;
+    };
+    ExPolygon indexed(subdivided_rectangle(0, 1000000));
+    ExPolygon direct(Polygon(Points{Point(0, 0), Point(1000000, 0), Point(1000000, 1000000), Point(0, 1000000)}));
+    const bool with_hole = GENERATE(false, true);
+    if (with_hole) {
+        Polygon indexed_hole = subdivided_rectangle(200000, 800000);
+        indexed_hole.make_clockwise();
+        indexed.holes.push_back(std::move(indexed_hole));
+        Polygon direct_hole(Points{Point(200000, 200000), Point(800000, 200000),
+                                  Point(800000, 800000), Point(200000, 800000)});
+        direct_hole.make_clockwise();
+        direct.holes.push_back(std::move(direct_hole));
+    }
+    const Polylines paths{
+        Polyline(Points{Point(100000, 500000), Point(900000, 500000)}), // Inside / crossing the hole.
+        Polyline(Points{Point(-200000, 500000), Point(-100000, 500000)}), // Outside.
+        Polyline(Points{Point(100000, 0), Point(900000, 0)}), // Horizontal outer boundary.
+        Polyline(Points{Point(-100000, 100000), Point(100000, -100000)}), // Touches one vertex only.
+        Polyline(Points{Point(500000, -100000), Point(500000, 1100000)}), // Crosses horizontal edges.
+        Polyline(Points{Point(-100000, -100000), Point(1100000, 1100000)}), // Crosses exact vertices.
+        Polyline(Points{Point(300000, 200000), Point(700000, 200000)}), // Horizontal hole boundary.
+        Polyline(Points{Point(0, 0), Point(1000000, 0)}) // Endpoint vertices and a horizontal edge.
+    };
+    for (size_t index = 0; index < paths.size(); ++index) {
+        INFO("path " << index << ", with hole " << with_hole);
+        Contact::PathContact indexed_contact, direct_contact;
+        indexed_contact.segments.push_back({0, {indexed}, {}});
+        direct_contact.segments.push_back({0, {direct}, {}});
+        const ExPolygons demand{rectangle(-3., -3., 13., 13.)};
+        const auto expected = Validation::validate_contacts({}, {}, {paths[index]}, demand, 2., .001, {direct_contact});
+        const auto actual = Validation::validate_contacts({}, {}, {paths[index]}, demand, 2., .001, {indexed_contact});
+        REQUIRE(expected.input_valid);
+        REQUIRE(expected.completed);
+        REQUIRE(actual.input_valid);
+        REQUIRE(actual.completed);
+        CHECK(actual.passed() == expected.passed());
+        CHECK(actual.max_unsupported_mm == Approx(expected.max_unsupported_mm));
+        REQUIRE(actual.unsupported_runs.size() == expected.unsupported_runs.size());
+        for (size_t run = 0; run < expected.unsupported_runs.size(); ++run) {
+            CHECK(actual.unsupported_runs[run].kind == expected.unsupported_runs[run].kind);
+            CHECK(actual.unsupported_runs[run].begin_mm == Approx(expected.unsupported_runs[run].begin_mm));
+            CHECK(actual.unsupported_runs[run].end_mm == Approx(expected.unsupported_runs[run].end_mm));
+            CHECK(actual.unsupported_runs[run].length_mm == Approx(expected.unsupported_runs[run].length_mm));
+            CHECK(actual.unsupported_runs[run].exceeds_gap == expected.unsupported_runs[run].exceeds_gap);
+        }
+        // A true polygon edge or isolated vertex never becomes a physical
+        // anchor merely because the candidate edge order changed in the tree.
+        if (index == 2 || index == 3 || index == 7 || (with_hole && index == 6)) {
+            REQUIRE(actual.unsupported_runs.size() == 1);
+            CHECK(actual.unsupported_runs.front().kind == Validation::UnsupportedRunKind::Floating);
+        }
+    }
+}
+
+TEST_CASE("Bridge aware indexed demand bounds repeated long-zigzag classification", "[BridgeAwareCubic][Validation]")
+{
+    // Non-collinear shallow teeth survive union normalization. All path points
+    // are well inside, so scanning this entire ring for every midpoint and
+    // endpoint is redundant; its Y index can discard the remote teeth exactly.
+    Polygon ring;
+    for (coord_t i = 0; i <= 1000; ++i)
+        ring.points.emplace_back(i * 10000, (i % 2) * 1000);
+    for (coord_t i = 0; i <= 1000; ++i)
+        ring.points.emplace_back((1000 - i) * 10000, 1000000 - (i % 2) * 1000);
+    Polyline upper;
+    Contact::PathContact contact;
+    const ExPolygon support = rectangle(0., 1., 100., 9.);
+    for (size_t i = 0; i <= 200; ++i) {
+        upper.points.emplace_back(i % 2 == 0 ? 100000 : 9900000, i % 2 == 0 ? 200000 : 800000);
+        if (i < 200)
+            contact.segments.push_back({i, {support}, {}});
+    }
+    // One million units cover index construction, all boundary scans, and
+    // actual candidate visits. Repeated full-ring classifications exceed it.
+    Validation::WorkBudget budget{1000000};
+    const auto result = Validation::validate_contacts({}, {}, {upper}, {ExPolygon(std::move(ring))},
+        1., .001, {contact}, &budget);
+    REQUIRE(result.input_valid);
+    REQUIRE(result.completed);
+    CHECK_FALSE(result.resource_limited);
+    CHECK(result.unsupported_runs.empty());
+    CHECK(result.passed());
+    CHECK(budget.remaining_work > 0);
+}
+
+TEST_CASE("Bridge aware indexed polygon sets bound disconnected-demand queries", "[BridgeAwareCubic][Validation]")
+{
+    ExPolygons demand;
+    for (size_t i = 0; i < 4096; ++i)
+        demand.push_back(rectangle(.5 * i, -.1, .5 * i + .2, .1));
+    const Polyline upper = path({{.05, 0.}, {2047.7, 0.}});
+    Contact::PathContact contact;
+    contact.segments.push_back({0, {}, {}});
+    // Every rectangle is genuinely crossed. The exact event list remains
+    // complete, but each midpoint needs only its nearby polygon candidates.
+    // A repeated scan of all 4,096 contour boxes exhausts this allowance.
+    Validation::WorkBudget budget{2000000};
+    const auto result = Validation::validate_contacts({}, {}, {upper}, demand, 5., 0., {contact}, &budget);
+    REQUIRE(result.input_valid);
+    REQUIRE(result.completed);
+    CHECK_FALSE(result.resource_limited);
+    REQUIRE(result.unsupported_runs.size() == 1);
+    CHECK(result.unsupported_runs.front().kind == Validation::UnsupportedRunKind::Floating);
+    CHECK(result.unsupported_runs.front().length_mm == Approx(2047.65));
+    CHECK(result.unsupported_runs.front().exceeds_gap);
+    CHECK_FALSE(result.passed());
+    CHECK(budget.remaining_work > 0);
+}
+
+TEST_CASE("Bridge aware indexed cell selection skips disjoint demand polygons", "[BridgeAwareCubic][Validation]")
+{
+    ExPolygons domain, support;
+    for (size_t i = 0; i < 100; ++i) {
+        const double x = 4. * i;
+        domain.push_back(rectangle(x, 0., x + 2., 2.));
+        auto walls = frame(2.);
+        for (auto &wall : walls) wall.translate(scale_(x), 0);
+        append(support, std::move(walls));
+    }
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    ExPolygons selection{rectangle(.75, .75, 1.25, 1.25)};
+    for (size_t i = 0; i < 3000; ++i)
+        selection.push_back(rectangle(.5 * i, 10., .5 * i + .2, 10.2));
+    // The cached cells are unchanged. Remote demand must not consume a full
+    // edge scan for each of their boundaries or create additional cells.
+    Validation::WorkBudget budget{1000000};
+    const auto result = Validation::validate_prepared_contacts(*prepared, {}, selection, 2., 0., {}, &budget);
+    REQUIRE(result.input_valid);
+    REQUIRE(result.completed);
+    CHECK_FALSE(result.resource_limited);
+    REQUIRE(result.void_cells.size() == 1);
+    CHECK(result.void_cells.front().closed);
+    CHECK(result.void_cells.front().diameter_mm == Approx(std::sqrt(2.)));
+    CHECK(result.passed());
+    CHECK(budget.remaining_work > 0);
+}
+
+TEST_CASE("Bridge aware polygon box index preserves exact boundary and hole selection", "[BridgeAwareCubic][Validation]")
+{
+    ExPolygons local{rectangle(0., 0., 10., 10.)};
+    Polygon hole = rectangle(2., 2., 8., 8.).contour;
+    hole.make_clockwise();
+    local.front().holes.push_back(std::move(hole));
+    ExPolygons indexed = local;
+    for (size_t i = 0; i < 100; ++i)
+        indexed.push_back(rectangle(20. + i, 20., 20.5 + i, 20.5));
+    const Polylines paths{
+        path({{1., 1.}, {9., 1.}}),
+        path({{-1., 0.}, {11., 0.}}),
+        path({{-1., 1.}, {1., -1.}}),
+        path({{1., 5.}, {9., 5.}}),
+        path({{3., 2.}, {7., 2.}}),
+        path({{3., 3.}, {7., 3.}}),
+        path({{-2., -2.}, {-1., -1.}})
+    };
+    const bool as_support = GENERATE(false, true);
+    for (const Polyline &upper : paths) {
+        Contact::PathContact direct_contact, indexed_contact;
+        direct_contact.segments.push_back({0, as_support ? local : ExPolygons{}, {}});
+        indexed_contact.segments.push_back({0, as_support ? indexed : ExPolygons{}, {}});
+        const ExPolygons whole{rectangle(-3., -3., 13., 13.)};
+        const auto expected = Validation::validate_contacts({}, {}, {upper}, as_support ? whole : local,
+            3., 0., {direct_contact});
+        const auto actual = Validation::validate_contacts({}, {}, {upper}, as_support ? whole : indexed,
+            3., 0., {indexed_contact});
+        REQUIRE(expected.completed);
+        REQUIRE(actual.completed);
+        REQUIRE(actual.input_valid);
+        CHECK(actual.passed() == expected.passed());
+        REQUIRE(actual.unsupported_runs.size() == expected.unsupported_runs.size());
+        for (size_t i = 0; i < expected.unsupported_runs.size(); ++i) {
+            CHECK(actual.unsupported_runs[i].kind == expected.unsupported_runs[i].kind);
+            CHECK(actual.unsupported_runs[i].begin_mm == Approx(expected.unsupported_runs[i].begin_mm));
+            CHECK(actual.unsupported_runs[i].end_mm == Approx(expected.unsupported_runs[i].end_mm));
+            CHECK(actual.unsupported_runs[i].length_mm == Approx(expected.unsupported_runs[i].length_mm));
+            CHECK(actual.unsupported_runs[i].exceeds_gap == expected.unsupported_runs[i].exceeds_gap);
+        }
+    }
+}
+
+TEST_CASE("Bridge aware polygon box index preserves overlapping-mask order", "[BridgeAwareCubic][Validation]")
+{
+    const bool boundary_first = GENERATE(false, true);
+    ExPolygons masks{rectangle(0., 0., 10., 1.), rectangle(0., -1., 10., 1.)};
+    if (!boundary_first) std::swap(masks[0], masks[1]);
+    Contact::PathContact direct, indexed;
+    direct.segments.push_back({0, masks, {}});
+    for (size_t i = 0; i < 100; ++i)
+        masks.push_back(rectangle(-100. + i, 20., -99.5 + i, 20.5));
+    indexed.segments.push_back({0, masks, {}});
+    const Polylines upper{path({{1., 0.}, {9., 0.}})};
+    const ExPolygons demand{rectangle(0., -2., 10., 2.)};
+    const auto expected = Validation::validate_contacts({}, {}, upper, demand, 9., 0., {direct});
+    const auto actual = Validation::validate_contacts({}, {}, upper, demand, 9., 0., {indexed});
+    REQUIRE(expected.completed);
+    REQUIRE(actual.completed);
+    CHECK(actual.passed() == expected.passed());
+    REQUIRE(actual.unsupported_runs.size() == expected.unsupported_runs.size());
+    CHECK(actual.max_unsupported_mm == Approx(expected.max_unsupported_mm));
 }

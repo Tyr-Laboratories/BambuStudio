@@ -5,6 +5,8 @@
 
 #include "../../Geometry.hpp"
 
+#include <cstdint>
+
 namespace Slic3r::FillLightning {
 
 coord_t Node::getWeightedDistance(const Point& unsupported_location, const coord_t& supporting_radius) const
@@ -162,8 +164,9 @@ bool lineSegmentPolygonsIntersection(const Point& a, const Point& b, const EdgeG
             for (auto it_contour_and_segment = cell_data_range.first; it_contour_and_segment != cell_data_range.second; ++it_contour_and_segment) {
                 // End points of the line segment and their vector.
                 auto segment = grid.segment(*it_contour_and_segment);
-                if (Vec2d ip; Geometry::segment_segment_intersection(segment.first.cast<double>(), segment.second.cast<double>(), this->line_a, this->line_b, ip))
-                    if (double d = (this->intersection_pt - this->line_b).squaredNorm(); d < d2min) {
+                if (Vec2d ip; line_alg::intersection(Linef{segment.first.cast<double>(), segment.second.cast<double>()},
+                        Linef{this->line_a, this->line_b}, &ip))
+                    if (double d = (ip - this->line_b).squaredNorm(); d < d2min) {
                         this->d2min = d;
                         this->intersection_pt = ip;
                     }
@@ -362,9 +365,20 @@ void Node::convertToPolylines(size_t long_line_idx, Polylines &output, bool stab
         output[long_line_idx].points.push_back(m_p);
         return;
     }
-    // Stable mode is used by relocated bridge stacks: repeating conversion
-    // must not move the trimmed end from one branch to another after anchoring.
-    const size_t first_child_idx = stable_traversal ? 0 : rand() % m_children.size();
+    // Junction trimming changes the deposited support geometry, so repeated
+    // conversions for bridge anchoring and final infill must choose the same
+    // continuation. Keep variety between ordinary junctions without depending
+    // on the process RNG, conversion order, or worker scheduling. Relocated
+    // bridge stacks retain their existing first-child traversal.
+    size_t first_child_idx = 0;
+    if (!stable_traversal && m_children.size() > 1) {
+        uint64_t hash = (uint64_t(uint32_t(m_p.x())) << 32) | uint32_t(m_p.y());
+        hash += UINT64_C(0x9e3779b97f4a7c15);
+        hash = (hash ^ (hash >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        hash = (hash ^ (hash >> 27)) * UINT64_C(0x94d049bb133111eb);
+        hash ^= hash >> 31;
+        first_child_idx = size_t(hash % m_children.size());
+    }
     m_children[first_child_idx]->convertToPolylines(long_line_idx, output, stable_traversal);
     output[long_line_idx].points.push_back(m_p);
 

@@ -57,7 +57,7 @@ TEST_CASE("Fill: adjusted solid distance") {
 #endif
 
 TEST_CASE("Fill: Pattern Path Length", "[Fill]") {
-    std::unique_ptr<Slic3r::Fill> filler(Slic3r::Fill::new_from_type("rectilinear"));
+    std::unique_ptr<Slic3r::Fill> filler(Slic3r::Fill::new_from_type(ipRectilinear));
     filler->angle = float(-(PI)/2.0);
 	FillParams fill_params;
 	filler->spacing = 5;
@@ -138,7 +138,9 @@ TEST_CASE("Fill: Pattern Path Length", "[Fill]") {
         filler->layer_id = 66;
         filler->z = 20.15;
 
-        Slic3r::Points points {Point(25771516,14142125),Point(14142138,25771515),Point(2512749,14142131),Point(14142125,2512749)};
+        // Archived coordinates used 1 nm units; state millimeters explicitly so
+        // this regression keeps its original geometry when SCALING_FACTOR changes.
+        Slic3r::Points points {Point::new_scale(25.771516,14.142125),Point::new_scale(14.142138,25.771515),Point::new_scale(2.512749,14.142131),Point::new_scale(14.142125,2.512749)};
         Slic3r::Polylines paths = test(Slic3r::ExPolygon(points));
         REQUIRE(paths.size() == 1); // one continuous path
 
@@ -151,7 +153,7 @@ TEST_CASE("Fill: Pattern Path Length", "[Fill]") {
     SECTION("Rotated Square") {
         Slic3r::Points square { Point::new_scale(0,0), Point::new_scale(50,0), Point::new_scale(50,50), Point::new_scale(0,50)};
         Slic3r::ExPolygon expolygon(square);
-        std::unique_ptr<Slic3r::Fill> filler(Slic3r::Fill::new_from_type("rectilinear"));
+        std::unique_ptr<Slic3r::Fill> filler(Slic3r::Fill::new_from_type(ipRectilinear));
 		filler->bounding_box = get_extents(expolygon.contour);
         filler->angle = 0;
         
@@ -189,21 +191,23 @@ TEST_CASE("Fill: Pattern Path Length", "[Fill]") {
     #endif
 
     SECTION("Solid surface fill") {
+        // These archived 1 nm coordinates are expressed in millimeters to keep
+        // the original 7.774779 x 15.275001 mm surface independent of integer scale.
         Slic3r::Points points {
-                Slic3r::Point(59515297,5422499),Slic3r::Point(59531249,5578697),Slic3r::Point(59695801,6123186),
-                Slic3r::Point(59965713,6630228),Slic3r::Point(60328214,7070685),Slic3r::Point(60773285,7434379),
-                Slic3r::Point(61274561,7702115),Slic3r::Point(61819378,7866770),Slic3r::Point(62390306,7924789),
-                Slic3r::Point(62958700,7866744),Slic3r::Point(63503012,7702244),Slic3r::Point(64007365,7434357),
-                Slic3r::Point(64449960,7070398),Slic3r::Point(64809327,6634999),Slic3r::Point(65082143,6123325),
-                Slic3r::Point(65245005,5584454),Slic3r::Point(65266967,5422499),Slic3r::Point(66267307,5422499),
-                Slic3r::Point(66269190,8310081),Slic3r::Point(66275379,17810072),Slic3r::Point(66277259,20697500),
-                Slic3r::Point(65267237,20697500),Slic3r::Point(65245004,20533538),Slic3r::Point(65082082,19994444),
-                Slic3r::Point(64811462,19488579),Slic3r::Point(64450624,19048208),Slic3r::Point(64012101,18686514),
-                Slic3r::Point(63503122,18415781),Slic3r::Point(62959151,18251378),Slic3r::Point(62453416,18198442),
-                Slic3r::Point(62390147,18197355),Slic3r::Point(62200087,18200576),Slic3r::Point(61813519,18252990),
-                Slic3r::Point(61274433,18415918),Slic3r::Point(60768598,18686517),Slic3r::Point(60327567,19047892),
-                Slic3r::Point(59963609,19493297),Slic3r::Point(59695865,19994587),Slic3r::Point(59531222,20539379),
-                Slic3r::Point(59515153,20697500),Slic3r::Point(58502480,20697500),Slic3r::Point(58502480,5422499)
+                Slic3r::Point::new_scale(59.515297,5.422499),Slic3r::Point::new_scale(59.531249,5.578697),Slic3r::Point::new_scale(59.695801,6.123186),
+                Slic3r::Point::new_scale(59.965713,6.630228),Slic3r::Point::new_scale(60.328214,7.070685),Slic3r::Point::new_scale(60.773285,7.434379),
+                Slic3r::Point::new_scale(61.274561,7.702115),Slic3r::Point::new_scale(61.819378,7.866770),Slic3r::Point::new_scale(62.390306,7.924789),
+                Slic3r::Point::new_scale(62.958700,7.866744),Slic3r::Point::new_scale(63.503012,7.702244),Slic3r::Point::new_scale(64.007365,7.434357),
+                Slic3r::Point::new_scale(64.449960,7.070398),Slic3r::Point::new_scale(64.809327,6.634999),Slic3r::Point::new_scale(65.082143,6.123325),
+                Slic3r::Point::new_scale(65.245005,5.584454),Slic3r::Point::new_scale(65.266967,5.422499),Slic3r::Point::new_scale(66.267307,5.422499),
+                Slic3r::Point::new_scale(66.269190,8.310081),Slic3r::Point::new_scale(66.275379,17.810072),Slic3r::Point::new_scale(66.277259,20.697500),
+                Slic3r::Point::new_scale(65.267237,20.697500),Slic3r::Point::new_scale(65.245004,20.533538),Slic3r::Point::new_scale(65.082082,19.994444),
+                Slic3r::Point::new_scale(64.811462,19.488579),Slic3r::Point::new_scale(64.450624,19.048208),Slic3r::Point::new_scale(64.012101,18.686514),
+                Slic3r::Point::new_scale(63.503122,18.415781),Slic3r::Point::new_scale(62.959151,18.251378),Slic3r::Point::new_scale(62.453416,18.198442),
+                Slic3r::Point::new_scale(62.390147,18.197355),Slic3r::Point::new_scale(62.200087,18.200576),Slic3r::Point::new_scale(61.813519,18.252990),
+                Slic3r::Point::new_scale(61.274433,18.415918),Slic3r::Point::new_scale(60.768598,18.686517),Slic3r::Point::new_scale(60.327567,19.047892),
+                Slic3r::Point::new_scale(59.963609,19.493297),Slic3r::Point::new_scale(59.695865,19.994587),Slic3r::Point::new_scale(59.531222,20.539379),
+                Slic3r::Point::new_scale(59.515153,20.697500),Slic3r::Point::new_scale(58.502480,20.697500),Slic3r::Point::new_scale(58.502480,5.422499)
         };
         Slic3r::ExPolygon expolygon(points);
          
@@ -461,7 +465,7 @@ for my $pattern (qw(rectilinear honeycomb hilbertcurve concentric)) {
 
 bool test_if_solid_surface_filled(const ExPolygon& expolygon, double flow_spacing, double angle, double density)
 {
-    std::unique_ptr<Slic3r::Fill> filler(Slic3r::Fill::new_from_type("rectilinear"));
+    std::unique_ptr<Slic3r::Fill> filler(Slic3r::Fill::new_from_type(ipRectilinear));
 	filler->bounding_box = get_extents(expolygon.contour);
     filler->angle = float(angle);
 
@@ -479,8 +483,11 @@ bool test_if_solid_surface_filled(const ExPolygon& expolygon, double flow_spacin
     Polygons grown_paths;
     grown_paths.reserve(paths.size());
 
-    // figure out what is actually going on here re: data types
-    float line_offset = float(scale_(filler->spacing / 2.0 + EPSILON));
+    // The filler may adjust pitch to fit a solid surface; the extrusion caller
+    // adjusts flow to that pitch. Measure the deposited bead width, not the
+    // distance between adjacent centerlines (which intentionally overlap).
+    const Flow deposited_flow = flow.with_spacing(float(filler->spacing));
+    float line_offset = float(scale_(deposited_flow.width() / 2.0 + EPSILON));
     std::for_each(paths.begin(), paths.end(), [line_offset, &grown_paths] (const Slic3r::Polyline& p) {
         polygons_append(grown_paths, offset(p, line_offset));
     });
@@ -491,6 +498,18 @@ bool test_if_solid_surface_filled(const ExPolygon& expolygon, double flow_spacin
     // ignore very small dots
     const double scaled_flow_spacing = std::pow(scale_(flow_spacing), 2);
     uncovered.erase(std::remove_if(uncovered.begin(), uncovered.end(), [scaled_flow_spacing](const ExPolygon& poly) { return poly.area() < scaled_flow_spacing; }), uncovered.end());
+
+    if (!uncovered.empty()) {
+        UNSCOPED_INFO("solid fill angle=" << angle << " density=" << density
+            << " paths=" << paths.size() << " pitch=" << filler->spacing
+            << " bead width=" << deposited_flow.width());
+        for (const ExPolygon &polygon : uncovered) {
+            const BoundingBox box = get_extents(polygon);
+            UNSCOPED_INFO("uncovered area=" << polygon.area() * SCALING_FACTOR * SCALING_FACTOR
+                << " mm^2, bounds=(" << unscale<double>(box.min.x()) << ", " << unscale<double>(box.min.y())
+                << ")-(" << unscale<double>(box.max.x()) << ", " << unscale<double>(box.max.y()) << ")");
+        }
+    }
 
 #if 0
 	if (! uncovered.empty()) {
@@ -1265,22 +1284,24 @@ TEST_CASE("Fill: conformal CrossZag Alternate starts inward on odd layers", "[Fi
     REQUIRE(lean0 * lean1 < 0.);
 }
 
-TEST_CASE("Fill: conformal orthogonal uses offset loops on odd layers", "[Fill][Conformal]") {
+TEST_CASE("Fill: conformal Orthogonal aliases None", "[Fill][Conformal]") {
     ExPolygon disk;
     disk.contour = make_regular_ngon(20., 48);
     const BoundingBox obj_bb = get_extents(disk);
-    Polylines even_paths = fill_conformal(disk, 0, ConformalStagger::Orthogonal, obj_bb, false);
-    Polylines odd_paths  = fill_conformal(disk, 1, ConformalStagger::Orthogonal, obj_bb, false);
-    REQUIRE_FALSE(even_paths.empty());
-    REQUIRE_FALSE(odd_paths.empty());
-    dump_conformal_overlay("cylinder_orthogonal", disk, even_paths, odd_paths);
-
-    REQUIRE(count_long_segment_angle_bins(even_paths, 2.0, 20.0) >= 4);
-    size_t closed = 0;
-    for (const Polyline &pl : odd_paths)
-        if (polyline_is_closed(pl))
-            ++closed;
-    REQUIRE(closed >= 1);
+    // Orthogonal is a retired setting normalized to None by the slicing
+    // pipeline. The direct filler must preserve the same compatibility result.
+    for (bool connect : {false, true}) {
+        for (size_t layer_id : {size_t(0), size_t(1)}) {
+            CAPTURE(connect, layer_id);
+            Polylines expected = fill_conformal(disk, layer_id, ConformalStagger::None, obj_bb, connect);
+            Polylines actual = fill_conformal(disk, layer_id, ConformalStagger::Orthogonal, obj_bb, connect);
+            REQUIRE_FALSE(expected.empty());
+            REQUIRE(actual.size() == expected.size());
+            REQUIRE(count_long_segment_angle_bins(actual, 2.0, 20.0) >= 4);
+            for (size_t i = 0; i < actual.size(); ++i)
+                REQUIRE(actual[i].points == expected[i].points);
+        }
+    }
 }
 
 TEST_CASE("Fill: conformal cone keeps the same headings", "[Fill][Conformal]") {

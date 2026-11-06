@@ -85,6 +85,26 @@ TEST_CASE("Support point generator should be deterministic if seeded",
     }
 }
 
+TEST_CASE("Concave hull containment tolerance rejects missing material", "[SLASupportGeneration]")
+{
+    const coord_t side = scaled<coord_t>(10.);
+    const Polygon square{{0, 0}, {side, 0}, {side, side}, {0, side}};
+    const ExPolygons footprint{ExPolygon{square}};
+    REQUIRE(concave_hull_contains(Polygons{square}, footprint));
+
+    // A coordinate rounding discrepancy is permitted by the clipping check.
+    Polygon rounded = square;
+    rounded.points[0].x() += 1;
+    rounded.points[3].x() += 1;
+    REQUIRE(concave_hull_contains(Polygons{rounded}, footprint));
+
+    // A real missing strip must still fail, even at a sub-printing resolution.
+    Polygon missing_strip = square;
+    missing_strip.points[0].x() += scaled<coord_t>(0.001);
+    missing_strip.points[3].x() += scaled<coord_t>(0.001);
+    REQUIRE_FALSE(concave_hull_contains(Polygons{missing_strip}, footprint));
+}
+
 TEST_CASE("Flat pad geometry is valid", "[SLASupportGeneration]") {
     sla::PadConfig padcfg;
     
@@ -159,8 +179,8 @@ TEST_CASE("FloorSupportsDoNotPierceModel", "[SLASupportGeneration]") {
 
 TEST_CASE("InitializedRasterShouldBeNONEmpty", "[SLARasterOutput]") {
     // Default SL1 display parameters
-    sla::RasterBase::Resolution res{2560, 1440};
-    sla::RasterBase::PixelDim   pixdim{120. / res.width_px, 68. / res.height_px};
+    sla::Resolution res{2560, 1440};
+    sla::PixelDim   pixdim{120. / res.width_px, 68. / res.height_px};
     
     sla::RasterGrayscaleAAGammaPower raster(res, pixdim, {}, 1.);
     REQUIRE(raster.resolution().width_px == res.width_px);
@@ -186,8 +206,8 @@ TEST_CASE("MirroringShouldBeCorrect", "[SLARasterOutput]") {
 
 TEST_CASE("RasterizedPolygonAreaShouldMatch", "[SLARasterOutput]") {
     double disp_w = 120., disp_h = 68.;
-    sla::RasterBase::Resolution res{2560, 1440};
-    sla::RasterBase::PixelDim pixdim{disp_w / res.width_px, disp_h / res.height_px};
+    sla::Resolution res{2560, 1440};
+    sla::PixelDim pixdim{disp_w / res.width_px, disp_h / res.height_px};
     
     double gamma = 1.;
     sla::RasterGrayscaleAAGammaPower raster(res, pixdim, {}, gamma);

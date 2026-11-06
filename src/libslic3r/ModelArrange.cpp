@@ -15,10 +15,13 @@ arrangement::ArrangePolygons get_arrange_polys(const Model &model, ModelInstance
     ArrangePolygons input;
     input.reserve(count);
     instances.clear(); instances.reserve(count);
-    ArrangePolygon ap;
     for (ModelObject *mo : model.objects)
         for (ModelInstance *minst : mo->instances) {
+            ArrangePolygon ap;
             minst->get_arrange_polygon(&ap);
+            // libnest2d reserves -1 for rejected items and skips them. Fresh
+            // model instances must enter packing as candidates on bed zero.
+            ap.bed_idx = 0;
             input.emplace_back(ap);
             instances.emplace_back(minst);
         }
@@ -43,6 +46,7 @@ bool apply_arrange_polys(ArrangePolygons &input, ModelInstancePtrs &instances, V
 Slic3r::arrangement::ArrangePolygon get_arrange_poly(const Model &model)
 {
     ArrangePolygon ap;
+    ap.bed_idx = 0;
     Points &apts = ap.poly.contour.points;
     for (const ModelObject *mo : model.objects)
         for (const ModelInstance *minst : mo->instances) {

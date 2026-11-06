@@ -179,7 +179,7 @@ public:
     bool defined = false;
 
     inline _Box(const P& center = {TCoord<P>(0), TCoord<P>(0)}):
-        _Box(TCoord<P>(0), TCoord<P>(0), center) {}
+        _Box(TCoord<P>(0), TCoord<P>(0), center) { defined = false; }
     
     inline _Box(const P& p, const P& pp):
         PointPair<P>({ p, pp }) { defined = true; }
@@ -490,7 +490,7 @@ inline _Box<P>::_Box(TCoord<P> width, TCoord<P> height, const P & center) :
     PointPair<P>({center - P{width / 2, height / 2},
                   center + P{width / 2, height / 2} +
                       P{modulo(width, TCoord<P>(2)),
-                        modulo(height, TCoord<P>(2))}}) {}
+                        modulo(height, TCoord<P>(2))}}), defined(true) {}
 
 template<class P>
 inline _Box<P> _Box<P>::infinite(const P& center) {
@@ -504,6 +504,7 @@ inline _Box<P> _Box<P>::infinite(const P& center) {
     
     ret.maxCorner() = center - P{Mx, My};
     ret.minCorner() = center + P{Mx, My};
+    ret.defined = true;
     
     return ret;
 }

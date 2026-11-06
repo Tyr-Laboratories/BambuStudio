@@ -2,6 +2,7 @@
 #define slic3r_GCodeWriter_hpp_
 
 #include "libslic3r.h"
+#include <array>
 #include <string>
 #include <charconv>
 #include "Extruder.hpp"
@@ -92,10 +93,10 @@ public:
     std::string travel_to_xyz(const Vec3d &point, const std::string &comment, bool use_short_travel_acceleration);
     std::string travel_to_z(double z, const std::string &comment = std::string());
     bool        will_move_z(double z) const;
-    std::string extrude_to_xy(const Vec2d &point, double dE, const std::string &comment = std::string(), bool force_no_extrusion = false);
+    std::string extrude_to_xy(const Vec2d &point, double dE, const std::string &comment = std::string(), bool force_no_extrusion = false, bool check_deposition = false);
     //BBS: generate G2 or G3 extrude which moves by arc
-    std::string extrude_arc_to_xy(const Vec2d &point, const Vec2d &center_offset, double dE, const bool is_ccw, const std::string &comment = std::string(), bool force_no_extrusion = false);
-    std::string extrude_to_xyz(const Vec3d &point, double dE, const std::string &comment = std::string(), bool force_no_extrusion = false);
+    std::string extrude_arc_to_xy(const Vec2d &point, const Vec2d &center_offset, double dE, const bool is_ccw, const std::string &comment = std::string(), bool force_no_extrusion = false, bool check_deposition = false);
+    std::string extrude_to_xyz(const Vec3d &point, double dE, const std::string &comment = std::string(), bool force_no_extrusion = false, bool check_deposition = false);
     std::string retract(bool before_wipe = false);
     std::string retract_for_toolchange(bool before_wipe = false);
     std::string unretract(float extra_retract = 0.f);
@@ -108,9 +109,25 @@ public:
     Vec3d       get_position() const { return m_pos; }
     void       set_position(Vec3d& in) { m_pos = in; }
 
+    // BAC contact validation uses the same serialized planes as motion output.
+    // Plate and instance export translations affect XY only; Z is print_z.
+    static constexpr size_t STANDARD_Z_EXPORT_DIGITS = 3;
+    static constexpr size_t BRIDGE_AWARE_CUBIC_Z_EXPORT_DIGITS = 12;
+    static constexpr size_t BRIDGE_AWARE_CUBIC_E_EXPORT_DIGITS = 9;
+    void set_bridge_aware_cubic_z_precision(bool enabled) { m_bridge_aware_cubic_z_precision = enabled; }
+    bool bridge_aware_cubic_z_precision() const { return m_bridge_aware_cubic_z_precision; }
+    size_t z_export_digits() const { return m_bridge_aware_cubic_z_precision ? BRIDGE_AWARE_CUBIC_Z_EXPORT_DIGITS : STANDARD_Z_EXPORT_DIGITS; }
+    static double serialized_z(double z, bool bridge_aware_cubic);
+    double serialized_xy_distance(const Vec2d &point) const;
+    size_t e_export_digits() const;
+    // Call at BAC model-path boundaries after custom code/travel/unretraction.
+    // The returned text must be emitted before relying on deposition checks.
+    std::string synchronize_extrusion_for_deposition();
+
     //BBS: set offset for gcode writer
     void set_xy_offset(double x, double y) { m_x_offset = x; m_y_offset = y; }
     Vec2f get_xy_offset() { return Vec2f{m_x_offset, m_y_offset}; };
+    Vec2d xy_offset() const { return Vec2d(m_x_offset, m_y_offset); }
     // To be called by the CoolingBuffer from another thread.
     static std::string set_fan(const GCodeFlavor gcode_flavor, unsigned int speed);
     // To be called by the main thread. It always emits the G-code, it does not remember the previous state.
@@ -174,6 +191,10 @@ private:
     //Pos must be clear after the first xyz travel move
     bool            m_is_current_pos_clear = false;
     bool            m_avoid_z_descent_travel = false;
+    bool            m_bridge_aware_cubic_z_precision = false;
+    // Exact nine-decimal E tokens, per physical extruder. In absolute mode
+    // unretract(extra_retract) can emit a value different from Extruder::E().
+    std::array<int64_t, 2> m_last_emitted_e{{0, 0}};
     //BBS: x, y offset for gcode generated
     double          m_x_offset{ 0 };
     double          m_y_offset{ 0 };
@@ -202,6 +223,8 @@ private:
     std::string _travel_to_z(double z, const std::string &comment,bool tool_change=false);
     std::string _spiral_travel_to_z(double z, const Vec2d &ij_offset, const std::string &comment, bool tool_change = false);
     std::string _retract(double length, double restart_extra, const std::string &comment);
+    void check_deposition(const Vec2d &point, double dE) const;
+    void record_emitted_e(double e);
 };
 
 class GCodeFormatter {
@@ -238,18 +261,18 @@ public:
         this->emit_axis('Y', point.y(), XYZF_EXPORT_DIGITS);
     }
 
-    void emit_xyz(const Vec3d &point) {
+    void emit_xyz(const Vec3d &point, size_t z_digits = XYZF_EXPORT_DIGITS) {
         this->emit_axis('X', point.x(), XYZF_EXPORT_DIGITS);
         this->emit_axis('Y', point.y(), XYZF_EXPORT_DIGITS);
-        this->emit_z(point.z());
+        this->emit_z(point.z(), z_digits);
     }
 
-    void emit_z(const double z) {
-        this->emit_axis('Z', z, XYZF_EXPORT_DIGITS);
+    void emit_z(const double z, size_t digits = XYZF_EXPORT_DIGITS) {
+        this->emit_axis('Z', z, digits);
     }
 
-    void emit_e(double v) {
-        this->emit_axis('E', v, E_EXPORT_DIGITS);
+    void emit_e(double v, size_t digits = E_EXPORT_DIGITS) {
+        this->emit_axis('E', v, digits);
     }
 
     void emit_f(double speed) {

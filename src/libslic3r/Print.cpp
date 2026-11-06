@@ -1327,6 +1327,27 @@ StringObjectException Print::validate(StringObjectException *warning, Polygons* 
 
     for (const PrintObject *object : m_objects) {
         if (object->has_bridge_aware_cubic()) {
+            if (m_config.spiral_mode.value)
+                return { L("Bridge aware cubic currently requires Spiral vase = Off because contact validation requires planar extrusion layers.") };
+            if (m_config.enable_mixed_color_sublayer.value) {
+                // Check effective enabled model roles on this object. A mixed
+                // slot configured elsewhere, or selected only for a disabled
+                // wall role's brim, does not change its certified model paths.
+                std::vector<unsigned int> model_slots;
+                for (const PrintRegion &region : object->all_regions())
+                    PrintRegion::collect_object_printing_extruders(m_config, region.config(), false, model_slots);
+                const auto &mixed = m_config.filament_is_mixed.values;
+                if (std::any_of(model_slots.begin(), model_slots.end(), [&mixed](unsigned int slot) {
+                        return slot < mixed.size() && mixed[slot];
+                    }))
+                    return { L("Bridge aware cubic currently requires Mixed color sublayer to be disabled when a mixed filament is assigned to an enabled model role on this object."),
+                             object, "enable_mixed_color_sublayer" };
+            }
+            const auto &offsets = m_config.extruder_offset.values;
+            if (!offsets.empty() && std::any_of(offsets.begin(), offsets.end(), [&offsets](const Vec2d &offset) {
+                    return !offset.allFinite() || offset.x() != offsets.front().x() || offset.y() != offsets.front().y();
+                }))
+                return { L("Bridge aware cubic currently requires identical extruder offsets because contact validation uses one physical nozzle coordinate system.") };
             if (object->config().seam_gap.value != 0.)
                 return { L("Bridge aware cubic currently requires Seam gap = 0 because gap validation precedes seam placement.") };
             for (const PrintRegion &region : object->all_regions()) {
@@ -2635,6 +2656,10 @@ void Print::process(std::unordered_map<std::string, long long>* slice_time, bool
 // It is up to the caller to show an error message.
 std::string Print::export_gcode(const std::string& path_template, GCodeProcessorResult* result, ThumbnailsGeneratorCallback thumbnail_cb)
 {
+    // Recheck the final paths at the current instance and plate placements,
+    // including prints whose shared geometry was prepared before a move.
+    for (const PrintObject *object : m_objects)
+        object->validate_bridge_aware_cubic();
     // output everything to a G-code file
     // The following call may die if the filename_format template substitution fails.
     std::string path = this->output_filepath(path_template);

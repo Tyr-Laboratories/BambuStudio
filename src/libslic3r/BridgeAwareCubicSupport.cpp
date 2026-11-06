@@ -2,24 +2,38 @@
 #include "Layer.hpp"
 #include "ClipperUtils.hpp"
 #include "Exception.hpp"
+#include "GCodeWriter.hpp"
 #include "Fill/BridgeAwareCubicValidation.hpp"
+#include "Fill/BridgeAwareCubicSupport.hpp"
+#include "Fill/BridgeAwareCubicAttachment.hpp"
+#include "Fill/BridgeAwareCubicContact.hpp"
+#include "Fill/BridgeAwareCubicClipMask.hpp"
+#include "Fill/BridgeAwareCubicDependencies.hpp"
+#include "Fill/BridgeAwareCubicSerialization.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <map>
+#include <limits>
+#include <numeric>
 #include <sstream>
+#include <set>
 #include <tuple>
 
 namespace Slic3r {
 namespace {
+namespace Dependency = BridgeAwareCubic::Dependencies;
 
-// No path simplification is allowed after nominal-footprint verification.
+// No path simplification is allowed after contact-qualified verification.
 // This allowance covers polygon operations plus paired XYZ export rounding:
 // 0.001 mm output can displace two relative XY endpoints by sqrt(2)*0.001.
-// Maximum XY bead width does not establish physical cross-section contact.
 constexpr double geometry_tolerance = .002 + 16. * SCALING_FACTOR;
-constexpr unsigned repair_limit = 6;
+
+double deposition_z(const Layer &layer)
+{
+    return GCodeWriter::serialized_z(layer.print_z, true);
+}
 
 bool participates(const PrintRegionConfig &config)
 {
@@ -49,6 +63,20 @@ template<class Visitor> void visit_layer(const Layer &layer, const Visitor &visi
     }
 }
 
+// Only independent open entities have free endpoints. The ends of a loop path
+// or an interior multipath component are joins and must never be extended.
+template<class Entity, class Visitor> void visit_free_paths(Entity &entity, const Visitor &visitor)
+{
+    using Path = std::conditional_t<std::is_const_v<Entity>, const ExtrusionPath, ExtrusionPath>;
+    using Collection = std::conditional_t<std::is_const_v<Entity>, const ExtrusionEntityCollection, ExtrusionEntityCollection>;
+    if (auto *path = dynamic_cast<Path*>(&entity)) {
+        if (!path->is_force_no_extrusion() && path->mm3_per_mm > 0. && path->polyline.size() >= 2)
+            visitor(*path);
+    } else if (auto *collection = dynamic_cast<Collection*>(&entity)) {
+        for (auto *child : collection->entities) visit_free_paths(*child, visitor);
+    }
+}
+
 bool has_circle_scarf(const ExtrusionEntity &entity)
 {
     if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(&entity))
@@ -68,6 +96,145 @@ ExPolygons sparse_domain(const LayerRegion &region)
     return union_ex(result);
 }
 
+bool closure_compatible(const LayerRegion &emitter, const LayerRegion &candidate)
+{
+    const auto &config = emitter.region().config();
+    const auto &other = candidate.region().config();
+    if (!participates(config) || !participates(other) || config.sparse_infill_filament != other.sparse_infill_filament)
+        return false;
+    // Closure courses use ordinary sparse flow. Density, gap and lattice
+    // angle may differ across a participating seam; physical material/flow
+    // ownership may not. Other extrusion roles do not enter this comparison.
+    const Flow own = emitter.flow(frInfill), adjacent = candidate.flow(frInfill);
+    return own.width() == adjacent.width() && own.height() == adjacent.height() && own.mm3_per_mm() == adjacent.mm3_per_mm();
+}
+
+ExPolygons closure_domain(const Layer &layer, size_t emitting_region)
+{
+    ExPolygons allowed;
+    if (emitting_region >= layer.regions().size()) return allowed;
+    const LayerRegion &emitter = *layer.get_region(int(emitting_region));
+    if (!participates(emitter.region().config()) || emitter.slices.empty()) return allowed;
+    for (const LayerRegion *region : layer.regions()) {
+        if (!closure_compatible(emitter, *region)) continue;
+        // Shared modifier faces are permitted only between compatible printable
+        // participating regions. Existing ordinary material may supply contact
+        // evidence, but it cannot become a destination for added BAC closure.
+        for (const Surface &surface : region->slices.surfaces) allowed.push_back(surface.expolygon);
+    }
+    return intersection_ex(union_ex(allowed), layer.lslices);
+}
+
+bool closure_paths_owned(const Layer &layer, size_t emitting_region, const Polylines &paths)
+{
+    if (emitting_region >= layer.regions().size()) return false;
+    const LayerRegion &emitter = *layer.get_region(int(emitting_region));
+    if (!participates(emitter.region().config()) || emitter.slices.empty()) return false;
+    ExPolygons own;
+    for (const Surface &surface : emitter.slices.surfaces) own.push_back(surface.expolygon);
+    // A shared-boundary course has one actual emitter. This allowance belongs
+    // only to integer ownership clipping; the full bead must separately fit
+    // the undilated participating material domain below.
+    if (!diff_pl(paths, offset_ex(union_ex(own), 2.)).empty()) return false;
+    const Flow flow = emitter.flow(frInfill);
+    return diff_ex(union_ex(offset(paths, scale_(.5 * flow.width()))), closure_domain(layer, emitting_region)).empty();
+}
+
+bool same_polyline(const Polyline &a, const Polyline &b)
+{
+    return a.points == b.points;
+}
+
+struct ActiveAttachments {
+    std::vector<BridgeAwareCubic::LayerAttachment> entries;
+    std::vector<size_t> storage_regions;
+};
+
+ActiveAttachments active_attachments(const Layer &layer)
+{
+    ActiveAttachments active;
+    for (size_t owner = 0; owner < layer.regions().size(); ++owner)
+        if (const auto *plan = layer.object()->bridge_aware_cubic_plan(owner))
+            for (auto &attachment : plan->attachments(layer.print_z)) {
+                active.storage_regions.push_back(owner);
+                active.entries.push_back(std::move(attachment));
+            }
+    return active;
+}
+
+BridgeAwareCubicAttachment::ResolvedChain resolve_attachments(const Layer &layer, const Polyline &path,
+    double width, double height, size_t emitter, const ActiveAttachments &active)
+{
+    try {
+        return BridgeAwareCubicAttachment::resolve_chain(path, width, height, emitter, active.entries);
+    } catch (const std::exception &error) {
+        throw SlicingError("Bridge aware cubic attachment replay failed at layer " + std::to_string(layer.id() + 1) +
+            ": " + error.what(), layer.object()->model_object()->id().id);
+    }
+}
+
+// Remove only coincident, parallel deposition. Crossing partition faces are
+// both retained; subtracting their finite-width footprints would open a joint.
+Polylines remove_collinear_duplicates(Polylines candidates, const Polylines &existing, bool matching_only = false)
+{
+    Polylines unique;
+    for (const Polyline &candidate : candidates) {
+        if (candidate.size() > 2) {
+            for (size_t i = 1; i < candidate.size(); ++i)
+                append(unique, remove_collinear_duplicates({Polyline(Points{candidate.points[i - 1], candidate.points[i]})},
+                                                            existing, matching_only));
+            continue;
+        }
+        Polylines overlaps;
+        bool completely_owned = false;
+        if (candidate.size() == 2) {
+            const Vec2d axis = (candidate.last_point() - candidate.first_point()).cast<double>();
+            const double length = axis.norm();
+            for (const Polyline &line : existing) for (size_t i = 1; i < line.size(); ++i) {
+                const Vec2d other = (line.points[i] - line.points[i - 1]).cast<double>();
+                const Vec2d delta = (line.points[i - 1] - candidate.first_point()).cast<double>();
+                const auto cross = [](const Vec2d &a, const Vec2d &b) { return a.x()*b.y()-a.y()*b.x(); };
+                bool coincident = false;
+                const double other_length = other.norm();
+                if (length > 0. && other_length > 0.) {
+                    if (matching_only) {
+                        // Both clipped endpoints can move by a coordinate unit.
+                        // Test the short interval against the long reference;
+                        // extrapolating its rounded direction to a distant owner
+                        // endpoint magnifies that error and loses true producers.
+                        const Vec2d reference = length >= other_length ? axis : other;
+                        const Point reference_start = length >= other_length ? candidate.first_point() : line.points[i - 1];
+                        const Point first = length >= other_length ? line.points[i - 1] : candidate.first_point();
+                        const Point last = length >= other_length ? line.points[i] : candidate.last_point();
+                        const double limit = 2. * std::max(length, other_length);
+                        coincident = std::abs(cross(reference, (first - reference_start).cast<double>())) <= limit &&
+                                     std::abs(cross(reference, (last - reference_start).cast<double>())) <= limit;
+                        // Preserve a completely owned source fragment exactly.
+                        // Re-clipping a short rounded segment through a thin
+                        // offset can move its endpoints or direction and leave
+                        // an artificial wedge in its finite-width ownership.
+                        const double begin = other.dot((candidate.first_point() - line.points[i - 1]).cast<double>());
+                        const double end = other.dot((candidate.last_point() - line.points[i - 1]).cast<double>());
+                        completely_owned |= coincident && std::min(begin, end) >= 0. &&
+                                            std::max(begin, end) <= other.squaredNorm();
+                    } else {
+                        // Deposition deduplication retains its stricter rule;
+                        // the broader clipping bound is only provenance data.
+                        coincident = std::abs(cross(axis, other)) <= std::max(length, other_length) &&
+                                     std::abs(cross(axis, delta)) <= length;
+                    }
+                }
+                if (coincident) overlaps.emplace_back(Points{line.points[i - 1], line.points[i]});
+            }
+        }
+        if (matching_only) {
+            if (completely_owned) unique.push_back(candidate);
+            else if (!overlaps.empty()) append(unique, intersection_pl(Polylines{candidate}, offset(overlaps, 2.)));
+        } else append(unique, overlaps.empty() ? Polylines{candidate} : diff_pl(Polylines{candidate}, offset(overlaps, 2.)));
+    }
+    return unique;
+}
+
 struct Target {
     size_t upper_layer = 0;
     size_t supporting_region = 0;
@@ -78,31 +245,54 @@ struct Target {
     Polylines paths;
     std::vector<double> path_widths;
     ExPolygons footprint;
+    ExtrusionPaths extrusions;
+    std::vector<size_t> emitting_regions;
+    std::vector<bool> free_ended;
+    std::vector<std::vector<BridgeAwareCubic::CellId>> producers;
+    std::vector<bool> solid_cuts;
+    std::vector<ExPolygons> path_footprints;
 };
+
+const ExPolygons &path_demand(const Target &target, size_t index)
+{
+    if (!target.path_footprints.empty()) return target.path_footprints.at(index);
+    // Synthetic attachment proposals historically supply one complete path.
+    // A grouped target must retain each path's exact selected demand identity.
+    if (target.paths.size() != 1 || index != 0)
+        throw std::logic_error("Bridge aware cubic lost an individual path's demand footprint.");
+    return target.footprint;
+}
 
 // Group equal contact planes, but retain complete emitted paths and endpoints.
 // Only the demand mask is clipped to the supplying region; it never closes a
 // cell or supplies an artificial endpoint to the validator.
-std::vector<Target> collect_targets(const PrintObject &object, bool dependencies, bool unsupported_only = true)
+std::vector<Target> collect_targets(const PrintObject &object, bool dependencies, bool unsupported_only = true,
+                                    const std::set<size_t> *selected_layers = nullptr)
 {
     std::vector<Target> targets;
+    BridgeAwareCubicValidation::WorkBudget contact_budget;
     const auto &layers = object.layers();
     const BoundingBox bounds = object.bounding_box();
     const ExPolygon broad_domain(Polygon{Points{
         bounds.min, Point(bounds.max.x(), bounds.min.y()), bounds.max,
         Point(bounds.min.x(), bounds.max.y())}});
     for (size_t index = 1; index < layers.size(); ++index) {
+        if (selected_layers != nullptr && selected_layers->count(index) == 0) continue;
         if (object.print()->canceled()) throw CanceledException();
         const Layer &upper = *layers[index];
         const Layer &lower = *layers[index - 1];
-        Polygons support_polygons;
+        const ActiveAttachments active = active_attachments(upper);
+        std::vector<BridgeAwareCubicContact::Bead> prior_beads;
         visit_layer(lower, [&](const ExtrusionPath &path) {
-            path.polygons_covered_by_width(support_polygons, 0.f);
+            prior_beads.push_back({&path, deposition_z(lower)});
         });
-        // Reserve positive overlap after relative support/target coordinate
-        // rounding. Erode the union, so real crossing/joining beads remain
-        // connected while a vanishing overlap is never accepted as an anchor.
-        const ExPolygons previous_material = offset_ex(union_ex(support_polygons), -scale_(geometry_tolerance));
+        // Collection visits many upper strands above the same immutable lower
+        // deposition. Reuse one owned section snapshot at its exact top/height
+        // key; replacing it first preserves the helper's combined resident and
+        // query allocation allowance. Rebuilds charge this collection's budget.
+        BridgeAwareCubicContact::PreparedLowerPtr prepared_lower;
+        std::optional<std::pair<double, float>> prepared_key;
+        const double upper_z = deposition_z(upper);
         std::vector<ExPolygons> eligible(lower.regions().size());
         std::vector<ExPolygons> bridge_eligible(lower.regions().size());
         for (size_t region_id = 0; region_id < lower.regions().size(); ++region_id) {
@@ -113,41 +303,121 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
             // Carry the originating sparse region's policy through bridge
             // planes, including across a modifier ending below a bridge. The
             // bridge's own region is not necessarily the support owner.
-            ExPolygons projection;
+            const auto charge = [&](size_t amount = 1) {
+                if (object.print()->canceled()) throw CanceledException();
+                if (amount > contact_budget.remaining_work)
+                    throw SlicingError("Bridge aware cubic bridge ancestry exceeded its geometry work limit.",
+                                       object.model_object()->id().id);
+                contact_budget.remaining_work -= amount;
+            };
+            const auto charge_polygons = [&](const ExPolygons &polygons) {
+                for (const ExPolygon &polygon : polygons) {
+                    charge(polygon.contour.size() + 1);
+                    for (const Polygon &hole : polygon.holes) charge(hole.size() + 1);
+                }
+            };
+            ExPolygons bridge_components;
             for (const LayerRegion *region : lower.regions())
                 for (const Surface &surface : region->fill_surfaces.surfaces)
                     if (surface.surface_type == stInternalBridge)
-                        projection.push_back(surface.expolygon);
-            for (size_t bridge_index = index - 1; bridge_index > 0 && !projection.empty(); --bridge_index) {
-                ExPolygons bases, continuing;
-                for (const LayerRegion *region : layers[bridge_index]->regions())
-                    for (const Surface &surface : region->fill_surfaces.surfaces)
-                        if (surface.surface_type == stInternalBridge)
-                            append(surface.bridge_followup ? continuing : bases,
-                                   intersection_ex(surface.expolygon, projection));
-                if (!bases.empty()) {
-                    const Layer &beneath_base = *layers[bridge_index - 1];
-                    for (size_t region_id = 0; region_id < beneath_base.regions().size(); ++region_id)
-                        if (participates(beneath_base.get_region(int(region_id))->region().config()))
-                            append(bridge_eligible[region_id], intersection_ex(bases,
-                                sparse_domain(*beneath_base.get_region(int(region_id)))));
+                        bridge_components.push_back(surface.expolygon);
+            charge_polygons(bridge_components);
+            bridge_components = union_ex(bridge_components);
+            std::vector<ExPolygons> upper_footprints;
+            if (!bridge_components.empty())
+                visit_layer(upper, [&](const ExtrusionPath &path) {
+                    if (path.role() == erInternalInfill || path.role() == erIroning) return;
+                    charge(path.polyline.size() + 1);
+                    upper_footprints.push_back(union_ex(offset(Polylines{path.polyline}, scale_(.5 * path.width))));
+                    charge_polygons(upper_footprints.back());
+                });
+            for (const ExPolygon &component : bridge_components) {
+                // Expand policy selection to real connected upper paths;
+                // deposited support and physical contact remain unchanged.
+                ExPolygons coverage{component};
+                for (const ExPolygons &footprint : upper_footprints) {
+                    charge_polygons(footprint);
+                    charge(component.contour.size() + 1);
+                    if (!intersection_ex(footprint, ExPolygons{component}).empty()) append(coverage, footprint);
                 }
-                projection = std::move(continuing);
+                charge_polygons(coverage);
+                coverage = union_ex(coverage);
+                ExPolygons projection{component};
+                for (size_t bridge_index = index - 1; bridge_index > 0 && !projection.empty(); --bridge_index) {
+                    ExPolygons bases, continuing;
+                    for (const LayerRegion *region : layers[bridge_index]->regions())
+                        for (const Surface &surface : region->fill_surfaces.surfaces) {
+                            charge();
+                            if (surface.surface_type != stInternalBridge) continue;
+                            charge_polygons(projection);
+                            charge_polygons(ExPolygons{surface.expolygon});
+                            if (!intersection_ex(surface.expolygon, projection).empty())
+                                (surface.bridge_followup ? continuing : bases).push_back(surface.expolygon);
+                        }
+                    if (!bases.empty()) {
+                        const Layer &beneath_base = *layers[bridge_index - 1];
+                        for (size_t region_id = 0; region_id < beneath_base.regions().size(); ++region_id) {
+                            const LayerRegion &source = *beneath_base.get_region(int(region_id));
+                            if (!participates(source.region().config())) continue;
+                            const ExPolygons sparse = sparse_domain(source);
+                            charge_polygons(bases);
+                            charge_polygons(sparse);
+                            if (intersection_ex(bases, sparse).empty()) continue;
+                            // Sparse interiors establish ownership, not the
+                            // extent of an inherited path's anchor obligation.
+                            // Keep the source's complete material section so
+                            // wall/anchor fringes survive, including when a
+                            // modifier ends below the reconstructed stack.
+                            ExPolygons material;
+                            for (const Surface &surface : source.slices.surfaces) material.push_back(surface.expolygon);
+                            charge_polygons(material);
+                            charge_polygons(coverage);
+                            append(bridge_eligible[region_id], intersection_ex(coverage, union_ex(material)));
+                        }
+                    }
+                    charge_polygons(continuing);
+                    projection = union_ex(continuing);
+                }
             }
         }
         for (ExPolygons &domain : eligible) domain = union_ex(domain);
         for (ExPolygons &domain : bridge_eligible) domain = union_ex(domain);
 
         std::map<std::tuple<size_t, double, bool>, size_t> groups;
-        auto add = [&](const ExtrusionPath &path, bool dependency, size_t emitting_region) {
+        auto add = [&](const ExtrusionPath &path, bool dependency, size_t emitting_region, bool free_ended,
+                       const std::vector<BridgeAwareCubic::CellId> &producers,
+                       const ExPolygons *selection = nullptr, bool solid_cut = false) {
             // A swept bead edge alone is not an unsupported extrusion. Select
             // actual air runs first and then use the real target bead width.
             // The original path below retains all endpoints and identities.
-            const bool contact = upper.print_z - path.height <= lower.print_z + geometry_tolerance;
-            const Polylines unsupported = unsupported_only && contact ?
-                diff_pl(Polylines{path.polyline}, previous_material) : Polylines{path.polyline};
+            Polylines unsupported;
+            if (unsupported_only) {
+                const bool finite_key = std::isfinite(upper_z) && std::isfinite(path.height);
+                const auto key = std::make_pair(upper_z, path.height);
+                if (!prepared_lower || !finite_key || !prepared_key || *prepared_key != key) {
+                    prepared_lower.reset();
+                    prepared_key.reset();
+                    prepared_lower = BridgeAwareCubicContact::prepare_lower(prior_beads, upper_z, path.height, &contact_budget);
+                    if (finite_key) prepared_key = key;
+                }
+                const auto contact = BridgeAwareCubicContact::footprint(*prepared_lower, path, upper_z, geometry_tolerance,
+                    BridgeAwareCubicContact::FootprintMode::ContactsOnly, &contact_budget);
+                if (contact.resource_limited)
+                    throw SlicingError("Bridge aware cubic target collection is incomplete at layer " + std::to_string(upper.id() + 1) +
+                        ": " + contact.failure_reason, object.model_object()->id().id);
+                if (contact.input_valid && contact.completed) {
+                    for (const auto &segment : contact.segments) {
+                        const size_t i = segment.segment_index;
+                        append(unsupported, diff_pl(Polylines{Polyline(Points{path.polyline.points[i], path.polyline.points[i + 1]})},
+                                                    segment.centerline_support));
+                    }
+                    if (contact.segments.empty()) unsupported.push_back(path.polyline);
+                } else unsupported.push_back(path.polyline);
+            } else unsupported.push_back(path.polyline);
             if (unsupported.empty()) return;
-            const ExPolygons footprint = union_ex(offset(unsupported, scale_(.5 * path.width)));
+            ExPolygons footprint = union_ex(offset(unsupported, scale_(.5 * path.width)));
+            if (selection != nullptr) footprint = intersection_ex(footprint, *selection);
+            if (footprint.empty()) return;
             for (size_t region_id = 0; region_id < eligible.size(); ++region_id) {
                 for (bool followup : {false, true}) {
                     const ExPolygons &domain = followup ? bridge_eligible[region_id] : eligible[region_id];
@@ -166,6 +436,12 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                     Target &target = targets[found->second];
                     target.paths.push_back(path.polyline);
                     target.path_widths.push_back(path.width);
+                    target.extrusions.push_back(path);
+                    target.emitting_regions.push_back(emitting_region);
+                    target.free_ended.push_back(free_ended);
+                    target.producers.push_back(producers);
+                    target.solid_cuts.push_back(solid_cut);
+                    target.path_footprints.push_back(demand);
                     append(target.footprint, std::move(demand));
                 }
             }
@@ -181,31 +457,121 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                     targets.push_back({index, emitting_region, config.bridge_aware_cubic_max_gap.value,
                                        upper.print_z - path.height, true, false, {path.polyline},
                                        {double(path.width)}, std::move(outside)});
+                    Target &target = targets.back();
+                    target.extrusions.push_back(path);
+                    target.emitting_regions.push_back(emitting_region);
+                    target.free_ended.push_back(free_ended);
+                    target.producers.push_back(producers);
+                    target.solid_cuts.push_back(solid_cut);
+                    target.path_footprints.push_back(target.footprint);
                 }
             }
         };
 
         if (!dependencies) {
-            visit_layer(upper, [&](const ExtrusionPath &path) {
-                if (path.role() != erInternalInfill && path.role() != erIroning)
-                    add(path, false, 0);
-            });
+            for (size_t region_id = 0; region_id < upper.regions().size(); ++region_id) {
+                const LayerRegion &region = *upper.get_region(int(region_id));
+                std::set<const ExtrusionPath*> free;
+                // Model perimeters are frozen before this preparation step
+                // and can survive an infill-only reslice. Repair their support
+                // below; never retain a path extension in that persistent tree.
+                visit_free_paths(region.fills, [&](const ExtrusionPath &path) { free.insert(&path); });
+                const auto model_path = [&](const ExtrusionPath &path) {
+                    if (path.role() != erInternalInfill && path.role() != erIroning)
+                        add(path, false, region_id, free.count(&path) != 0, {});
+                };
+                visit_paths(region.perimeters, model_path);
+                visit_paths(region.fills, model_path);
+            }
         } else {
             for (size_t region_id = 0; region_id < upper.regions().size(); ++region_id) {
                 const auto *plan = object.bridge_aware_cubic_plan(region_id);
                 if (plan == nullptr) continue;
                 const Polylines added = plan->refinement_lines(upper.print_z, broad_domain);
-                if (added.empty()) continue;
-                const Polygons added_mask = offset(added, scale_(geometry_tolerance));
+                if (added.empty() && plan->solid_area(upper.print_z).empty() && plan->attachments(upper.print_z).empty()) continue;
+                const ExPolygons solid_area = plan->solid_area(upper.print_z);
+                Polygons added_mask = offset(added, scale_(geometry_tolerance));
+                append(added_mask, to_polygons(solid_area));
+                const BridgeAwareCubic::BoundedClipMask added_clip_mask(std::move(added_mask));
+                const auto &saved_attachments = active.entries;
+                const auto solid_sections = plan->solid_sections(upper.print_z);
+                const auto owner_sections = plan->partition_lines(upper.print_z, broad_domain);
                 visit_paths(upper.get_region(int(region_id))->fills, [&](const ExtrusionPath &path) {
                     if (path.role() != erInternalInfill) return;
-                    const Polylines matched = intersection_pl(Polylines{path.polyline}, added_mask);
-                    double matched_length = 0.;
-                    for (const Polyline &line : matched) matched_length += line.length();
+                    const Polylines matched = intersection_pl(Polylines{path.polyline}, added_clip_mask.candidates(path.polyline));
                     // Full emitted strand identity, not a clipped fragment.
-                    if (matched_length + scale_(geometry_tolerance) >= path.polyline.length())
-                        add(path, true, region_id);
+                    bool attachment_match = false;
+                    std::set<size_t> attachment_lineage;
+                    for (const auto &attachment : saved_attachments)
+                        if (attachment.emitting_region == region_id) {
+                            const auto chain = resolve_attachments(upper, attachment.original, path.width, path.height, region_id, active);
+                            if (!chain.applied_indices.empty() && same_polyline(path.polyline, chain.polyline)) {
+                                attachment_match = true;
+                                attachment_lineage.insert(chain.applied_indices.begin(), chain.applied_indices.end());
+                            }
+                        }
+                    const bool ordinary_full_path = BridgeAwareCubic::complete_construction_match(path.polyline, matched, geometry_tolerance);
+                    if (attachment_match || ordinary_full_path) {
+                        std::vector<BridgeAwareCubic::CellId> producers;
+                        for (const auto &[owner_id, owner_lines] : owner_sections) {
+                            const auto pieces = remove_collinear_duplicates({path.polyline}, owner_lines, true);
+                            if (BridgeAwareCubic::complete_construction_match(path.polyline, pieces, 2. * SCALING_FACTOR))
+                                producers.push_back(owner_id);
+                        }
+                        for (const auto &solid : solid_sections)
+                            if (diff_pl(Polylines{path.polyline}, ExPolygons{ExPolygon(solid.polygon)}).empty())
+                                producers.push_back(solid.cell_id);
+                        for (size_t id : attachment_lineage)
+                            if (active.storage_regions[id] == region_id)
+                                append(producers, saved_attachments[id].owners);
+                        const auto attachment_selection = BridgeAwareCubic::merged_attachment_selection(
+                            ordinary_full_path, saved_attachments, attachment_lineage);
+                        add(path, true, region_id, true, producers,
+                            attachment_selection ? &*attachment_selection : nullptr, attachment_selection.has_value());
+                    } else if (!solid_area.empty()) {
+                        // Replacing cubic with a solid patch also cuts the
+                        // inherited bulk lines. A new terminal point is a
+                        // construction change even though the remaining line
+                        // was not itself an added midplane. Select only this
+                        // terminal neighbourhood; the validator retains the
+                        // entire intersecting air run and both real endpoints.
+                        std::vector<BridgeAwareCubic::CellId> producers;
+                        ExPolygons terminal_selection;
+                        for (const auto &solid : solid_sections) {
+                            ExPolygons selected = BridgeAwareCubic::solid_cut_endpoint_demand(path.polyline,
+                                {ExPolygon(solid.polygon)}, path.width, geometry_tolerance);
+                            if (!selected.empty()) {
+                                append(terminal_selection, std::move(selected));
+                                producers.push_back(solid.cell_id);
+                            }
+                        }
+                        if (!terminal_selection.empty()) {
+                            terminal_selection = union_ex(terminal_selection);
+                            add(path, true, region_id, true, producers, &terminal_selection, true);
+                        }
+                    }
                 });
+                // A closure may be stored with its demand owner while a
+                // different compatible region emits a predecessor course.
+                for (const auto &closure : plan->closures(upper.print_z)) {
+                    const size_t emitter = closure.emitting_region == std::numeric_limits<size_t>::max() ? region_id : closure.emitting_region;
+                    if (emitter == region_id || emitter >= upper.regions().size()) continue;
+                    Polylines emitted_closure = closure.paths;
+                    const Flow closure_flow = upper.get_region(int(emitter))->flow(frInfill);
+                    for (Polyline &line : emitted_closure)
+                        line = resolve_attachments(upper, line, float(closure_flow.width()), float(closure_flow.height()), emitter, active).polyline;
+                    const Polygons closure_mask = offset(emitted_closure, scale_(geometry_tolerance));
+                    visit_paths(upper.get_region(int(emitter))->fills, [&](const ExtrusionPath &path) {
+                        if (path.role() != erInternalInfill) return;
+                        const auto matched = intersection_pl(Polylines{path.polyline}, closure_mask);
+                        if (BridgeAwareCubic::complete_construction_match(path.polyline, matched, geometry_tolerance))
+                            // Cell IDs belong to the storage lattice. A course
+                            // emitted elsewhere retains its dependency through
+                            // the actual active closure path (ClosureRoot), not
+                            // by interpreting foreign IDs in the emitter plan.
+                            add(path, true, emitter, true, {});
+                    });
+                }
             }
         }
         for (const auto &group : groups)
@@ -217,76 +583,960 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
 struct Failure {
     Target target;
     BridgeAwareCubicValidation::Result result;
+    Polylines verified_paths;
 };
 
-ExPolygons repair_footprint(const Failure &failure)
+std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
+                                   const PrintObject *phase_object = nullptr);
+
+[[noreturn]] void fail(const PrintObject &object, const Failure &failure);
+
+ExPolygons repair_footprint(const Failure &failure, bool complete_selected_runs = false)
 {
-    ExPolygons affected;
-    for (const auto &run : failure.result.unsupported_runs) {
-        if (!run.exceeds_gap && run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge)
-            continue;
-        const Polyline &original = failure.target.paths.at(run.path_index);
-        const double total = unscale<double>(original.length());
-        // Diagnostic arclengths are approximate doubles. Expand along the
-        // path before clipping, and radially after clipping, so a subresolution
-        // failing interval cannot disappear during scaled-coordinate rounding.
-        const double begin = std::max(0., run.begin_mm - geometry_tolerance);
-        const double end = std::min(total, run.end_mm + geometry_tolerance);
-        Polyline interval = original;
-        interval.clip_end(scale_(std::max(0., total - end)));
-        if (interval.size() >= 2) interval.clip_start(scale_(begin));
-        if (interval.size() >= 2)
-            append(affected, union_ex(offset(Polylines{std::move(interval)},
-                scale_(.5 * failure.target.path_widths.at(run.path_index) + geometry_tolerance))));
-    }
+    std::vector<ExPolygons> synthetic_demand;
+    if (failure.target.path_footprints.empty() && !failure.target.paths.empty())
+        synthetic_demand.push_back(path_demand(failure.target, 0));
+    ExPolygons affected = BridgeAwareCubic::select_unsupported_run_demands(failure.target.paths,
+        failure.verified_paths, failure.target.path_widths,
+        failure.target.path_footprints.empty() ? synthetic_demand : failure.target.path_footprints,
+        failure.result.unsupported_runs, geometry_tolerance, complete_selected_runs);
+    ExPolygons cells;
     for (const auto &cell : failure.result.void_cells)
         if (!cell.closed || cell.exceeds_gap)
-            append(affected, offset_ex(cell.geometry, scale_(geometry_tolerance)));
+            append(cells, offset_ex(cell.geometry, scale_(geometry_tolerance)));
     // The grouped target may contain many unrelated passing paths. Only a
-    // violating run or void selects repair, and the original finite-width
-    // demand remains the outer limit of that repair selection.
-    return intersection_ex(union_ex(affected), failure.target.footprint);
+    // violating run or void selects repair. A selected complete air run may
+    // require support across a region seam, while void-cell selection remains
+    // local to the original demand and never turns a logical seam into a wall.
+    append(affected, intersection_ex(union_ex(cells), failure.target.footprint));
+    return complete_selected_runs ? union_ex(affected) :
+        intersection_ex(union_ex(affected), failure.target.footprint);
 }
 
-std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets)
+std::vector<BridgeAwareCubicContact::Bead> deposited_beads(const Layer &layer)
+{
+    std::vector<BridgeAwareCubicContact::Bead> beads;
+    visit_layer(layer, [&](const ExtrusionPath &path) { beads.push_back({&path, deposition_z(layer)}); });
+    return beads;
+}
+
+bool repair_attachments(const PrintObject &object, const Failure &failure,
+                        std::vector<std::vector<BridgeAwareCubic::LayerAttachment>> &attachments,
+                        const ExPolygons *same_layer_walls = nullptr)
+{
+    const Layer &upper = *object.layers()[failure.target.upper_layer];
+    const Layer &lower = *object.layers()[failure.target.upper_layer - 1];
+    const auto prior = deposited_beads(lower);
+    std::set<size_t> candidates;
+    for (const auto &run : failure.result.unsupported_runs)
+        if (run.kind != BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge)
+            candidates.insert(run.path_index);
+    bool repaired = false;
+    for (size_t index : candidates) {
+        if (!failure.target.free_ended.at(index)) continue;
+        const size_t emitter = failure.target.emitting_regions.at(index);
+        const ExtrusionPath &original = failure.target.extrusions.at(index);
+        BridgeAwareCubicAttachment::TerminalAirLengths terminal_air;
+        for (const auto &run : failure.result.unsupported_runs) {
+            if (run.path_index != index || run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge) continue;
+            if (run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::Floating || run.begin_mm == 0.)
+                terminal_air.start_mm = std::max(terminal_air.start_mm.value_or(0.), run.length_mm);
+            if (run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::Floating || run.begin_mm != 0.)
+                terminal_air.end_mm = std::max(terminal_air.end_mm.value_or(0.), run.length_mm);
+        }
+        ExPolygons support, start_support, end_support;
+        if (same_layer_walls != nullptr) {
+            // A cell-closing extension starts in this already emitted strand
+            // and terminates in real wall material on the same contact plane.
+            // This is only a candidate-search mask. The replacement must still
+            // pass the actual preceding-layer proof below.
+            support = union_ex(offset(Polylines{original.polyline}, scale_(.5 * original.width)));
+            start_support = end_support = *same_layer_walls;
+        } else {
+            const auto contact = BridgeAwareCubicContact::footprint(prior, original, deposition_z(upper), 0.,
+                BridgeAwareCubicContact::FootprintMode::ContactsOnly);
+            if (!contact.input_valid || !contact.completed) {
+                continue;
+            }
+            for (const auto &segment : contact.segments) {
+                append(support, segment.centerline_support);
+                if (segment.segment_index == 0) start_support = segment.centerline_support;
+                if (segment.segment_index + 2 == original.polyline.size()) end_support = segment.centerline_support;
+            }
+            // A contact mask is bounded to its queried segment. Query the actual
+            // terminal direction over the permitted search distance so a real
+            // prior strand just beyond the original endpoint is considered. The
+            // probe is not deposited and supplies no material to the certificate.
+            const auto probe_support = [&](bool start) {
+                ExtrusionPath probe = original;
+                const Point endpoint = start ? original.polyline.first_point() : original.polyline.last_point();
+                const Point neighbour = start ? original.polyline.points[1] : original.polyline.points[original.polyline.size() - 2];
+                const Vec2d direction = (endpoint - neighbour).cast<double>();
+                const double length = direction.norm();
+                if (length == 0.) return ExPolygons{};
+                const Vec2d far = endpoint.cast<double>() + direction * (scale_(failure.target.gap) / length);
+                constexpr double coordinate_limit = double(std::numeric_limits<coord_t>::max() / 4);
+                if (!far.allFinite() || far.cwiseAbs().maxCoeff() > coordinate_limit) return ExPolygons{};
+                const Point point(far.cast<coord_t>());
+                probe.polyline = start ? Polyline(Points{point, neighbour}) : Polyline(Points{neighbour, point});
+                const auto queried = BridgeAwareCubicContact::footprint(prior, probe, deposition_z(upper), 0.,
+                    BridgeAwareCubicContact::FootprintMode::ContactsOnly);
+                ExPolygons masks;
+                if (queried.input_valid && queried.completed)
+                    for (const auto &segment : queried.segments) append(masks, segment.centerline_support);
+                return union_ex(masks);
+            };
+            if (terminal_air.start_mm) start_support = probe_support(true);
+            if (terminal_air.end_mm) end_support = probe_support(false);
+        }
+        append(support, start_support);
+        append(support, end_support);
+        const ExPolygons qualified_support = union_ex(support);
+        const ExPolygons allowed_domain = BridgeAwareCubic::endpoint_attachment_domain(upper, emitter);
+        std::optional<Polyline> replacement;
+        Polylines attempted;
+        BridgeAwareCubicAttachment::TerminalAnchorIntervals interval_search;
+        unsigned skipped_intervals = 0;
+        std::optional<Failure> last_interval_failure;
+        // The nearest source anchor can yield a very short new segment whose
+        // direction changes after XY serialization. Try deeper points inside
+        // the same real contact intervals; the helper caps each preference at
+        // the interval midpoint and every proposal receives the full proof.
+        for (;;) {
+        bool retry_start = false, retry_end = false;
+        for (double inset : {2. * geometry_tolerance, .5 * double(original.width), failure.target.gap}) {
+            auto candidate = BridgeAwareCubicAttachment::attach_endpoints(original.polyline, qualified_support,
+                allowed_domain, original.width, failure.target.gap, 0., inset,
+                &start_support, &end_support, &terminal_air, &interval_search);
+            if (!candidate) continue;
+            if (std::any_of(attempted.begin(), attempted.end(), [&](const Polyline &previous) {
+                    return same_polyline(previous, *candidate);
+                })) continue;
+            attempted.push_back(*candidate);
+            ExtrusionPath extended = original;
+            extended.polyline = *candidate;
+            Target proposed;
+            proposed.upper_layer = failure.target.upper_layer;
+            proposed.supporting_region = failure.target.supporting_region;
+            proposed.gap = failure.target.gap;
+            proposed.dependency = true; // Complete path/anchor check; no new cell demand.
+            proposed.paths = {*candidate};
+            proposed.path_widths = {original.width};
+            proposed.extrusions = {extended};
+            proposed.footprint = union_ex(offset(Polylines{*candidate}, scale_(.5 * original.width)));
+            proposed.path_footprints = {proposed.footprint};
+            // The final proof uses the actual serialized path in every instance,
+            // including each newly added terminal segment.
+            const auto rejected = check_targets(object, {proposed});
+            if (!rejected.empty()) {
+                if (!rejected.front().result.input_valid || !rejected.front().result.completed)
+                    fail(object, rejected.front());
+                for (const auto &run : rejected.front().result.unsupported_runs) {
+                    if (run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge) continue;
+                    if (terminal_air.start_mm && (run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::Floating || run.begin_mm == 0.))
+                        retry_start = true;
+                    if (terminal_air.end_mm && (run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::Floating || run.begin_mm != 0.))
+                        retry_end = true;
+                }
+                last_interval_failure = rejected.front();
+                continue;
+            }
+            replacement = std::move(candidate);
+            break;
+        }
+        if (replacement || (!retry_start && !retry_end)) break;
+        const unsigned advance = unsigned(retry_start) + unsigned(retry_end);
+        if (skipped_intervals + advance > 8) {
+            last_interval_failure->result.completed = false;
+            last_interval_failure->result.resource_limited = true;
+            last_interval_failure->result.failure_reason =
+                "Endpoint attachment exhausted its bounded real-anchor interval search before serialization-qualified support was found.";
+            fail(object, *last_interval_failure);
+        }
+        // A thin first physical contact interval may disappear after output
+        // rounding. Advance only endpoints rejected by the complete proof;
+        // later real intervals remain subject to the original gap/domain.
+        interval_search.start_skip += unsigned(retry_start);
+        interval_search.end_skip += unsigned(retry_end);
+        skipped_intervals += advance;
+        }
+        if (!replacement) {
+            continue;
+        }
+        const bool changed_start = replacement->first_point() != original.polyline.first_point();
+        const bool changed_end = replacement->last_point() != original.polyline.last_point();
+        // Storage follows the producing lattice, while the saved emitter is
+        // the region whose immutable ordinary path will be replayed.
+        size_t owner = emitter;
+        if (object.bridge_aware_cubic_plan(owner) == nullptr) owner = failure.target.supporting_region;
+        auto &saved = attachments.at(owner);
+        const bool duplicate = std::any_of(saved.begin(), saved.end(), [&](const auto &entry) {
+            return entry.z == upper.print_z && entry.emitting_region == emitter && same_polyline(entry.original, original.polyline);
+        });
+        if (duplicate) continue;
+        // A floating construction can require both terminals. Keep two exact
+        // replay records instead of assigning either addition to the opposite
+        // endpoint's alternative producers. Nothing is published until both
+        // records are valid and the complete replacement has passed above.
+        const auto make_record = [&](const Polyline &before, const Polyline &after)
+                -> std::optional<BridgeAwareCubic::LayerAttachment> {
+            BridgeAwareCubic::LayerAttachment attachment;
+            attachment.z = upper.print_z;
+            attachment.emitting_region = emitter;
+            attachment.original = before;
+            attachment.replacement = after;
+            attachment.width = original.width;
+            attachment.height = original.height;
+            if (failure.target.dependency && owner == emitter) {
+                // A merged emitted face may span several refined cells, so no
+                // single cell owns the entire original line. Endpoint additions
+                // inherit only producers whose actual interval reaches that end.
+                if (const auto *plan = object.bridge_aware_cubic_plan(owner)) {
+                    Polylines terminals;
+                    if (attachment.original.first_point() != attachment.replacement.first_point())
+                        terminals.emplace_back(Points{attachment.original.points[1], attachment.original.first_point()});
+                    if (attachment.original.last_point() != attachment.replacement.last_point())
+                        terminals.emplace_back(Points{attachment.original.points[attachment.original.size() - 2], attachment.original.last_point()});
+                    const BoundingBox bounds = object.bounding_box();
+                    const ExPolygon domain(Polygon{Points{bounds.min, Point(bounds.max.x(), bounds.min.y()), bounds.max,
+                        Point(bounds.min.x(), bounds.max.y())}});
+                    for (const auto &[owner_id, owner_lines] : plan->partition_lines(upper.print_z, domain)) {
+                        for (const Polyline &terminal : terminals)
+                            for (const Polyline &piece : remove_collinear_duplicates({terminal}, owner_lines, true))
+                                if ((piece.first_point() - terminal.last_point()).cast<double>().norm() <= 2. ||
+                                    (piece.last_point() - terminal.last_point()).cast<double>().norm() <= 2.)
+                                    attachment.owners.push_back(owner_id);
+                    }
+                    for (const auto &cell : plan->solid_sections(upper.print_z))
+                        for (const Polyline &terminal : terminals)
+                            if (cell.polygon.contains(terminal.last_point())) attachment.owners.push_back(cell.cell_id);
+                }
+                std::sort(attachment.owners.begin(), attachment.owners.end());
+                attachment.owners.erase(std::unique(attachment.owners.begin(), attachment.owners.end()), attachment.owners.end());
+                if (attachment.owners.empty()) {
+                    // Only an explicit persistent closure can have no cell owner.
+                    // Do not turn an unrecognized construction extension into a
+                    // permanent model demand merely to retain its support.
+                    double residual = 0.;
+                    for (const Polyline &piece : remove_collinear_duplicates({attachment.original},
+                            BridgeAwareCubic::layer_closure_lines(upper))) residual += piece.length();
+                    if (residual > scale_(geometry_tolerance)) {
+                        return std::nullopt;
+                    }
+                }
+            }
+            attachment.solid_cut = failure.target.solid_cuts.at(index);
+            if (attachment.solid_cut) {
+                const ExPolygons original_bead = union_ex(offset(Polylines{original.polyline}, scale_(.5 * original.width)));
+                const ExPolygons replacement_bead = union_ex(offset(Polylines{attachment.replacement}, scale_(.5 * original.width)));
+                attachment.demand_selection = union_ex(intersection_ex(path_demand(failure.target, index), original_bead),
+                                                       diff_ex(replacement_bead, original_bead));
+            }
+            return attachment;
+        };
+        std::vector<BridgeAwareCubic::LayerAttachment> staged;
+        if (failure.target.dependency && changed_start && changed_end) {
+            Polyline intermediate = original.polyline;
+            intermediate.append_before(replacement->first_point());
+            auto first = make_record(original.polyline, intermediate);
+            auto second = make_record(intermediate, *replacement);
+            if (!first || !second) continue;
+            staged.push_back(std::move(*first));
+            staged.push_back(std::move(*second));
+        } else {
+            auto entry = make_record(original.polyline, *replacement);
+            if (!entry) continue;
+            staged.push_back(std::move(*entry));
+        }
+        bool duplicate_stage = false;
+        for (const auto &entry : staged)
+            duplicate_stage = duplicate_stage || std::any_of(saved.begin(), saved.end(), [&](const auto &existing) {
+                return existing.z == entry.z && existing.emitting_region == entry.emitting_region &&
+                    same_polyline(existing.original, entry.original);
+            });
+        if (duplicate_stage) continue;
+        append(saved, std::move(staged));
+        repaired = true;
+    }
+    return repaired;
+}
+
+bool repair_wall_connections(const PrintObject &object, const Failure &failure,
+                             std::vector<std::vector<BridgeAwareCubic::LayerAttachment>> &attachments)
+{
+    if (failure.target.dependency || failure.target.bridge_followup ||
+        failure.target.upper_layer < 2 || failure.target.extrusions.empty()) return false;
+    ExPolygons cells;
+    for (const auto &cell : failure.result.void_cells)
+        if (!cell.closed || cell.exceeds_gap) cells.push_back(cell.geometry);
+    if (cells.empty()) return false;
+
+    const size_t layer_index = failure.target.upper_layer - 1;
+    const Layer &layer = *object.layers()[layer_index];
+    const size_t emitter = failure.target.supporting_region;
+    const LayerRegion &region = *layer.get_region(int(emitter));
+    if (!participates(region.region().config())) return false;
+    std::vector<BridgeAwareCubicContact::Bead> wall_beads;
+    visit_paths(region.perimeters, [&](const ExtrusionPath &path) {
+        if (path.role() == erPerimeter || path.role() == erExternalPerimeter)
+            wall_beads.push_back({&path, deposition_z(layer)});
+    });
+    if (wall_beads.empty()) return false;
+    // Query the same physical plane that exposed the failed model cell. A
+    // surface boundary supplies no support; only these actual wall beads do.
+    const auto contact = BridgeAwareCubicContact::footprint(deposited_beads(layer), failure.target.extrusions.front(),
+        deposition_z(*object.layers()[failure.target.upper_layer]), 0.,
+        BridgeAwareCubicContact::FootprintMode::ContactsOnly);
+    if (contact.resource_limited)
+        throw SlicingError("Bridge aware cubic wall-connection search is incomplete: " + contact.failure_reason,
+            object.model_object()->id().id);
+    if (!contact.input_valid || !contact.completed) return false;
+    Polygons wall_sections;
+    for (const auto &bead : wall_beads) {
+        const double width = BridgeAwareCubicContact::section_width_mm(bead.path->width, bead.path->height,
+            bead.print_z, contact.contact_z);
+        if (!std::isfinite(width) || width <= 0.) continue;
+        // Construct each straight wall section on the common plane, with a
+        // two-grid inward reserve for polygon rounding. Never replace the
+        // actual section by the bead's maximum XY width or a logical contour.
+        const double radius = std::floor(scale_(.5 * width)) - 2.;
+        if (radius <= 0.) continue;
+        float offset_radius = float(radius);
+        if (double(offset_radius) > radius)
+            offset_radius = std::nextafter(offset_radius, -std::numeric_limits<float>::infinity());
+        for (size_t i = 1; i < bead.path->polyline.size(); ++i) {
+            const Point &a = bead.path->polyline.points[i - 1], &b = bead.path->polyline.points[i];
+            if (a != b) append(wall_sections, offset(Polyline(Points{a, b}), offset_radius,
+                ClipperLib::jtSquare, 2., ClipperLib::etOpenButt));
+        }
+    }
+    const ExPolygons walls = union_ex(wall_sections);
+    if (walls.empty()) return false;
+
+    const ExPolygons affected = union_ex(cells);
+    const auto contains = [](const ExPolygons &polygons, const Point &point) {
+        return std::any_of(polygons.begin(), polygons.end(), [&](const ExPolygon &polygon) { return polygon.contains(point); });
+    };
+    bool repaired = false;
+    size_t searched = 0;
+    std::map<double, ExPolygons> nearby_by_width;
+    visit_free_paths(region.fills, [&](const ExtrusionPath &path) {
+        if (path.role() != erInternalInfill || path.polyline.size() < 2) return;
+        if (object.print()->canceled()) throw CanceledException();
+        auto nearby_entry = nearby_by_width.find(path.width);
+        if (nearby_entry == nearby_by_width.end())
+            nearby_entry = nearby_by_width.emplace(path.width,
+                offset_ex(affected, scale_(.5 * path.width + geometry_tolerance))).first;
+        const ExPolygons &nearby = nearby_entry->second;
+        const bool start = contains(nearby, path.polyline.first_point()) &&
+            !contains(walls, path.polyline.first_point());
+        const bool end = contains(nearby, path.polyline.last_point()) &&
+            !contains(walls, path.polyline.last_point());
+        if (!start && !end) return;
+        if (++searched > 4096)
+            throw SlicingError("Bridge aware cubic wall-connection search exceeded its path work limit.",
+                object.model_object()->id().id);
+        Failure request;
+        Target &target = request.target;
+        target.upper_layer = layer_index;
+        target.supporting_region = emitter;
+        target.gap = std::min(failure.target.gap, region.region().config().bridge_aware_cubic_max_gap.value);
+        target.bottom_z = layer.print_z - path.height;
+        target.dependency = true;
+        target.paths = {path.polyline};
+        target.path_widths = {path.width};
+        target.extrusions = {path};
+        target.footprint = union_ex(offset(Polylines{path.polyline}, scale_(.5 * path.width)));
+        target.path_footprints = {target.footprint};
+        target.emitting_regions = {emitter};
+        target.free_ended = {true};
+        target.producers.resize(1);
+        target.solid_cuts = {false};
+        BridgeAwareCubicValidation::UnsupportedRun run;
+        run.path_index = 0;
+        run.kind = start && end ? BridgeAwareCubicValidation::UnsupportedRunKind::Floating :
+                                 BridgeAwareCubicValidation::UnsupportedRunKind::OneSidedOverhang;
+        run.begin_mm = start ? 0. : unscale<double>(path.polyline.length());
+        run.end_mm = run.begin_mm;
+        // The original strand is already emitted on this plane. Only the
+        // bounded extension spends the search gap; actual predecessor support
+        // for its complete replacement is independently certified afterward.
+        run.length_mm = 0.;
+        request.result.unsupported_runs.push_back(run);
+        repaired |= repair_attachments(object, request, attachments, &walls);
+    });
+    return repaired;
+}
+
+bool repair_interfaces(const PrintObject &object, const Failure &failure,
+                       std::vector<std::vector<BridgeAwareCubic::LayerClosure>> &closures,
+                       const std::optional<Dependency::SourceOwner> &producer = std::nullopt)
+{
+    if (failure.target.bridge_followup) return false;
+    if (failure.target.dependency && !producer) {
+        // A dense fallback can still leave a free endpoint between its actual
+        // strands. Propose a landing only for one complete, exactly owned
+        // source at a time; alternative owners from unrelated paths must not
+        // keep an orphaned interface course alive.
+        std::set<size_t> paths;
+        for (const auto &run : failure.result.unsupported_runs)
+            if (run.kind != BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge)
+                paths.insert(run.path_index);
+        bool repaired = false;
+        for (size_t index : paths) {
+            if (!failure.target.free_ended.at(index) || failure.target.producers.at(index).size() != 1) continue;
+            const size_t emitter = failure.target.emitting_regions.at(index);
+            const auto *plan = object.bridge_aware_cubic_plan(emitter);
+            const auto &cell = failure.target.producers[index].front();
+            if (plan == nullptr || std::none_of(plan->refinements().begin(), plan->refinements().end(),
+                    [&](const auto &refinement) { return refinement.id == cell; })) continue;
+            Failure selected;
+            selected.target.upper_layer = failure.target.upper_layer;
+            selected.target.supporting_region = failure.target.supporting_region;
+            selected.target.gap = failure.target.gap;
+            selected.target.dependency = true;
+            selected.target.paths = {failure.target.paths[index]};
+            selected.target.path_widths = {failure.target.path_widths[index]};
+            selected.target.extrusions = {failure.target.extrusions[index]};
+            selected.target.footprint = path_demand(failure.target, index);
+            selected.target.path_footprints = {selected.target.footprint};
+            if (!failure.verified_paths.empty()) selected.verified_paths = {failure.verified_paths[index]};
+            for (auto run : failure.result.unsupported_runs)
+                if (run.path_index == index && run.kind != BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge) {
+                    run.path_index = 0;
+                    selected.result.unsupported_runs.push_back(run);
+                }
+            repaired |= repair_interfaces(object, selected, closures, Dependency::SourceOwner{emitter, cell});
+        }
+        return repaired;
+    }
+    ExPolygons failing_cells;
+    Lines terminal_rays;
+    std::set<size_t> closed_seams;
+    if (failure.target.dependency) {
+        const Polyline &path = failure.target.paths.front();
+        if (path.size() < 2) return false;
+        for (const auto &run : failure.result.unsupported_runs) {
+            const double remaining = failure.target.gap - run.length_mm - geometry_tolerance;
+            if (!(remaining > 0.)) continue;
+            for (bool start : {true, false}) {
+                if (run.kind != BridgeAwareCubicValidation::UnsupportedRunKind::Floating && start != (run.begin_mm == 0.)) continue;
+                const Point endpoint = start ? path.first_point() : path.last_point();
+                const Point neighbour = start ? path.points[1] : path.points[path.size() - 2];
+                const Vec2d direction = (endpoint - neighbour).cast<double>();
+                if (direction.squaredNorm() == 0.) continue;
+                const Vec2d far = endpoint.cast<double>() + direction.normalized() * scale_(remaining);
+                constexpr double limit = double(std::numeric_limits<coord_t>::max() / 4);
+                if (!far.allFinite() || far.cwiseAbs().maxCoeff() > limit) continue;
+                terminal_rays.emplace_back(endpoint, Point(far.cast<coord_t>()));
+            }
+        }
+        Polylines probes;
+        for (const Line &ray : terminal_rays) probes.emplace_back(ray.a, ray.b);
+        // This is only a bounded interface-search window. It supplies no
+        // deposited support; actual ray/interface intersection is required.
+        failing_cells = union_ex(offset(probes, scale_(geometry_tolerance)));
+    } else {
+        for (const auto &cell : failure.result.void_cells)
+            if (!cell.closed || cell.exceeds_gap) failing_cells.push_back(cell.geometry);
+        for (const auto &run : failure.result.unsupported_runs) {
+            if (run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge) continue;
+            const size_t index = run.path_index;
+            const Polyline &path = failure.target.paths.at(index);
+            if (path.size() < 3 || path.first_point() != path.last_point() ||
+                failure.target.free_ended.at(index) || !is_perimeter(failure.target.extrusions.at(index).role())) continue;
+            const Polyline &verified = failure.verified_paths.empty() ? path : failure.verified_paths.at(index);
+            if (run.begin_mm == 0. || run.end_mm >= unscale<double>(verified.length()) - geometry_tolerance)
+                closed_seams.insert(index);
+        }
+    }
+    if (failing_cells.empty() && closed_seams.empty()) return false;
+    const size_t support_index = failure.target.upper_layer - 1;
+    const Layer &top = *object.layers()[support_index];
+    const size_t owner = failure.target.supporting_region;
+    const size_t storage_owner = producer ? producer->region : owner;
+    const LayerRegion &owner_region = *top.get_region(int(owner));
+    const Flow top_flow = owner_region.flow(frInfill);
+    ExPolygons owner_slice;
+    for (const Surface &surface : owner_region.slices.surfaces) owner_slice.push_back(surface.expolygon);
+    Polylines interfaces;
+    for (size_t neighbour = 0; neighbour < top.regions().size(); ++neighbour) {
+        if (neighbour == owner) continue;
+        const LayerRegion &region = *top.get_region(int(neighbour));
+        if (!closure_compatible(owner_region, region)) continue;
+        ExPolygons neighbour_slice;
+        for (const Surface &surface : region.slices.surfaces) neighbour_slice.push_back(surface.expolygon);
+        Polylines shared = intersection_pl(to_polylines(union_ex(owner_slice)), offset_ex(union_ex(neighbour_slice), 2.));
+        shared = intersection_pl(shared, offset_ex(union_ex(failing_cells), scale_(top_flow.width())));
+        shared = intersection_pl(shared, offset_ex(sparse_domain(owner_region), scale_(top_flow.width())));
+        append(interfaces, std::move(shared));
+    }
+    // A real model bridge or solid patch can leave its open strand slots
+    // connected to a demanded sparse fringe. Propose deposited closure only
+    // on the selected shared fill interface; the interface itself is never
+    // counted as support. Existing material containment, predecessor courses
+    // and final contact/cell verification apply to these courses unchanged.
+    const auto append_fill_interfaces = [&](const LayerRegion &region) {
+        ExPolygons solid_surfaces;
+        for (const Surface &surface : region.fill_surfaces.surfaces)
+            if (surface.is_solid()) solid_surfaces.push_back(surface.expolygon);
+        if (solid_surfaces.empty()) return;
+        // Ordinary surface differencing leaves ClipperSafetyOffset between
+        // adjacent sparse and solid classifications. Recognize that known
+        // clearance when proposing a real course on the unchanged boundary;
+        // it never expands deposited support or the allowed material domain.
+        Polylines shared = intersection_pl(to_polylines(union_ex(solid_surfaces)),
+            offset_ex(sparse_domain(region), ClipperSafetyOffset + 2.f));
+        shared = intersection_pl(shared, offset_ex(union_ex(failing_cells), scale_(top_flow.width())));
+        append(interfaces, std::move(shared));
+    };
+    append_fill_interfaces(owner_region);
+    if (producer) {
+        // An added partition may begin above an ordinary bridge which has
+        // already consumed the lower sparse island. Its exact upper fill
+        // interface remains a bounded place to propose a real landing below.
+        // Only the failing terminal rays select it; the projected boundary
+        // supplies no contact evidence or permission to deposit material.
+        const Layer &upper = *object.layers()[failure.target.upper_layer];
+        if (producer->region < upper.regions().size())
+            append_fill_interfaces(*upper.get_region(int(producer->region)));
+    }
+    Polylines candidates;
+    const ExPolygons centers = offset_ex(closure_domain(top, owner), -scale_(.5 * top_flow.width()));
+    for (size_t index : closed_seams) {
+        // A fixed model loop must start on actual material. A tangent course
+        // beside its seam does not establish that contact, and joining the
+        // initial/final air runs would conceal the unsupported start. Deposit
+        // one short landing through the unchanged source seam instead.
+        const Polyline &path = failure.target.paths[index];
+        const Point seam = path.first_point();
+        const auto next = std::find_if(path.points.begin() + 1, path.points.end(),
+            [&](const Point &point) { return point != seam; });
+        if (next == path.points.end() || std::none_of(centers.begin(), centers.end(),
+                [&](const ExPolygon &polygon) { return polygon.contains(seam, true); })) continue;
+        const Vec2d half = (*next - seam).cast<double>().normalized() * scale_(top_flow.width());
+        const Vec2d begin = seam.cast<double>() - half, end = seam.cast<double>() + half;
+        constexpr double limit = double(std::numeric_limits<coord_t>::max() / 4);
+        if (!begin.allFinite() || !end.allFinite() || begin.cwiseAbs().maxCoeff() > limit || end.cwiseAbs().maxCoeff() > limit) continue;
+        append(candidates, intersection_pl(Polylines{Polyline(Point(begin.cast<coord_t>()), Point(end.cast<coord_t>()))}, centers));
+    }
+    for (const Polyline &line : interfaces) for (size_t i = 1; i < line.size(); ++i) {
+        Polyline segment(Points{line.points[i - 1], line.points[i]});
+        if (segment.length() <= scale_(geometry_tolerance)) continue;
+        if (failure.target.dependency) {
+            const Line boundary_line(segment.first_point(), segment.last_point());
+            const Vec2d direction = (boundary_line.b - boundary_line.a).cast<double>().normalized();
+            for (const Line &ray : terminal_rays) {
+                Point crossing;
+                if (!boundary_line.intersection(ray, &crossing)) continue;
+                const Vec2d half = direction * scale_(top_flow.width());
+                const Vec2d begin = crossing.cast<double>() - half, end = crossing.cast<double>() + half;
+                constexpr double limit = double(std::numeric_limits<coord_t>::max() / 4);
+                if (!begin.allFinite() || !end.allFinite() || begin.cwiseAbs().maxCoeff() > limit || end.cwiseAbs().maxCoeff() > limit) continue;
+                append(candidates, intersection_pl(Polylines{Polyline(Point(begin.cast<coord_t>()), Point(end.cast<coord_t>()))}, centers));
+            }
+            continue;
+        }
+        segment.extend_start(scale_(top_flow.width()));
+        segment.extend_end(scale_(top_flow.width()));
+        append(candidates, intersection_pl(Polylines{std::move(segment)}, centers));
+    }
+    Polylines already;
+    const auto *storage_plan = object.bridge_aware_cubic_plan(storage_owner);
+    for (const auto &stored : closures[storage_owner]) {
+        if (std::abs(stored.z - top.print_z) > EPSILON) continue;
+        const bool active = stored.owners.empty() || (storage_plan != nullptr &&
+            std::any_of(stored.owners.begin(), stored.owners.end(), [&](const auto &id) {
+                return std::any_of(storage_plan->refinements().begin(), storage_plan->refinements().end(),
+                    [&](const auto &refinement) { return refinement.id == id; });
+            }));
+        if (active) append(already, stored.paths);
+    }
+    candidates = remove_collinear_duplicates(std::move(candidates), already);
+    if (candidates.empty()) {
+        return false;
+    }
+
+    std::vector<BridgeAwareCubic::LayerClosure> accepted;
+    for (const Polyline &candidate : candidates) {
+    const Polylines course{candidate};
+    std::vector<BridgeAwareCubic::LayerClosure> construction;
+    bool printable = true;
+    for (size_t layer_index = support_index + 1; layer_index-- > 0;) {
+        if (object.print()->canceled()) throw CanceledException();
+        const Layer &layer = *object.layers()[layer_index];
+        size_t emitter = owner;
+        const auto fits = [&](size_t region_id) {
+            return closure_compatible(*layer.get_region(int(owner)), *layer.get_region(int(region_id))) &&
+                closure_paths_owned(layer, region_id, course);
+        };
+        if (!fits(emitter)) {
+            emitter = 0;
+            while (emitter < layer.regions().size() && !fits(emitter)) ++emitter;
+            if (emitter == layer.regions().size()) {
+                printable = false;
+                break;
+            }
+        }
+        const Flow flow = layer.get_region(int(emitter))->flow(frInfill);
+        BridgeAwareCubic::LayerClosure closure;
+        closure.z = layer.print_z;
+        closure.paths = course;
+        closure.reservation = union_ex(offset(course, scale_(.5 * flow.width() + geometry_tolerance)));
+        closure.emitting_region = emitter;
+        if (producer) closure.owners = {producer->cell};
+        construction.push_back(std::move(closure));
+        if (layer_index == 0) break;
+        const auto prior = deposited_beads(*object.layers()[layer_index - 1]);
+        ExtrusionPath path(erInternalInfill, flow.mm3_per_mm(), float(flow.width()), float(flow.height()));
+        path.polyline = candidate;
+        const auto contact = BridgeAwareCubicContact::footprint(prior, path, deposition_z(layer), geometry_tolerance,
+            BridgeAwareCubicContact::FootprintMode::ContactsOnly);
+        const auto checked = BridgeAwareCubicValidation::validate_contacts({}, contact.physical_footprint, course,
+            construction.back().reservation, failure.target.gap, geometry_tolerance, {contact});
+        if (checked.passed()) break;
+    }
+    // One unowned extension must not discard another legitimate interface
+    // course. Publish only complete predecessor stacks, with each layer's
+    // actual emitter and whole-bead containment established independently.
+    if (printable) append(accepted, std::move(construction));
+    }
+    if (accepted.empty()) return false;
+    append(closures[storage_owner], std::move(accepted));
+    return true;
+}
+
+Vec2d common_nozzle_offset(const PrintObject &object)
+{
+    const auto &offsets = object.print()->config().extruder_offset.values;
+    const Vec2d common = offsets.empty() ? Vec2d::Zero() : offsets.front();
+    if (!common.allFinite() || std::any_of(offsets.begin(), offsets.end(), [&](const Vec2d &offset) {
+            return !offset.allFinite() || offset != common;
+        }))
+        throw SlicingError("Bridge aware cubic currently requires identical nozzle XY offsets because its support certificate does not resolve per-path physical nozzle changes.", object.model_object()->id().id);
+    return common;
+}
+
+std::vector<BridgeAwareCubic::SerializedXY> serialization_phases(const PrintObject &geometry,
+                                                                const PrintObject *phase_object)
+{
+    std::vector<BridgeAwareCubic::SerializedXY> phases;
+    const Vec2d nozzle_offset = common_nozzle_offset(geometry);
+    const Vec2d plate_origin = geometry.print()->get_plate_origin().head<2>();
+    const auto append_object = [&](const PrintObject &object) {
+        for (const PrintInstance &instance : object.instances()) {
+            BridgeAwareCubic::SerializedXY phase;
+            phase.shift = unscale(Vec2crd(instance.shift));
+            phase.nozzle_offset = nozzle_offset;
+            phase.plate_origin = plate_origin;
+            phases.push_back(std::move(phase));
+        }
+    };
+    if (phase_object != nullptr) append_object(*phase_object);
+    else for (const PrintObject *object : geometry.print()->objects())
+        if (object == &geometry || object->get_shared_object() == &geometry) append_object(*object);
+    if (phases.empty()) phases.push_back({Vec2d::Zero(), nozzle_offset, plate_origin});
+    return phases;
+}
+
+void remove_stationary_construction(Layer &layer, const ActiveAttachments &active)
+{
+    const PrintObject &object = *layer.object();
+    bool has_plan = false;
+    for (size_t emitter = 0; emitter < layer.regions().size(); ++emitter)
+        has_plan |= object.bridge_aware_cubic_plan(emitter) != nullptr;
+    if (!has_plan) return;
+
+    const auto phases = serialization_phases(object, nullptr);
+    const BoundingBox bounds = object.bounding_box();
+    const ExPolygon broad_domain(Polygon{Points{bounds.min, Point(bounds.max.x(), bounds.min.y()),
+        bounds.max, Point(bounds.min.x(), bounds.max.y())}});
+    struct Sources {
+        bool prepared = false;
+        Polylines original_bulk;
+        Polylines partitions;
+        Polylines closures;
+        ExPolygons solids;
+    };
+    std::vector<Sources> sources(layer.regions().size());
+    const auto prepare_sources = [&](size_t emitter) -> const Sources& {
+        Sources &source = sources[emitter];
+        if (source.prepared) return source;
+        source.prepared = true;
+        if (const auto *plan = object.bridge_aware_cubic_plan(emitter)) {
+            // The active filler emits these straight original scaffold axes
+            // without ordinary Cubic boundary hooks. A larger domain retains
+            // their finite source extents before region/material clipping.
+            // Keep ambiguous microscopic crossings of bulk and added faces;
+            // two-grid provenance proximity alone cannot distinguish them.
+            BridgeAwareCubic::Plan original(plan->parameters(), {});
+            source.original_bulk = original.lines(layer.print_z, broad_domain);
+            for (auto &owned : plan->partition_lines(layer.print_z, broad_domain))
+                append(source.partitions, std::move(owned.second));
+            source.solids = plan->solid_area(layer.print_z);
+        }
+        for (size_t owner = 0; owner < layer.regions().size(); ++owner)
+            if (const auto *plan = object.bridge_aware_cubic_plan(owner))
+                for (const auto &closure : plan->closures(layer.print_z)) {
+                    const size_t region = closure.emitting_region == std::numeric_limits<size_t>::max() ?
+                        owner : closure.emitting_region;
+                    if (region != emitter) continue;
+                    const Flow flow = layer.get_region(int(emitter))->flow(frInfill);
+                    for (const Polyline &line : closure.paths)
+                        source.closures.push_back(resolve_attachments(layer, line, float(flow.width()),
+                            float(flow.height()), emitter, active).polyline);
+                }
+        return source;
+    };
+    const auto is_stationary = [&](const ExtrusionPath &path) {
+        if (path.role() != erInternalInfill || path.is_force_no_extrusion() ||
+            !(path.mm3_per_mm > 0.) || path.polyline.size() < 2 || !path.polyline.fitting_result.empty())
+            return false;
+        for (const auto &phase : phases) {
+            const Point first = phase(path.polyline.first_point());
+            if (std::all_of(path.polyline.points.begin() + 1, path.polyline.points.end(),
+                    [&](const Point &point) { return phase(point) == first; }))
+                return true;
+        }
+        return false;
+    };
+    const auto is_construction = [&](const ExtrusionPath &path, size_t emitter) {
+        const Sources &source = prepare_sources(emitter);
+        if (!remove_collinear_duplicates({path.polyline}, source.original_bulk, true).empty())
+            return false;
+        const auto completely_matched = [&](const Polylines &reference) {
+            return BridgeAwareCubic::complete_construction_match(path.polyline,
+                remove_collinear_duplicates({path.polyline}, reference, true), 2. * SCALING_FACTOR);
+        };
+        if (completely_matched(source.partitions) || completely_matched(source.closures)) return true;
+        if (!source.solids.empty() && BridgeAwareCubic::complete_construction_match(path.polyline,
+                intersection_pl(Polylines{path.polyline}, source.solids), 2. * SCALING_FACTOR))
+            return true;
+        for (const auto &attachment : active.entries) {
+            if (attachment.emitting_region != emitter || attachment.owners.empty()) continue;
+            const auto chain = resolve_attachments(layer, attachment.original, path.width, path.height, emitter, active);
+            if (!chain.applied_indices.empty() && same_polyline(path.polyline, chain.polyline)) return true;
+        }
+        return false;
+    };
+    for (size_t emitter = 0; emitter < layer.regions().size(); ++emitter) {
+        const auto remove = [&](auto &&self, ExtrusionEntityCollection &collection) -> void {
+            for (auto it = collection.entities.begin(); it != collection.entities.end();) {
+                if (object.print()->canceled()) throw CanceledException();
+                ExtrusionEntity *entity = *it;
+                bool discard = false;
+                if (const auto *path = dynamic_cast<const ExtrusionPath*>(entity)) {
+                    try {
+                        discard = is_stationary(*path) && is_construction(*path, emitter);
+                    } catch (const std::logic_error &error) {
+                        throw SlicingError("Bridge aware cubic cannot generate serialized construction at layer " +
+                            std::to_string(layer.id() + 1) + ": " + error.what(), object.model_object()->id().id);
+                    }
+                } else if (auto *nested = dynamic_cast<ExtrusionEntityCollection*>(entity)) {
+                    const bool was_empty = nested->empty();
+                    self(self, *nested);
+                    discard = !was_empty && nested->empty();
+                }
+                // Only standalone paths are removed. A loop or multipath join
+                // is retained intact, as is every path with moving output in
+                // every actual instance.
+                if (discard) {
+                    delete entity;
+                    it = collection.entities.erase(it);
+                } else ++it;
+            }
+        };
+        remove(remove, layer.get_region(int(emitter))->fills);
+    }
+}
+
+std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
+                                   const PrintObject *phase_object)
 {
     std::vector<Failure> failures;
-    size_t cached_lower = size_t(-1);
-    ExPolygons support;
-    ExPolygons domain;
-    for (const Target &target : targets) {
-        if (object.print()->canceled()) throw CanceledException();
-        const Layer &lower = *object.layers()[target.upper_layer - 1];
-        if (cached_lower != target.upper_layer - 1) {
-            Polygons material;
-            visit_layer(lower, [&](const ExtrusionPath &path) {
-                path.polygons_covered_by_width(material, 0.f);
-            });
-            support = offset_ex(union_ex(material), -scale_(geometry_tolerance));
-            domain = union_ex(lower.lslices);
-            cached_lower = target.upper_layer - 1;
+    BridgeAwareCubicValidation::WorkBudget budget;
+    // Quantize whole original paths in the exact writer operation order. An
+    // integer translation back near the object origin keeps all shared joints
+    // exact while allowing failed cells to select their original local demand.
+    // Source-coordinate tolerance is only used by repair discovery; emitted
+    // geometry itself is checked without a hypothetical XY displacement.
+    for (const auto &phase : serialization_phases(object, phase_object)) {
+        const Point origin = phase(Point(0, 0));
+        const auto emitted_path = [&](const ExtrusionPath &source) {
+            ExtrusionPath emitted = source;
+            try {
+                emitted.polyline = phase.emitted_polyline(source.polyline);
+            } catch (const std::logic_error &error) {
+                throw SlicingError("Bridge aware cubic cannot certify serialized extrusion geometry for object \"" +
+                    object.model_object()->name + "\": " + error.what(), object.model_object()->id().id);
+            }
+            emitted.polyline.translate(-origin);
+            return emitted;
+        };
+        std::vector<ExPolygons> preserved_demands;
+        std::vector<std::vector<ExPolygons>> preserved_path_demands;
+        std::map<size_t, ExPolygons> layer_demands;
+        preserved_demands.reserve(targets.size());
+        preserved_path_demands.reserve(targets.size());
+        for (const Target &target : targets) {
+            try {
+                preserved_demands.push_back(BridgeAwareCubic::serialized_demand(target.footprint, target.paths, phase));
+                std::vector<ExPolygons> paths;
+                paths.reserve(target.paths.size());
+                for (size_t index = 0; index < target.paths.size(); ++index)
+                    paths.push_back(BridgeAwareCubic::serialized_demand(path_demand(target, index), {target.paths[index]}, phase));
+                preserved_path_demands.push_back(std::move(paths));
+            } catch (const std::logic_error &error) {
+                throw SlicingError("Bridge aware cubic cannot preserve output demand for object \"" +
+                    object.model_object()->name + "\": " + error.what(), object.model_object()->id().id);
+            }
+            if (!target.dependency && !target.bridge_followup)
+                append(layer_demands[target.upper_layer], preserved_demands.back());
         }
-        // Only preceding deposition is admissible: no reliance on same-layer
-        // scheduling, a future wall, or a lower strand separated in Z.
-        const bool contact = target.bottom_z <= lower.print_z + geometry_tolerance;
-        // Model roof/wall targets require closed cubic cells in every
-        // direction. Construction strands and follow-up bridge planes instead
-        // bridge actual preceding deposition. Their complete unsupported runs
-        // need two real anchors and must satisfy the inherited gap, but a short
-        // growing partition tip does not require the adjacent coarse parent
-        // cell to reach the final model-target cell size. Empty domain disables
-        // only the cell test for these two explicit construction target kinds.
-        auto result = BridgeAwareCubicValidation::validate(target.bridge_followup || target.dependency ? ExPolygons{} : domain,
-            contact ? support : ExPolygons{},
-            target.paths, target.footprint, target.gap, geometry_tolerance);
-        if (!result.passed()) failures.push_back({target, std::move(result)});
+        size_t cached_lower = size_t(-1);
+        ExtrusionPaths prior_paths;
+        std::vector<BridgeAwareCubicContact::Bead> prior_beads;
+        std::map<double, BridgeAwareCubicValidation::PreparedGeometryPtr> prepared;
+        std::map<std::pair<double, float>, BridgeAwareCubicContact::PreparedLowerPtr> prepared_lower;
+        for (size_t target_index = 0; target_index < targets.size(); ++target_index) {
+            const Target &target = targets[target_index];
+            if (object.print()->canceled()) throw CanceledException();
+            const Layer &lower = *object.layers()[target.upper_layer - 1];
+            if (cached_lower != target.upper_layer - 1) {
+                // The prepared sections own their snapshot, but clearing all
+                // lower-geometry caches before replacing it makes the lifetime
+                // and output-phase boundary explicit.
+                prepared_lower.clear();
+                prepared.clear();
+                prior_paths.clear();
+                visit_layer(lower, [&](const ExtrusionPath &path) {
+                    auto emitted = emitted_path(path);
+                    if (emitted.polyline.size() >= 2) prior_paths.push_back(std::move(emitted));
+                });
+                prior_beads.clear();
+                for (const ExtrusionPath &path : prior_paths) prior_beads.push_back({&path, deposition_z(lower)});
+                cached_lower = target.upper_layer - 1;
+            }
+            BridgeAwareCubicValidation::Result result;
+            Polylines verified_paths(target.paths.size());
+            for (size_t index = 0; index < target.paths.size(); ++index) {
+                const ExtrusionPath upper = emitted_path(target.extrusions.at(index));
+                verified_paths[index] = upper.polyline;
+                // A source path made entirely of repeated points emits no
+                // segment and supplies neither a demand nor support.
+                if (upper.polyline.size() < 2) continue;
+                const double upper_z = deposition_z(*object.layers()[target.upper_layer]);
+                BridgeAwareCubicContact::PreparedLowerPtr lower_contact;
+                if (std::isfinite(upper_z) && std::isfinite(upper.height)) {
+                    const auto key = std::make_pair(upper_z, upper.height);
+                    auto found = prepared_lower.find(key);
+                    if (found == prepared_lower.end()) {
+                        // Eviction affects reuse only. Every miss performs the
+                        // same bounded preparation and charges the shared pass
+                        // budget; no geometry is omitted to fit the cache.
+                        // Keep one resident snapshot so the helper's combined
+                        // prepared-plus-query allocation admission remains the
+                        // complete allowance, rather than one per cached key.
+                        prepared_lower.clear();
+                        found = prepared_lower.emplace(key, BridgeAwareCubicContact::prepare_lower(
+                            prior_beads, upper_z, upper.height, &budget)).first;
+                    }
+                    lower_contact = found->second;
+                } else {
+                    // Invalid floating values must not enter an ordered key.
+                    // Retain the contact helper's normal invalid-input result.
+                    prepared_lower.clear();
+                    lower_contact = BridgeAwareCubicContact::prepare_lower(prior_beads, upper_z, upper.height, &budget);
+                }
+                const auto contact = BridgeAwareCubicContact::footprint(*lower_contact, upper, upper_z, 0.,
+                    BridgeAwareCubicContact::FootprintMode::ContactsOnly, &budget);
+                if (contact.resource_limited) {
+                    result.completed = false;
+                    result.resource_limited = true;
+                    result.failure_reason = contact.failure_reason;
+                    break;
+                }
+                Polylines unsupported;
+                for (const auto &segment : contact.segments) {
+                    const size_t i = segment.segment_index;
+                    append(unsupported, diff_pl(Polylines{Polyline(Points{upper.polyline.points[i], upper.polyline.points[i + 1]})},
+                                                segment.centerline_support));
+                }
+                if (!contact.input_valid || !contact.completed || contact.segments.empty()) unsupported = {upper.polyline};
+                const ExPolygons selected = intersection_ex(preserved_path_demands[target_index][index],
+                    union_ex(offset(unsupported, scale_(.5 * target.path_widths[index]))));
+                BridgeAwareCubicValidation::Result checked;
+                if (target.bridge_followup || target.dependency || selected.empty() || !contact.input_valid || !contact.completed) {
+                    // Construction and follow-up paths require actual prior
+                    // anchors and bounded complete air runs. They do not turn
+                    // long slots between bridge strands into cubic cells.
+                    checked = BridgeAwareCubicValidation::validate_contacts({}, contact.physical_footprint,
+                        {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                } else {
+                    // Raw occupied material is independent of upper direction
+                    // at the same selected contact plane. Reuse only immutable
+                    // geometry from this exact lower layer and output phase.
+                    auto found = prepared.find(contact.contact_z);
+                    if (found == prepared.end()) {
+                        // Physical sections are identical for every target at
+                        // this plane. Construct them only on a cache miss;
+                        // segment contact predicates above remain per-path.
+                        const auto physical = BridgeAwareCubicContact::footprint(*lower_contact, upper, upper_z, 0.,
+                            BridgeAwareCubicContact::FootprintMode::Full, &budget);
+                        if (!physical.input_valid || !physical.completed || physical.contact_z != contact.contact_z) {
+                            result.input_valid = physical.input_valid && physical.contact_z == contact.contact_z;
+                            result.completed = physical.completed;
+                            result.resource_limited = physical.resource_limited;
+                            result.failure_reason = physical.failure_reason.empty() ?
+                                "Physical support section changed during immutable contact verification." : physical.failure_reason;
+                            break;
+                        }
+                        // Compute the actual support complement in a padded
+                        // window containing every demand for this layer. No
+                        // rounded model seam may erase a cell or act as a wall.
+                        const ExPolygons domain = BridgeAwareCubic::support_topology_domain(
+                            physical.physical_footprint, layer_demands.at(target.upper_layer));
+                        found = prepared.emplace(contact.contact_z,
+                            BridgeAwareCubicValidation::prepare_geometry(domain, physical.physical_footprint, &budget)).first;
+                    }
+                    checked = BridgeAwareCubicValidation::validate_prepared_contacts(*found->second,
+                        {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                }
+                result.input_valid &= checked.input_valid;
+                result.completed &= checked.completed;
+                result.resource_limited |= checked.resource_limited;
+                if (!checked.failure_reason.empty() && result.failure_reason.empty()) result.failure_reason = checked.failure_reason;
+                result.max_unsupported_mm = std::max(result.max_unsupported_mm, checked.max_unsupported_mm);
+                result.max_void_diameter_mm = std::max(result.max_void_diameter_mm, checked.max_void_diameter_mm);
+                for (auto &run : checked.unsupported_runs) run.path_index = index;
+                append(result.unsupported_runs, std::move(checked.unsupported_runs));
+                append(result.void_cells, std::move(checked.void_cells));
+                if (!result.input_valid || !result.completed) break;
+            }
+            if (!result.passed()) {
+                const bool incomplete = !result.input_valid || !result.completed;
+                failures.push_back({target, std::move(result), std::move(verified_paths)});
+                if (incomplete) return failures;
+            }
+        }
+        // Repair one output phase at a time, preserving original path identity.
+        // All phases are checked again after the resulting geometry changes.
+        if (!failures.empty()) break;
     }
     return failures;
 }
 
+
 [[noreturn]] void fail(const PrintObject &object, const Failure &failure)
 {
     const Layer &layer = *object.layers()[failure.target.upper_layer];
+    if (failure.result.resource_limited) {
+        std::ostringstream incomplete;
+        incomplete << "Bridge aware cubic support verification is incomplete for object \"" << object.model_object()->name
+                   << "\", layer " << layer.id() + 1 << " (Z " << layer.print_z << " mm): "
+                   << failure.result.failure_reason;
+        throw SlicingError(incomplete.str(), object.model_object()->id().id);
+    }
     std::ostringstream message;
     message << "Bridge aware cubic cannot satisfy the requested support gap for object \""
             << object.model_object()->name << "\", layer " << layer.id() + 1
@@ -323,7 +1573,652 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
     throw SlicingError(message.str(), object.model_object()->id().id);
 }
 
+// prepare_infill rebuilds these surfaces from typed slices and reruns ordinary
+// bridge reconstruction before entering this solve. Infill-only regeneration
+// does not call this helper, so its accepted angles remain frozen rather than
+// becoming the starting point of another rotation on the same surfaces.
+void orient_automatic_bridges_impl(PrintObject &object, const std::function<void()> &generate)
+{
+    using RunKind = BridgeAwareCubicValidation::UnsupportedRunKind;
+    using Score = std::tuple<size_t, double, double, double>;
+    struct Evaluation { Score score{}; std::vector<Failure> failures; };
+    size_t work = 0;
+    const auto checkpoint = [&](size_t amount = 1) {
+        if (object.print()->canceled()) throw CanceledException();
+        constexpr size_t max_work = 1000000;
+        if (amount > max_work - work)
+            throw SlicingError("Bridge aware cubic automatic orientation exceeded its work limit.", object.model_object()->id().id);
+        work += amount;
+    };
+    const auto normalize = [](double angle) {
+        angle = std::fmod(angle, M_PI);
+        return angle < 0. ? angle + M_PI : angle;
+    };
+    const auto charge_polygon = [&](const ExPolygon &polygon) {
+        checkpoint(polygon.contour.size() + 1);
+        for (const Polygon &hole : polygon.holes) checkpoint(hole.size() + 1);
+    };
+    const auto compatible_region = [](const LayerRegion &supplier, const LayerRegion &candidate) {
+        const auto &config = supplier.region().config();
+        const auto &other = candidate.region().config();
+        if (!participates(other) || config.wall_filament != other.wall_filament ||
+            config.solid_infill_filament != other.solid_infill_filament || config.sparse_infill_filament != other.sparse_infill_filament ||
+            config.outer_wall_line_width != other.outer_wall_line_width || config.inner_wall_line_width != other.inner_wall_line_width ||
+            config.sparse_infill_line_width != other.sparse_infill_line_width || config.skin_infill_line_width != other.skin_infill_line_width ||
+            config.skeleton_infill_line_width != other.skeleton_infill_line_width ||
+            config.internal_solid_infill_line_width != other.internal_solid_infill_line_width ||
+            config.top_surface_line_width != other.top_surface_line_width || config.bridge_flow != other.bridge_flow)
+            return false;
+        const auto equal_flow = [](const Flow &a, const Flow &b) {
+            return a.width() == b.width() && a.height() == b.height() && a.mm3_per_mm() == b.mm3_per_mm();
+        };
+        for (FlowRole role : {frExternalPerimeter, frPerimeter, frInfill, frSolidInfill, frTopSolidInfill})
+            if (!equal_flow(supplier.flow(role), candidate.flow(role)) ||
+                !equal_flow(supplier.bridging_flow(role, false), candidate.bridging_flow(role, false)) ||
+                !equal_flow(supplier.bridging_flow(role, true), candidate.bridging_flow(role, true))) return false;
+        return true;
+    };
+    const auto evaluate = [&] {
+        checkpoint();
+        auto targets = collect_targets(object, false, false);
+        targets.erase(std::remove_if(targets.begin(), targets.end(), [&](const Target &target) {
+            return !target.bridge_followup || !participates(object.printing_region(target.supporting_region).config());
+        }), targets.end());
+        Evaluation evaluation;
+        evaluation.failures = check_targets(object, targets);
+        size_t over_gap = 0;
+        double excess = 0., maximum = 0., unanchored = 0.;
+        for (const Failure &failure : evaluation.failures) {
+            if (!failure.result.input_valid || !failure.result.completed) fail(object, failure);
+            const double gap = failure.target.gap;
+            if (!std::isfinite(gap) || gap <= 0.)
+                throw SlicingError("Bridge aware cubic automatic orientation requires a finite positive gap.", object.model_object()->id().id);
+            for (const auto &run : failure.result.unsupported_runs) {
+                checkpoint();
+                // A lost anchor must not improve the score merely by turning
+                // an overlong two-ended interval into a floating interval.
+                if (run.exceeds_gap) {
+                    ++over_gap;
+                    const double ratio = std::max(0., run.length_mm / gap - 1.);
+                    excess += std::min(1000., ratio);
+                    maximum = std::max(maximum, ratio);
+                }
+                if (run.kind != RunKind::TwoEndedBridge)
+                    unanchored += (run.kind == RunKind::Floating ? 1. : 0.) + std::min(1., run.length_mm / gap);
+            }
+        }
+        evaluation.score = {over_gap, excess, maximum, unanchored};
+        return evaluation;
+    };
+
+    Evaluation initial = evaluate();
+    const bool has_interior_failure = std::any_of(initial.failures.begin(), initial.failures.end(), [](const Failure &failure) {
+        return std::any_of(failure.result.unsupported_runs.begin(), failure.result.unsupported_runs.end(), [](const auto &run) {
+            return run.kind == RunKind::TwoEndedBridge && run.exceeds_gap;
+        });
+    });
+    if (!has_interior_failure) return;
+
+    struct Slice { size_t layer, region; Surface *surface; };
+    std::vector<Slice> slices;
+    std::map<std::pair<size_t, size_t>, std::vector<size_t>> by_plane;
+    for (size_t layer = 0; layer < object.layers().size(); ++layer)
+        for (size_t region = 0; region < object.layers()[layer]->regions().size(); ++region)
+            for (Surface &surface : object.layers()[layer]->get_region(int(region))->fill_surfaces.surfaces) {
+                checkpoint();
+                if (surface.surface_type != stInternalBridge) continue;
+                by_plane[{layer, region}].push_back(slices.size());
+                slices.push_back({layer, region, &surface});
+            }
+    std::vector<size_t> group_for_slice(slices.size(), size_t(-1));
+    struct Group { std::vector<size_t> slices; bool automatic = true; };
+    std::vector<Group> groups;
+    const auto overlaps = [&](const ExPolygon &first, const ExPolygon &second) {
+        charge_polygon(first);
+        charge_polygon(second);
+        return !intersection_ex(first, second).empty();
+    };
+    for (size_t start = 0; start < slices.size(); ++start) {
+        if (group_for_slice[start] != size_t(-1)) continue;
+        const size_t id = groups.size();
+        groups.push_back({{start}, true});
+        group_for_slice[start] = id;
+        for (size_t head = 0; head < groups[id].slices.size(); ++head) {
+            checkpoint();
+            const Slice &slice = slices[groups[id].slices[head]];
+            const auto &config = object.layers()[slice.layer]->get_region(int(slice.region))->region().config();
+            groups[id].automatic &= participates(config) && config.bridge_angle.value == 0. && std::isfinite(slice.surface->bridge_angle) &&
+                slice.surface->bridge_angle >= 0.;
+            for (bool upward : {false, true}) {
+                if ((!upward && (slice.layer == 0 || !slice.surface->bridge_followup)) ||
+                    (upward && slice.layer + 1 >= object.layers().size())) continue;
+                const size_t layer = upward ? slice.layer + 1 : slice.layer - 1;
+                const auto found = by_plane.find({layer, slice.region});
+                if (found == by_plane.end()) continue;
+                for (size_t next : found->second) {
+                    checkpoint();
+                    if (group_for_slice[next] != size_t(-1) || (upward && !slices[next].surface->bridge_followup)) continue;
+                    if (overlaps(slice.surface->expolygon, slices[next].surface->expolygon)) {
+                        group_for_slice[next] = id;
+                        groups[id].slices.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+
+    struct Direction { double weight = 0., x = 0., y = 0.; };
+    struct Seed { size_t slice = 0; double ratio = 0.; std::map<int, Direction> directions; };
+    std::map<size_t, Seed> seeds;
+    for (const Failure &failure : initial.failures) {
+        std::map<size_t, std::vector<BridgeAwareCubicValidation::UnsupportedRun>> runs_by_path;
+        for (const auto &run : failure.result.unsupported_runs)
+            if (run.kind == RunKind::TwoEndedBridge && run.exceeds_gap) runs_by_path[run.path_index].push_back(run);
+        for (const auto &entry : runs_by_path) {
+            checkpoint();
+            const size_t path_index = entry.first;
+            const Polyline &verified = failure.verified_paths.empty() ? failure.target.paths[path_index] : failure.verified_paths[path_index];
+            Polylines intervals;
+            double ratio = 0.;
+            for (const auto &run : entry.second) {
+                checkpoint(verified.size() + 1);
+                ratio = std::max(ratio, run.length_mm / failure.target.gap);
+                Polyline interval = verified;
+                const double total = unscale<double>(interval.length());
+                interval.clip_end(scale_(std::max(0., total - run.end_mm)));
+                if (interval.size() >= 2) interval.clip_start(scale_(run.begin_mm));
+                if (interval.size() >= 2) intervals.push_back(std::move(interval));
+            }
+            if (intervals.empty()) continue;
+            const size_t lower = failure.target.upper_layer - 1;
+            const LayerRegion &supplier = *object.layers()[lower]->get_region(int(failure.target.supporting_region));
+            for (size_t region = 0; region < object.layers()[lower]->regions().size(); ++region) {
+                // Complete air runs may cross a modifier seam. Their unrelated
+                // portions cannot authorize changing another material policy.
+                if (!compatible_region(supplier, *object.layers()[lower]->get_region(int(region)))) continue;
+                const auto found = by_plane.find({lower, region});
+                if (found == by_plane.end()) continue;
+                for (size_t slice_index : found->second) {
+                    const size_t group = group_for_slice[slice_index];
+                    if (!groups[group].automatic) continue;
+                    charge_polygon(slices[slice_index].surface->expolygon);
+                    const Polylines local = intersection_pl(intervals, ExPolygons{slices[slice_index].surface->expolygon});
+                    if (local.empty()) continue;
+                    Seed candidate;
+                    candidate.slice = slice_index;
+                    candidate.ratio = ratio;
+                    for (const Polyline &line : local) for (size_t i = 1; i < line.size(); ++i) {
+                        checkpoint();
+                        const Vec2d direction = (line.points[i] - line.points[i - 1]).cast<double>();
+                        const double length = direction.norm();
+                        if (length < scale_(std::max(.5, 2. * failure.target.path_widths[path_index]))) continue;
+                        const double angle = normalize(std::atan2(direction.y(), direction.x()));
+                        const int bin = int(std::floor(angle * 180. / M_PI + .5)) % 180;
+                        auto &value = candidate.directions[bin];
+                        value.weight += length;
+                        value.x += length * std::cos(2. * angle);
+                        value.y += length * std::sin(2. * angle);
+                    }
+                    if (candidate.directions.empty()) continue;
+                    auto current = seeds.find(group);
+                    // One deterministic worst failing contact plane supplies
+                    // proposals; every follow-up plane participates in scoring.
+                    if (current == seeds.end() || candidate.ratio > current->second.ratio)
+                        seeds[group] = std::move(candidate);
+                }
+            }
+        }
+    }
+    if (seeds.size() > 32)
+        throw SlicingError("Bridge aware cubic automatic orientation exceeded its bridge-group limit.", object.model_object()->id().id);
+
+    Evaluation current = std::move(initial);
+    for (const auto &entry : seeds) {
+        checkpoint();
+        if (std::get<0>(current.score) == 0) break;
+        const Group &group = groups[entry.first];
+        const Seed &seed = entry.second;
+        const auto dominant = std::max_element(seed.directions.begin(), seed.directions.end(), [](const auto &a, const auto &b) {
+            return a.second.weight < b.second.weight;
+        });
+        const double upper_angle = normalize(.5 * std::atan2(dominant->second.y, dominant->second.x));
+        double separation = normalize(slices[seed.slice].surface->bridge_angle - upper_angle);
+        if (separation > .5 * M_PI) separation -= M_PI;
+        const double direction = separation < 0. ? -1. : 1.;
+        const double magnitude = std::abs(separation);
+        const double margin = M_PI / 180.;
+        const double suggested = std::min(.5 * M_PI, std::max(magnitude + margin,
+            std::asin(std::min(1., seed.ratio * std::sin(magnitude))) + margin));
+        std::vector<double> deltas;
+        for (double target : {suggested, M_PI / 12., M_PI / 4., M_PI / 2.}) {
+            if (target <= magnitude + 1.e-9) continue;
+            const double delta = direction * (target - magnitude);
+            if (std::none_of(deltas.begin(), deltas.end(), [&](double existing) { return std::abs(existing - delta) < 1.e-9; }))
+                deltas.push_back(delta);
+        }
+        std::sort(deltas.begin(), deltas.end(), [](double a, double b) { return std::abs(a) < std::abs(b); });
+        std::vector<double> original_angles;
+        for (size_t index : group.slices) original_angles.push_back(slices[index].surface->bridge_angle);
+        const auto apply = [&](double delta) {
+            for (size_t i = 0; i < group.slices.size(); ++i)
+                slices[group.slices[i]].surface->bridge_angle = delta == 0. ? original_angles[i] : normalize(original_angles[i] + delta);
+        };
+        double best_delta = 0.;
+        Evaluation best = std::move(current);
+        for (double delta : deltas) {
+            checkpoint();
+            apply(delta);
+            generate();
+            Evaluation trial = evaluate();
+            // Losing intermediate contacts can merge several short failures
+            // into one longer run. A smaller count alone must not prefer it.
+            if (trial.score < best.score && std::get<2>(trial.score) <= std::get<2>(best.score)) {
+                best_delta = delta;
+                best = std::move(trial);
+            }
+        }
+        apply(best_delta);
+        // Only the complete regenerated geometry enters the authoritative
+        // solve. The score is a bounded proposal, never a support certificate.
+        if (!deltas.empty()) generate();
+        current = std::move(best);
+    }
+}
+
 } // namespace
+
+namespace BridgeAwareCubic {
+
+void orient_automatic_bridges(PrintObject &object, const std::function<void()> &regenerate)
+{
+    orient_automatic_bridges_impl(object, regenerate);
+}
+
+ExPolygons endpoint_attachment_domain(const Layer &layer, size_t emitting_region)
+{
+    const LayerRegion &emitter = *layer.get_region(int(emitting_region));
+    const auto &config = emitter.region().config();
+    const auto compatible = [&](const LayerRegion &candidate) {
+        const auto &other = candidate.region().config();
+        if (!participates(other) || config.wall_filament != other.wall_filament ||
+            config.solid_infill_filament != other.solid_infill_filament || config.sparse_infill_filament != other.sparse_infill_filament ||
+            config.outer_wall_line_width != other.outer_wall_line_width || config.inner_wall_line_width != other.inner_wall_line_width ||
+            config.sparse_infill_line_width != other.sparse_infill_line_width || config.skin_infill_line_width != other.skin_infill_line_width ||
+            config.skeleton_infill_line_width != other.skeleton_infill_line_width ||
+            config.internal_solid_infill_line_width != other.internal_solid_infill_line_width ||
+            config.top_surface_line_width != other.top_surface_line_width || config.bridge_flow != other.bridge_flow)
+            return false;
+        const auto equal_flow = [](const Flow &a, const Flow &b) {
+            return a.width() == b.width() && a.height() == b.height() && a.mm3_per_mm() == b.mm3_per_mm();
+        };
+        for (FlowRole role : {frExternalPerimeter, frPerimeter, frInfill, frSolidInfill, frTopSolidInfill})
+            if (!equal_flow(emitter.flow(role), candidate.flow(role)) ||
+                !equal_flow(emitter.bridging_flow(role, false), candidate.bridging_flow(role, false)) ||
+                !equal_flow(emitter.bridging_flow(role, true), candidate.bridging_flow(role, true))) return false;
+        return true;
+    };
+    ExPolygons allowed;
+    for (const LayerRegion *region : layer.regions())
+        if (region == &emitter || compatible(*region))
+            for (const Surface &surface : region->slices.surfaces) allowed.push_back(surface.expolygon);
+    return intersection_ex(union_ex(allowed), layer.lslices);
+}
+
+Polylines matching_partition_segments(const Polylines &candidates, const Polylines &partitions)
+{
+    return remove_collinear_duplicates(candidates, partitions, true);
+}
+
+bool complete_construction_match(const Polyline &path, const Polylines &matched, double tolerance_mm)
+{
+    if (!std::isfinite(tolerance_mm) || tolerance_mm < 0.)
+        throw std::invalid_argument("Bridge aware cubic construction matching requires a finite nonnegative tolerance.");
+    double covered = 0.;
+    for (const Polyline &piece : matched) covered += piece.length();
+    return covered > 0. && covered + scale_(tolerance_mm) >= path.length();
+}
+
+ExPolygons partition_provenance_footprint(const Polylines &owned, double width_mm, double tolerance_mm,
+                                         const Polylines *source_segments)
+{
+    if (!std::isfinite(width_mm) || width_mm <= 0. || !std::isfinite(tolerance_mm) || tolerance_mm < 0.)
+        throw std::invalid_argument("Bridge aware cubic requires finite partition provenance dimensions.");
+    ExPolygons footprint;
+    if (source_segments == nullptr) {
+        footprint = union_ex(offset(owned, scale_(.5 * width_mm + tolerance_mm)));
+    } else {
+        constexpr size_t max_vertices = 200000, max_work = 50000000;
+        constexpr coord_t coordinate_limit = std::numeric_limits<coord_t>::max() / 4;
+        size_t owned_points = 0, source_points = 0;
+        const auto checked_size = [&](const Polylines &paths, size_t &count) {
+            for (const Polyline &path : paths) {
+                if (path.size() > max_vertices - count)
+                    throw std::runtime_error("Bridge aware cubic partition provenance exceeds its vertex work limit.");
+                count += path.size();
+                for (const Point &point : path.points)
+                    if (point.x() < -coordinate_limit || point.x() > coordinate_limit ||
+                            point.y() < -coordinate_limit || point.y() > coordinate_limit)
+                        throw std::invalid_argument("Bridge aware cubic partition provenance exceeds finite coordinate bounds.");
+            }
+        };
+        checked_size(owned, owned_points);
+        checked_size(*source_segments, source_points);
+        if (owned_points != 0 && source_points > max_work / owned_points)
+            throw std::runtime_error("Bridge aware cubic partition provenance exceeds its matching work limit.");
+        const long double radius = (.5L * width_mm + tolerance_mm) / SCALING_FACTOR;
+        if (!std::isfinite(radius) || radius > coordinate_limit)
+            throw std::invalid_argument("Bridge aware cubic partition provenance exceeds finite width bounds.");
+        const auto point = [&](long double x, long double y) {
+            if (!std::isfinite(x) || !std::isfinite(y) || std::abs(x) > coordinate_limit || std::abs(y) > coordinate_limit)
+                throw std::invalid_argument("Bridge aware cubic partition provenance exceeds finite coordinate bounds.");
+            return Point(coord_t(std::llround(x)), coord_t(std::llround(y)));
+        };
+        for (const Polyline &source : *source_segments) for (size_t i = 1; i < source.size(); ++i) {
+            const Point &a = source.points[i - 1], &b = source.points[i];
+            const long double dx = static_cast<long double>(b.x()) - a.x();
+            const long double dy = static_cast<long double>(b.y()) - a.y();
+            const long double squared = dx * dx + dy * dy;
+            if (squared == 0.) continue;
+            const long double length = std::sqrt(squared);
+            const long double nx = -dy * radius / length, ny = dx * radius / length;
+            const Polylines matches = remove_collinear_duplicates({Polyline(a, b)}, owned, true);
+            for (const Polyline &match : matches) for (size_t j = 1; j < match.size(); ++j) {
+                const auto projection = [&](const Point &p) {
+                    return std::clamp(((static_cast<long double>(p.x()) - a.x()) * dx +
+                                       (static_cast<long double>(p.y()) - a.y()) * dy) / squared, 0.L, 1.L);
+                };
+                long double begin = projection(match.points[j - 1]), end = projection(match.points[j]);
+                if (begin > end) std::swap(begin, end);
+                if (begin == end) continue;
+                if (footprint.size() >= max_vertices / 4)
+                    throw std::runtime_error("Bridge aware cubic partition provenance exceeds its output work limit.");
+                // Keep both slab caps perpendicular to the ORIGINAL segment.
+                // Rounding projected endpoints before buffering would rotate a
+                // short interval and amplify that error over half a bead width.
+                const long double x0 = a.x() + begin * dx, y0 = a.y() + begin * dy;
+                const long double x1 = a.x() + end * dx, y1 = a.y() + end * dy;
+                Polygon slab(Points{point(x0 - nx, y0 - ny), point(x1 - nx, y1 - ny),
+                                    point(x1 + nx, y1 + ny), point(x0 + nx, y0 + ny)});
+                if (slab.area() > 0.) footprint.emplace_back(std::move(slab));
+            }
+        }
+        footprint = union_ex(footprint);
+    }
+    // Boolean intersections round their vertices to the integer grid. A
+    // selected vertex can therefore lie fractionally beyond a source butt
+    // cap even when selection was intersected with that exact source bead.
+    // Widening the stroke alone cannot cover this longitudinal roundoff.
+    return offset_ex(footprint, 2.);
+}
+
+ExPolygons serialized_demand(const ExPolygons &source, const Polylines &paths, const SerializedXY &phase)
+{
+    if (source.empty()) return {};
+    constexpr coord_t limit = std::numeric_limits<coord_t>::max() / 4;
+    const auto bounded = [&](const Point &point) {
+        if (point.x() < -limit || point.x() > limit || point.y() < -limit || point.y() > limit)
+            throw std::out_of_range("Bridge aware cubic demand displacement exceeds the safe geometry range.");
+    };
+    const Point origin = phase(Point(0, 0));
+    bounded(origin);
+    coord_t margin = 0;
+    for (const Polyline &path : paths) for (const Point &point : path.points) {
+        const Point serialized = phase(point);
+        bounded(point);
+        bounded(serialized);
+        // Each subtraction is bounded by 3*limit. The integer L1 norm is an
+        // exact upper bound on Euclidean displacement, without sqrt rounding.
+        const coord_t dx = std::abs(serialized.x() - origin.x() - point.x());
+        const coord_t dy = std::abs(serialized.y() - origin.y() - point.y());
+        if (dx > limit || dy > limit || dx > limit - dy)
+            throw std::out_of_range("Bridge aware cubic demand displacement exceeds the safe geometry range.");
+        margin = std::max(margin, dx + dy);
+    }
+    constexpr coord_t boolean_allowance = 2;
+    if (margin > limit - boolean_allowance)
+        throw std::out_of_range("Bridge aware cubic demand envelope exceeds the safe geometry range.");
+    const coord_t integer_envelope = margin + boolean_allowance;
+    float envelope = float(integer_envelope);
+    if (envelope >= float(limit))
+        throw std::out_of_range("Bridge aware cubic demand envelope exceeds the safe geometry range.");
+    // Clipper's offset entry point takes float. Compare in the integer domain
+    // so even a large int64 bound cannot silently round down through double.
+    if (coord_t(envelope) < integer_envelope)
+        envelope = std::nextafter(envelope, std::numeric_limits<float>::infinity());
+    if (envelope >= float(limit))
+        throw std::out_of_range("Bridge aware cubic demand envelope exceeds the safe geometry range.");
+    const coord_t source_limit = limit - coord_t(envelope);
+    const auto bounded_source = [&](const Point &point) {
+        if (point.x() < -source_limit || point.x() > source_limit || point.y() < -source_limit || point.y() > source_limit)
+            throw std::out_of_range("Bridge aware cubic demand envelope exceeds the safe geometry range.");
+    };
+    for (const ExPolygon &polygon : source) {
+        for (const Point &point : polygon.contour.points) bounded_source(point);
+        for (const Polygon &hole : polygon.holes) for (const Point &point : hole.points) bounded_source(point);
+    }
+    return offset_ex(source, envelope);
+}
+
+ExPolygons support_topology_domain(const ExPolygons &support, const ExPolygons &all_demands)
+{
+    BoundingBox bounds;
+    for (const auto *polygons : {&support, &all_demands})
+        for (const ExPolygon &polygon : *polygons) {
+            bounds.merge(polygon.contour.points);
+            for (const Polygon &hole : polygon.holes) bounds.merge(hole.points);
+        }
+    if (!bounds.defined)
+        throw std::invalid_argument("Bridge aware cubic support topology has no finite verification bounds.");
+    const coord_t pad = scale_(1.);
+    constexpr coord_t limit = std::numeric_limits<coord_t>::max() / 4;
+    if (bounds.min.x() < -limit + pad || bounds.min.y() < -limit + pad ||
+        bounds.max.x() > limit - pad || bounds.max.y() > limit - pad)
+        throw std::out_of_range("Bridge aware cubic support topology exceeds the safe geometry range.");
+    bounds.offset(pad);
+    return {ExPolygon(Polygon{Points{bounds.min, Point(bounds.max.x(), bounds.min.y()), bounds.max,
+                                    Point(bounds.min.x(), bounds.max.y())}})};
+}
+
+std::optional<ExPolygons> merged_attachment_selection(bool ordinary_full_path,
+    const std::vector<LayerAttachment> &active, const std::set<size_t> &applicable_lineage)
+{
+    if (ordinary_full_path || applicable_lineage.empty()) return std::nullopt;
+    ExPolygons selected;
+    for (size_t index : applicable_lineage) {
+        const LayerAttachment &attachment = active.at(index);
+        // Empty is the core payload's explicit whole-path sentinel. Neither
+        // a convergent cut-only chain nor storage ordering may narrow it.
+        if (!attachment.solid_cut || attachment.demand_selection.empty()) return std::nullopt;
+        append(selected, attachment.demand_selection);
+    }
+    return union_ex(selected);
+}
+
+ExPolygons unsupported_interval_demand(const Polyline &verified_path, double begin_mm, double end_mm,
+                                       double width_mm, double tolerance_mm, const ExPolygons &original_demand,
+                                       const Polyline *source_path)
+{
+    if (verified_path.size() < 2) return {};
+    if (!std::isfinite(begin_mm) || !std::isfinite(end_mm) || !std::isfinite(width_mm) ||
+        !std::isfinite(tolerance_mm) || begin_mm < 0. || end_mm < begin_mm || width_mm <= 0. || tolerance_mm < 0.)
+        throw std::invalid_argument("Bridge aware cubic requires finite unsupported-interval geometry.");
+    const double total = unscale<double>(verified_path.length());
+    const double begin = std::max(0., begin_mm - tolerance_mm);
+    const double end = std::min(total, end_mm + tolerance_mm);
+    if (begin >= end) return {};
+    Polyline interval = verified_path;
+    interval.clip_end(scale_(std::max(0., total - end)));
+    if (interval.size() >= 2) interval.clip_start(scale_(begin));
+    if (interval.size() < 2) return {};
+    const ExPolygons selected = source_path == nullptr ? original_demand :
+        intersection_ex(original_demand, union_ex(offset(Polylines{*source_path}, scale_(.5 * width_mm))));
+    return intersection_ex(union_ex(offset(Polylines{std::move(interval)}, scale_(.5 * width_mm + tolerance_mm))), selected);
+}
+
+ExPolygons select_unsupported_run_demands(const Polylines &source_paths, const Polylines &verified_paths,
+    const std::vector<double> &widths_mm, const std::vector<ExPolygons> &path_demands,
+    const std::vector<BridgeAwareCubicValidation::UnsupportedRun> &runs, double tolerance_mm,
+    bool complete_selected_runs)
+{
+    if (source_paths.size() != widths_mm.size() || source_paths.size() != path_demands.size() ||
+        (!verified_paths.empty() && verified_paths.size() != source_paths.size()))
+        throw std::invalid_argument("Bridge aware cubic repair requires matching per-path demand identities.");
+    ExPolygons affected;
+    for (const auto &run : runs) {
+        if (!run.exceeds_gap && run.kind == BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge)
+            continue;
+        const Polyline &source = source_paths.at(run.path_index);
+        const Polyline &verified = verified_paths.empty() ? source : verified_paths.at(run.path_index);
+        const double width = widths_mm.at(run.path_index);
+        ExPolygons selected = unsupported_interval_demand(verified, run.begin_mm, run.end_mm,
+            width, tolerance_mm, path_demands.at(run.path_index), &source);
+        if (selected.empty()) continue;
+        if (complete_selected_runs) {
+            const ExPolygons bead = union_ex(offset(Polylines{source}, scale_(.5 * width)));
+            selected = unsupported_interval_demand(verified, run.begin_mm, run.end_mm,
+                width, tolerance_mm, bead, &source);
+        }
+        append(affected, std::move(selected));
+    }
+    return affected;
+}
+
+ExPolygons solid_cut_endpoint_demand(const Polyline &path, const ExPolygons &solid_area,
+                                     double width_mm, double tolerance_mm)
+{
+    ExPolygons selected;
+    if (path.size() < 2 || solid_area.empty()) return selected;
+    if (!std::isfinite(width_mm) || width_mm <= 0. || !std::isfinite(tolerance_mm) || tolerance_mm < 0.)
+        throw std::invalid_argument("Bridge aware cubic requires finite solid-endpoint geometry.");
+    const ExPolygons near = offset_ex(solid_area, scale_(tolerance_mm));
+    const coord_t radius = scale_(.5 * width_mm + tolerance_mm);
+    for (const Point &endpoint : {path.first_point(), path.last_point()})
+        if (std::any_of(near.begin(), near.end(), [&](const ExPolygon &polygon) { return polygon.contains(endpoint, true); }))
+            selected.emplace_back(Polygon{Points{
+                endpoint + Point(-radius, -radius), endpoint + Point(radius, -radius),
+                endpoint + Point(radius, radius), endpoint + Point(-radius, radius)}});
+    return union_ex(selected);
+}
+
+ExPolygons solid_cut_provenance_footprint(const Polyline &path, const ExPolygons &selection, double width_mm)
+{
+    constexpr size_t max_vertices = 200000;
+    constexpr coord_t coordinate_limit = std::numeric_limits<coord_t>::max() / 4;
+    if (!std::isfinite(width_mm) || width_mm <= 0. ||
+        .5L * width_mm / SCALING_FACTOR > coordinate_limit)
+        throw std::invalid_argument("Bridge aware cubic requires finite solid-cut provenance width.");
+    size_t vertices = 0;
+    const auto check_points = [&](const Points &points) {
+        if (points.size() > max_vertices - vertices)
+            throw std::runtime_error("Bridge aware cubic solid-cut provenance exceeds its vertex work limit.");
+        vertices += points.size();
+        for (const Point &point : points)
+            if (point.x() < -coordinate_limit || point.x() > coordinate_limit ||
+                point.y() < -coordinate_limit || point.y() > coordinate_limit)
+                throw std::invalid_argument("Bridge aware cubic solid-cut provenance exceeds finite coordinate bounds.");
+    };
+    check_points(path.points);
+    for (const ExPolygon &polygon : selection) {
+        check_points(polygon.contour.points);
+        for (const Polygon &hole : polygon.holes) check_points(hole.points);
+        if (!polygon.is_valid())
+            throw std::invalid_argument("Bridge aware cubic requires valid solid-cut provenance selections.");
+    }
+    if (path.size() < 2 || selection.empty()) return {};
+    const ExPolygons bead = union_ex(offset(Polylines{path}, scale_(.5 * width_mm)));
+    // Bound each original constraint before intersecting. Offsetting an
+    // already rounded intersection spends that vertex roundoff a second time
+    // and can extend beyond the source or selector's two-unit envelope.
+    return intersection_ex(offset_ex(bead, 2.), offset_ex(selection, 2.));
+}
+
+Polylines layer_closure_lines(const Layer &layer)
+{
+    Polylines result;
+    const ActiveAttachments active = active_attachments(layer);
+    for (size_t owner = 0; owner < layer.regions().size(); ++owner) {
+        const Plan *plan = layer.object()->bridge_aware_cubic_plan(owner);
+        if (plan == nullptr) continue;
+        for (const LayerClosure &closure : plan->closures(layer.print_z)) {
+            const size_t emitter = closure.emitting_region == std::numeric_limits<size_t>::max() ? owner : closure.emitting_region;
+            if (emitter >= layer.regions().size())
+                throw SlicingError("Bridge aware cubic closure has no printable owning region.", layer.object()->model_object()->id().id);
+            if (!closure_paths_owned(layer, emitter, closure.paths))
+                throw SlicingError("Bridge aware cubic closure has no compatible participating material owner at Z " +
+                    std::to_string(layer.print_z) + " mm.", layer.object()->model_object()->id().id);
+            const Flow flow = layer.get_region(int(emitter))->flow(frInfill);
+            for (const Polyline &line : closure.paths)
+                result.push_back(resolve_attachments(layer, line, float(flow.width()), float(flow.height()), emitter, active).polyline);
+        }
+    }
+    return result;
+}
+
+void apply_layer_paths(Layer &layer)
+{
+    const PrintObject &object = *layer.object();
+    // Replay only immutable original-path identities. This hook also runs in
+    // the parallel final fill pass and never reads another layer's mutable fills.
+    const ActiveAttachments active = active_attachments(layer);
+    for (const auto &attachment : active.entries)
+        if (attachment.emitting_region >= layer.regions().size())
+            throw SlicingError("Bridge aware cubic attachment has no printable owning region.", object.model_object()->id().id);
+    const auto replay_attachments = [&] {
+        for (size_t emitter = 0; emitter < layer.regions().size(); ++emitter) {
+            LayerRegion &region = *layer.get_region(int(emitter));
+            const auto replay = [&](ExtrusionPath &path) {
+                path.polyline = resolve_attachments(layer, path.polyline, path.width, path.height, emitter, active).polyline;
+            };
+            visit_free_paths(region.perimeters, replay);
+            visit_free_paths(region.fills, replay);
+        }
+    };
+    replay_attachments();
+
+    Polylines deposited;
+    visit_layer(layer, [&](const ExtrusionPath &path) { deposited.push_back(path.polyline); });
+    for (size_t owner = 0; owner < layer.regions().size(); ++owner) {
+        const Plan *plan = object.bridge_aware_cubic_plan(owner);
+        if (plan == nullptr) continue;
+        for (const LayerClosure &closure : plan->closures(layer.print_z)) {
+            const size_t emitter = closure.emitting_region == std::numeric_limits<size_t>::max() ? owner : closure.emitting_region;
+            if (emitter >= layer.regions().size())
+                throw SlicingError("Bridge aware cubic closure has no printable owning region.", object.model_object()->id().id);
+            if (!closure_paths_owned(layer, emitter, closure.paths))
+                throw SlicingError("Bridge aware cubic closure has no compatible participating material owner at Z " +
+                    std::to_string(layer.print_z) + " mm.", object.model_object()->id().id);
+            LayerRegion &region = *layer.get_region(int(emitter));
+            const Flow flow = region.flow(frInfill);
+            Polylines paths = remove_collinear_duplicates(closure.paths, deposited);
+            ExtrusionPaths extrusions;
+            extrusion_paths_append(extrusions, paths, erInternalInfill, flow.mm3_per_mm(), float(flow.width()), float(flow.height()));
+            Polygons footprint;
+            for (const auto &path : extrusions) path.polygons_covered_by_width(footprint, 0.f);
+            if (!diff_ex(union_ex(footprint), closure_domain(layer, emitter)).empty())
+                throw SlicingError("Bridge aware cubic closure would leave permitted printable material at Z " +
+                    std::to_string(layer.print_z) + " mm.", object.model_object()->id().id);
+            if (!extrusions.empty()) {
+                auto *collection = new ExtrusionEntityCollection;
+                collection->no_sort = true;
+                collection->append(std::move(extrusions));
+                region.fills.entities.push_back(collection);
+                append(deposited, std::move(paths));
+            }
+        }
+    }
+    // Saved attachments may also belong to a newly emitted closure course.
+    // The exact identity check makes this second replay idempotent for paths
+    // already generated by ordinary fill groups.
+    replay_attachments();
+    // A microscopic clipped partition can emit E while every output XY point
+    // coincides. Remove that complete construction entity from the actual
+    // generated material for all instances, before support collection. This
+    // runs on every trial and final fill; the remaining model, cell and
+    // dependency geometry must still pass the ordinary final certificate.
+    remove_stationary_construction(layer, active);
+}
+
+} // namespace BridgeAwareCubic
 
 bool PrintObject::has_bridge_aware_cubic() const
 {
@@ -353,6 +2248,10 @@ void PrintObject::prepare_bridge_aware_cubic()
     m_bridge_aware_cubic_plans.resize(num_printing_regions());
     m_bridge_aware_cubic_reservations.clear();
     if (!has_bridge_aware_cubic() || m_layers.empty()) return;
+    common_nozzle_offset(*this);
+
+    if (print()->config().spiral_mode.value)
+        throw SlicingError("Bridge aware cubic requires Spiral vase disabled because its support certificate uses planar layers.", model_object()->id().id);
 
     if (config().seam_gap.value != 0.)
         throw SlicingError("Bridge aware cubic currently requires Seam gap = 0 because support validation precedes seam placement.", model_object()->id().id);
@@ -382,16 +2281,26 @@ void PrintObject::prepare_bridge_aware_cubic()
     // bridge passes. The hierarchy retains the bulk scaffold and only adds
     // partitions; these exact upper paths are the planning targets.
     generate();
-    const std::vector<Target> roofs = collect_targets(*this, false);
+    BridgeAwareCubic::orient_automatic_bridges(*this, generate);
+    std::vector<Target> roofs = collect_targets(*this, false);
     std::vector<std::vector<BridgeAwareCubic::Demand>> demands(num_printing_regions());
+    std::vector<std::vector<BridgeAwareCubic::LayerClosure>> closures(num_printing_regions());
+    std::vector<std::vector<BridgeAwareCubic::LayerAttachment>> attachments(num_printing_regions());
+    std::vector<Dependency::DemandKey> direct_roots;
+    struct ClosureRoot { Dependency::DemandKey demand; double z; Polyline producer; };
+    std::vector<ClosureRoot> closure_roots;
+    std::vector<Dependency::Obligation> obligations;
+    std::vector<std::vector<size_t>> demand_indices(num_printing_regions());
     for (const Target &target : roofs) {
         if (target.bridge_followup) continue;
         const Layer &lower = *m_layers[target.upper_layer - 1];
         ExPolygons refinable = intersection_ex(target.footprint,
             sparse_domain(*lower.get_region(int(target.supporting_region))));
-        if (!refinable.empty())
+        if (!refinable.empty()) {
+            direct_roots.push_back({target.supporting_region, demands[target.supporting_region].size()});
             demands[target.supporting_region].push_back({std::move(refinable), lower.print_z,
                                                         target.gap - geometry_tolerance});
+        }
     }
 
     const BoundingBox bounds = bounding_box();
@@ -416,10 +2325,96 @@ void PrintObject::prepare_bridge_aware_cubic()
         params.density = config.sparse_infill_density.value * .01;
         params.angle = Geometry::deg2rad(config.infill_direction.value);
         params.throw_if_canceled = [this] { throw_if_canceled(); };
+        params.allow_solid_fallback = true;
     }
 
+    // A new predecessor can be discovered one layer below an accepted repair.
+    // Its initial request must not inherit tightening from unrelated earlier
+    // layers. Scope escalation to this receiving layer, target and exact
+    // producer/source-path identity; reversing a path preserves its identity.
+    using PathIdentity = std::vector<std::pair<coord_t, coord_t>>;
+    using MaskIdentity = std::vector<PathIdentity>;
+    using RepairIdentity = std::tuple<size_t, size_t, size_t, double, bool,
+        std::vector<Dependency::SourceOwner>, PathIdentity, MaskIdentity>;
+    std::map<RepairIdentity, unsigned> local_repairs;
+    unsigned refinement_limit = 0;
+    for (const auto &params : parameters)
+        if (params.flow_spacing > 0.) refinement_limit = std::max(refinement_limit, params.max_depth);
+    const size_t per_layer_limit = size_t(refinement_limit) + 1;
+    if (m_layers.size() > (std::numeric_limits<size_t>::max() - 1) / per_layer_limit)
+        throw SlicingError("Bridge aware cubic propagation exceeds its finite layer work range.", model_object()->id().id);
+    // Each construction chain descends through actual model layers, with at
+    // most the configured finite refinement depth spent at any one layer.
+    const size_t propagation_limit = m_layers.size() * per_layer_limit;
+
+    // Cell identities are scoped to their lattice. Resolve construction
+    // dependencies globally before rebuilding any local Plan, so a coincident
+    // address in another modifier cannot impersonate the true producer.
+    const auto prune_dependencies = [&] {
+        Dependency::Limits limits;
+        limits.throw_if_canceled = [this] { throw_if_canceled(); };
+        for (size_t iteration = 0;; ++iteration) {
+            if (iteration > demands.size() + obligations.size() + 1)
+                throw SlicingError("Bridge aware cubic dependency pruning did not converge.", model_object()->id().id);
+            std::vector<Dependency::Producer> producers;
+            for (size_t region = 0; region < m_bridge_aware_cubic_plans.size(); ++region)
+                if (const auto *plan = bridge_aware_cubic_plan(region))
+                    for (const auto &refinement : plan->refinements()) {
+                        Dependency::Producer producer;
+                        producer.owner = {region, refinement.id};
+                        for (size_t index : refinement.demand_indices)
+                            producer.demand_indices.push_back(demand_indices[region].at(index));
+                        producers.push_back(std::move(producer));
+                    }
+            auto roots = direct_roots;
+            std::map<double, Polylines> closure_preview;
+            for (const ClosureRoot &root : closure_roots) {
+                auto found = closure_preview.find(root.z);
+                if (found == closure_preview.end()) {
+                    Polylines paths;
+                    for (const Layer *layer : m_layers)
+                        if (std::abs(layer->print_z - root.z) <= EPSILON) {
+                            paths = BridgeAwareCubic::layer_closure_lines(*layer);
+                            break;
+                        }
+                    found = closure_preview.emplace(root.z, std::move(paths)).first;
+                }
+                double unmatched = 0.;
+                for (const auto &piece : remove_collinear_duplicates({root.producer}, found->second)) unmatched += piece.length();
+                // The allowance may complete a real finite overlap, never
+                // keep a microscopic course alive after its producer vanished.
+                // Use the strict deposition matcher above, not the broader
+                // proximity matcher used for rounded ownership fragments.
+                if (unmatched < root.producer.length() && unmatched <= scale_(geometry_tolerance))
+                    roots.push_back(root.demand);
+            }
+            const auto reachable = Dependency::resolve(roots, producers, obligations, limits);
+            bool changed = false;
+            for (size_t region = 0; region < m_bridge_aware_cubic_plans.size(); ++region) {
+                auto &plan = m_bridge_aware_cubic_plans[region];
+                if (plan == nullptr) continue;
+                std::vector<size_t> selected;
+                std::vector<BridgeAwareCubic::Demand> active;
+                for (size_t index = 0; index < demands[region].size(); ++index)
+                    if (reachable.is_active(Dependency::DemandKey{region, index})) {
+                        selected.push_back(index);
+                        active.push_back(demands[region][index]);
+                    }
+                if (selected != demand_indices[region]) {
+                    plan = std::make_unique<BridgeAwareCubic::Plan>(plan->with_demands(std::move(active)));
+                    demand_indices[region] = std::move(selected);
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+    };
+
     std::vector<Failure> failures;
-    for (unsigned pass = 0; pass < repair_limit; ++pass) {
+    // Every accepted repair batch receives a fresh deposition/verification
+    // pass, including the final bounded batch. Never report the stale failure
+    // that preceded a repair which has not yet been regenerated.
+    for (size_t pass = 0; pass <= propagation_limit; ++pass) {
         throw_if_canceled();
         for (size_t region_id = 0; region_id < num_printing_regions(); ++region_id) {
             if (parameters[region_id].flow_spacing <= 0.) continue;
@@ -444,20 +2439,261 @@ void PrintObject::prepare_bridge_aware_cubic()
                     " mm: " + error.what(), model_object()->id().id);
             };
             try {
-                m_bridge_aware_cubic_plans[region_id] = std::make_unique<BridgeAwareCubic::Plan>(parameters[region_id], demands[region_id]);
+                m_bridge_aware_cubic_plans[region_id] = std::make_unique<BridgeAwareCubic::Plan>(parameters[region_id], demands[region_id],
+                    closures[region_id], attachments[region_id]);
+                demand_indices[region_id].resize(demands[region_id].size());
+                std::iota(demand_indices[region_id].begin(), demand_indices[region_id].end(), size_t(0));
             } catch (const std::logic_error &error) {
                 throw contextual_error(error);
             } catch (const std::runtime_error &error) {
                 throw contextual_error(error);
             }
         }
+        prune_dependencies();
         generate();
+        // Attachments alter the actual model path. Preserve the original
+        // demand selection while following each committed replay identity, so
+        // later validation and coarsening never certify abandoned endpoints.
+        for (Target &target : roofs) {
+            const Layer &layer = *m_layers[target.upper_layer];
+            const ActiveAttachments active = active_attachments(layer);
+            for (size_t index = 0; index < target.paths.size(); ++index) {
+                const ExtrusionPath &extrusion = target.extrusions[index];
+                auto chain = resolve_attachments(layer, target.paths[index], extrusion.width, extrusion.height,
+                                                 target.emitting_regions[index], active);
+                target.paths[index] = std::move(chain.polyline);
+                target.extrusions[index].polyline = target.paths[index];
+            }
+        }
         failures = check_targets(*this, roofs);
         const auto dependencies = collect_targets(*this, true);
         auto dependency_failures = check_targets(*this, dependencies);
         failures.insert(failures.end(), std::make_move_iterator(dependency_failures.begin()),
                         std::make_move_iterator(dependency_failures.end()));
         if (failures.empty()) {
+            // The initial mask selects only air found before construction.
+            // Changed deposition can expose another part of the same required
+            // model path. Check the complete current obligations before
+            // support reduction; a newly exposed seam or strand must receive
+            // ordinary bounded repair rather than fail only after coarsening.
+            roofs = collect_targets(*this, false, false);
+            failures = check_targets(*this, roofs);
+            auto complete_dependencies = check_targets(*this, collect_targets(*this, true, false));
+            failures.insert(failures.end(), std::make_move_iterator(complete_dependencies.begin()),
+                            std::make_move_iterator(complete_dependencies.end()));
+        }
+        if (failures.empty()) {
+            // Freeze all final model paths and their supplying-region masks.
+            // Every trial recomputes which portions are actually unsupported,
+            // so removing a partition can expose a new target without either
+            // retaining an abandoned endpoint or demanding a cell beside an
+            // already fully supported perimeter.
+            // Test removal against the exact deposited paths. Ideal zero-width
+            // cell sizing is only a construction proposal; bead width may make
+            // a coarser parent sufficient. A changed cell affects its own layer
+            // paths and the next layer's contacts, not every layer in the part.
+            size_t trials = 0;
+            const auto changed_plan_layers = [&](const auto &previous, const auto &previous_indices) {
+                std::set<size_t> changed;
+                const auto mark_range = [&](const BridgeAwareCubic::Refinement &refinement) {
+                    for (size_t index = 0; index < m_layers.size(); ++index)
+                        if (m_layers[index]->print_z >= refinement.bottom_z - EPSILON &&
+                            m_layers[index]->print_z <= refinement.top_z + EPSILON) changed.insert(index);
+                };
+                const auto witnesses = [](const BridgeAwareCubic::Refinement &refinement, const auto &indices) {
+                    std::vector<size_t> result;
+                    result.reserve(refinement.demand_indices.size());
+                    for (size_t index : refinement.demand_indices) result.push_back(indices.at(index));
+                    std::sort(result.begin(), result.end());
+                    return result;
+                };
+                const auto same_closure = [](const auto &a, const auto &b) {
+                    return a.z == b.z && a.paths == b.paths && a.reservation == b.reservation &&
+                        a.owners == b.owners && a.emitting_region == b.emitting_region;
+                };
+                const auto same_attachment = [](const auto &a, const auto &b) {
+                    return a.z == b.z && a.emitting_region == b.emitting_region &&
+                        a.original == b.original && a.replacement == b.replacement &&
+                        a.width == b.width && a.height == b.height && a.owners == b.owners &&
+                        a.solid_cut == b.solid_cut && a.demand_selection == b.demand_selection;
+                };
+                for (size_t region = 0; region < previous.size(); ++region) {
+                    const auto *before = previous[region].get();
+                    const auto *after = m_bridge_aware_cubic_plans[region].get();
+                    if (before == nullptr || after == nullptr) {
+                        if (before != after)
+                            for (size_t index = 0; index < m_layers.size(); ++index) changed.insert(index);
+                        continue;
+                    }
+                    std::map<BridgeAwareCubic::CellId, const BridgeAwareCubic::Refinement*> remaining;
+                    for (const auto &refinement : after->refinements()) remaining.emplace(refinement.id, &refinement);
+                    for (const auto &refinement : before->refinements()) {
+                        const auto found = remaining.find(refinement.id);
+                        if (found == remaining.end()) { mark_range(refinement); continue; }
+                        const auto &replacement = *found->second;
+                        // Local demand indices can shift when the global graph
+                        // prunes another obligation. Compare their stable source
+                        // identities, not counts or reindexed vector positions.
+                        if (refinement.solid != replacement.solid || refinement.bottom_z != replacement.bottom_z ||
+                            refinement.top_z != replacement.top_z ||
+                            witnesses(refinement, previous_indices[region]) != witnesses(replacement, demand_indices[region])) {
+                            mark_range(refinement);
+                            mark_range(replacement);
+                        }
+                        remaining.erase(found);
+                    }
+                    for (const auto &entry : remaining) mark_range(*entry.second);
+                    for (size_t index = 0; index < m_layers.size(); ++index) {
+                        throw_if_canceled();
+                        const double z = m_layers[index]->print_z;
+                        const auto old_closures = before->closures(z), new_closures = after->closures(z);
+                        const auto old_attachments = before->attachments(z), new_attachments = after->attachments(z);
+                        // Geometry, emitter, owner and target-mask changes all
+                        // matter even when the number of saved paths is equal.
+                        if (old_closures.size() != new_closures.size() ||
+                            !std::equal(old_closures.begin(), old_closures.end(), new_closures.begin(), same_closure) ||
+                            old_attachments.size() != new_attachments.size() ||
+                            !std::equal(old_attachments.begin(), old_attachments.end(), new_attachments.begin(), same_attachment))
+                            changed.insert(index);
+                    }
+                }
+                // Floating solid fill may use the preceding layer's sparse
+                // preview (including closures), even if that layer has no
+                // remaining sparse BAC surface group. Its preview is rebuilt
+                // from plans/surfaces, not from emitted paths, so this direct
+                // successor is the complete generation dependency.
+                const auto deposition_changed = changed;
+                for (size_t index : deposition_changed)
+                    if (index + 1 < m_layers.size()) changed.insert(index + 1);
+                return changed;
+            };
+            const auto same_model_targets = [](const std::vector<Target> &a, const std::vector<Target> &b) {
+                if (a.size() != b.size()) return false;
+                for (size_t i = 0; i < a.size(); ++i) {
+                    const Target &left = a[i], &right = b[i];
+                    if (left.upper_layer != right.upper_layer || left.supporting_region != right.supporting_region ||
+                        left.gap != right.gap || left.bottom_z != right.bottom_z || left.dependency != right.dependency ||
+                        left.bridge_followup != right.bridge_followup || left.paths != right.paths ||
+                        left.path_widths != right.path_widths || left.footprint != right.footprint ||
+                        left.emitting_regions != right.emitting_regions || left.free_ended != right.free_ended ||
+                        left.producers != right.producers || left.solid_cuts != right.solid_cuts ||
+                        left.path_footprints != right.path_footprints || left.extrusions.size() != right.extrusions.size()) return false;
+                    for (size_t index = 0; index < left.extrusions.size(); ++index) {
+                        const ExtrusionPath &before = left.extrusions[index], &after = right.extrusions[index];
+                        if (before.polyline != after.polyline || before.role() != after.role() ||
+                            before.width != after.width || before.height != after.height || before.mm3_per_mm != after.mm3_per_mm ||
+                            before.is_force_no_extrusion() != after.is_force_no_extrusion()) return false;
+                    }
+                }
+                return true;
+            };
+            const auto check_changed_layers = [&](const std::set<size_t> &changed) {
+                std::set<size_t> checked_layers;
+                for (size_t index : changed) {
+                    m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                    if (index > 0) checked_layers.insert(index);
+                    if (index + 1 < m_layers.size()) checked_layers.insert(index + 1);
+                }
+                std::vector<Target> selected;
+                for (const Target &target : roofs) if (checked_layers.count(target.upper_layer)) selected.push_back(target);
+                const auto actual = collect_targets(*this, false, false, &checked_layers);
+                // Coarsening may remove support, never adopt a different
+                // required model path to avoid its frozen support obligation.
+                if (!same_model_targets(selected, actual)) return false;
+                auto rejected = check_targets(*this, actual);
+                if (rejected.empty()) rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers));
+                for (const Failure &failure : rejected)
+                    if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
+                return rejected.empty();
+            };
+            bool accepted;
+            do {
+                accepted = false;
+                struct Candidate { size_t region; BridgeAwareCubic::Refinement refinement; };
+                std::vector<Candidate> candidates;
+                for (size_t region = 0; region < m_bridge_aware_cubic_plans.size(); ++region)
+                    if (const auto *plan = bridge_aware_cubic_plan(region))
+                        for (const auto &refinement : plan->refinements()) candidates.push_back({region, refinement});
+                std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
+                    if (a.refinement.top_z != b.refinement.top_z) return a.refinement.top_z > b.refinement.top_z;
+                    if (a.refinement.id.depth != b.refinement.id.depth) return a.refinement.id.depth > b.refinement.id.depth;
+                    return std::tie(a.region, a.refinement.id) < std::tie(b.region, b.refinement.id);
+                });
+                for (const Candidate &candidate : candidates) {
+                    throw_if_canceled();
+                    auto &current = m_bridge_aware_cubic_plans[candidate.region];
+                    if (std::none_of(current->refinements().begin(), current->refinements().end(), [&](const auto &entry) {
+                        return entry.id == candidate.refinement.id;
+                    })) continue;
+                    if (++trials > 10000)
+                        throw SlicingError("Bridge aware cubic exceeded the final coarsening work limit; no minimal support certificate was produced.", model_object()->id().id);
+                    std::vector<std::unique_ptr<BridgeAwareCubic::Plan>> previous(m_bridge_aware_cubic_plans.size());
+                    for (size_t region = 0; region < previous.size(); ++region)
+                        if (m_bridge_aware_cubic_plans[region])
+                            previous[region] = std::make_unique<BridgeAwareCubic::Plan>(m_bridge_aware_cubic_plans[region]->clone());
+                    const auto previous_indices = demand_indices;
+                    current = std::make_unique<BridgeAwareCubic::Plan>(current->collapsed(candidate.refinement.id));
+                    prune_dependencies();
+                    const auto changed = changed_plan_layers(previous, previous_indices);
+                    const bool verified = check_changed_layers(changed);
+                    if (verified) accepted = true;
+                    else {
+                        m_bridge_aware_cubic_plans = std::move(previous);
+                        demand_indices = previous_indices;
+                        for (size_t index : changed)
+                            m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                    }
+                }
+                // A shared interface partition is a complete construction
+                // stack, not an immortal direct-demand root. Trial-remove all
+                // of its identical XY courses together, release their support
+                // obligations, and certify the remaining final deposition.
+                const auto same_paths = [](const Polylines &a, const Polylines &b) {
+                    if (a.size() != b.size()) return false;
+                    for (size_t i = 0; i < a.size(); ++i) if (!same_polyline(a[i], b[i])) return false;
+                    return true;
+                };
+                for (size_t owner = 0; owner < closures.size(); ++owner) {
+                    if (!m_bridge_aware_cubic_plans[owner]) continue;
+                    std::vector<Polylines> stacks;
+                    for (const auto &closure : closures[owner])
+                        if (std::none_of(stacks.begin(), stacks.end(), [&](const auto &paths) { return same_paths(paths, closure.paths); }))
+                            stacks.push_back(closure.paths);
+                    for (const auto &stack : stacks) {
+                        if (++trials > 10000)
+                            throw SlicingError("Bridge aware cubic exceeded the final closure coarsening work limit.", model_object()->id().id);
+                        std::vector<std::unique_ptr<BridgeAwareCubic::Plan>> previous(m_bridge_aware_cubic_plans.size());
+                        for (size_t region = 0; region < previous.size(); ++region)
+                            if (m_bridge_aware_cubic_plans[region])
+                                previous[region] = std::make_unique<BridgeAwareCubic::Plan>(m_bridge_aware_cubic_plans[region]->clone());
+                        const auto previous_indices = demand_indices;
+                        const auto previous_closures = closures[owner];
+                        auto &remaining = closures[owner];
+                        remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [&](const auto &closure) {
+                            return same_paths(stack, closure.paths);
+                        }), remaining.end());
+                        m_bridge_aware_cubic_plans[owner] = std::make_unique<BridgeAwareCubic::Plan>(
+                            m_bridge_aware_cubic_plans[owner]->with_payloads(remaining, attachments[owner]));
+                        prune_dependencies();
+                        const auto changed = changed_plan_layers(previous, previous_indices);
+                        const bool verified = check_changed_layers(changed);
+                        if (verified) accepted = true;
+                        else {
+                            m_bridge_aware_cubic_plans = std::move(previous);
+                            demand_indices = previous_indices;
+                            closures[owner] = previous_closures;
+                            for (size_t index : changed)
+                                m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                        }
+                    }
+                }
+            } while (accepted);
+            const auto final_model_targets = collect_targets(*this, false, false);
+            if (!same_model_targets(roofs, final_model_targets))
+                throw SlicingError("Bridge aware cubic could not preserve the required model paths during final support reduction.", model_object()->id().id);
+            failures = check_targets(*this, final_model_targets);
+            if (failures.empty()) failures = check_targets(*this, collect_targets(*this, true, false));
+            if (!failures.empty()) fail(*this, failures.front());
             // Reservation is separate from refinement demand. An added strand
             // already supported by a retained parent face must not split that
             // parent's otherwise coarse cells, but combination must retain the
@@ -487,26 +2723,246 @@ void PrintObject::prepare_bridge_aware_cubic()
             return;
         }
 
+        if (pass == propagation_limit) {
+            failures.front().result.completed = false;
+            failures.front().result.resource_limited = true;
+            failures.front().result.failure_reason =
+                "The bounded support-repair work limit was reached before a complete support certificate could be produced.";
+            fail(*this, failures.front());
+        }
         bool repaired = false;
+        // Plans remain immutable during this repair pass. Reuse each layer's
+        // exact clipped emission batch across paths and producing-cell queries.
+        std::map<std::pair<size_t, size_t>,
+            std::vector<std::pair<BridgeAwareCubic::CellId, Polylines>>> partition_batches;
         for (const Failure &failure : failures) {
             if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
-            // Changing sparse cubic partitions cannot repair spacing between
-            // already emitted bridge planes. Report this setting conflict.
+            // A short free tail can be repaired only by extending real upper
+            // deposition into qualified prior material inside its own region.
+            if (repair_attachments(*this, failure, attachments)) { repaired = true; continue; }
+            // A physically open strip beside a wall is closed only by actual
+            // deposition joining that wall, never by the logical fill boundary.
+            if (repair_wall_connections(*this, failure, attachments)) { repaired = true; continue; }
+            // Independent modifier lattices have no implicit wall at their
+            // logical boundary. Construct an owned physical partition and its
+            // preceding courses before asking either lattice to split again.
+            if (repair_interfaces(*this, failure, closures)) { repaired = true; continue; }
             if (failure.target.bridge_followup) fail(*this, failure);
             const size_t lower_index = failure.target.upper_layer - 1;
             const Layer &lower = *m_layers[lower_index];
-            const ExPolygons affected = repair_footprint(failure);
+            struct Fragment {
+                ExPolygons footprint;
+                std::vector<Dependency::SourceOwner> sources;
+                Polyline closure_source;
+                Polyline source_path;
+            };
+            std::vector<Fragment> fragments;
+            if (failure.target.dependency) {
+                // Distinct emitted strands are separate obligations. OR over
+                // producers of different fragments would keep an orphan after
+                // only one fragment's producer survived.
+                const Layer &construction_layer = *m_layers[failure.target.upper_layer];
+                const ActiveAttachments active = active_attachments(construction_layer);
+                for (size_t index = 0; index < failure.target.paths.size(); ++index) {
+                    Failure selected;
+                    selected.target.upper_layer = failure.target.upper_layer;
+                    selected.target.supporting_region = failure.target.supporting_region;
+                    selected.target.gap = failure.target.gap;
+                    selected.target.dependency = true;
+                    selected.target.paths = {failure.target.paths[index]};
+                    selected.target.path_widths = {failure.target.path_widths[index]};
+                    selected.target.extrusions = {failure.target.extrusions[index]};
+                    selected.target.footprint = path_demand(failure.target, index);
+                    selected.target.path_footprints = {selected.target.footprint};
+                    if (!failure.verified_paths.empty()) selected.verified_paths = {failure.verified_paths[index]};
+                    for (auto run : failure.result.unsupported_runs)
+                        if (run.path_index == index && (run.exceeds_gap ||
+                            run.kind != BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge)) {
+                            run.path_index = 0;
+                            selected.result.unsupported_runs.push_back(run);
+                        }
+                    if (selected.result.unsupported_runs.empty()) continue;
+                    const ExPolygons failed = repair_footprint(selected);
+                    const size_t emitter = failure.target.emitting_regions[index];
+                    const auto *producer_plan = bridge_aware_cubic_plan(emitter);
+                    ExPolygons covered;
+                    if (producer_plan != nullptr) {
+                        const double z = m_layers[failure.target.upper_layer]->print_z;
+                        const ExPolygon domain(Polygon{Points{bounds.min, Point(bounds.max.x(), bounds.min.y()), bounds.max,
+                            Point(bounds.min.x(), bounds.max.y())}});
+                        const auto key = std::make_pair(failure.target.upper_layer, emitter);
+                        auto cached = partition_batches.find(key);
+                        if (cached == partition_batches.end())
+                            cached = partition_batches.emplace(key, producer_plan->partition_lines(z, domain)).first;
+                        const auto owner_lines = [&](const BridgeAwareCubic::CellId &owner) -> const Polylines& {
+                            const auto &batch = cached->second;
+                            const auto found = std::lower_bound(batch.begin(), batch.end(), owner,
+                                [](const auto &entry, const auto &id) { return entry.first < id; });
+                            static const Polylines empty;
+                            return found != batch.end() && found->first == owner ? found->second : empty;
+                        };
+                        Polylines segments;
+                        const Polyline &path = failure.target.paths[index];
+                        for (size_t i = 1; i < path.size(); ++i)
+                            segments.emplace_back(Points{path.points[i - 1], path.points[i]});
+                        std::set<size_t> lineage;
+                        for (const auto &attachment : active.entries)
+                            if (attachment.emitting_region == emitter) {
+                                const auto chain = resolve_attachments(construction_layer, attachment.original,
+                                    failure.target.extrusions[index].width, failure.target.extrusions[index].height, emitter, active);
+                                if (!chain.applied_indices.empty() && same_polyline(path, chain.polyline))
+                                    lineage.insert(chain.applied_indices.begin(), chain.applied_indices.end());
+                            }
+                        const auto solid_sections = producer_plan->solid_sections(z);
+                        for (const auto &refinement : producer_plan->refinements()) {
+                            ExPolygons produced;
+                            if (refinement.solid) {
+                                for (const auto &cell : solid_sections)
+                                    if (cell.cell_id == refinement.id) {
+                                        if (failure.target.solid_cuts[index]) {
+                                            if (std::find(failure.target.producers[index].begin(), failure.target.producers[index].end(), refinement.id) !=
+                                                failure.target.producers[index].end()) {
+                                                ExPolygons selection = BridgeAwareCubic::solid_cut_endpoint_demand(path,
+                                                    {ExPolygon(cell.polygon)}, failure.target.path_widths[index], geometry_tolerance);
+                                                for (size_t id : lineage) {
+                                                    const auto &attachment = active.entries[id];
+                                                    if (active.storage_regions[id] == emitter && attachment.solid_cut &&
+                                                        std::find(attachment.owners.begin(), attachment.owners.end(), refinement.id) !=
+                                                            attachment.owners.end())
+                                                        append(selection, attachment.demand_selection);
+                                                }
+                                                // The collector selects a square terminal
+                                                // neighbourhood, whose diagonal corner need
+                                                // not lie in an offset of the solid cell.
+                                                // Reuse that exact selector on the real bead.
+                                                append(produced, BridgeAwareCubic::solid_cut_provenance_footprint(
+                                                    path, union_ex(selection), failure.target.path_widths[index]));
+                                            }
+                                        } else {
+                                            // Solid fill is finite-width deposition. Its
+                                            // owning cell contains the centreline, while
+                                            // the printed edge can extend beyond that
+                                            // section by half the real bead width.
+                                            const auto centre = intersection_pl(Polylines{path}, ExPolygons{ExPolygon(cell.polygon)});
+                                            append(produced, BridgeAwareCubic::partition_provenance_footprint(centre,
+                                                failure.target.path_widths[index], 2. * geometry_tolerance, &segments));
+                                        }
+                                    }
+                            } else {
+                                const Polylines &lines = owner_lines(refinement.id);
+                                const auto matching = remove_collinear_duplicates(segments, lines, true);
+                                produced = BridgeAwareCubic::partition_provenance_footprint(
+                                    matching, failure.target.path_widths[index], geometry_tolerance, &segments);
+                            }
+                            for (size_t id : lineage) {
+                                const auto &attachment = active.entries[id];
+                                if (active.storage_regions[id] != emitter ||
+                                    std::find(attachment.owners.begin(), attachment.owners.end(), refinement.id) == attachment.owners.end()) continue;
+                                // Buffer only the real terminal addition. A
+                                // widened replacement minus a narrower original
+                                // creates a false halo along unchanged material.
+                                Polylines added;
+                                if (attachment.original.first_point() != attachment.replacement.first_point())
+                                    added.emplace_back(Points{attachment.replacement.first_point(), attachment.original.first_point()});
+                                if (attachment.original.last_point() != attachment.replacement.last_point())
+                                    added.emplace_back(Points{attachment.original.last_point(), attachment.replacement.last_point()});
+                                append(produced, BridgeAwareCubic::partition_provenance_footprint(added,
+                                    failure.target.path_widths[index], 2. * geometry_tolerance, &segments));
+                            }
+                            ExPolygons local = intersection_ex(failed, produced);
+                            if (local.empty()) continue;
+                            // Keep the original provenance envelope for this
+                            // coverage proof. Re-unioning rounded intersections
+                            // can manufacture a second sliver along failed's edge.
+                            append(covered, produced);
+                            // The local selected fragment identifies the exact
+                            // producer that creates this obligation. Its complete
+                            // failing air run can require a landing in another
+                            // participating region, including beyond an attached
+                            // endpoint's original modifier boundary.
+                            ExPolygons complete_run = BridgeAwareCubic::select_unsupported_run_demands(
+                                selected.target.paths, selected.verified_paths, selected.target.path_widths,
+                                {local}, selected.result.unsupported_runs, geometry_tolerance, true);
+                            fragments.push_back({std::move(complete_run), {{emitter, refinement.id}}, {}, path});
+                        }
+                    }
+                    // Persistent interface courses are explicit direct
+                    // obligations. Any residual comes from their actual saved
+                    // path, never from a perpendicular crossing lattice face.
+                    ExPolygons residual = diff_ex(failed, union_ex(covered));
+                    if (!residual.empty()) {
+                        ExPolygons explicit_courses;
+                        const double z = m_layers[failure.target.upper_layer]->print_z;
+                        const auto matching = remove_collinear_duplicates({failure.target.paths[index]},
+                            BridgeAwareCubic::layer_closure_lines(*m_layers[failure.target.upper_layer]), true);
+                        const Polylines source{failure.target.paths[index]};
+                        append(explicit_courses, BridgeAwareCubic::partition_provenance_footprint(matching,
+                            failure.target.path_widths[index], geometry_tolerance, &source));
+                        if (!diff_ex(residual, union_ex(explicit_courses)).empty()) {
+                            throw SlicingError("Bridge aware cubic could not identify the exact producer of a required construction fragment for object \"" +
+                                model_object()->name + "\", layer " + std::to_string(m_layers[failure.target.upper_layer]->id() + 1) +
+                                " (Z " + std::to_string(z) + " mm).", model_object()->id().id);
+                        }
+                        ExPolygons complete_run = BridgeAwareCubic::select_unsupported_run_demands(
+                            selected.target.paths, selected.verified_paths, selected.target.path_widths,
+                            {residual}, selected.result.unsupported_runs, geometry_tolerance, true);
+                        fragments.push_back({std::move(complete_run), {}, failure.target.paths[index], failure.target.paths[index]});
+                    }
+                }
+            } else fragments.push_back({repair_footprint(failure, true), {}});
             // Propagate the specific failed footprint into allowed sparse
             // material. Do not refine a roof's bounding box or a whole ancestor.
-            for (size_t region_id = 0; region_id < lower.regions().size(); ++region_id) {
+            for (const Fragment &fragment : fragments) for (size_t region_id = 0; region_id < lower.regions().size(); ++region_id) {
                 if (parameters[region_id].flow_spacing <= 0.) continue;
-                ExPolygons local = intersection_ex(affected, sparse_domain(*lower.get_region(int(region_id))));
+                ExPolygons local = intersection_ex(fragment.footprint, sparse_domain(*lower.get_region(int(region_id))));
                 if (local.empty()) continue;
-                const double gap = std::min(failure.target.gap,
-                    printing_region(region_id).config().bridge_aware_cubic_max_gap.value) /
-                    std::pow(2., failure.target.dependency ? pass : pass + 1);
-                if (gap <= parameters[region_id].flow_spacing + geometry_tolerance) continue;
+                PathIdentity path_identity;
+                path_identity.reserve(fragment.source_path.size());
+                for (const Point &point : fragment.source_path.points)
+                    path_identity.emplace_back(point.x(), point.y());
+                const PathIdentity reversed(path_identity.rbegin(), path_identity.rend());
+                if (reversed < path_identity) path_identity = reversed;
+                auto sources = fragment.sources;
+                std::sort(sources.begin(), sources.end());
+                sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
+                MaskIdentity mask_identity;
+                if (!failure.target.dependency) {
+                    // Distinct direct failures in one roof group must not
+                    // inherit each other's refinement strength. Polygon
+                    // winding is retained while cyclic starts/order normalize.
+                    for (const Polygon &ring : to_polygons(local)) {
+                        PathIdentity points;
+                        points.reserve(ring.size());
+                        for (const Point &point : ring.points) points.emplace_back(point.x(), point.y());
+                        if (!points.empty()) std::rotate(points.begin(), std::min_element(points.begin(), points.end()), points.end());
+                        mask_identity.push_back(std::move(points));
+                    }
+                    std::sort(mask_identity.begin(), mask_identity.end());
+                }
+                const RepairIdentity identity{lower_index, region_id, failure.target.supporting_region,
+                    failure.target.bottom_z, failure.target.dependency, std::move(sources), std::move(path_identity), std::move(mask_identity)};
+                unsigned &attempt = local_repairs[identity];
+                const double gap = std::ldexp(std::min(failure.target.gap,
+                    printing_region(region_id).config().bridge_aware_cubic_max_gap.value),
+                    -int(attempt + (failure.target.dependency ? 0 : 1)));
+                // A sub-spacing gap may be feasible with a supported solid
+                // patch. The emitted solid geometry, not nominal line spacing,
+                // decides feasibility in the next authoritative check.
+                if (attempt >= parameters[region_id].max_depth || gap <= geometry_tolerance) {
+                    Failure incomplete = failure;
+                    incomplete.result.completed = false;
+                    incomplete.result.resource_limited = true;
+                    incomplete.result.failure_reason =
+                        "A local support obligation exhausted the finite refinement depth or geometry resolution before verification completed.";
+                    fail(*this, incomplete);
+                }
+                const Dependency::DemandKey key{region_id, demands[region_id].size()};
+                if (!fragment.sources.empty()) obligations.push_back({key, fragment.sources});
+                else if (fragment.closure_source.size() >= 2)
+                    closure_roots.push_back({key, m_layers[failure.target.upper_layer]->print_z, fragment.closure_source});
+                else direct_roots.push_back(key);
                 demands[region_id].push_back({std::move(local), lower.print_z, gap - geometry_tolerance});
+                ++attempt;
                 repaired = true;
             }
         }
@@ -518,22 +2974,34 @@ void PrintObject::prepare_bridge_aware_cubic()
 void PrintObject::validate_bridge_aware_cubic() const
 {
     if (!has_bridge_aware_cubic()) return;
-    if (m_shared_object != nullptr) {
-        m_shared_object->validate_bridge_aware_cubic();
-        return;
-    }
+    const PrintObject &geometry = m_shared_object == nullptr ? *this : *m_shared_object;
+    // Untargeted paths can precede a model target in the exporter. Check their
+    // straight-path representation and output-coordinate range too. BAC
+    // export retains every nonzero source edge, including tiny destinations.
+    for (const auto &phase : serialization_phases(geometry, this))
+        for (const Layer *layer : geometry.layers()) {
+            print()->throw_if_canceled();
+            visit_layer(*layer, [&](const ExtrusionPath &path) {
+                try {
+                    phase.validate_path(path.polyline);
+                } catch (const std::logic_error &error) {
+                    throw SlicingError("Bridge aware cubic cannot certify serialized extrusion geometry for object \"" +
+                        model_object()->name + "\", layer " + std::to_string(layer->id() + 1) + ": " + error.what(), model_object()->id().id);
+                }
+            });
+        }
     for (size_t region_id = 0; region_id < num_printing_regions(); ++region_id) {
         if (!participates(printing_region(region_id).config()) || bridge_aware_cubic_plan(region_id) != nullptr)
             continue;
-        for (const Layer *layer : m_layers)
+        for (const Layer *layer : geometry.layers())
             if (!sparse_domain(*layer->get_region(int(region_id))).empty())
                 throw SlicingError("Bridge aware cubic support plan is missing for object \"" + model_object()->name +
                     "\". Reslice the object to rebuild and verify its support geometry.", model_object()->id().id);
     }
-    auto failures = check_targets(*this, collect_targets(*this, false));
-    if (!failures.empty()) fail(*this, failures.front());
-    failures = check_targets(*this, collect_targets(*this, true));
-    if (!failures.empty()) fail(*this, failures.front());
+    auto failures = check_targets(geometry, collect_targets(geometry, false, false), this);
+    if (!failures.empty()) fail(geometry, failures.front());
+    failures = check_targets(geometry, collect_targets(geometry, true, false), this);
+    if (!failures.empty()) fail(geometry, failures.front());
 }
 
 } // namespace Slic3r

@@ -1032,6 +1032,7 @@ PrintConfigDef::PrintConfigDef()
     assign_printer_technology_to_unknown(this->options, ptAny);
     this->init_fff_params();
     this->init_extruder_option_keys();
+    this->init_filament_option_keys();
     assign_printer_technology_to_unknown(this->options, ptFFF);
     this->init_sla_params();
     assign_printer_technology_to_unknown(this->options, ptSLA);
@@ -6855,9 +6856,9 @@ void PrintConfigDef::init_filament_option_keys()
 
     m_filament_retract_keys = {
         "deretraction_speed",
+        "filament_retract_length_nc",
         "long_retractions_when_cut",
         "retract_before_wipe",
-        "filament_retract_length_nc",
         "retract_restart_extra",
         "retract_when_changing_layer",
         "retraction_distances_when_cut",
@@ -7862,8 +7863,11 @@ DynamicPrintConfig DynamicPrintConfig::full_print_config()
 	return DynamicPrintConfig((const PrintRegionConfig&)FullPrintConfig::defaults());
 }
 
-DynamicPrintConfig::DynamicPrintConfig(const StaticPrintConfig& rhs) : DynamicConfig(rhs, rhs.keys_ref())
+DynamicPrintConfig::DynamicPrintConfig(const StaticPrintConfig& rhs)
 {
+    // Static generic enum vectors contain values but no serialization dictionary.
+    // Create definition-backed dynamic options before copying their values.
+    this->apply_only(rhs, rhs.keys_ref());
 }
 
 DynamicPrintConfig* DynamicPrintConfig::new_from_defaults_keys(const std::vector<std::string> &keys)

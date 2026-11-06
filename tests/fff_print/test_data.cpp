@@ -2,6 +2,7 @@
 
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Format/OBJ.hpp"
@@ -186,13 +187,24 @@ TriangleMesh mesh(TestMesh m)
     return mesh;
 }
 
-static bool verbose_gcode() 
+void arrange_on_print_bed(Model &model, const DynamicPrintConfig &config)
 {
-    const char *v = std::getenv("SLIC3R_TESTS_GCODE");
-    if (v == nullptr)
-    	return false;
-    std::string s(v);
-    return s == "1" || s == "on" || s == "yes";
+    // Use the same candidate preparation as the GUI, including configured
+    // material and support information, before applying clearance inflation.
+    ArrangePolygons candidates;
+    for (ModelObject *object : model.objects)
+        for (ModelInstance *instance : object->instances)
+            candidates.emplace_back(get_instance_arrange_poly(instance, config));
+
+    ArrangeParams params{scaled(min_object_distance(config))};
+    arrangement::update_arrange_params(params, config, candidates);
+    arrangement::update_selected_items_inflation(candidates, config, params);
+    arrangement::arrange(candidates, arrangement::get_shrink_bedpts(config, params), params);
+    for (ArrangePolygon &candidate : candidates) {
+        if (candidate.bed_idx != 0)
+            throw_if_out_of_bed(candidate);
+        candidate.apply();
+    }
 }
 
 void init_print(std::vector<TriangleMesh> &&meshes, Slic3r::Print &print, Slic3r::Model &model, const DynamicPrintConfig &config_in, bool comments)
@@ -200,16 +212,13 @@ void init_print(std::vector<TriangleMesh> &&meshes, Slic3r::Print &print, Slic3r
 	DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
     config.apply(config_in);
 
-    if (verbose_gcode())
-        config.set_key_value("gcode_comments", new ConfigOptionBool(true));
-
     for (const TriangleMesh &t : meshes) {
 		ModelObject *object = model.add_object();
 		object->name += "object.stl";
 		object->add_volume(std::move(t));
 		object->add_instance();
 	}
-    arrange_objects(model, InfiniteBed{}, ArrangeParams{ scaled(min_object_distance(config))});
+    arrange_on_print_bed(model, config);
 	for (ModelObject *mo : model.objects) {
         mo->ensure_on_bed();
 		print.auto_assign_extruders(mo);
@@ -282,10 +291,12 @@ void init_and_process_print(std::initializer_list<TriangleMesh> meshes, Slic3r::
 
 std::string gcode(Print & print)
 {
-	boost::filesystem::path temp = boost::filesystem::unique_path();
+    const boost::filesystem::path temp = boost::filesystem::temp_directory_path() /
+        boost::filesystem::unique_path("bambu-gcode-test-%%%%-%%%%-%%%%.gcode");
     print.set_status_silent();
     print.process();
-    print.export_gcode(temp.string(), nullptr, nullptr);
+    GCodeProcessorResult result;
+    print.export_gcode(temp.string(), &result, nullptr);
     std::ifstream t(temp.string());
 	std::string str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
 	boost::nowide::remove(temp.string().c_str());
@@ -338,6 +349,90 @@ std::string slice(std::initializer_list<TriangleMesh> meshes, std::initializer_l
 
 #include <catch2/catch.hpp>
 
+TEST_CASE("A new print starts at the default plate origin", "[test_data]")
+{
+    Slic3r::Print print;
+    REQUIRE(print.get_plate_origin().isZero());
+}
+
+TEST_CASE("Print fixture placement uses the configured bed and spacing", "[test_data]")
+{
+    using namespace Slic3r;
+    const DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    Model model;
+
+    SECTION("Fresh candidates are placed on the physical bed with their requested clearance") {
+        for (int i = 0; i < 2; ++i) {
+            ModelObject *object = model.add_object();
+            object->add_volume(make_cube(20., 20., 20.));
+            object->add_instance();
+        }
+        Test::arrange_on_print_bed(model, config);
+
+        const BoundingBoxf bed(config.option<ConfigOptionPoints>("printable_area")->values);
+        std::vector<BoundingBoxf3> boxes;
+        for (const ModelObject *object : model.objects) {
+            boxes.push_back(object->instance_bounding_box(size_t(0)));
+            for (int axis = 0; axis < 2; ++axis) {
+                REQUIRE(boxes.back().min[axis] >= bed.min[axis] - EPSILON);
+                REQUIRE(boxes.back().max[axis] <= bed.max[axis] + EPSILON);
+            }
+        }
+        const double gap_x = std::max({0., boxes[0].min.x() - boxes[1].max.x(), boxes[1].min.x() - boxes[0].max.x()});
+        const double gap_y = std::max({0., boxes[0].min.y() - boxes[1].max.y(), boxes[1].min.y() - boxes[0].max.y()});
+        REQUIRE(std::hypot(gap_x, gap_y) >= min_object_distance(config) - EPSILON);
+    }
+
+    SECTION("An oversized object still fails placement") {
+        ModelObject *object = model.add_object();
+        object->add_volume(make_cube(250., 250., 20.));
+        object->add_instance();
+        REQUIRE_THROWS_AS(Test::arrange_on_print_bed(model, config), Slic3r::RuntimeError);
+    }
+}
+
+TEST_CASE("Legacy model arrangement prepares fresh packing candidates", "[test_data][arrange]")
+{
+    using namespace Slic3r;
+    const BoundingBox bed(Point(0, 0), Point(scaled(200.), scaled(200.)));
+    const ArrangeParams params(scaled(6.));
+    Model model;
+    ModelObject *object = model.add_object();
+    object->add_volume(make_cube(20., 20., 20.));
+    object->add_instance();
+
+    SECTION("Individual instances fit on the physical bed with requested spacing") {
+        object->add_instance();
+        REQUIRE(arrange_objects(model, bed, params));
+    }
+    SECTION("Copies of a whole model fit on the physical bed with requested spacing") {
+        REQUIRE_NOTHROW(duplicate(model, size_t(2), bed, params));
+    }
+    SECTION("Oversized instances still fail placement") {
+        object->scale(Vec3d(15., 15., 1.));
+        REQUIRE_THROWS_AS(arrange_objects(model, bed, params), Slic3r::RuntimeError);
+        return;
+    }
+    SECTION("Oversized model copies still fail placement") {
+        object->scale(Vec3d(15., 15., 1.));
+        REQUIRE_THROWS_AS(duplicate(model, size_t(2), bed, params), Slic3r::RuntimeError);
+        return;
+    }
+
+    REQUIRE(object->instances.size() == 2);
+    const BoundingBoxf3 first = object->instance_bounding_box(size_t(0));
+    const BoundingBoxf3 second = object->instance_bounding_box(size_t(1));
+    for (const BoundingBoxf3 &box : {first, second}) {
+        for (int axis = 0; axis < 2; ++axis) {
+            REQUIRE(box.min[axis] >= -EPSILON);
+            REQUIRE(box.max[axis] <= 200. + EPSILON);
+        }
+    }
+    const double gap_x = std::max({0., first.min.x() - second.max.x(), second.min.x() - first.max.x()});
+    const double gap_y = std::max({0., first.min.y() - second.max.y(), second.min.y() - first.max.y()});
+    REQUIRE(std::hypot(gap_x, gap_y) >= 6. - EPSILON);
+}
+
 SCENARIO("init_print functionality", "[test_data]") {
 	GIVEN("A default config") {
 		Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
@@ -367,4 +462,65 @@ SCENARIO("init_print functionality", "[test_data]") {
 #endif
 		}
 	}
+}
+
+TEST_CASE("Static print defaults retain enum dictionaries in dynamic copies", "[Config][GCode]")
+{
+    const Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
+    size_t enum_vectors = 0;
+    for (const std::string &key : config.keys()) {
+        const Slic3r::ConfigOption *option = config.option(key);
+        if (option->type() != Slic3r::coEnums)
+            continue;
+        CAPTURE(key);
+        const Slic3r::ConfigOptionDef *definition = config.def()->get(key);
+        REQUIRE(definition != nullptr);
+        REQUIRE(definition->enum_keys_map != nullptr);
+        if (option->nullable()) {
+            const auto *value = dynamic_cast<const Slic3r::ConfigOptionEnumsGenericNullable *>(option);
+            REQUIRE(value != nullptr);
+            REQUIRE(value->keys_map == definition->enum_keys_map);
+        } else {
+            const auto *value = dynamic_cast<const Slic3r::ConfigOptionEnumsGeneric *>(option);
+            REQUIRE(value != nullptr);
+            REQUIRE(value->keys_map == definition->enum_keys_map);
+        }
+        REQUIRE_NOTHROW(option->serialize());
+        ++enum_vectors;
+    }
+    REQUIRE(enum_vectors > 0);
+}
+
+TEST_CASE("Changing filament count resizes material slots without adding nozzles", "[Config][GCode]")
+{
+    using namespace Slic3r;
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict("filament_diameter", "1.72");
+    config.set_deserialize_strict("filament_colour", "#123456");
+    const std::vector<double> nozzle_diameters = config.option<ConfigOptionFloats>("nozzle_diameter")->values;
+
+    config.set_num_filaments(4);
+    REQUIRE(config.option<ConfigOptionFloats>("filament_diameter")->values == std::vector<double>(4, 1.72));
+    REQUIRE(config.option<ConfigOptionStrings>("filament_colour")->values == std::vector<std::string>(4, "#123456"));
+    REQUIRE(config.option<ConfigOptionFloats>("nozzle_diameter")->values == nozzle_diameters);
+
+    config.option<ConfigOptionFloats>("filament_diameter")->values[1] = 1.80;
+    config.set_num_filaments(2);
+    REQUIRE(config.option<ConfigOptionFloats>("filament_diameter")->values == std::vector<double>({1.72, 1.80}));
+    REQUIRE(config.option<ConfigOptionStrings>("filament_colour")->values.size() == 2);
+    REQUIRE(config.option<ConfigOptionFloats>("nozzle_diameter")->values == nozzle_diameters);
+}
+
+TEST_CASE("G-code export permits a null preview result", "[GCode]")
+{
+    Slic3r::Print print;
+    Slic3r::Model model;
+    Slic3r::Test::init_print({Slic3r::Test::TestMesh::cube_20x20x20}, print, model);
+    print.process();
+    const boost::filesystem::path path = boost::filesystem::temp_directory_path() /
+        boost::filesystem::unique_path("bambu-no-preview-%%%%-%%%%-%%%%.gcode");
+    REQUIRE_NOTHROW(print.export_gcode(path.string(), nullptr));
+    REQUIRE(boost::filesystem::is_regular_file(path));
+    REQUIRE(boost::filesystem::file_size(path) > 0);
+    boost::nowide::remove(path.string().c_str());
 }

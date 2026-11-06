@@ -136,7 +136,7 @@ typedef std::vector< PolyNode* > PolyNodes;
 class PolyNode 
 { 
 public:
-    PolyNode() : Childs(), Parent(0), Index(0), m_IsOpen(false) {}
+    PolyNode() : Childs(), Parent(0), Index(0), m_IsOpen(false), m_OpenPathIndex(size_t(-1)) {}
     virtual ~PolyNode(){};
     Path Contour;
     PolyNodes Childs;
@@ -144,11 +144,16 @@ public:
     // Traversal of the polygon tree in a depth first fashion.
     PolyNode* GetNext() const { return Childs.empty() ? GetNextSiblingUp() : Childs.front(); }
     bool IsHole() const;
-    bool IsOpen() const { return m_IsOpen; }  
+    bool IsOpen() const { return m_IsOpen; }
+    // Index among supplied open input paths, including rejected/empty slots.
+    // Closed inputs do not advance it. Invalid for closed output or an
+    // unexpected merge of distinct sources. Indices restart after Clear().
+    size_t OpenPathIndex() const { return m_OpenPathIndex; }
     int  ChildCount() const { return (int)Childs.size(); }
 private:
     unsigned Index; //node index in Parent.Childs
     bool m_IsOpen;
+    size_t m_OpenPathIndex;
     JoinType m_jointype;
     EndType m_endtype;
     PolyNode* GetNextSiblingUp() const { return Parent ? ((Index == Parent->Childs.size() - 1) ? Parent->GetNextSiblingUp() : Parent->Childs[Index + 1]) : nullptr; }
@@ -171,6 +176,7 @@ public:
         Parent     = nullptr;
         Index      = src.Index;
         m_IsOpen   = src.m_IsOpen;
+        m_OpenPathIndex = src.m_OpenPathIndex;
         m_jointype = src.m_jointype;
         m_endtype  = src.m_endtype;
         for (size_t i = 0; i < Childs.size(); ++ i)
@@ -235,6 +241,7 @@ enum EdgeSide { esLeft = 1, esRight = 2};
     int WindCnt;
     int WindCnt2; //winding count of the opposite polytype
     int OutIdx;
+    size_t OpenPathIndex;
     // Next edge in the input path.
     TEdge *Next;
     // Previous edge in the input path.
@@ -309,6 +316,9 @@ public:
     if (num_paths == 1)
         return AddPath(*paths_provider.begin(), PolyTyp, Closed);
 
+    const size_t first_open_path = m_OpenPathCount;
+    if (!Closed) m_OpenPathCount += num_paths;
+
     std::vector<int> num_edges(num_paths, 0);
     int num_edges_total = 0;
     size_t i = 0;
@@ -337,7 +347,8 @@ public:
     i = 0;
     for (const Path &pg : paths_provider) {
       if (num_edges[i]) {
-        bool res = AddPathInternal(pg, num_edges[i] - 1, PolyTyp, Closed, p_edge);
+        bool res = AddPathInternal(pg, num_edges[i] - 1, PolyTyp, Closed, p_edge,
+                                  Closed ? size_t(-1) : first_open_path + i);
         if (res) {
           p_edge += num_edges[i];
           result = true;
@@ -358,7 +369,8 @@ public:
   bool PreserveCollinear() const {return m_PreserveCollinear;};
   void PreserveCollinear(bool value) {m_PreserveCollinear = value;};
 protected:
-  bool AddPathInternal(const Path &pg, int highI, PolyType PolyTyp, bool Closed, TEdge* edges);
+  bool AddPathInternal(const Path &pg, int highI, PolyType PolyTyp, bool Closed, TEdge* edges,
+                       size_t open_path_index);
   TEdge* AddBoundsToLML(TEdge *e, bool IsClosed);
   void Reset();
   TEdge* ProcessBound(TEdge* E, bool IsClockwise);
@@ -382,6 +394,7 @@ protected:
   bool             m_PreserveCollinear;
   // Is any of the paths inserted by AddPath() or AddPaths() open?
   bool             m_HasOpenPaths;
+  size_t           m_OpenPathCount = 0;
 };
 //------------------------------------------------------------------------------
 

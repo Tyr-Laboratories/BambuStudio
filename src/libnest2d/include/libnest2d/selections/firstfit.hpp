@@ -36,6 +36,7 @@ public:
 
         using Placer = PlacementStrategyLike<TPlacer>;
 
+        this->last_packed_bin_id_ = -1;
         store_.clear();
         store_.reserve(last-first);
 
@@ -44,6 +45,12 @@ public:
 
         typename Base::PackGroup fixed_bins;
         std::for_each(first, last, [this, &fixed_bins](Item& itm) {
+            // Degenerate polygons have no placement and no reference vertex.
+            // Reject them before either placer evaluates their geometry.
+            if (itm.area() <= 0) {
+                itm.binId(BIN_ID_UNFIT);
+                return;
+            }
             if (itm.isFixed()) {
                 if (itm.binId() < 0) itm.binId(0);
                 auto binidx = size_t(itm.binId());
@@ -57,6 +64,10 @@ public:
                 store_.emplace_back(itm);
             }
             });
+
+        // Fixed items count even when no movable item is placed in their bin.
+        // Assigning also clears results left by an earlier execute() call.
+        packed_bins_ = fixed_bins;
 
         std::for_each(pconfig.m_excluded_regions.begin(), pconfig.m_excluded_regions.end(), [this, &pconfig](Item& itm) {
             pconfig.m_excluded_items.emplace_back(itm);
@@ -224,7 +235,8 @@ public:
                         placers.back().configure(pconfig);
                         if (fixed_bins.size() >= placers.size()) placers.back().preload(fixed_bins[placers.size() - 1]);
                         // placers.back().preload(pconfig.m_excluded_items);
-                        packed_bins_.emplace_back();
+                        if (packed_bins_.size() < placers.size())
+                            packed_bins_.emplace_back();
                         j = placers.size() - 1;
                     } else {
                         it->get().binId(BIN_ID_UNFIT);
@@ -234,6 +246,11 @@ public:
                 }
             }
         }
+
+        // An attempted empty bin is not a packing result. Keep empty gaps
+        // before fixed/occupied bins because item bin IDs index this array.
+        while (!packed_bins_.empty() && packed_bins_.back().empty())
+            packed_bins_.pop_back();
     }
 
 };

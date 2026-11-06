@@ -16,6 +16,7 @@
 #include "libslic3r/format.hpp"
 #include "MultiNozzleUtils.hpp"
 #include "GCodeReader.hpp"
+#include "Fill/BridgeAwareCubicSerialization.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1525,6 +1526,12 @@ std::vector<GCode::LayerToPrint> GCode::collect_layers_to_print(const PrintObjec
             --idx_support_layer;
         }
 
+        if (object.has_bridge_aware_cubic() && layer_to_print.object_layer && layer_to_print.support_layer &&
+            GCodeWriter::serialized_z(layer_to_print.object_layer->print_z, true) !=
+                GCodeWriter::serialized_z(layer_to_print.support_layer->print_z, true))
+            throw SlicingError("Bridge aware cubic cannot combine object and support layers at different serialized heights. Use matching layer heights.",
+                               object.model_object()->id().id);
+
         layer_to_print.original_object = &object;
         layers_to_print.push_back(layer_to_print);
 
@@ -1657,6 +1664,21 @@ std::vector<std::pair<coordf_t, std::vector<GCode::LayerToPrint>>> GCode::collec
         size_t j = i + 1;
         coordf_t zmax = ordering[i].print_z + EPSILON;
         for (; j < ordering.size() && ordering[j].print_z <= zmax; ++j);
+        // The legacy scheduler emits a close-height group at its first object's
+        // plane. A BAC certificate cannot be reused at a different plane.
+        const auto bac = std::find_if(ordering.begin() + i, ordering.begin() + j, [&print](const OrderingItem &item) {
+            return print.objects()[item.object_idx]->has_bridge_aware_cubic();
+        });
+        if (!print.is_sequential_print() && bac != ordering.begin() + j) {
+            const double certified_z = GCodeWriter::serialized_z(per_object[bac->object_idx][bac->layer_idx].layer()->print_z, true);
+            if (std::any_of(ordering.begin() + i, ordering.begin() + j, [&per_object, certified_z](const OrderingItem &item) {
+                    const LayerToPrint &candidate = per_object[item.object_idx][item.layer_idx];
+                    return (candidate.object_layer && GCodeWriter::serialized_z(candidate.object_layer->print_z, true) != certified_z) ||
+                        (candidate.support_layer && GCodeWriter::serialized_z(candidate.support_layer->print_z, true) != certified_z);
+                }))
+                throw SlicingError("Bridge aware cubic cannot combine objects at different serialized layer heights. Use matching layer heights or print objects sequentially.",
+                                   print.objects()[bac->object_idx]->model_object()->id().id);
+        }
         // Merge into layers_to_print.
         std::pair<coordf_t, std::vector<LayerToPrint>> merged;
         // Assign an average print_z to the set of layers with nearly equal print_z.
@@ -2006,8 +2028,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     BOOST_LOG_TRIVIAL(info) << "Exporting G-code finished" << log_memory_info();
     print->set_done(psGCodeExport);
     //BBS: set enable_label_object
-    result->label_object_enabled = m_enable_label_object;
-    result->support_material_on_wipe_tower = print->support_material_on_wipe_tower();
+    if (result != nullptr) {
+        result->label_object_enabled = m_enable_label_object;
+        result->support_material_on_wipe_tower = print->support_material_on_wipe_tower();
+    }
     // Write the profiler measurements to file
     PROFILE_UPDATE();
     PROFILE_OUTPUT(debug_out_path("gcode-export-profile.txt").c_str());
@@ -2371,6 +2395,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     m_enable_cooling_markers = true;
     m_is_ironing_fan_on      = false;
     this->apply_print_config(print.config());
+    m_writer.set_bridge_aware_cubic_z_precision(std::any_of(print.objects().begin(), print.objects().end(),
+        [](const PrintObject *object) { return object->has_bridge_aware_cubic(); }));
     m_config.apply(print.default_object_config());
     m_config.apply(print.default_region_config());
 
@@ -2383,6 +2409,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     if (print.config().max_volumetric_extrusion_rate_slope_positive.value > 0 ||
         print.config().max_volumetric_extrusion_rate_slope_negative.value > 0)
         m_pressure_equalizer = make_unique<PressureEqualizer>(&print.config());
+    if (m_pressure_equalizer && m_writer.bridge_aware_cubic_z_precision())
+        throw Slic3r::RuntimeError("Bridge aware cubic requires pressure equalization to be disabled because it rewrites certified extrusion heights.");
     m_enable_extrusion_role_markers = (bool)m_pressure_equalizer;
 #else /* HAS_PRESSURE_EQUALIZER */
     m_enable_extrusion_role_markers = false;
@@ -4514,13 +4542,15 @@ GCode::TimelapseGCodeResult GCode::generate_timelapse_gcode(const Print &print, 
 
     double temp_z_after_tool_change;
     if (GCodeProcessor::get_last_z_from_gcode(timelapse_gcode, temp_z_after_tool_change)) {
-        if (std::abs(temp_z_after_tool_change - z_before_timelapse) > EPSILON) {
+        if (m_writer.bridge_aware_cubic_z_precision() ?
+            GCodeWriter::serialized_z(temp_z_after_tool_change, true) != GCodeWriter::serialized_z(z_before_timelapse, true) :
+            std::abs(temp_z_after_tool_change - z_before_timelapse) > EPSILON) {
             // Timelapse template changed Z externally (e.g. head wrap detect G0 Z2).
             // Append raw G1 Z to restore; skip set_position to keep m_lifted intact
             // so the subsequent layer-change lift logic works normally.
-            char buf[64];
-            snprintf(buf, sizeof(buf), "G1 Z%.3f\n", z_before_timelapse);
-            timelapse_gcode += buf;
+            GCodeG1Formatter restore;
+            restore.emit_z(z_before_timelapse, m_writer.z_export_digits());
+            timelapse_gcode += restore.string();
         } else {
             Vec3d pos = m_writer.get_position();
             pos(2)    = temp_z_after_tool_change;
@@ -4652,11 +4682,13 @@ GCode::LayerResult GCode::process_layer(
     gcode += ";" + GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Layer_Change) + "\n";
     // export layer z
     char buf[64];
-    sprintf(buf, "; Z_HEIGHT: %g\n", print_z);
+    sprintf(buf, "; Z_HEIGHT: %.*g\n", m_writer.bridge_aware_cubic_z_precision() ?
+            std::numeric_limits<double>::max_digits10 : 6, print_z);
     gcode += buf;
     // export layer height
     float height = first_layer ? static_cast<float>(print_z) : static_cast<float>(print_z) - m_last_layer_z;
-    sprintf(buf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(), height);
+    sprintf(buf, ";%s%.*g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(),
+            m_writer.bridge_aware_cubic_z_precision() ? std::numeric_limits<float>::max_digits10 : 6, height);
     gcode += buf;
     // update caches
     m_last_layer_z = static_cast<float>(print_z);
@@ -5577,6 +5609,11 @@ GCode::LayerResult GCode::process_layer(
             auto mixed_instances_it = filament_to_print_instances.find(grp.mixed_slot_0based);
             if (mixed_instances_it == filament_to_print_instances.end() || mixed_instances_it->second.empty())
                 continue;
+
+            for (const InstanceToPrint &instance : mixed_instances_it->second)
+                if (instance.print_object.has_bridge_aware_cubic())
+                    throw SlicingError("Bridge aware cubic requires Mixed color sublayer to be disabled because sublayers change certified extrusion heights and flow.",
+                                       instance.print_object.model_object()->id().id);
 
             double lh = grp.layer_height > 0. ? grp.layer_height : static_cast<double>(height);
             double cumulative_h = 0.0;
@@ -7124,8 +7161,21 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double 
 }
 
 std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed, bool use_seperate_speed, bool is_first_slope)
-{
+try {
     std::string gcode;
+    const bool certified_output = m_writer.bridge_aware_cubic_z_precision() &&
+        m_layer && m_layer->object() && m_layer->object()->has_bridge_aware_cubic();
+    if (certified_output) {
+        if (GCodeWriter::serialized_z(m_nominal_z, true) != GCodeWriter::serialized_z(m_layer->print_z, true))
+            throw std::invalid_argument("The scheduled extrusion height differs from the certified layer height.");
+        // Check the actual post-seam/reversal path in the exact output phase
+        // before emitting any of its travel or extrusion commands.
+        BridgeAwareCubic::SerializedXY serialized;
+        serialized.shift = m_origin;
+        serialized.nozzle_offset = EXTRUDER_CONFIG(extruder_offset);
+        serialized.plate_origin = m_writer.xy_offset();
+        serialized.validate_path(path.polyline);
+    }
 
     if (is_bridge(path.role()))
         description += " (bridge)";
@@ -7426,7 +7476,8 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
     if (last_was_wipe_tower || m_last_width != path.width) {
         m_last_width = path.width;
-        sprintf(buf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Width).c_str(), m_last_width);
+        sprintf(buf, ";%s%.*g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Width).c_str(),
+                m_writer.bridge_aware_cubic_z_precision() ? std::numeric_limits<float>::max_digits10 : 6, m_last_width);
         gcode += buf;
     }
 
@@ -7438,9 +7489,11 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     }
 #endif // ENABLE_GCODE_VIEWER_DATA_CHECKING
 
-    if (last_was_wipe_tower || std::abs(m_last_height - effective_height) > EPSILON) {
+    if (last_was_wipe_tower || (m_writer.bridge_aware_cubic_z_precision() ?
+        m_last_height != effective_height : std::abs(m_last_height - effective_height) > EPSILON)) {
         m_last_height = effective_height;
-        sprintf(buf, ";%s%g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(), m_last_height);
+        sprintf(buf, ";%s%.*g\n", GCodeProcessor::reserved_tag(GCodeProcessor::ETags::Height).c_str(),
+                m_writer.bridge_aware_cubic_z_precision() ? std::numeric_limits<float>::max_digits10 : 6, m_last_height);
         gcode += buf;
     }
 
@@ -7484,7 +7537,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
     //if (sloped == nullptr)
     gcode += m_writer.set_speed(F, "", comment);
 
-    auto check_and_insert_timelapse = [this, &gcode](const Point &endpoint_scaled) {
+    auto check_and_insert_timelapse = [this, &gcode, certified_output](const Point &endpoint_scaled) {
         if (!m_farthest_point_timelapse.enabled || !m_farthest_point_timelapse.farthest_is_photo_head || m_farthest_point_timelapse.inserted_this_layer)
             return;
         // Inline M971 only when current extruder is the photo head; other nozzles
@@ -7509,12 +7562,18 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                                       &m_farthest_point_timelapse.layer_object_label_ids, &m_printed_objects, true);
         if (!timelapse_result.gcode.empty()) {
             gcode += timelapse_result.gcode;
+            if (certified_output)
+                gcode += m_writer.synchronize_extrusion_for_deposition();
             m_farthest_point_timelapse.inserted_this_layer = true;
         }
     };
 
     double path_length = 0.;
     {
+        // This returned text is actually appended, unlike some custom-tool
+        // bookkeeping calls. It also restores M82/M83 after arbitrary snippets.
+        if (certified_output)
+            gcode += m_writer.synchronize_extrusion_for_deposition();
         std::string comment = GCodeWriter::full_gcode_comment ? description : "";
         //BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode
         //Attention: G2 and G3 is not supported in spiral_mode mode
@@ -7527,17 +7586,22 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             for (const Line &line : path.polyline.lines()) {
                 const double line_length = line.length() * SCALING_FACTOR;
                 // BBS: extursion cmd should E0 on cmd line
-                if (line_length < EPSILON) continue;
+                if (certified_output ? line.a == line.b : line_length < EPSILON) continue;
                 path_length += line_length;
+                const Vec2d destination = this->point_to_gcode(line.b);
+                const double serialized_length = certified_output ? m_writer.serialized_xy_distance(destination) : 0.;
+                // Certify the section deposited along the emitted segment.
+                // Retain stationary E-only moves; they supply no bead segment.
+                const double extrusion_length = serialized_length > 0. ? serialized_length : line_length;
 
                 if (sloped == nullptr) {
                     gcode += m_writer.extrude_to_xy(
-                        this->point_to_gcode(line.b),
-                        e_per_mm * line_length,
-                        comment,path.is_force_no_extrusion());
+                        destination,
+                        e_per_mm * extrusion_length,
+                        comment, path.is_force_no_extrusion(), certified_output);
                 } else {
                     // Sloped extrusion
-                    auto dE = e_per_mm * line_length;
+                    auto dE = e_per_mm * extrusion_length;
                     auto [z_ratio, e_ratio, slope_speed] = sloped->interpolate(path_length / total_length);
                     //FIX: cooling need to apply correctly
                     //gcode += m_writer.set_speed(slope_speed * 60, "", comment);
@@ -7545,7 +7609,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                     Vec3d dest3d(dest2d(0), dest2d(1), get_sloped_z(z_ratio));
                     //BBS: todo, should use small e at start to get good seam
                     double slope_e = dE * e_ratio;
-                    gcode += m_writer.extrude_to_xyz(dest3d, slope_e);
+                    gcode += m_writer.extrude_to_xyz(dest3d, slope_e, "", false, certified_output);
                 }
                 check_and_insert_timelapse(line.b);
             }
@@ -7561,13 +7625,13 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                         const Line line = Line(path.polyline.points[point_index - 1], path.polyline.points[point_index]);
                         const double line_length = line.length() * SCALING_FACTOR;
                         // BBS: extursion cmd should E0 on cmd line
-                        if (line_length < EPSILON)
+                        if (certified_output ? line.a == line.b : line_length < EPSILON)
                             continue;
                         path_length += line_length;
                         gcode += m_writer.extrude_to_xy(
                             this->point_to_gcode(line.b),
                             e_per_mm * line_length,
-                            comment, path.is_force_no_extrusion());
+                            comment, path.is_force_no_extrusion(), certified_output);
                         check_and_insert_timelapse(line.b);
                     }
                     break;
@@ -7586,7 +7650,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                             center_offset,
                             e_per_mm * arc_length,
                             arc.direction == ArcDirection::Arc_Dir_CCW,
-                            comment, path.is_force_no_extrusion());
+                            comment, path.is_force_no_extrusion(), certified_output);
                     check_and_insert_timelapse(arc.end_point);
                     break;
                 }
@@ -7627,6 +7691,14 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
     this->set_last_pos(path.last_point());
     return gcode;
+}
+catch (const std::logic_error &error) {
+    if (!m_writer.bridge_aware_cubic_z_precision() || !m_layer || !m_layer->object() ||
+        !m_layer->object()->has_bridge_aware_cubic())
+        throw;
+    const size_t object_id = m_layer && m_layer->object() ? m_layer->object()->model_object()->id().id : 0;
+    const std::string layer_context = m_layer ? " at layer Z " + std::to_string(m_layer->print_z) : "";
+    throw SlicingError("Bridge aware cubic output" + layer_context + ": " + error.what(), object_id);
 }
 
 std::string encodeBase64(uint64_t value)

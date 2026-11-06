@@ -112,6 +112,14 @@ set(lisbslic3r_sources
     Fill/BridgeAwareCubic.hpp
     Fill/BridgeAwareCubicValidation.cpp
     Fill/BridgeAwareCubicValidation.hpp
+    Fill/BridgeAwareCubicAttachment.cpp
+    Fill/BridgeAwareCubicAttachment.hpp
+    Fill/BridgeAwareCubicContact.cpp
+    Fill/BridgeAwareCubicContact.hpp
+    Fill/BridgeAwareCubicDependencies.cpp
+    Fill/BridgeAwareCubicDependencies.hpp
+    Fill/BridgeAwareCubicSupport.hpp
+    Fill/BridgeAwareCubicSerialization.hpp
     Fill/FillBridgeAwareCubic.hpp
     BridgeAwareCubicSupport.cpp
     Fill/FillBase.cpp

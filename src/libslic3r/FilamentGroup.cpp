@@ -307,12 +307,18 @@ namespace Slic3r
         double best_score = std::numeric_limits<double>::max();
         int best_prefer_level = 0;
         int best_flush = 0;
+        size_t extruder_count = 0;
+        for (const auto& nozzle : ctx.nozzle_info.nozzle_list)
+            extruder_count = std::max(extruder_count, static_cast<size_t>(nozzle.extruder_id + 1));
 
         const long long total = (long long)std::pow(k, n);
         for (long long mask = 0; mask < total; mask++) {
             long long num = mask;
             std::unordered_map<int, std::vector<int>> nozzles_filaments;
-            std::vector<int> groups_count(k, 0);
+            // Capacity and preferences belong to extruders, which can own
+            // several nozzles. Counting each nozzle separately can admit a
+            // grouping that exceeds the shared AMS capacity.
+            std::vector<int> groups_count(extruder_count, 0);
             std::vector<int> used_labels(n, 0);
 
             for (int i = 0; i < n; i++) {
@@ -320,7 +326,7 @@ namespace Slic3r
                 num /= k;
                 used_labels[i] = g_id;
                 nozzles_filaments[g_id].emplace_back(i);
-                groups_count[g_id]++;
+                groups_count[ctx.nozzle_info.nozzle_list[g_id].extruder_id]++;
             }
 
             // Hash dedup
@@ -346,7 +352,7 @@ namespace Slic3r
             prefer_level += placeable_count * UNPLACEABLE_LIMIT_REWARD;
 
             bool size_ok = true;
-            for (int g = 0; g < k; g++) {
+            for (int g = 0; g < groups_count.size(); g++) {
                 if (g < (int)ctx.machine_info.max_group_size.size() && groups_count[g] > ctx.machine_info.max_group_size[g])
                     size_ok = false;
             }
@@ -355,7 +361,7 @@ namespace Slic3r
 
             if (ctx.group_info.strategy == FGStrategy::BestFit) {
                 bool all_full = true;
-                for (int g = 0; g < k; g++) {
+                for (int g = 0; g < groups_count.size(); g++) {
                     if (g < (int)ctx.machine_info.max_group_size.size() && groups_count[g] < ctx.machine_info.max_group_size[g])
                         all_full = false;
                 }
@@ -364,7 +370,8 @@ namespace Slic3r
             }
 
             for (int g = 0; g < k; g++) {
-                if (g < (int)ctx.machine_info.prefer_non_model_filament.size() && ctx.machine_info.prefer_non_model_filament[g]) {
+                int extruder = ctx.nozzle_info.nozzle_list[g].extruder_id;
+                if (extruder < (int)ctx.machine_info.prefer_non_model_filament.size() && ctx.machine_info.prefer_non_model_filament[extruder]) {
                     for (int fidx : nozzles_filaments[g]) {
                         if (ctx.model_info.filament_info[used_filaments[fidx]].usage_type == SupportOnly)
                             prefer_level += SUPPORT_PREFER_REWARD;
@@ -381,7 +388,7 @@ namespace Slic3r
             double score = full_evaluate(used_filaments, full_map, ctx, get_custom_seq, &flush_vol);
 
             int master_ex_id = ctx.machine_info.master_extruder_id;
-            if (master_ex_id < k && groups_count[master_ex_id] < (int)(used_filaments.size() + 1) / 2)
+            if (master_ex_id >= 0 && master_ex_id < groups_count.size() && groups_count[master_ex_id] < (int)(used_filaments.size() + 1) / 2)
                 score += ABSOLUTE_FLUSH_GAP_TOLERANCE;
 
             if (prefer_level > best_prefer_level || (prefer_level == best_prefer_level && score < best_score)) {
@@ -1134,6 +1141,27 @@ namespace Slic3r
         std::vector<int>machine_filament_capacity(machine_filament_list.size(),l_nodes.size());
         std::vector<int>extruder_filament_count(2, 0);
 
+        // Machine slots share their extruder's AMS capacity. Applying a
+        // capacity independently to each slot allows MatchMode to overfill
+        // an extruder even when a feasible assignment exists.
+        const bool enough_capacity = std::accumulate(ctx.machine_info.max_group_size.begin(),
+            ctx.machine_info.max_group_size.end(), 0LL) >= static_cast<long long>(used_filaments.size());
+        auto remaining_group_capacities = [&]() {
+            std::vector<std::pair<std::set<int>, int>> capacities;
+            if (!enough_capacity)
+                return capacities;
+            for (size_t eid = 0; eid < ctx.machine_info.max_group_size.size(); ++eid) {
+                std::set<int> slots;
+                for (size_t i = 0; i < machine_filament_list.size(); ++i)
+                    if (machine_filament_list[i].extruder_id == eid)
+                        slots.insert(static_cast<int>(i));
+                if (!slots.empty())
+                    capacities.emplace_back(std::move(slots), std::max(0,
+                        ctx.machine_info.max_group_size[eid] - extruder_filament_count[eid]));
+            }
+            return capacities;
+        };
+
         auto is_extruder_filament_compatible = [&unprintable_limit_indices](int filament_idx, int extruder_id) {
             auto iter = unprintable_limit_indices.find(filament_idx);
             if (iter != unprintable_limit_indices.end() && iter->second == extruder_id)
@@ -1197,6 +1225,9 @@ namespace Slic3r
                 std::vector<std::pair<int, int>> valid_candidates; // 存储可用的机器耗材idx与评分
                 for (auto machine_filament : optional_filaments) {
                     int new_extruder_id = machine_filament_list[machine_filament].extruder_id;
+                    if (enough_capacity && new_extruder_id < ctx.machine_info.max_group_size.size() &&
+                        extruder_filament_count[new_extruder_id] >= ctx.machine_info.max_group_size[new_extruder_id])
+                        continue;
 
                     // 计算新分配的偏好得分
                     int preference_score = 0;
@@ -1259,7 +1290,8 @@ namespace Slic3r
             });
 
         {
-            MatchModeGroupSolver s(match_cost_matrix, l_nodes, r_nodes, machine_filament_capacity, unlink_limits_full);
+            MinFlushFlowSolver s(match_cost_matrix, l_nodes, r_nodes, {}, unlink_limits_full,
+                {}, machine_filament_capacity, remaining_group_capacities());
             ungrouped_filaments = optimize_map_to_machine_filament(s.solve(), l_nodes, r_nodes,group);
             if (ungrouped_filaments.empty())
                 return group;
@@ -1272,7 +1304,26 @@ namespace Slic3r
                 return is_extruder_filament_compatible(used_filament_idx, machine_filament_list[machine_filament_idx].extruder_id);
                 });
 
-            MatchModeGroupSolver s(match_cost_matrix, l_nodes, r_nodes, machine_filament_capacity, unlink_limits);
+            MinFlushFlowSolver s(match_cost_matrix, l_nodes, r_nodes, {}, unlink_limits,
+                {}, machine_filament_capacity, remaining_group_capacities());
+            ungrouped_filaments = optimize_map_to_machine_filament(s.solve(), l_nodes, r_nodes, group);
+            if (ungrouped_filaments.empty())
+                return group;
+        }
+
+        // A type-preferred assignment from the first pass can occupy the only
+        // compatible extruder for a remaining filament. Reassign the whole
+        // set before relaxing physical restrictions.
+        if (enough_capacity) {
+            l_nodes.resize(used_filaments.size());
+            std::iota(l_nodes.begin(), l_nodes.end(), 0);
+            std::fill(extruder_filament_count.begin(), extruder_filament_count.end(), 0);
+            auto unlink_limits = build_unlink_limits(l_nodes, r_nodes,
+                [&machine_filament_list, is_extruder_filament_compatible](int filament_idx, int slot_idx) {
+                    return is_extruder_filament_compatible(filament_idx, machine_filament_list[slot_idx].extruder_id);
+                });
+            MinFlushFlowSolver s(match_cost_matrix, l_nodes, r_nodes, {}, unlink_limits,
+                {}, machine_filament_capacity, remaining_group_capacities());
             ungrouped_filaments = optimize_map_to_machine_filament(s.solve(), l_nodes, r_nodes, group);
             if (ungrouped_filaments.empty())
                 return group;
@@ -1281,13 +1332,17 @@ namespace Slic3r
         // remove all limits
         {
             l_nodes = ungrouped_filaments;
-            MatchModeGroupSolver s(match_cost_matrix, l_nodes, r_nodes, machine_filament_capacity, {});
+            MinFlushFlowSolver s(match_cost_matrix, l_nodes, r_nodes, {}, {},
+                {}, machine_filament_capacity, remaining_group_capacities());
             auto ret = optimize_map_to_machine_filament(s.solve(), l_nodes, r_nodes, group);
-            for (size_t idx = 0; idx < ret.size(); ++idx) {
-                if (ret[idx] == MaxFlowGraph::INVALID_ID)
-                    assert(false);
-                else
-                    group[used_filaments[l_nodes[idx]]] = machine_filament_list[r_nodes[ret[idx]]].extruder_id;
+            if (!ret.empty()) {
+                // An extruder may have capacity but no loaded AMS slots. The
+                // unmatched values are filament indices, not slot indices;
+                // use the capacity-aware flush assignment instead of indexing
+                // the slot array with them. MatchMode returns extruder IDs.
+                group = calc_filament_group_for_flush(cost);
+                for (unsigned int filament : used_filaments)
+                    group[filament] = ctx.nozzle_info.nozzle_list[group[filament]].extruder_id;
             }
         }
 

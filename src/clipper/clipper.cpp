@@ -89,6 +89,7 @@ struct OutRec {
   int       Idx;
   bool      IsHole;
   bool      IsOpen;
+  size_t    OpenPathIndex;
   //The 'FirstLeft' field points to another OutRec that contains or is the
   //'parent' of OutRec. It is 'first left' because the ActiveEdgeList (AEL) is
   //parsed left from the current edge (owning OutRec) until the owner OutRec
@@ -760,6 +761,7 @@ TEdge* ClipperBase::ProcessBound(TEdge* E, bool NextIsForward)
 bool ClipperBase::AddPath(const Path &pg, PolyType PolyTyp, bool Closed)
 {
   CLIPPERLIB_PROFILE_FUNC();
+  const size_t open_path_index = Closed ? size_t(-1) : m_OpenPathCount++;
   // Remove duplicate end point from a closed input path.
   // Remove duplicate points from the end of the input path.
   int highI = (int)pg.size() -1;
@@ -774,14 +776,15 @@ bool ClipperBase::AddPath(const Path &pg, PolyType PolyTyp, bool Closed)
   // Allocate a new edge array.
   std::vector<TEdge> edges(highI + 1);
   // Fill in the edge array.
-  bool result = AddPathInternal(pg, highI, PolyTyp, Closed, edges.data());
+  bool result = AddPathInternal(pg, highI, PolyTyp, Closed, edges.data(), open_path_index);
   if (result)
     // Success, remember the edge array.
     m_edges.emplace_back(std::move(edges));
   return result;
 }
 
-bool ClipperBase::AddPathInternal(const Path &pg, int highI, PolyType PolyTyp, bool Closed, TEdge* edges)
+bool ClipperBase::AddPathInternal(const Path &pg, int highI, PolyType PolyTyp, bool Closed, TEdge* edges,
+                                size_t open_path_index)
 {
   CLIPPERLIB_PROFILE_FUNC();
 #ifdef use_lines
@@ -816,6 +819,8 @@ bool ClipperBase::AddPathInternal(const Path &pg, int highI, PolyType PolyTyp, b
   {
     throw; //range test fails
   }
+  // InitEdge clears each structure; install metadata only afterward.
+  for (int i = 0; i <= highI; ++i) edges[i].OpenPathIndex = open_path_index;
   TEdge *eStart = &edges[0];
 
   //2. Remove duplicate vertices, and (when closed) collinear edges ...
@@ -968,6 +973,7 @@ void ClipperBase::Clear()
   m_UseFullRange = false;
 #endif // CLIPPERLIB_INT32
   m_HasOpenPaths = false;
+  m_OpenPathCount = 0;
 }
 //------------------------------------------------------------------------------
 
@@ -1892,6 +1898,11 @@ void Clipper::AppendPolygon(TEdge *e1, TEdge *e2) const
   //get the start and ends of both output polygons ...
   OutRec *outRec1 = m_PolyOuts[e1->OutIdx];
   OutRec *outRec2 = m_PolyOuts[e2->OutIdx];
+  // Open records normally join only bounds of one input path. Preserve the
+  // ordinary geometry even if that invariant changes, but never invent an
+  // unambiguous source for a merged record.
+  if (outRec1->IsOpen && outRec1->OpenPathIndex != outRec2->OpenPathIndex)
+    outRec1->OpenPathIndex = size_t(-1);
 
   OutRec *holeStateRec;
   if (Param1RightOfParam2(outRec1, outRec2)) 
@@ -1991,6 +2002,7 @@ OutRec* Clipper::CreateOutRec()
   OutRec* result = new OutRec;
   result->IsHole = false;
   result->IsOpen = false;
+  result->OpenPathIndex = size_t(-1);
   result->FirstLeft = 0;
   result->Pts = 0;
   result->BottomPt = 0;
@@ -2007,6 +2019,7 @@ OutPt* Clipper::AddOutPt(TEdge *e, const IntPoint &pt)
   {
     OutRec *outRec = CreateOutRec();
     outRec->IsOpen = (e->WindDelta == 0);
+    if (outRec->IsOpen) outRec->OpenPathIndex = e->OpenPathIndex;
     OutPt* newOp = this->AllocateOutPt();
     outRec->Pts = newOp;
     newOp->Idx = outRec->Idx;
@@ -2020,6 +2033,8 @@ OutPt* Clipper::AddOutPt(TEdge *e, const IntPoint &pt)
   } else
   {
     OutRec *outRec = m_PolyOuts[e->OutIdx];
+    if (outRec->IsOpen && outRec->OpenPathIndex != e->OpenPathIndex)
+      outRec->OpenPathIndex = size_t(-1);
     //OutRec.Pts is the 'Left-most' point & OutRec.Pts.Prev is the 'Right-most'
     OutPt* op = outRec->Pts;
 
@@ -2816,6 +2831,7 @@ void Clipper::BuildResult2(PolyTree& polytree)
         outRec->PolyNd = pn;
         pn->Parent = 0;
         pn->Index = 0;
+        if (outRec->IsOpen) pn->m_OpenPathIndex = outRec->OpenPathIndex;
         pn->Contour.reserve(cnt);
         OutPt *op = outRec->Pts->Prev;
         for (int j = 0; j < cnt; j++)

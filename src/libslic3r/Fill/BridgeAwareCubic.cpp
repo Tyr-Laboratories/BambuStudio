@@ -1,4 +1,5 @@
 #include "BridgeAwareCubic.hpp"
+#include "BridgeAwareCubicClipMask.hpp"
 
 #include "../ClipperUtils.hpp"
 #include "../Geometry/ConvexHull.hpp"
@@ -7,10 +8,13 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 
@@ -29,8 +33,12 @@ struct Cell {
     std::array<int64_t, 3> address;
     unsigned depth = 0;
     bool split = false;
+    bool solid = false;
     size_t reason_demand = std::numeric_limits<size_t>::max();
     double reason_diameter = 0.;
+    std::vector<size_t> reason_demands;
+
+    CellId id() const { return { address, depth }; }
 };
 
 struct PlaneKey {
@@ -85,9 +93,20 @@ struct Plan::Impl {
     Vec3d origin;
     std::vector<Cell> cells;
     std::vector<BoundingBox> demand_bounds;
+    std::vector<BoundedClipMask> demand_masks;
+    std::vector<LayerClosure> closures;
+    std::vector<LayerAttachment> layer_attachments;
+    std::set<CellId> forced_leaves;
+    std::set<CellId> active_owners;
+    std::vector<Refinement> refinements;
+    std::vector<size_t> active_demands;
 
-    Impl(Parameters input_parameters, std::vector<Demand> input_demands)
-        : parameters(std::move(input_parameters)), demands(std::move(input_demands))
+    Impl(Parameters input_parameters, std::vector<Demand> input_demands,
+         std::vector<LayerClosure> input_closures = {}, std::vector<LayerAttachment> input_attachments = {},
+         std::set<CellId> input_forced_leaves = {})
+        : parameters(std::move(input_parameters)), demands(std::move(input_demands)),
+          closures(std::move(input_closures)), layer_attachments(std::move(input_attachments)),
+          forced_leaves(std::move(input_forced_leaves))
     {
         validate();
         cancel();
@@ -135,21 +154,51 @@ struct Plan::Impl {
         }
 
         demand_bounds.reserve(demands.size());
-        std::vector<size_t> candidates;
+        demand_masks.reserve(demands.size());
         for (size_t i = 0; i < demands.size(); ++i) {
+            if ((i & 255) == 0) cancel();
             demand_bounds.push_back(get_extents(demands[i].footprint));
-            if (!demands[i].footprint.empty())
-                candidates.push_back(i);
+            demand_masks.emplace_back(to_polygons(demands[i].footprint));
         }
         cells.reserve(std::min(parameters.max_nodes, root_count * 2));
-        statistics.root_cells = root_count;
+        std::vector<bool> enabled(demands.size(), false);
+        for (size_t i = 0; i < demands.size(); ++i)
+            enabled[i] = !demands[i].dependency;
         size_t work = 0;
-        for (int64_t u = first[0]; u <= last[0]; ++u)
-            for (int64_t v = first[1]; v <= last[1]; ++v)
-                for (int64_t w = first[2]; w <= last[2]; ++w) {
-                    cancel();
-                    append_and_refine(Cell { { u, v, w } }, candidates, work);
+        // Begin every rebuild from DIRECT demands. Carrying an old activation
+        // set into a collapsed trial would preserve unrooted dependency cycles.
+        for (;;) {
+            cells.clear();
+            statistics = {};
+            statistics.root_cells = root_count;
+            active_demands.clear();
+            for (size_t i = 0; i < enabled.size(); ++i)
+                if (enabled[i] && !demands[i].footprint.empty()) active_demands.push_back(i);
+            for (int64_t u = first[0]; u <= last[0]; ++u)
+                for (int64_t v = first[1]; v <= last[1]; ++v)
+                    for (int64_t w = first[2]; w <= last[2]; ++w) {
+                        cancel();
+                        append_and_refine(Cell { { u, v, w } }, active_demands, work);
+                    }
+            active_owners.clear();
+            refinements.clear();
+            for (const Cell &cell : cells) {
+                if (!cell.split && !cell.solid) continue;
+                active_owners.insert(cell.id());
+                const double low_z = lower(cell).sum() / sqrt_three;
+                const double size = edge(cell);
+                refinements.push_back({ cell.id(), cell.solid,
+                    low_z + (cell.solid ? 0. : .5 * size / sqrt_three),
+                    low_z + (cell.solid ? 3. : 2.5) * size / sqrt_three, cell.reason_demands });
+            }
+            bool activated = false;
+            for (size_t i = 0; i < enabled.size(); ++i)
+                if (!enabled[i] && has_owner(demands[i].owners, &work)) {
+                    enabled[i] = true;
+                    activated = true;
                 }
+            if (!activated) break;
+        }
         statistics.nodes = cells.size();
         statistics.leaves = statistics.nodes - statistics.splits;
     }
@@ -176,7 +225,24 @@ struct Plan::Impl {
         if (demands.size() > parameters.max_nodes)
             throw std::runtime_error("Bridge aware cubic exceeds the support-demand work limit");
         size_t point_count = 0;
+        size_t owner_count = 0;
+        const auto validate_owners = [&](const std::vector<CellId> &owners) {
+            const size_t limit = parameters.max_nodes * 16;
+            if (owners.size() > limit - owner_count)
+                throw std::runtime_error("Bridge aware cubic exceeds the ownership reference work limit");
+            owner_count += owners.size();
+            for (size_t i = 0; i < owners.size(); ++i) {
+                if ((i & 255) == 0) cancel();
+                if (owners[i].depth > parameters.max_depth)
+                    throw std::invalid_argument("Bridge aware cubic owner exceeds the configured lattice depth");
+            }
+        };
+        size_t validated = 0;
         for (const Demand &demand : demands) {
+            if ((++validated & 255) == 0) cancel();
+            validate_owners(demand.owners);
+            if (demand.dependency && demand.owners.empty())
+                throw std::invalid_argument("Bridge aware cubic dependencies require an actual refinement owner");
             if (!std::isfinite(demand.z) || demand.z < parameters.bounds.min.z() ||
                     demand.z > parameters.bounds.max.z() ||
                     !std::isfinite(demand.gap) || demand.gap <= geometry_tolerance ||
@@ -194,6 +260,77 @@ struct Plan::Impl {
                     throw std::invalid_argument("Bridge aware cubic requires valid finite-width support footprints");
             }
         }
+        if (closures.size() + layer_attachments.size() > parameters.max_nodes)
+            throw std::runtime_error("Bridge aware cubic exceeds the immutable path payload work limit");
+        for (const LayerClosure &closure : closures) {
+            if ((++validated & 255) == 0) cancel();
+            validate_owners(closure.owners);
+            if (!std::isfinite(closure.z) || closure.z < parameters.bounds.min.z() || closure.z > parameters.bounds.max.z())
+                throw std::invalid_argument("Bridge aware cubic closure elevation is outside the object bounds");
+            for (const Polyline &path : closure.paths) {
+                point_count += path.points.size();
+                if (path.points.size() < 2)
+                    throw std::invalid_argument("Bridge aware cubic closure paths require two endpoints");
+            }
+            for (const ExPolygon &reservation : closure.reservation) {
+                point_count += reservation.contour.points.size();
+                for (const Polygon &hole : reservation.holes) point_count += hole.points.size();
+                if (!reservation.is_valid())
+                    throw std::invalid_argument("Bridge aware cubic closure reservations require valid polygons");
+            }
+        }
+        for (const LayerAttachment &attachment : layer_attachments) {
+            if ((++validated & 255) == 0) cancel();
+            validate_owners(attachment.owners);
+            point_count += attachment.original.points.size() + attachment.replacement.points.size();
+            if (!std::isfinite(attachment.z) || !std::isfinite(attachment.width) ||
+                    !std::isfinite(attachment.height) || attachment.width <= 0. || attachment.height <= 0. ||
+                    attachment.original.size() < 2 || attachment.replacement.size() < 2)
+                throw std::invalid_argument("Bridge aware cubic attachments require finite deposition geometry and paths");
+            const auto count_selection_ring = [&](const Polygon &ring) {
+                const size_t limit = parameters.max_nodes * 16;
+                if (point_count > limit || ring.points.size() > limit - point_count)
+                    throw std::runtime_error("Bridge aware cubic exceeds the immutable path payload vertex work limit");
+                point_count += ring.points.size();
+                // Match the final verifier's safe arithmetic range before
+                // externally supplied selection reaches polygon operations.
+                constexpr coord_t coordinate_limit = std::numeric_limits<coord_t>::max() / 4;
+                for (size_t i = 0; i < ring.points.size(); ++i) {
+                    if ((i & 255) == 0) cancel();
+                    const Point &point = ring.points[i];
+                    if (point.x() < -coordinate_limit || point.x() > coordinate_limit ||
+                            point.y() < -coordinate_limit || point.y() > coordinate_limit)
+                        throw std::invalid_argument("Bridge aware cubic attachment demand selection exceeds finite coordinate bounds");
+                }
+            };
+            for (const ExPolygon &selection : attachment.demand_selection) {
+                if ((++validated & 255) == 0) cancel();
+                count_selection_ring(selection.contour);
+                for (const Polygon &hole : selection.holes) count_selection_ring(hole);
+                if (!selection.is_valid() || selection.contour.area() <= 0. ||
+                        std::any_of(selection.holes.begin(), selection.holes.end(),
+                                    [](const Polygon &hole) { return hole.area() >= 0.; }))
+                    throw std::invalid_argument("Bridge aware cubic attachment demand selections require valid finite-width polygons");
+            }
+        }
+        if (point_count > parameters.max_nodes * 16)
+            throw std::runtime_error("Bridge aware cubic exceeds the immutable path payload vertex work limit");
+    }
+
+    bool has_owner(const std::vector<CellId> &owners, size_t *work = nullptr) const
+    {
+        for (size_t i = 0; i < owners.size(); ++i) {
+            if ((i & 255) == 0) cancel();
+            if (work != nullptr && ++*work > parameters.max_nodes * 64)
+                throw std::runtime_error("Bridge aware cubic exceeds the dependency ownership work limit");
+            if (active_owners.find(owners[i]) != active_owners.end()) return true;
+        }
+        return false;
+    }
+
+    bool closure_active(const LayerClosure &closure, double z) const
+    {
+        return std::abs(closure.z - z) <= 1.e-9 && (closure.owners.empty() || has_owner(closure.owners));
     }
 
     double edge(const Cell &cell) const { return std::ldexp(bulk_edge, -int(cell.depth)); }
@@ -241,6 +378,8 @@ struct Plan::Impl {
         const size_t id = cells.size();
         cells.push_back(cell);
         statistics.max_depth = std::max(statistics.max_depth, cell.depth);
+        if (forced_leaves.find(cell.id()) != forced_leaves.end())
+            return;
         std::vector<size_t> local;
         for (const size_t demand_id : candidates) {
             if (++work > parameters.max_nodes * 64)
@@ -249,15 +388,19 @@ struct Plan::Impl {
                 cancel();
             const Demand &demand = demands[demand_id];
             const Polygon polygon = section(cell, demand.z);
-            if (polygon.empty() || !bounds_overlap(get_extents(polygon), demand_bounds[demand_id]) ||
-                    intersection_ex(ExPolygon(polygon), demand.footprint).empty())
+            const BoundingBox bounds = get_extents<true>(polygon.points);
+            if (polygon.empty() || !bounds_overlap(bounds, demand_bounds[demand_id]) ||
+                    intersection_ex(ExPolygon(polygon), demand_masks[demand_id].candidates(bounds)).empty())
                 continue;
             local.push_back(demand_id);
             const double diameter = section_diameter(polygon);
-            if (diameter > demand.gap - geometry_tolerance && !cell.split) {
-                cell.split = true;
-                cell.reason_demand = demand_id;
-                cell.reason_diameter = diameter;
+            if (diameter > demand.gap - geometry_tolerance) {
+                cell.reason_demands.push_back(demand_id);
+                if (!cell.split) {
+                    cell.split = true;
+                    cell.reason_demand = demand_id;
+                    cell.reason_diameter = diameter;
+                }
             }
         }
         if (!cell.split)
@@ -267,6 +410,13 @@ struct Plan::Impl {
         // line-wall hierarchy needs a separately validated local solid fill;
         // silently adding overlapping walls is not a saturation strategy.
         const bool saturated = std::ldexp(parameters.density, int(cell.depth + 1)) >= 1.;
+        if (saturated && parameters.allow_solid_fallback) {
+            cell.split = false;
+            cell.solid = true;
+            cells[id] = std::move(cell);
+            ++statistics.solid_cells;
+            return;
+        }
         if (cell.depth >= parameters.max_depth || saturated || edge(cell) * .5 < parameters.flow_spacing) {
             std::ostringstream message;
             message << "Bridge aware cubic cannot meet gap " << demands[cell.reason_demand].gap
@@ -300,14 +450,15 @@ struct Plan::Impl {
 
     // Complete midplane intersections, from their inherited-edge birth to
     // their inherited-edge death. The footprint never clips these intervals.
-    PlaneIntervals refinement_intervals(double z) const
+    PlaneIntervals refinement_intervals(double z, const CellId *owner = nullptr,
+                                        const PlaneIntervals *selected_planes = nullptr) const
     {
         PlaneIntervals result;
         size_t visited = 0;
         for (const Cell &cell : cells) {
             if ((++visited & 255) == 0)
                 cancel();
-            if (!cell.split)
+            if (!cell.split || (owner != nullptr && !(cell.id() == *owner)))
                 continue;
             const double size = edge(cell);
             const Vec3d lo = lower(cell);
@@ -315,19 +466,55 @@ struct Plan::Impl {
             if (t <= 0. || t >= 2. * size)
                 continue;
             for (unsigned axis = 0; axis < 3; ++axis) {
+                const PlaneKey key{axis, cell.depth + 1, cell.address[axis] * 2 + 1};
+                if (selected_planes != nullptr && selected_planes->find(key) == selected_planes->end())
+                    continue;
                 const unsigned a = (axis + 1) % 3;
                 const double first = lo[a] + std::max(0., t - size);
                 const double last = lo[a] + std::min(size, t);
                 if (last > first)
-                    result[{ axis, cell.depth + 1, cell.address[axis] * 2 + 1 }].emplace_back(first, last);
+                    result[key].emplace_back(first, last);
             }
         }
         return result;
     }
 
-    Polylines refinement(double z, const ExPolygon &domain) const
+    using Partitions = std::vector<std::pair<CellId, Polylines>>;
+
+    Polylines refinement(double z, const ExPolygon &domain, const ExPolygons *solid = nullptr,
+                         Partitions *partitions = nullptr) const
     {
+        struct ProducerInterval { CellId id; double first, last; };
+        struct RawLine {
+            Point first, last;
+            std::vector<ProducerInterval> producers;
+        };
+        std::map<PlaneKey, std::vector<ProducerInterval>> producers;
+        if (partitions != nullptr) {
+            for (const Cell &cell : cells) {
+                if (!cell.split) continue;
+                cancel();
+                const double size = edge(cell);
+                const Vec3d lo = lower(cell);
+                const double t = z * sqrt_three - lo.sum() - .5 * size;
+                if (t <= 0. || t >= 2. * size) continue;
+                for (unsigned axis = 0; axis < 3; ++axis) {
+                    const unsigned a = (axis + 1) % 3;
+                    const double first = lo[a] + std::max(0., t - size);
+                    const double last = lo[a] + std::min(size, t);
+                    if (last > first)
+                        producers[{axis, cell.depth + 1, cell.address[axis] * 2 + 1}].push_back({cell.id(), first, last});
+                }
+            }
+        }
         Polylines raw;
+        std::vector<RawLine> original;
+        size_t work = 0;
+        const auto visit = [&] {
+            if (++work > parameters.max_nodes * size_t(64))
+                throw std::runtime_error("Bridge aware cubic exceeds the partition ownership work limit");
+            if ((work & 255) == 0) cancel();
+        };
         PlaneIntervals planes = refinement_intervals(z);
         for (auto &entry : planes) {
             cancel();
@@ -346,14 +533,21 @@ struct Plan::Impl {
                 p[a] = last;
                 p[b] = z * sqrt_three - fixed - last;
                 const Point p1 = scaled_point(origin + to_world * p);
-                if (p0 != p1)
-                    raw.emplace_back(p0, p1);
+                if (p0 == p1) return;
+                raw.emplace_back(p0, p1);
+                if (partitions == nullptr) return;
+                RawLine source{p0, p1, {}};
+                for (const ProducerInterval &owner : producers.at(plane)) {
+                    visit();
+                    const double begin = (std::max(first, owner.first) - first) / (last - first);
+                    const double end = (std::min(last, owner.last) - first) / (last - first);
+                    if (end > begin) source.producers.push_back({owner.id, begin, end});
+                }
+                original.push_back(std::move(source));
             };
             double first = intervals.front().first;
             double last = intervals.front().second;
             for (size_t i = 1; i < intervals.size(); ++i) {
-                // Only bridge floating arithmetic roundoff, never an actual
-                // gap or a material hole. Domain clipping is done afterward.
                 const double eps = 64. * std::numeric_limits<double>::epsilon() *
                     std::max({ 1., std::abs(last), std::abs(intervals[i].first) });
                 if (intervals[i].first <= last + eps)
@@ -366,7 +560,74 @@ struct Plan::Impl {
             }
             emit(first, last);
         }
-        return intersection_pl(raw, domain);
+        // Preserve one identical boolean batch for emission and ownership.
+        // Clipper's handling of touching open subjects can depend on the other
+        // subjects in its scan; separately clipping a face loses real output.
+        if (partitions == nullptr) {
+            if (solid != nullptr && !solid->empty()) raw = diff_pl(raw, *solid);
+            return intersection_pl(raw, domain);
+        }
+        std::vector<size_t> source_ids(raw.size());
+        std::iota(source_ids.begin(), source_ids.end(), size_t(0));
+        const auto clip = [&](ClipperLib::ClipType operation, const auto &mask) {
+            ClipperLib::Clipper clipper;
+            clipper.AddPaths(ClipperUtils::PolylinesProvider(raw), ClipperLib::ptSubject, false);
+            clipper.AddPaths(mask, ClipperLib::ptClip, true);
+            ClipperLib::PolyTree result;
+            clipper.Execute(operation, result, ClipperLib::pftNonZero, ClipperLib::pftNonZero);
+            Polylines clipped;
+            std::vector<size_t> clipped_sources;
+            clipped.reserve(result.Total());
+            clipped_sources.reserve(result.Total());
+            // Match PolyTreeToPolylines' traversal exactly. The metadata is
+            // carried by open output records, not inferred from rounded axes.
+            for (auto *node = result.GetFirst(); node != nullptr; node = node->GetNext()) {
+                if (node->Contour.empty()) continue;
+                visit();
+                if (!node->IsOpen() || node->OpenPathIndex() >= source_ids.size())
+                    throw std::runtime_error("Bridge aware cubic lost a clipped partition's source identity");
+                clipped_sources.push_back(source_ids[node->OpenPathIndex()]);
+                clipped.emplace_back(std::move(node->Contour));
+            }
+            raw = std::move(clipped);
+            source_ids = std::move(clipped_sources);
+        };
+        if (solid != nullptr && !solid->empty())
+            clip(ClipperLib::ctDifference, ClipperUtils::ExPolygonsProvider(*solid));
+        clip(ClipperLib::ctIntersection, ClipperUtils::ExPolygonProvider(domain));
+
+        std::map<CellId, Polylines> owned;
+        for (size_t line_index = 0; line_index < raw.size(); ++line_index) {
+            const Polyline &line = raw[line_index];
+            const RawLine &source = original.at(source_ids[line_index]);
+            const Vec2d direction = (source.last - source.first).cast<double>();
+            const double squared = direction.squaredNorm();
+            for (size_t i = 1; i < line.size(); ++i) {
+                cancel();
+                const Point &start = line.points[i - 1], &finish = line.points[i];
+                const double from = direction.dot((start - source.first).cast<double>()) / squared;
+                const double to = direction.dot((finish - source.first).cast<double>()) / squared;
+                if (from == to) continue;
+                for (const ProducerInterval &owner : source.producers) {
+                    visit();
+                    const double low = std::max(owner.first, std::min(from, to));
+                    const double high = std::min(owner.last, std::max(from, to));
+                    if (high <= low) continue;
+                    const auto point_at = [&](double position) {
+                        if (position == from) return start;
+                        if (position == to) return finish;
+                        const Vec2d point = start.cast<double>() +
+                            (finish - start).cast<double>() * ((position - from) / (to - from));
+                        return Point(coord_t(std::llround(point.x())), coord_t(std::llround(point.y())));
+                    };
+                    const Point a = point_at(low), b = point_at(high);
+                    if (a != b) owned[owner.id].emplace_back(a, b);
+                }
+            }
+        }
+        partitions->reserve(owned.size());
+        for (auto &entry : owned) partitions->emplace_back(entry.first, std::move(entry.second));
+        return raw;
     }
 
     Polylines bulk(double z, const ExPolygon &domain) const
@@ -435,8 +696,11 @@ struct Plan::Impl {
     }
 };
 
-Plan::Plan(Parameters parameters, std::vector<Demand> demands)
-    : m_impl(std::make_unique<Impl>(std::move(parameters), std::move(demands))) {}
+Plan::Plan(Parameters parameters, std::vector<Demand> demands,
+           std::vector<LayerClosure> closures, std::vector<LayerAttachment> attachments)
+    : m_impl(std::make_unique<Impl>(std::move(parameters), std::move(demands),
+                                   std::move(closures), std::move(attachments))) {}
+Plan::Plan(std::unique_ptr<const Impl> implementation) : m_impl(std::move(implementation)) {}
 Plan::~Plan() = default;
 Plan::Plan(Plan&&) noexcept = default;
 Plan& Plan::operator=(Plan&&) noexcept = default;
@@ -446,16 +710,73 @@ Polylines Plan::lines(double z, const ExPolygon &domain) const
     m_impl->cancel();
     if (!m_impl->has_elevation(z))
         return {};
-    Polylines result = m_impl->bulk(z, domain);
-    Polylines added = m_impl->refinement(z, domain);
-    result.insert(result.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
-    return result;
+    const ExPolygons solid = solid_area(z);
+    Polylines emitted = m_impl->bulk(z, domain);
+    if (!solid.empty()) emitted = diff_pl(emitted, solid);
+    Polylines added = m_impl->refinement(z, domain, &solid);
+    emitted.insert(emitted.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
+    return emitted;
 }
 
 Polylines Plan::refinement_lines(double z, const ExPolygon &domain) const
 {
     m_impl->cancel();
-    return m_impl->has_elevation(z) ? m_impl->refinement(z, domain) : Polylines {};
+    if (!m_impl->has_elevation(z)) return {};
+    const ExPolygons solid = solid_area(z);
+    Polylines result = m_impl->refinement(z, domain, &solid);
+    Polylines closures = intersection_pl(closure_lines(z), domain);
+    result.insert(result.end(), std::make_move_iterator(closures.begin()), std::make_move_iterator(closures.end()));
+    return result;
+}
+
+Polylines Plan::partition_lines(const CellId &owner, double z, const ExPolygon &domain) const
+{
+    auto partitions = partition_lines(z, domain);
+    const auto found = std::lower_bound(partitions.begin(), partitions.end(), owner,
+        [](const auto &entry, const CellId &id) { return entry.first < id; });
+    return found != partitions.end() && found->first == owner ? std::move(found->second) : Polylines{};
+}
+
+std::vector<std::pair<CellId, Polylines>> Plan::partition_lines(double z, const ExPolygon &domain) const
+{
+    m_impl->cancel();
+    if (!m_impl->has_elevation(z)) return {};
+    const ExPolygons solid = solid_area(z);
+    Impl::Partitions partitions;
+    m_impl->refinement(z, domain, &solid, &partitions);
+    return partitions;
+}
+
+Polylines Plan::closure_lines(double z) const
+{
+    m_impl->cancel();
+    if (!m_impl->has_elevation(z)) return {};
+    Polylines paths;
+    for (const LayerClosure &closure : m_impl->closures)
+        if (m_impl->closure_active(closure, z))
+            paths.insert(paths.end(), closure.paths.begin(), closure.paths.end());
+    return paths;
+}
+
+std::vector<LayerClosure> Plan::closures(double z) const
+{
+    m_impl->cancel();
+    if (!m_impl->has_elevation(z)) return {};
+    std::vector<LayerClosure> result;
+    for (const LayerClosure &closure : m_impl->closures)
+        if (m_impl->closure_active(closure, z)) result.push_back(closure);
+    return result;
+}
+
+std::vector<LayerAttachment> Plan::attachments(double z) const
+{
+    m_impl->cancel();
+    if (!std::isfinite(z)) throw std::invalid_argument("Bridge aware cubic requires a finite attachment elevation");
+    std::vector<LayerAttachment> result;
+    for (const LayerAttachment &attachment : m_impl->layer_attachments)
+        if (std::abs(attachment.z - z) <= 1.e-9 &&
+                (attachment.owners.empty() || m_impl->has_owner(attachment.owners))) result.push_back(attachment);
+    return result;
 }
 
 ExPolygons Plan::refinement_area(double z) const
@@ -463,21 +784,24 @@ ExPolygons Plan::refinement_area(double z) const
     m_impl->cancel();
     if (!m_impl->has_elevation(z))
         return {};
-    Polygons selected;
+    ExPolygons selected;
     size_t visited = 0;
     for (const Cell &cell : m_impl->cells) {
         if ((++visited & 255) == 0)
             m_impl->cancel();
-        if (!cell.split)
+        if (!cell.split && !cell.solid)
             continue;
         const double size = m_impl->edge(cell);
         const double t = z * sqrt_three - m_impl->lower(cell).sum() - .5 * size;
-        if (t > 0. && t < 2. * size) {
+        if (cell.solid || (t > 0. && t < 2. * size)) {
             Polygon polygon = m_impl->section(cell, z);
             if (!polygon.empty())
-                selected.push_back(std::move(polygon));
+                selected.emplace_back(std::move(polygon));
         }
     }
+    for (const LayerClosure &closure : m_impl->closures)
+        if (m_impl->closure_active(closure, z))
+            selected.insert(selected.end(), closure.reservation.begin(), closure.reservation.end());
     return union_ex(selected);
 }
 
@@ -494,10 +818,98 @@ std::vector<LeafSection> Plan::leaf_sections(double z) const
         if (!cell.split) {
             Polygon polygon = m_impl->section(cell, z);
             if (!polygon.empty())
-                sections.push_back({ id, cell.depth, m_impl->edge(cell), std::move(polygon) });
+                sections.push_back({ id, cell.depth, m_impl->edge(cell), std::move(polygon), cell.id(), cell.solid });
         }
     }
     return sections;
+}
+
+std::vector<LeafSection> Plan::solid_sections(double z) const
+{
+    m_impl->cancel();
+    if (!m_impl->has_elevation(z)) return {};
+    if (m_impl->statistics.solid_cells == 0) return {};
+    std::vector<LeafSection> sections;
+    for (size_t id = 0; id < m_impl->cells.size(); ++id) {
+        if ((id & 255) == 0) m_impl->cancel();
+        const Cell &cell = m_impl->cells[id];
+        if (cell.solid) {
+            Polygon polygon = m_impl->section(cell, z);
+            if (!polygon.empty())
+                sections.push_back({ id, cell.depth, m_impl->edge(cell), std::move(polygon), cell.id(), true });
+        }
+    }
+    return sections;
+}
+
+ExPolygons Plan::solid_area(double z) const
+{
+    ExPolygons polygons;
+    for (LeafSection &section : solid_sections(z)) polygons.emplace_back(std::move(section.polygon));
+    return union_ex(polygons);
+}
+
+const std::vector<Refinement>& Plan::refinements() const { return m_impl->refinements; }
+const std::vector<size_t>& Plan::active_demands() const { return m_impl->active_demands; }
+
+Plan Plan::clone() const
+{
+    m_impl->cancel();
+    return Plan(std::make_unique<Impl>(*m_impl));
+}
+
+Plan Plan::with_demands(std::vector<Demand> demands) const
+{
+    m_impl->cancel();
+    return Plan(std::make_unique<Impl>(m_impl->parameters, std::move(demands),
+                                       m_impl->closures, m_impl->layer_attachments, m_impl->forced_leaves));
+}
+
+Plan Plan::with_payloads(std::vector<LayerClosure> closures, std::vector<LayerAttachment> attachments) const
+{
+    m_impl->cancel();
+    return Plan(std::make_unique<Impl>(m_impl->parameters, m_impl->demands,
+                                       std::move(closures), std::move(attachments), m_impl->forced_leaves));
+}
+
+Plan Plan::collapsed(const CellId &id) const
+{
+    m_impl->cancel();
+    if (m_impl->active_owners.find(id) == m_impl->active_owners.end())
+        throw std::invalid_argument("Bridge aware cubic can only collapse an active split or solid cell");
+    std::set<CellId> forced = m_impl->forced_leaves;
+    forced.insert(id);
+    return Plan(std::make_unique<Impl>(m_impl->parameters, m_impl->demands,
+                                       m_impl->closures, m_impl->layer_attachments, std::move(forced)));
+}
+
+Plan Plan::coarsened(const std::function<bool(const Plan&)> &validate, size_t max_trials) const
+{
+    m_impl->cancel();
+    if (!validate) throw std::invalid_argument("Bridge aware cubic coarsening requires a final-deposition validator");
+    Plan current(std::make_unique<Impl>(*m_impl));
+    if (!validate(current))
+        throw std::runtime_error("Bridge aware cubic cannot coarsen an uncertified starting plan");
+    size_t attempts = 0;
+    for (;;) {
+        std::vector<Refinement> candidates = current.refinements();
+        std::sort(candidates.begin(), candidates.end(), [](const Refinement &a, const Refinement &b) {
+            return a.id.depth == b.id.depth ? a.id.address < b.id.address : a.id.depth > b.id.depth;
+        });
+        bool accepted = false;
+        for (const Refinement &candidate : candidates) {
+            current.m_impl->cancel();
+            if (attempts++ >= max_trials)
+                throw std::runtime_error("Bridge aware cubic exceeds the coarsening work limit before reaching an irreducible plan");
+            Plan trial = current.collapsed(candidate.id);
+            if (validate(trial)) {
+                current = std::move(trial);
+                accepted = true;
+                break;
+            }
+        }
+        if (!accepted) return current;
+    }
 }
 
 const Parameters& Plan::parameters() const { return m_impl->parameters; }

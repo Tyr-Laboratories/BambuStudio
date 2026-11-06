@@ -7,6 +7,7 @@
 #include "libslic3r/Fill/Lightning/TreeNode.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <map>
 
 using namespace Slic3r;
@@ -174,6 +175,11 @@ TEST_CASE("Internal bridge stacks rebuild demand-driven sparse infill below part
     process_pattern(baseline, model, stack_pattern_config(pattern, 1));
     process_pattern(stacked, model, stack_pattern_config(pattern, count));
 
+    std::vector<std::vector<Segment>> first_stacked_sparse;
+    if (pattern == "lightning")
+        for (const Layer *layer : stacked.get_object(size_t(0))->layers())
+            first_stacked_sparse.push_back(sparse_segments(*layer));
+
     const auto before = classified_areas(baseline, stInternalBridge);
     const auto after = classified_areas(stacked, stInternalBridge);
     REQUIRE(before.size() >= 2); // A terrace roof and the separate tower roof.
@@ -303,6 +309,13 @@ TEST_CASE("Internal bridge stacks rebuild demand-driven sparse infill below part
     CAPTURE(repeated_anchored, repeated_ends);
     REQUIRE(repeated_ends > 20);
     CHECK(double(repeated_anchored) / repeated_ends >= double(baseline_anchored) / baseline_ends - 0.02);
+    if (pattern == "lightning") {
+        REQUIRE(stacked.get_object(size_t(0))->layer_count() == first_stacked_sparse.size());
+        for (size_t index = 0; index < first_stacked_sparse.size(); ++index) {
+            CAPTURE(index);
+            REQUIRE(sparse_segments(*stacked.get_object(size_t(0))->get_layer(index)) == first_stacked_sparse[index]);
+        }
+    }
 }
 
 TEST_CASE("Bridge stack Lightning keeps junction support geometry stable", "[BridgeControls][Layers][StackPatterns][LightningTraversal]")
@@ -321,12 +334,73 @@ TEST_CASE("Bridge stack Lightning keeps junction support geometry stable", "[Bri
     const Polylines expected = stable.convertToLines(outline, scale_(0.3));
     REQUIRE(expected.size() == 3);
     for (int repeat = 0; repeat < 32; ++repeat) {
-        // Ordinary conversion consumes the native RNG and may trim a different
-        // branch. It must not change a stack's already chosen support geometry.
+        // Interleaving ordinary conversion must not change a stack's already
+        // chosen first-child support geometry.
         ordinary.convertToLines(outline, scale_(0.3));
         const Polylines actual = stable.convertToLines(outline, scale_(0.3));
         REQUIRE(actual.size() == expected.size());
         for (size_t index = 0; index < actual.size(); ++index)
             CHECK(actual[index].points == expected[index].points);
     }
+}
+
+TEST_CASE("Lightning junction support geometry is repeatable", "[BridgeControls][Layers][StackPatterns][LightningDeterminism]")
+{
+    const auto make_tree = [] {
+        const auto root = FillLightning::Node::create(Point(scale_(0.), scale_(0.)));
+        const auto fork = root->addChild(Point(scale_(5.), scale_(0.)));
+        fork->addChild(Point(scale_(10.), scale_(-5.)));
+        fork->addChild(Point(scale_(10.), scale_(0.)));
+        fork->addChild(Point(scale_(10.), scale_(5.)));
+        return root;
+    };
+    FillLightning::Layer layer;
+    layer.tree_roots.push_back(make_tree());
+    const Polygons outline{Polygon{{Point(scale_(-1.), scale_(-6.)), Point(scale_(11.), scale_(-6.)),
+        Point(scale_(11.), scale_(6.)), Point(scale_(-1.), scale_(6.))}}};
+    const auto segments = [](const Polylines &polylines) {
+        std::vector<Segment> result;
+        for (const Polyline &polyline : polylines)
+            for (const Line &line : polyline.lines()) {
+                Point a = line.a, b = line.b;
+                if (a.x() > b.x() || (a.x() == b.x() && a.y() > b.y()))
+                    std::swap(a, b);
+                result.push_back({a.x(), a.y(), b.x(), b.y()});
+            }
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+    const auto expected = segments(layer.convertToLines(outline, scale_(0.3)));
+    REQUIRE(expected.size() == 4);
+    FillLightning::Layer independent;
+    independent.tree_roots.push_back(make_tree());
+    REQUIRE(segments(independent.convertToLines(outline, scale_(0.3))) == expected);
+    for (int repeat = 0; repeat < 32; ++repeat) {
+        CAPTURE(repeat);
+        // Unrelated work and previous conversions must not move the trimmed
+        // junction endpoints used by bridge anchoring and final extrusion.
+        (void) std::rand();
+        const auto actual = segments(layer.convertToLines(outline, scale_(0.3)));
+        REQUIRE(actual == expected);
+    }
+}
+
+TEST_CASE("Lightning reconnects at the nearest boundary crossing", "[BridgeControls][Layers][StackPatterns][LightningDeterminism]")
+{
+    const Point shift = GENERATE(Point(0, 0), Point(scale_(20.), scale_(30.)), Point(scale_(-20.), scale_(-30.)));
+    const Polygons outline{Polygon{{shift, shift + Point(scale_(10.), scale_(0.)),
+        shift + Point(scale_(10.), scale_(10.)), shift + Point(scale_(0.), scale_(10.))}}};
+    EdgeGrid::Grid locator(get_extents(outline).inflated(scale_(2.)));
+    locator.create(outline, scale_(1.));
+    const Point a = shift + Point(scale_(-1.), scale_(5.));
+    const Point b = shift + Point(scale_(11.), scale_(5.));
+    Point intersection;
+
+    // Both sides cross the query segment. Reconnection must select the side
+    // nearest its destination, independent of the outline's world position.
+    REQUIRE(FillLightning::lineSegmentPolygonsIntersection(a, b, locator, intersection, scale_(2.)));
+    CHECK(intersection == shift + Point(scale_(10.), scale_(5.)));
+    REQUIRE(FillLightning::lineSegmentPolygonsIntersection(b, a, locator, intersection, scale_(2.)));
+    CHECK(intersection == shift + Point(scale_(0.), scale_(5.)));
+    CHECK_FALSE(FillLightning::lineSegmentPolygonsIntersection(a, b, locator, intersection, scale_(0.5)));
 }

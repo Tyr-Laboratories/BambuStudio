@@ -10,50 +10,104 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Flow.hpp"
+#include "libslic3r/Layer.hpp"
 #include "libslic3r/libslic3r.h"
 
 using namespace Slic3r::Test;
 using namespace Slic3r;
 
 SCENARIO("Extrusion width specifics", "[Flow]") {
-    GIVEN("A config with a skirt, brim, some fill density, 3 perimeters, and 1 bottom solid layer and a 20mm cube mesh") {
-        // this is a sharedptr
-        DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
-		config.set_deserialize_strict({
-			{ "brim_width",			2 },
-			{ "skirts",				1 },
-			{ "perimeters",			3 },
-			{ "fill_density",		"40%" },
-			{ "first_layer_height", 0.3 }
-			});
+    GIVEN("A 20mm cube with a skirt, brim, three walls and one bottom solid layer") {
+        DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+        config.set_deserialize_strict({
+            {"nozzle_diameter", "0.4"},
+            {"initial_layer_print_height", "0.3"}, {"layer_height", "0.2"},
+            {"initial_layer_line_width", "0.6"}, {"initial_layer_infill_line_width", "0"},
+            {"line_width", "0.45"}, {"outer_wall_line_width", "0.45"},
+            {"inner_wall_line_width", "0.45"}, {"sparse_infill_line_width", "0.45"},
+            {"internal_solid_infill_line_width", "0.45"},
+            {"wall_generator", "classic"}, {"wall_loops", "3"},
+            {"only_one_wall_first_layer", "0"},
+            {"bottom_shell_layers", "1"}, {"bottom_shell_thickness", "0"},
+            {"top_shell_layers", "0"}, {"top_shell_thickness", "0"},
+            // Monotonic lines retain the requested width instead of widening
+            // solid infill lines to fit an integer number across the surface.
+            {"bottom_surface_pattern", "monotonicline"},
+            {"sparse_infill_density", "40%"}, {"sparse_infill_pattern", "grid"},
+            {"initial_layer_flow_ratio", "1"}, {"infill_combination", "0"},
+            {"brim_type", "outer_only"}, {"brim_width", "2"},
+            {"skirt_loops", "1"}, {"skirt_height", "1"}
+        });
 
-        WHEN("first layer width set to 2mm") {
-            Slic3r::Model model;
-            config.set("first_layer_extrusion_width", 2);
-            Slic3r::Print print;
-            Slic3r::Test::init_print({TestMesh::cube_20x20x20}, print, model, config);
+        WHEN("the first-layer width is wider than the regular width") {
+            Model model;
+            Print print;
+            init_print({TestMesh::cube_20x20x20}, print, model, config);
+            print.process();
 
-            std::vector<double> E_per_mm_bottom;
-            std::string gcode = Test::gcode(print);
-            Slic3r::GCodeReader parser;
-            const double layer_height = config.opt_float("layer_height");
-            parser.parse_buffer(gcode, [&E_per_mm_bottom, layer_height] (Slic3r::GCodeReader& self, const Slic3r::GCodeReader::GCodeLine& line)
-            { 
-                if (self.z() == Approx(layer_height).margin(0.01)) { // only consider first layer
-                    if (line.extruding(self) && line.dist_XY(self) > 0) {
-                        E_per_mm_bottom.emplace_back(line.dist_E(self) / line.dist_XY(self));
+            // Inspect generated deposition paths, including nested loops and
+            // multipaths, without relying on rounded G-code E coordinates.
+            const auto check_role = [](const ExtrusionEntity& entity, ExtrusionRole role,
+                                       double width, double height, double mm3_per_mm) {
+                size_t count = 0;
+                const auto visit = [&](const auto& self, const ExtrusionEntity& current) -> void {
+                    if (const auto* path = dynamic_cast<const ExtrusionPath*>(&current)) {
+                        // Gap fill has variable width, and wiping paths deposit
+                        // nothing; neither is a constant-width extrusion.
+                        if (path->role() != role || path->is_force_no_extrusion())
+                            return;
+                        CAPTURE(role, path->width, path->height);
+                        REQUIRE(path->polyline.length() > 0.0);
+                        CHECK(path->width == Approx(width).epsilon(1e-6));
+                        CHECK(path->height == Approx(height).epsilon(1e-6));
+                        CHECK(path->mm3_per_mm == Approx(mm3_per_mm).epsilon(1e-6));
+                        ++count;
+                    } else if (const auto* loop = dynamic_cast<const ExtrusionLoop*>(&current)) {
+                        for (const auto& path : loop->paths)
+                            self(self, path);
+                    } else if (const auto* multi = dynamic_cast<const ExtrusionMultiPath*>(&current)) {
+                        for (const auto& path : multi->paths)
+                            self(self, path);
+                    } else if (const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(&current)) {
+                        for (const auto* child : collection->entities)
+                            self(self, *child);
+                    } else {
+                        FAIL("Unexpected extrusion entity in constant-width fixture");
                     }
-                }
-            });
-            THEN(" First layer width applies to everything on first layer.") {
-                bool pass = false;
-                double avg_E = std::accumulate(E_per_mm_bottom.cbegin(), E_per_mm_bottom.cend(), 0.0) / static_cast<double>(E_per_mm_bottom.size());
+                };
+                visit(visit, entity);
+                CAPTURE(role);
+                REQUIRE(count > 0);
+            };
 
-                pass = (std::count_if(E_per_mm_bottom.cbegin(), E_per_mm_bottom.cend(), [avg_E] (const double& v) { return v == Approx(avg_E); }) == 0);
-                REQUIRE(pass == true);
-                REQUIRE(E_per_mm_bottom.size() > 0); // make sure it actually passed because of extrusion
+            REQUIRE(print.objects().size() == 1);
+            const PrintObject* object = print.get_object(size_t(0));
+            REQUIRE(object->layer_count() > 1);
+
+            THEN("first-layer walls, bottom infill, skirt and brim use the first-layer width and flow") {
+                const Layer* first = object->get_layer(0);
+                REQUIRE(first->print_z == Approx(0.3));
+                REQUIRE(first->regions().size() == 1);
+                const LayerRegion& region = *first->regions().front();
+                // Rounded-rectangle cross section: h * (w - h * (1 - pi/4)).
+                constexpr double first_layer_mm3_per_mm = 0.1606858347;
+                for (const ExtrusionRole role : {erExternalPerimeter, erPerimeter})
+                    check_role(region.perimeters, role, 0.6, 0.3, first_layer_mm3_per_mm);
+                check_role(region.fills, erBottomSurface, 0.6, 0.3, first_layer_mm3_per_mm);
+                check_role(print.skirt(), erSkirt, 0.6, 0.3, first_layer_mm3_per_mm);
+                REQUIRE(print.get_brimMap().size() == 1);
+                check_role(print.get_brimMap().begin()->second, erBrim, 0.6, 0.3, first_layer_mm3_per_mm);
             }
-            THEN(" First layer width does not apply to upper layer.") {
+
+            THEN("the next layer returns to the regular wall and sparse infill widths and flow") {
+                const Layer* upper = object->get_layer(1);
+                REQUIRE(upper->print_z == Approx(0.5));
+                REQUIRE(upper->regions().size() == 1);
+                const LayerRegion& region = *upper->regions().front();
+                constexpr double regular_mm3_per_mm = 0.0814159265;
+                for (const ExtrusionRole role : {erExternalPerimeter, erPerimeter})
+                    check_role(region.perimeters, role, 0.45, 0.2, regular_mm3_per_mm);
+                check_role(region.fills, erInternalInfill, 0.45, 0.2, regular_mm3_per_mm);
             }
         }
     }

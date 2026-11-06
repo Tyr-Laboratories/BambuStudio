@@ -1,96 +1,128 @@
 # Bridge aware cubic implementation plan
 
-> **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans to implement these tasks. Preserve the pre-existing working changes and use the approved spec as authority.
+> **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans for implementation. Preserve unrelated working changes and use the approved spec as authority. One controller owns shared CMake changes and builds.
 
-**Goal:** Add Bridge aware cubic with bulk-density preservation, selective recursive subdivision under actual extrusion footprints, and checks on emitted support gaps.
+**Goal:** Add Bridge aware cubic with ordinary Cubic bulk spacing, selective recursive subdivision under actual extrusion footprints, and checks on emitted support gaps and construction.
 
-**Architecture:** A region-owned immutable cubic hierarchy supplies both sparse toolpaths and the transition domains that must survive infill combination. Demand comes from actual candidate upper extrusion paths; every recursive child intersects that demand independently. Final generated paths are checked before successful slicing.
+**Status:** The source work below has passed an automated correctness checkpoint. Delivery is held for the user's additional mandatory performance limit: end-to-end slicing must be no more than twice stock official Bambu Studio using regular Cubic. The current implementation is substantially slower and requires optimization plus renewed correctness and performance verification.
 
-**Tech Stack:** Existing C++17 slicer, Eigen geometry, Clipper polygon operations, Catch2, CMake/Ninja, wxWidgets configuration UI.
+**Architecture:** `PrintObject` owns per-region immutable plans. A physical cubic hierarchy supplies ordinary bulk walls, local partitions, and saturated local solid domains. Candidate non-sparse paths establish support demand after bridge-stack placement. Separate contact, validation, attachment, and dependency modules check actual deposition, repair local failures, and remove unnecessary construction before the final plan is used for output.
 
-**Spec:** `docs/superpowers/specs/2026-11-05-bridge-aware-cubic-design.md`
+**Tech stack:** C++17, Eigen, Clipper, Catch2, CMake/Ninja, and the existing wxWidgets configuration UI.
+
+**Spec:** [Approved design](../specs/2026-11-05-bridge-aware-cubic-design.md). Keep the approved specification unchanged unless a separate change is authorized.
 
 ## Global constraints
 
-- Pattern `bridgeawarecubic`, label `Bridge aware cubic`, positive scalar millimeter option `bridge_aware_cubic_max_gap`, provisional default 5 mm.
-- Sparse density retains ordinary Cubic bulk spacing. Zero density disables sparse fill; 100% uses existing solid handling.
-- Every recursion independently tests actual finite-width extrusion footprint and its gap requirement. Unneeded siblings remain coarse; global neighbor balancing is prohibited.
-- Retain natural partition births, inherited walls, region ownership, required deposition planes, and explicit support dependencies.
-- Preserve existing bridge controls and all unrelated working changes. No printer, installed-app, cloud, or deployment actions.
-- The branch is `codex/bridge-aware-cubic`. Pre-existing changed files are snapshotted outside the repository; do not commit unrelated work.
+- Serialize the pattern as `bridgeawarecubic` and the positive scalar millimeter option as `bridge_aware_cubic_max_gap`; the provisional default is 5 mm.
+- Preserve ordinary Cubic bulk spacing. Zero density disables sparse fill; 100% routes to Rectilinear fill.
+- Re-evaluate the actual finite-width demand in every child. Unneeded siblings remain coarse, and a neighboring depth difference alone never requires refinement.
+- Keep natural partition births, inherited faces, region ownership, real support elevations, and explicit dependencies. A logical modifier edge or clipped demand edge cannot supply material or an anchor.
+- Use only preceding deposition for support evidence; do not rely on same-layer sorting to make a future parent strand available.
+- Preserve the independently released bridge controls and unrelated working changes. Treat source verification, application installation, release publication, and physical printing as separate actions and evidence levels. Delivery follows the user's explicit instructions recorded below; physical printer work remains outside this task.
+- Meet the user's subsequent 2× stock-official regular-Cubic end-to-end slicing limit using identical persistent model/settings fixtures. Measure actual slicing through G-code export separately from application startup and project packaging. Do not satisfy the limit by weakening geometry, anchoring, ownership, work-limit, or irreducibility requirements.
 
-## Review focus
+## Implemented source work
 
-- A line or two separated lines must not refine their entire containing roof rectangle.
-- Modifier seams and negative-volume holes are not support walls; ownership and actual deposition govern clipping.
-- Bridge-stack base relocation and infill combination must not remove presumed supports.
-- Tiny gaps, thin parts, absent anchors, and topology cleanup must fail explicitly when the bound cannot be established.
-- Changing gap, direction, geometry, or region settings must remove stale branches and regenerate deterministic output.
+### 1. Settings and pattern integration
 
-### Task 1: Persistent settings and user controls
+**Files:** `PrintConfig.{hpp,cpp}`, `Preset.cpp`, `Fill/FillBase.cpp`, `Fill/Fill.cpp`, `Layer.cpp`, and GUI `Tab.cpp`, `GUI_Factories.cpp`, `ConfigManipulation.cpp`, `ParamTooltip.cpp`.
 
-**Files:** `src/libslic3r/PrintConfig.{hpp,cpp}`, `src/libslic3r/Preset.cpp`, `src/slic3r/GUI/{Tab,GUI_Factories,ConfigManipulation}.cpp`, `tests/fff_print/test_bridge_aware_cubic_config.cpp`.
+- [x] Append the enum without renumbering existing patterns; register the scalar setting, persistence, inheritance, and conditional UI.
+- [x] Instantiate a dedicated filler and keep distinct region plans from merging during fill grouping.
+- [x] Preserve zero/full-density behavior and reject unrepresentable positive densities and invalid gap values.
+- [x] Invalidate preparation when settings change demand, contact, ownership, or emitted geometry; reject reuse of extrusion caches without a plan.
+- [ ] Record the final configuration, persistence, UI-build, and legacy-pattern verification results.
 
-**Interfaces:** Append `ipBridgeAwareCubic` before `ipCount`, register `bridgeawarecubic`, and add `ConfigOptionFloat bridge_aware_cubic_max_gap` to region config and its macro registration. The setting is a scalar across nozzle variants. Integration consumes these names verbatim.
+### 2. Physical cubic hierarchy and local solid saturation
 
-- [x] Add failing real config round-trip and invalid-value tests.
-- [x] Register the enum, setting, preset/inheritance lists, conditional UI, and multiline incompatibility.
-- [x] Run the focused tests and review configuration consumers.
+**Files:** `Fill/BridgeAwareCubic.{hpp,cpp}`, `Fill/FillBridgeAwareCubic.hpp`.
 
-### Task 2: Selective cubic hierarchy and geometry
+- [x] Use actual cubic cell edge `a`, with ordinary Cubic family pitch `p = 3s/d`, `a = p sqrt(2/3)`, and ideal horizontal diameter bound `sqrt(2) a`.
+- [x] Intersect each child's actual section with current finite-width demand; stop locally and retain untouched siblings.
+- [x] Emit complete selected midplanes from their natural births, retain ancestor faces, and deduplicate shared collinear intervals.
+- [x] Expose stable lattice-scoped cell identities, refinement reasons, solid sections, and immutable closure/attachment payloads.
+- [x] Detect local density saturation before emitting overlapping cubic walls beyond the supported density. The integrated filler emits two perpendicular half-density line families within the affected local leaf sections, at a combined nominal density of 100%, and clips beads to actual material. Final contact-plane openings and supporting predecessors are still verified.
+- [x] Bound coordinates, allocation, recursion, work, and cancellation. Solid masks remain construction obligations subject to the same deposition checks.
+- [ ] Record final geometry, phase, saturation, and construction acceptance results.
 
-**Files:** new `src/libslic3r/Fill/BridgeAwareCubic.{hpp,cpp}` and `tests/fff_print/test_bridge_aware_cubic_geometry.cpp`; source/test CMake registration coordinated by the parent implementer.
+### 3. Actual contact and emitted-geometry validation
 
-**Interfaces:** Namespace `Slic3r::BridgeAwareCubic`; immutable `Plan` built from per-region `Parameters` and `std::vector<Demand>`. A demand carries physical support Z, finite-width `ExPolygons` footprint, and gap. Parameters carry bulk flow spacing, fractional density, infill angle in radians, world bounds, and cancellation callback. Expose `Polylines lines(double z, const ExPolygon &domain) const` for complete bulk plus selected partitions; `ExPolygons refinement_area(double z) const` for protecting transition material; and inspectable geometric leaf/split statistics for diagnostics. Agree precise header types with the integrating implementer before coding.
+**Files:** `Fill/BridgeAwareCubicContact.{hpp,cpp}`, `Fill/BridgeAwareCubicValidation.{hpp,cpp}`, `BridgeAwareCubicSupport.cpp`.
 
-- [x] Write focused tests for no-demand bulk pitch, one line vs uniform subdivision, separate lines, actual-section early stopping, replaced demand, variable Z and angle, and invalid/bounded inputs.
-- [x] Implement physical cubic cells and full midplane births, recursive per-child demand clipping, stopping at the local cell gap, deduplicated shared partitions, cancellation and bounded work.
-- [x] Preserve coarse siblings and expose exact transition domains; rebuild from current demand to discard historical branches.
-- [x] Run geometry tests with independently computed span/coverage assertions and review the hierarchy.
+- [x] Derive contact from actual emitted width, height, and serialized deposition elevation using rounded-rectangle or circular bead sections at one common plane.
+- [x] Keep undilated physical lower sections separate from direction-dependent upper-path contact evidence. Finite line contacts do not become inflated cell walls, and isolated points do not become anchors.
+- [x] Restrict vertical snapping to representation roundoff; an XY margin cannot close a real vertical gap. Unsupported shapes, fitted arcs, invalid input, and exhausted contact work fail closed.
+- [x] Measure complete unsupported path intervals, preserving endpoints across demand masks and region seams, with explicit two-ended, one-sided, and floating classifications.
+- [x] Measure whole actual void components selected by roof/wall demand. An opening through a missing face joins the adjacent voids; material and cavity boundaries are never invented from demand clipping.
+- [x] Check construction strands and follow-up bridges against actual preceding deposition without imposing final roof-cell sizing on their surrounding coarse cells.
+- [ ] Record final contact, anchoring, void-topology, variable-height, and thick-bridge verification results.
 
-### Task 3: Slicing integration and final support verification
+### 4. Local repair, interface ownership, and deposition reservations
 
-**Files:** new inline filler `src/libslic3r/Fill/FillBridgeAwareCubic.hpp` and `src/libslic3r/BridgeAwareCubicSupport.cpp`; modify `FillBase.{hpp,cpp}`, `Fill.cpp`, `Print.{hpp,cpp}`, `PrintObject.cpp`, `Layer.cpp`, source/test CMake; new `tests/fff_print/test_bridge_aware_cubic.cpp`.
+**Files:** `Fill/BridgeAwareCubicAttachment.{hpp,cpp}`, `Fill/BridgeAwareCubicSupport.hpp`, `BridgeAwareCubicSupport.cpp`, `Fill/Fill.cpp`, `PrintObject.cpp`.
 
-**Interfaces:** Dedicated filler consumes `const BridgeAwareCubic::Plan*` for its surface's region and uses ordinary Cubic during provisional generation. `PrintObject` owns region plans and prepares them from actual upper fill/perimeter footprints at final bridge base elevations. The same plan supplies anchoring and final generation. Protected domains are subtracted from infill-combination candidates.
+- [x] Freeze candidate upper geometry after ordinary bridge placement. Collect non-sparse path demand and carry the supplying sparse region's gap policy through follow-up bridge planes.
+- [x] Extend only genuine free endpoints along their terminal tangents into contact-qualified preceding material. Keep original points, enforce the emitting region's permitted bead footprint, and revalidate the whole replacement path.
+- [x] Store repairs by original path identity and replay them during final generation; do not extend closed-loop joins or interior multipath joins.
+- [x] Build physical interface partitions for incompatible modifier lattices using explicit storage/emitting ownership. Limit construction to compatible positive-density regions using the same sparse-infill filament; deduplicate coincident courses without deleting crossing joints.
+- [x] Continue interface courses downward until preceding material passes the contact/span check. If a valid construction cannot be found within the solve, reject it.
+- [x] Restrict refinement repair to failing strand fragments or affected voids, preserving each fragment's producing cell or explicit closure identity.
+- [x] Reserve both actual transition paths and their predecessor scaffold from combination and trimming. An already-supported partition does not need extra refinement merely to preserve its supporting bulk cells.
+- [ ] Record final modifiers, endpoint repair, ribs/inward walls, cavities, combination, and reslice verification results.
 
-- [ ] Add failing full-slicing fixtures for 5% cubes, partial roofs, inward walls, bridge stacks, gap changes, modifiers, and combination.
-- [x] Generate provisional non-sparse paths, collect precise demands across eligible regions, build plans, and reserve required transition/support material before layer combination.
-- [x] Wire factory, grouping identity, flow/angle/region settings, anchoring and final filling. Keep other patterns unchanged.
-- [ ] Verify final actual support footprints, relevant closed cells, consecutive unsupported path intervals, anchors, and added-partition deposition support. Repair/refine and regenerate locally or reject unsatisfied geometry; do not silently certify a sizing estimate.
-- [x] Preserve dependencies through emission or require prior-layer support. Enforce explicit incompatibilities and invalidate all demand-affecting settings.
-- [ ] Run integration and pre-existing bridge regression tests, then review the combined implementation.
+### 5. Dependency pruning and final coarsening
 
-### Task 4: Verification and delivery
+**Files:** `Fill/BridgeAwareCubicDependencies.{hpp,cpp}`, `Fill/BridgeAwareCubic.{hpp,cpp}`, `BridgeAwareCubicSupport.cpp`.
 
-**Files:** feature tests, user documentation, and this plan's completion record.
+- [x] Resolve dependencies across region-scoped lattice identities from direct demand roots and actual surviving producers. A different region's same-numbered cell or a surviving ancestor cannot impersonate the removed producer.
+- [x] Remove unreachable obligations, including unrooted cycles, and rebuild affected plan demand without retaining obsolete exploratory branches.
+- [x] Trial collapsing active subdivisions and solid leaves, regenerate affected layers, and check the affected frozen roof paths plus construction strands against their actual preceding deposition.
+- [x] Trial removing complete interface construction stacks and release their dependent obligations. Repeat accepted reductions until no candidate collapse succeeds.
+- [x] Reject work-limit exhaustion before claiming the chosen plan is irreducible. This procedure is bounded to the chosen lattice and available collapse operations, not a global material optimum.
+- [ ] Record final ownership, orphan-pruning, coarsening, determinism, and runtime evidence.
 
-- [x] Build the native slicing tests and affected GUI translation units in the existing configured build. A complete application bundle and installation remain outside this increment.
-- [ ] Run geometry/config/integration tests and relevant existing bridge, wall, flow, and serialization tests. Record failures separately from baseline results.
-- [ ] Obtain an independent feature review, resolve actionable findings, and re-run affected checks.
-- [x] Document settings and bounded behavior. Report the branch, changes, evidence, and any remaining qualification gap.
+### 6. Output precision and post-verification constraints
+
+**Files:** `GCodeWriter.{hpp,cpp}`, `GCode.cpp`, `Print.cpp`, `PrintObject.cpp`, `BridgeAwareCubicSupport.cpp`.
+
+- [x] Use the same serialized deposition Z values in contact checks and motion output. Current source selects 12 fractional Z digits for prints containing Bridge aware cubic and retains the ordinary three-digit path otherwise.
+- [x] Preserve sufficient emitted width/height annotation precision for exported-geometry checks. Check actual XY output conversion, rounding, and skipped source segments at each instance placement, with a fresh check before export.
+- [x] Reject different configured XY nozzle offsets until tool-specific physical contact handling is available.
+- [x] Reject Spiral vase, nonzero seam gap, scarf transformations, incompatible Multiline, and Conformal infill when this pattern participates. Reject compensated circular loops that would still receive scarf seams.
+- [x] Preserve participating objects' wall/infill paths instead of applying subsequent simplification or arc fitting that would invalidate the checked geometry.
+- [ ] Record the final build and exported-coordinate verification after the precision changes settle.
+
+## Qualification and delivery work
+
+The test sources cover configuration/persistence, independent lattice geometry, validator topology, rounded-bead contact, attachment constraints, dependency ownership, local repair, modifiers, combination, reslicing, bridge stacks, demand phases, inward walls, variable heights, cavities, and actual G-code coordinates. Test presence does not establish their final result.
+
+- [ ] Run the final feature suite, including acceptance and export tests, after all source changes land.
+- [ ] Run relevant existing bridge, wall, flow, and serialization regressions; distinguish feature regressions from separately reproduced baseline failures.
+- [ ] Finish independent review and rerun checks affected by any correction.
+- [ ] Record runtime, refinement/material extent, and any work-limit behavior on representative fixtures. Small acceptance fixtures alone do not qualify large-model performance.
+- [ ] Update the user documentation and this record with the final bounded evidence, without implying application installation or printer acceptance.
+- [ ] Perform physical coupon qualification separately with the intended printer, filament, temperatures, flow, cooling, and bridge settings, inspecting the first roof layer and finished top.
+
+The geometric bead model does not establish adhesion, sag resistance, or production print quality. A checked source path, an exported G-code file, an installed application, and a successful physical print are separate evidence levels.
 
 ## Execution record
 
-- Branch created at `66a45f8f7271420dd0c75681b5b7ea4aa3598298`; existing dirty state retained and snapshotted.
-- User approved the design and explicitly instructed implementation. Continue without another plan-approval round.
-- Use disjoint file ownership for parallel work; one controller owns CMake, builds, and integration to avoid concurrent build mutations.
+- The feature branch began at `66a45f8f7271420dd0c75681b5b7ea4aa3598298` with the existing dirty state retained and snapshotted.
+- The user approved the design and instructed implementation. Routine source completion and verification do not require another design-approval round.
+- The user subsequently instructed committing all changes, testing them, merging the feature into the main branch after tests pass, and directing the release agent to build a release containing everything. The active delivery objective also authorizes replacing the local application and publishing the new release to the fork. These actions remain conditional on successful source verification.
+- The branch was advanced to the released bridge-controls baseline `28aed765070b663ae4938b93435b87c9680c2a24` (`v2.8.4.57-tyr.17`), preserving the feature changes and unrelated artifacts.
+- Earlier reviews identified saturation, modifier closure, endpoint attachment, physical contact, stale ownership, export precision, and cache gaps. The source now contains the corresponding construction and verification mechanisms described above; final combined qualification remains pending.
+- A Lightning repeat-slice anchor-ratio failure was also reproduced using the unmodified release-baseline executable. Its tree ordering has since been made deterministic; the final combined verification below must include the bridge-controls suite.
+- Shared builds and final test execution remain under one controller. The release agent will handle the authorized application and release delivery after the tested merge; physical printer qualification remains separate.
 
-- Advanced the feature branch to the released bridge-controls baseline `28aed765070b663ae4938b93435b87c9680c2a24` (`v2.8.4.57-tyr.17`). A three-way merge against the original dirty-state snapshot retained the cubic additions and incorporated the independently completed baseline changes. Existing unrelated artifacts were preserved.
-- Independent geometry and integration reviews identified saturation, seam/scarf transformations, export rounding, bridge-follow-up ownership, and cache hazards. The current increment rejects unsupported saturation and export transformations, reserves positive geometric overlap, carries support-region policy through bridge stacks, and rejects caches without a plan.
-- Local repairs now select only violating run footprints and failed void cells, intersected with original finite-width demand. A new full-slicing regression verifies that a failed strand does not request refinement under passing strands elsewhere in the same group.
-- Final feature run: **58 of 62 declared test cases pass**. All 48 configuration, geometry, and validator cases pass; 10 of 14 full-slicing cases pass, including the low-density cube, 8-to-3 mm reslice, bridge stack, zero/full density behavior, cache/export guards, sparse follow-up rejection, empty-neighbor preservation, and repair locality. Runtime was 86.1 seconds on the development build. JUnit expands one test into two section entries, producing 63 XML entries.
-- Four full-slicing cases remain failing: mixed density/angle/gap modifier interfaces; modifier reslicing blocked by a 0.023 mm one-sided follow-up tail; stepped cavity blocked by a 0.025 mm tail; and tall combined infill reaching density saturation during construction repair. The tests retain their required success expectations.
-- Relevant legacy checks: bridge acceleration **4 cases / 68 assertions passed**; overhang walls **18 cases / 5,585 assertions passed**. The bridge-controls suite has one failed Lightning repeat-slice anchor-ratio case. A copied executable from the unmodified `28aed7650` release build reproduces the same assertion without the cubic feature, with a different stack-count parameter; this baseline failure is recorded separately and remains unresolved.
-- Core/test builds and the four affected GUI translation units compile. Whitespace checks pass. Feature changes remain on the feature branch pending successful verification before merge; no installed application or printer was changed.
+## Final verification
 
-## Open implementation work
+The 6 November correctness checkpoint passed the full application build, all 243 default feature cases (245 executions), both opt-in qualification cases, all 17 existing CTest targets, and all 44 packaging tests. Feature tests totaled 290,500 passing assertions. The detailed fixture timings, material, refinement extent, and limits are recorded in [the feature documentation](../../bridge-aware-cubic.md#correctness-checkpoint-and-outstanding-performance-gate).
 
-- [ ] Construct real shared interface partitions for incompatible modifier lattices, with explicit material ownership, deduplication, and supported deposition.
-- [ ] Repair short one-sided construction and follow-up endpoints using actual supported attachment geometry. Do not waive anchor checks merely because a tail is shorter than the requested gap.
-- [ ] Implement supported local solid-fill fallback at cubic saturation, confined to affected cells and construction dependencies.
-- [ ] Coarsen against final deposited geometry and remove orphaned repair dependencies until no valid collapse remains.
-- [ ] Qualify contact from actual bead cross sections and deposition heights; nominal projected width is not a physical-contact proof.
-- [ ] Complete partial-roof/inward-wall, variable-height/thick-bridge, phase-sweep, export-geometry, performance, and physical-print acceptance evidence.
+This is not release acceptance. The small and large fixture process-plus-export times were approximately 34.74 and 673.64 seconds, compared with about 0.026 seconds for ordinary Cubic in the same fork. Stock-official timing has not yet been established. The user added the 2× stock-official limit before merge, and it remains unsatisfied.
 
-This is an initial implementation increment. The unchecked acceptance work and known failing fixtures prevent calling the approved design complete.
+- [ ] Establish a verified stock-official baseline and exact model/settings parity.
+- [ ] Profile complete planning, repair, coarsening, verification, and export costs.
+- [ ] Eliminate repeated whole-plan and geometry work while retaining the approved support and irreducibility contracts.
+- [ ] Repeat all affected correctness checks and prove the 2× end-to-end performance gate before merging, installing, or publishing.

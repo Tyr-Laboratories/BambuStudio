@@ -7,6 +7,16 @@ add_executable(${_TEST_NAME}_tests
     )
 
 target_link_libraries(${_TEST_NAME}_tests test_common libslic3r_gui libslic3r)
+# These tests include GUI utility headers, so they need the same wxWidgets
+# header configuration as their production dependency.
+get_directory_property(_utils_wx_includes DIRECTORY ${PROJECT_SOURCE_DIR}/src DEFINITION wxWidgets_INCLUDE_DIRS)
+get_directory_property(_utils_wx_definitions DIRECTORY ${PROJECT_SOURCE_DIR}/src DEFINITION wxWidgets_DEFINITIONS)
+target_include_directories(${_TEST_NAME}_tests PRIVATE ${_utils_wx_includes})
+target_compile_definitions(${_TEST_NAME}_tests PRIVATE ${_utils_wx_definitions})
+if (APPLE)
+    target_link_libraries(${_TEST_NAME}_tests
+        "-framework AVFoundation" "-framework AVKit" "-framework CoreMedia" "-framework VideoToolbox")
+endif()
 if (MSVC)
     target_link_libraries(${_TEST_NAME}_tests Setupapi.lib)
 endif ()
