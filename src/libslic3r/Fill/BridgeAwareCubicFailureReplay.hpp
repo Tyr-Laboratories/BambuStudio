@@ -36,6 +36,95 @@ public:
         }
     };
 
+    // make_fills writes only the top-level fill child vector in the restricted
+    // probe, not the container flags. The caller has excluded surface and
+    // perimeter mutations and pre-admitted all displaced children/metadata.
+    template<class FillTree, class Snapshots> class ScopedLowerStage {
+        FillTree &destination, displaced;
+        Snapshots &live, saved;
+    public:
+        ScopedLowerStage(FillTree &fill, Snapshots &snapshots) : destination(fill), live(snapshots) {
+            displaced.entities.swap(destination.entities);
+            saved.swap(live);
+        }
+        ~ScopedLowerStage() noexcept {
+            displaced.entities.swap(destination.entities);
+            saved.swap(live);
+        }
+        ScopedLowerStage(const ScopedLowerStage &) = delete;
+        ScopedLowerStage &operator=(const ScopedLowerStage &) = delete;
+    };
+
+    // Diagnostic only. Retains one definite failing event. A cell is moved
+    // from the disposable probe result only after all its backing capacity
+    // fits the caller's allowance. No hashes or shape bounds assert equality.
+    struct ExactWitness {
+        std::optional<BridgeAwareCubicValidation::UnsupportedRun> run;
+        std::optional<BridgeAwareCubicValidation::VoidCell> cell;
+
+        template<class Charge>
+        bool take(BridgeAwareCubicValidation::Result &r, size_t room, Charge charge) {
+            if (run || cell || !r.input_valid || !r.completed || r.resource_limited ||
+                room < sizeof(ExactWitness) + 256) return false;
+            room -= sizeof(ExactWitness) + 256;
+            for (const auto &item : r.unsupported_runs) {
+                if (!charge(1)) return false;
+                if (item.kind != BridgeAwareCubicValidation::UnsupportedRunKind::TwoEndedBridge || item.exceeds_gap) {
+                    run = item;
+                    return true;
+                }
+            }
+            const auto admit = [&](size_t count, size_t width) {
+                if (count && (room < 64 || count > (room - 64) / width)) return false;
+                if (count) room -= 64 + count * width;
+                return true;
+            };
+            for (auto &item : r.void_cells) {
+                if (!charge(1)) return false;
+                if (item.closed && !item.exceeds_gap) continue;
+                if (!admit(item.geometry.contour.points.capacity(), sizeof(Point)) ||
+                    !admit(item.geometry.holes.capacity(), sizeof(Polygon))) return false;
+                for (const auto &hole : item.geometry.holes)
+                    if (!charge(1) || !admit(hole.points.capacity(), sizeof(Point))) return false;
+                cell.emplace(std::move(item));
+                return true;
+            }
+            return false;
+        }
+
+        template<class Charge>
+        bool matches(const BridgeAwareCubicValidation::Result &r, Charge charge) const {
+            if (!r.input_valid || !r.completed || r.resource_limited) return false;
+            if (run) {
+                for (const auto &item : r.unsupported_runs) {
+                    if (!charge(8)) return false;
+                    if (item.path_index == run->path_index && item.begin_mm == run->begin_mm &&
+                        item.end_mm == run->end_mm && item.length_mm == run->length_mm &&
+                        item.uncertainty_mm == run->uncertainty_mm && item.kind == run->kind &&
+                        item.exceeds_gap == run->exceeds_gap) return true;
+                }
+            } else if (cell) {
+                for (const auto &item : r.void_cells) {
+                    if (!charge(4)) return false;
+                    if (item.closed != cell->closed || item.exceeds_gap != cell->exceeds_gap ||
+                        item.diameter_mm != cell->diameter_mm || item.geometry.holes.size() != cell->geometry.holes.size())
+                        continue;
+                    bool same = true;
+                    for (size_t i = 0; same && i < item.geometry.num_contours(); ++i) {
+                        if (!charge(1)) return false;
+                        const auto &a = item.geometry.contour_or_hole(i).points;
+                        const auto &b = cell->geometry.contour_or_hole(i).points;
+                        if (a.size() != b.size()) { same = false; break; }
+                        if (!charge(a.size())) return false;
+                        same = a == b;
+                    }
+                    if (same) return true;
+                }
+            }
+            return false;
+        }
+    };
+
     explicit ModelFailureReplay(size_t capacity = 4096) : m_capacity(std::min(capacity, size_t(4096))) {}
 
     std::optional<Hint> find(const Key &key) const

@@ -1,4 +1,5 @@
 #include <catch2/catch.hpp>
+#include "libslic3r/ExtrusionEntityCollection.hpp"
 
 #include "libslic3r/Fill/BridgeAwareCubicContact.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicFailureReplay.hpp"
@@ -172,4 +173,70 @@ TEST_CASE("Bridge aware failure replay cell hint retains a whole physical openin
     CHECK(std::any_of(result.void_cells.begin(), result.void_cells.end(), [](const auto &cell) {
         return cell.closed && cell.exceeds_gap && cell.diameter_mm > 17.;
     }));
+}
+
+TEST_CASE("Sparse rejection audit distinguishes different failures of the same kind",
+          "[BridgeAwareCubic][FailureReplay]")
+{
+    const auto charge = [](size_t) { return true; };
+    Validation::Result reported;
+    // Completed physical counterexamples normally carry human-readable reasons.
+    // The complete/valid/resource status and failing geometry are authoritative.
+    reported.failure_reason = "Unsupported strand lacks two actual end anchors.";
+    SECTION("air interval shifted on the same path with unchanged length and classification") {
+        reported.unsupported_runs.push_back({3, 1., 3., 2., .001, Validation::UnsupportedRunKind::Floating, false});
+        const auto original = reported;
+        Replay::ExactWitness witness;
+        REQUIRE(witness.take(reported, 32768, charge));
+        REQUIRE(witness.matches(original, charge));
+        reported.unsupported_runs.front().begin_mm += .25;
+        reported.unsupported_runs.front().end_mm += .25;
+        REQUIRE(Replay::failure_kind(original) == Replay::failure_kind(reported));
+        CHECK_FALSE(witness.matches(reported, charge));
+    }
+    SECTION("a different opening has the same diameter and status") {
+        reported.void_cells.push_back({rectangle(0., 0., 8., 1.), std::hypot(8., 1.), true, true});
+        auto other = reported;
+        Replay::ExactWitness witness;
+        REQUIRE_FALSE(witness.take(reported, 1, charge));
+        REQUIRE(witness.take(reported, 32768, charge));
+        REQUIRE(witness.matches(other, charge));
+        other.void_cells.front().geometry.translate(Point::new_scale(.1, 0.));
+        REQUIRE(Replay::failure_kind(other) == Replay::Kind::Cell);
+        CHECK_FALSE(witness.matches(other, charge));
+    }
+}
+
+TEST_CASE("Sparse generation restores original owned fills and provenance on unwind",
+          "[BridgeAwareCubic][FailureReplay]")
+{
+    ExtrusionEntityCollection fills;
+    fills.no_sort = true;
+    fills.loop_node_range = {4, 8};
+    fills.entities.push_back(new ExtrusionPath(bead({1., 2.}, {3., 4.})));
+    const auto *const base_fill = fills.entities.front();
+    const auto *const base_owners = fills.entities.data();
+    const auto base_capacity = fills.entities.capacity();
+    std::vector<std::shared_ptr<const int>> snapshots{std::make_shared<const int>(42)};
+    const auto base_token = snapshots.front();
+    const auto *const base_slots = snapshots.data();
+    struct ProbeInterrupted {};
+    CHECK_THROWS_AS(([&] {
+        Replay::ScopedLowerStage stage(fills, snapshots);
+        REQUIRE(fills.entities.empty());
+        REQUIRE(snapshots.empty());
+        fills.entities.push_back(new ExtrusionPath(bead({0., 0.}, {9., 0.})));
+        snapshots.push_back(std::make_shared<const int>(7));
+        throw ProbeInterrupted{};
+    }()), ProbeInterrupted);
+    REQUIRE(fills.entities.size() == 1);
+    CHECK(fills.entities.front() == base_fill);
+    CHECK(fills.entities.data() == base_owners);
+    CHECK(fills.entities.capacity() == base_capacity);
+    CHECK(fills.no_sort);
+    CHECK(fills.loop_node_range.first == 4);
+    CHECK(fills.loop_node_range.second == 8);
+    REQUIRE(snapshots.size() == 1);
+    CHECK(snapshots.data() == base_slots);
+    CHECK(snapshots.front() == base_token);
 }

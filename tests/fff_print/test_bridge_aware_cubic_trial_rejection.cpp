@@ -42,7 +42,7 @@ struct TrialEnvironment {
     {
         for (const char *name : {"BAC_PROFILE_FILE", "BAC_PROFILE_STAGE", "BAC_PROFILE_FULL_TRIAL_CHECKS",
                                  "BAC_PROFILE_AUDIT_EMISSION_COLLECTION", "BAC_PROFILE_AUDIT_CONTACT_EPOCHS",
-                                 "BAC_PROFILE_AUDIT_COMPLETE_SPANS"}) {
+                                 "BAC_PROFILE_AUDIT_COMPLETE_SPANS", "BAC_PROFILE_AUDIT_SPARSE_REJECTIONS"}) {
             const char *value = std::getenv(name);
             previous.emplace(name, value == nullptr ? std::nullopt : std::optional<std::string>(value));
         }
@@ -57,9 +57,9 @@ struct TrialEnvironment {
         boost::filesystem::remove_all(directory, error);
     }
 
-    std::string select(bool exhaustive) const
+    std::string select(bool exhaustive, bool sparse_audit) const
     {
-        const std::string file = (directory / (exhaustive ? "exhaustive.jsonl" : "early.jsonl")).string();
+        const std::string file = (directory / (exhaustive ? "exhaustive.jsonl" : sparse_audit ? "early.jsonl" : "sparse-production.jsonl")).string();
         REQUIRE_FALSE(boost::filesystem::exists(file));
         REQUIRE(set("BAC_PROFILE_FILE", file.c_str()) == 0);
         REQUIRE(set("BAC_PROFILE_STAGE", "process") == 0);
@@ -67,6 +67,7 @@ struct TrialEnvironment {
         REQUIRE(set("BAC_PROFILE_AUDIT_EMISSION_COLLECTION", exhaustive ? nullptr : "1") == 0);
         REQUIRE(set("BAC_PROFILE_AUDIT_CONTACT_EPOCHS", exhaustive ? nullptr : "1") == 0);
         REQUIRE(set("BAC_PROFILE_AUDIT_COMPLETE_SPANS", exhaustive ? nullptr : "1") == 0);
+        REQUIRE(set("BAC_PROFILE_AUDIT_SPARSE_REJECTIONS", !exhaustive && sparse_audit ? "1" : nullptr) == 0);
         return file;
     }
 };
@@ -194,9 +195,9 @@ struct TrialResult {
     Json counters;
 };
 
-TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const TrialEnvironment &environment, bool exhaustive)
+TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const TrialEnvironment &environment, bool exhaustive, bool sparse_audit = true)
 {
-    const std::string profile = environment.select(exhaustive);
+    const std::string profile = environment.select(exhaustive, sparse_audit);
     Print print;
     print.set_status_silent();
     print.auto_assign_extruders(model.objects.front());
@@ -242,6 +243,13 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
     REQUIRE(final_proofs > 0);
     if (exhaustive) {
         REQUIRE(result.counters.at("early_trial_rejections").get<size_t>() == 0);
+        for (const char *name : {"sparse_probe_attempts", "sparse_probe_rejections",
+                                "sparse_probe_saved_generation_layers", "sparse_probe_saved_rollback_layers",
+                                "sparse_probe_would_skip_generation_layers", "sparse_probe_would_skip_rollback_layers",
+                                "sparse_probe_audits", "sparse_probe_audit_mismatches"}) {
+            CAPTURE(name);
+            REQUIRE(result.counters.value(name, size_t(0)) == 0);
+        }
         for (const char *counter : {"model_cache_hits", "model_cache_fallbacks", "model_cache_vertices", "model_cache_items"}) {
             CAPTURE(counter);
             REQUIRE(result.counters.at(counter).get<size_t>() == 0);
@@ -290,10 +298,35 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
         REQUIRE(result.counters.at("model_input_combined_items").get<size_t>() <= 20000);
         // A remembered failure only proposes a new physical check. Exercise
         // both that check and a newly verified rejection on this real fixture.
-        REQUIRE(result.counters.at("model_replay_probes").get<size_t>() > 0);
-        REQUIRE(result.counters.at("model_replay_rejections").get<size_t>() > 0);
+        if (sparse_audit) {
+            REQUIRE(result.counters.at("model_replay_probes").get<size_t>() > 0);
+            REQUIRE(result.counters.at("model_replay_rejections").get<size_t>() > 0);
+        }
         REQUIRE(result.counters.at("model_replay_stores").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_replay_entries").get<size_t>() <= 4096);
+        // Repeated candidates must actually skip multi-layer generation and
+        // rollback. In this diagnostic mode every proposed rejection must
+        // independently fail the original full candidate route from the base.
+        // The full route compares the candidate's own complete ordered model
+        // Targets to the frozen model, and then uses the actual lower emission.
+        const size_t sparse_rejected = result.counters.value("sparse_probe_rejections", size_t(0));
+        REQUIRE(sparse_rejected > 0);
+        REQUIRE(result.counters.at("sparse_probe_attempts").get<size_t>() >= sparse_rejected);
+        REQUIRE(sparse_rejected <= result.counters.at("repeated_cell_trials").get<size_t>());
+        REQUIRE(result.counters.at("sparse_probe_would_skip_generation_layers").get<size_t>() > 0);
+        REQUIRE(result.counters.at("sparse_probe_would_skip_rollback_layers").get<size_t>() > 0);
+        if (sparse_audit) {
+            REQUIRE(result.counters.at("sparse_probe_saved_generation_layers").get<size_t>() == 0);
+            REQUIRE(result.counters.at("sparse_probe_saved_rollback_layers").get<size_t>() == 0);
+            REQUIRE(result.counters.at("sparse_probe_audits").get<size_t>() == sparse_rejected);
+        } else {
+            REQUIRE(result.counters.at("sparse_probe_saved_generation_layers").get<size_t>() ==
+                    result.counters.at("sparse_probe_would_skip_generation_layers").get<size_t>());
+            REQUIRE(result.counters.at("sparse_probe_saved_rollback_layers").get<size_t>() ==
+                    result.counters.at("sparse_probe_would_skip_rollback_layers").get<size_t>());
+            REQUIRE(result.counters.at("sparse_probe_audits").get<size_t>() == 0);
+        }
+        REQUIRE(result.counters.at("sparse_probe_audit_mismatches").get<size_t>() == 0);
         for (const char *counter : {"construction_containment_indices", "construction_containment_queries",
                                    "construction_containment_proofs"}) {
             CAPTURE(counter);
@@ -346,19 +379,23 @@ TEST_CASE("Bridge aware cubic early trial rejection preserves exhaustive final o
     object->add_instance()->set_offset(Vec3d(80., 80., 0.));
     const auto config = trial_config();
     const TrialResult exhaustive = run_trial_mode(model, config, environment, true);
-    const TrialResult early = run_trial_mode(model, config, environment, false);
-    for (const char *counter : {"trials", "accepted", "rejected", "repeated_cell_trials", "closure_trials"}) {
-        CAPTURE(counter);
-        CHECK(exhaustive.counters.at(counter) == early.counters.at(counter));
-    }
-    REQUIRE(exhaustive.layers.size() == early.layers.size());
-    for (size_t layer = 0; layer < exhaustive.layers.size(); ++layer) {
-        CAPTURE(layer);
-        CHECK(bool(exhaustive.layers[layer] == early.layers[layer]));
-    }
-    REQUIRE(exhaustive.plans.size() == early.plans.size());
-    for (size_t region = 0; region < exhaustive.plans.size(); ++region) {
-        CAPTURE(region);
-        CHECK(bool(exhaustive.plans[region] == early.plans[region]));
+    const TrialResult audited = run_trial_mode(model, config, environment, false, true);
+    const TrialResult production = run_trial_mode(model, config, environment, false, false);
+    for (const auto *mode : {&audited, &production}) {
+        const auto &early = *mode;
+        for (const char *counter : {"trials", "accepted", "rejected", "repeated_cell_trials", "closure_trials"}) {
+            CAPTURE(counter);
+            CHECK(exhaustive.counters.at(counter) == early.counters.at(counter));
+        }
+        REQUIRE(exhaustive.layers.size() == early.layers.size());
+        for (size_t layer = 0; layer < exhaustive.layers.size(); ++layer) {
+            CAPTURE(layer);
+            CHECK(bool(exhaustive.layers[layer] == early.layers[layer]));
+        }
+        REQUIRE(exhaustive.plans.size() == early.plans.size());
+        for (size_t region = 0; region < exhaustive.plans.size(); ++region) {
+            CAPTURE(region);
+            CHECK(bool(exhaustive.plans[region] == early.plans[region]));
+        }
     }
 }

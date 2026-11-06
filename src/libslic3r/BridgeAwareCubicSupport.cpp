@@ -380,6 +380,9 @@ struct ProfileState {
     std::set<std::tuple<size_t, unsigned, std::array<int64_t, 3>>> candidates;
     uint64_t trials = 0, accepted = 0, rejected = 0, repeated = 0, closure_trials = 0;
     uint64_t early_trial_rejections = 0;
+    uint64_t sparse_probe_attempts = 0, sparse_probe_rejections = 0, sparse_probe_audits = 0, sparse_probe_audit_mismatches = 0;
+    uint64_t sparse_probe_saved_generation_layers = 0, sparse_probe_saved_rollback_layers = 0;
+    uint64_t sparse_probe_would_skip_generation_layers = 0, sparse_probe_would_skip_rollback_layers = 0;
     uint64_t model_replay_probes = 0, model_replay_rejections = 0, model_replay_passes = 0;
     uint64_t model_replay_unavailable = 0, model_replay_stores = 0, model_replay_entries = 0;
     uint64_t construction_containment_indices = 0, construction_containment_queries = 0, construction_containment_proofs = 0;
@@ -410,6 +413,7 @@ struct ProfileState {
     bool audit_emission_collection = false;
     bool audit_contact_epochs = false;
     bool audit_complete_spans = false;
+    bool audit_sparse_rejections = false;
     bool truncated = false;
     std::string file, stage;
     const char *session;
@@ -474,6 +478,14 @@ struct ProfileState {
                     << ",\"rejected\":" << rejected << ",\"repeated_cell_trials\":" << repeated
                     << ",\"closure_trials\":" << closure_trials
                     << ",\"early_trial_rejections\":" << early_trial_rejections
+                    << ",\"sparse_probe_attempts\":" << sparse_probe_attempts
+                    << ",\"sparse_probe_rejections\":" << sparse_probe_rejections
+                    << ",\"sparse_probe_audits\":" << sparse_probe_audits
+                    << ",\"sparse_probe_audit_mismatches\":" << sparse_probe_audit_mismatches
+                    << ",\"sparse_probe_saved_generation_layers\":" << sparse_probe_saved_generation_layers
+                    << ",\"sparse_probe_saved_rollback_layers\":" << sparse_probe_saved_rollback_layers
+                    << ",\"sparse_probe_would_skip_generation_layers\":" << sparse_probe_would_skip_generation_layers
+                    << ",\"sparse_probe_would_skip_rollback_layers\":" << sparse_probe_would_skip_rollback_layers
                     << ",\"model_replay_probes\":" << model_replay_probes
                     << ",\"model_replay_rejections\":" << model_replay_rejections
                     << ",\"model_replay_passes\":" << model_replay_passes
@@ -591,6 +603,8 @@ public:
                 state->audit_emission_collection = audit[0] == '1' && audit[1] == '\0';
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_CONTACT_EPOCHS"))
                 state->audit_contact_epochs = audit[0] == '1' && audit[1] == '\0';
+            if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_SPARSE_REJECTIONS"))
+                state->audit_sparse_rejections = audit[0] == '1' && audit[1] == '\0';
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_COMPLETE_SPANS"))
                 state->audit_complete_spans = audit[0] == '1' && audit[1] == '\0';
             static std::atomic<uint64_t> sequence{0};
@@ -1064,6 +1078,74 @@ bool current_emission_matches(const Layer &layer, size_t emitter,
     return false;
 }
 
+// A rejection may generate one real predecessor out of order only when its
+// emission is independent of earlier changed layers. This initial case has
+// one participating and correctly bound region, only ordinary internal fill,
+// no narrow-solid detection/LockedZag surface edits or other fill generators,
+// and no free perimeter path on which either attachment replay can write.
+bool sparse_probe_layer_eligible(const Layer &layer, const EmissionReuseRow *saved,
+                                 BridgeAwareCubicValidation::WorkBudget &budget)
+{
+    const PrintObject &object = *layer.object();
+    if (!saved || saved->entries.size() != 1 || saved->retained.size() != 1 ||
+        saved->retained[0] || saved->entries[0].base || saved->entries[0].base_projection ||
+        object.num_printing_regions() != 1 || layer.regions().size() != 1 ||
+        layer.bridge_aware_emission_budget || !layer.bridge_aware_emission_builders.empty() ||
+        layer.bridge_aware_emission_snapshots.size() > 1 ||
+        object.config().detect_narrow_internal_solid_infill.value) return false;
+    const LayerRegion &region = *layer.get_region(0);
+    const auto &cfg = region.region().config();
+    if (region.layer() != &layer || &region.region() != &object.printing_region(0) ||
+        !participates(cfg) || !object.bridge_aware_cubic_plan(0) || cfg.conformal_infill.value ||
+        cfg.fill_multiline.value != 1 || !region.thin_fills.entities.empty() ||
+        region.fill_surfaces.surfaces.empty()) return false;
+    for (const Surface &surface : region.fill_surfaces.surfaces)
+        if (!emission_charge(object, budget) || surface.surface_type != stInternal) return false;
+    const auto joined_perimeters = [&](auto &&self, const ExtrusionEntity &entity, size_t depth) -> bool {
+        if (depth >= 64 || !emission_charge(object, budget)) return false;
+        if (typeid(entity) == typeid(ExtrusionLoop) || typeid(entity) == typeid(ExtrusionMultiPath)) return true;
+        if (typeid(entity) != typeid(ExtrusionEntityCollection)) return false;
+        for (const auto *child : static_cast<const ExtrusionEntityCollection &>(entity).entities)
+            if (!child || !self(self, *child, depth + 1)) return false;
+        return true;
+    };
+    if (!joined_perimeters(joined_perimeters, region.perimeters, 0)) return false;
+
+    // Stash only the original fill's owned child tree. Its extra live payload,
+    // all snapshots and any projection share the existing emitter allowance.
+    // Unknown/derived trees cannot be measured conservatively: use full trial.
+    size_t remaining = emission_quota(layer);
+    const auto admit = [&](size_t count, size_t size) {
+        if (count > remaining / size) return false;
+        remaining -= count * size;
+        return true;
+    };
+    if (!admit(1, 512) || !admit(layer.bridge_aware_emission_snapshots.capacity(), sizeof(BridgeAwareCubic::EmissionSnapshotPtr)))
+        return false;
+    const auto &projection = saved->entries[0].projection;
+    const auto snapshot = layer.bridge_aware_emission_snapshots.empty() ? nullptr : layer.bridge_aware_emission_snapshots.front();
+    if (snapshot && !admit(snapshot->resident_bytes(), 1)) return false;
+    if (projection && !admit(projection->snapshot() == snapshot ? projection->owned_bytes() : projection->resident_bytes(), 1))
+        return false;
+    const auto measure = [&](auto &&self, const ExtrusionEntity &entity, size_t depth) -> bool {
+        if (depth >= 64 || !emission_charge(object, budget)) return false;
+        if (typeid(entity) == typeid(ExtrusionPath)) {
+            const auto &path = static_cast<const ExtrusionPath &>(entity);
+            return path.polyline.fitting_result.empty() && admit(1, sizeof(ExtrusionPath) + 192) &&
+                admit(path.polyline.points.capacity(), sizeof(Point)) &&
+                admit(path.polyline.fitting_result.capacity(), sizeof(PathFittingData));
+        }
+        if (typeid(entity) != typeid(ExtrusionEntityCollection)) return false;
+        const auto &collection = static_cast<const ExtrusionEntityCollection &>(entity);
+        if (!admit(1, sizeof(ExtrusionEntityCollection) + 128) ||
+            !admit(collection.entities.capacity(), sizeof(ExtrusionEntity *))) return false;
+        for (const auto *child : collection.entities)
+            if (!child || !self(self, *child, depth + 1)) return false;
+        return true;
+    };
+    return measure(measure, region.fills, 0);
+}
+
 class EmissionReuseContext {
 public:
     explicit EmissionReuseContext(const PrintObject &object)
@@ -1088,9 +1170,13 @@ public:
                 if (row.retained.capacity() > (reserved - used) / sizeof(size_t)) { clear(); return; }
                 used += row.retained.capacity() * sizeof(size_t);
             }
+            // One optional diagnostic receipt, outside all per-emitter
+            // quotas, may borrow only already reserved, unused row bytes.
+            m_audit_slack = reserved - used > 512 ? reserved - used - 512 : 0;
         } catch (const std::bad_alloc &) { clear(); }
     }
 
+    size_t audit_slack() const noexcept { return std::min(m_audit_slack, size_t(32 * 1024)); }
     EmissionReuseRow *row(size_t index) noexcept { return index < m_rows.size() ? &m_rows[index] : nullptr; }
 
     void save(const PrintObject &object, const std::set<size_t> &changed,
@@ -1181,6 +1267,7 @@ public:
     }
 private:
     std::vector<EmissionReuseRow> m_rows;
+    size_t m_audit_slack = 0;
     void clear() noexcept { std::vector<EmissionReuseRow>().swap(m_rows); }
 };
 
@@ -2647,6 +2734,9 @@ struct PreparedModelView {
     // Each actual target maps to the equal frozen target in this snapshot.
     const std::vector<size_t> &frozen_indices;
     BridgeAwareCubic::ModelLayerProofCache *proofs = nullptr;
+    // Only a traversal-filtered rejection probe may pass the complete frozen
+    // vector itself. Its target indices are already the prepared indices.
+    const std::vector<Target> *complete_frozen_probe = nullptr;
 };
 
 std::unique_ptr<const BridgeAwareCubic::ModelCollectionInputs> prepare_model_collection_inputs(
@@ -2880,8 +2970,10 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
     ProfileScope profile(kind, &budget);
     profile.items(targets.size());
     const auto phases = serialization_phases(object, phase_object);
+    const bool complete_frozen_probe = probe && prepared_model && !prepared_model->proofs &&
+        prepared_model->complete_frozen_probe == &targets;
     bool use_model_cache = prepared_model != nullptr && prepared_model->snapshot != nullptr && mode == TargetCheck::RejectTrial &&
-        prepared_model->frozen_indices.size() == targets.size() && prepared_model->snapshot->phases.size() == phases.size() &&
+        (complete_frozen_probe || prepared_model->frozen_indices.size() == targets.size()) && prepared_model->snapshot->phases.size() == phases.size() &&
         std::none_of(targets.begin(), targets.end(), [](const Target &target) { return target.dependency; });
     if (use_model_cache) {
         const auto equal_offset = [](const Vec2d &a, const Vec2d &b) { return a.x() == b.x() && a.y() == b.y(); };
@@ -2891,6 +2983,7 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                 !equal_offset(saved.plate_origin, phases[i].plate_origin)) { use_model_cache = false; break; }
         }
     }
+    if (complete_frozen_probe && !use_model_cache) return failures;
     if (active_profile && prepared_model) {
         if (use_model_cache) ++active_profile->model_cache_hits;
         else ++active_profile->model_cache_fallbacks;
@@ -2951,7 +3044,8 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
         for (size_t target_index = 0; target_index < targets.size(); ++target_index) {
             if (probe && probe->target != target_index) continue;
             const Target &target = targets[target_index];
-            const size_t frozen_index = cached_phase ? prepared_model->frozen_indices.at(target_index) : 0;
+            const size_t frozen_index = complete_frozen_probe ? target_index :
+                cached_phase ? prepared_model->frozen_indices.at(target_index) : 0;
             if (object.print()->canceled()) throw CanceledException();
             const Layer &lower = *object.layers()[target.upper_layer - 1];
             if (!probe && cached_phase && prepared_model->proofs && target_index >= proof_layer_end) {
@@ -4551,8 +4645,40 @@ void PrintObject::prepare_bridge_aware_cubic()
                 }
                 return true;
             };
+            using Replay = BridgeAwareCubic::ModelFailureReplay;
+            struct SparseWitness { Replay::Hint hint; Replay::Kind failure; Replay::ExactWitness evidence; };
+            const auto probe_frozen_witness = [&](const Replay::Hint &hint, BridgeAwareCubicValidation::WorkBudget &budget,
+                    Replay::ExactWitness *capture, const Replay::ExactWitness *expected)
+                    -> std::optional<Replay::Kind> {
+                if (!prepared_roofs || hint.frozen_target >= roofs.size()) return {};
+                const Target &target = roofs[hint.frozen_target];
+                if (target.dependency || hint.path >= target.paths.size()) return {};
+                // Full frozen vector, all same-plane demand, complete original
+                // path and exact output transform. No positive cache may read
+                // or publish through this non-accepting probe.
+                const Replay::Probe probe{hint.frozen_target, hint.path, hint.phase};
+                const std::vector<size_t> no_remap;
+                const PreparedModelView view{prepared_roofs.get(), no_remap, nullptr, &roofs};
+                bool checked = false;
+                const TargetCheckContext context{&budget, &probe, nullptr, nullptr, &checked};
+                // Admit the full vector's candidate/role scans, though the
+                // verifier reads actual geometry from only the selected path.
+                const auto charge = [&](size_t n) { return emission_charge(*this, budget, n); };
+                if (roofs.size() > budget.remaining_work / 4 || !charge(4 * roofs.size())) return {};
+                auto failures = check_targets(*this, roofs, nullptr, TargetCheck::RejectTrial, &view, &context);
+                if (!checked || failures.size() != 1) return {};
+                auto &result = failures.front().result;
+                if (!charge(result.unsupported_runs.size()) || !charge(result.void_cells.size())) return {};
+                const auto kind = Replay::failure_kind(result);
+                if (!kind || (expected && !expected->matches(result, charge)) ||
+                    (capture && !capture->take(result, emission_reuse.audit_slack(), charge))) return {};
+                return kind;
+            };
             const auto check_changed_layers = [&](const std::set<size_t> &changed,
-                                                   const BridgeAwareCubic::ModelFailureReplay::Key *candidate_key = nullptr) {
+                                                   const Replay::Key *candidate_key = nullptr,
+                                                   BridgeAwareCubicValidation::WorkBudget *trial_model_budget = nullptr,
+                                                   const SparseWitness *sparse_audit = nullptr,
+                                                   bool *audit_matched = nullptr) {
                 std::set<size_t> checked_layers;
                 {
                     ProfileScope profile(ProfilePhase::GenerateChanged);
@@ -4564,6 +4690,20 @@ void PrintObject::prepare_bridge_aware_cubic()
                         if (index > 0) checked_layers.insert(index);
                         if (index + 1 < m_layers.size()) checked_layers.insert(index + 1);
                     }
+                }
+                BridgeAwareCubicValidation::WorkBudget local_model_budget;
+                auto &model_budget = trial_model_budget ? *trial_model_budget : local_model_budget;
+                if (sparse_audit) {
+                    // Recheck exactly the sparse witness with actual fully
+                    // generated predecessor material, not an unrelated failure.
+                    // Normal model collection and the full trial still follow.
+                    // Defer reporting any mismatch until the ordinary trial
+                    // rollback has restored Plans, fills and emission handles.
+                    *audit_matched = probe_frozen_witness(sparse_audit->hint, model_budget,
+                        nullptr, &sparse_audit->evidence) == sparse_audit->failure;
+                    // A missing witness is already an audit failure. Do not
+                    // spend a possibly exhausted budget before restoring base.
+                    if (!*audit_matched) return false;
                 }
                 std::vector<Target> selected;
                 std::vector<size_t> frozen_indices;
@@ -4666,7 +4806,6 @@ void PrintObject::prepare_bridge_aware_cubic()
                 const TargetCheck mode = active_profile && active_profile->full_trial_checks ?
                     TargetCheck::CollectFailures : TargetCheck::RejectTrial;
                 const PreparedModelView prepared_view{prepared_roofs.get(), frozen_indices, model_proofs.get()};
-                BridgeAwareCubicValidation::WorkBudget model_budget;
                 std::optional<BridgeAwareCubic::ModelFailureReplay::Hint> first_model_failure;
                 TargetCheckContext context{&model_budget, nullptr, &frozen_indices, &first_model_failure, nullptr,
                     &span_proofs, &contact_epochs};
@@ -4789,16 +4928,95 @@ void PrintObject::prepare_bridge_aware_cubic()
                                 previous[region] = std::make_unique<BridgeAwareCubic::Plan>(m_bridge_aware_cubic_plans[region]->clone());
                             }
                     }
-                    const auto previous_indices = demand_indices;
+                    auto previous_indices = demand_indices;
                     {
                         ProfileScope profile(ProfilePhase::PlanCollapse);
                         current = std::make_unique<BridgeAwareCubic::Plan>(current->collapsed(candidate.refinement.id));
                     }
                     prune_dependencies();
                     const auto changed = changed_plan_layers(previous, previous_indices);
+                    const Replay::Key candidate_key{candidate.region, candidate.refinement.id};
+                    BridgeAwareCubicValidation::WorkBudget trial_budget;
+                    std::optional<SparseWitness> sparse;
+                    try {
+                        if (prepared_roofs && changed.size() > 1 && !(active_profile && active_profile->full_trial_checks)) {
+                            const auto old = model_replay.find(candidate_key);
+                            if (old && old->frozen_target < roofs.size()) {
+                                const size_t upper = roofs[old->frozen_target].upper_layer;
+                                if (upper > 0 && upper < m_layers.size() && changed.count(upper - 1)) {
+                                    const size_t index = upper - 1;
+                                    Layer &lower = *m_layers[index];
+                                    if (lower.object() == this &&
+                                        sparse_probe_layer_eligible(lower, emission_reuse.row(index), trial_budget)) {
+                                        if (active_profile) ++active_profile->sparse_probe_attempts;
+                                        Replay::ScopedLowerStage stage(lower.get_region(0)->fills,
+                                            lower.bridge_aware_emission_snapshots);
+                                        lower.make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(),
+                                            m_lightning_generator.get(), false);
+                                        sparse.emplace();
+                                        sparse->hint = *old;
+                                        const bool capture = active_profile && active_profile->audit_sparse_rejections;
+                                        if (auto failed = probe_frozen_witness(*old, trial_budget,
+                                                capture ? &sparse->evidence : nullptr, nullptr))
+                                            sparse->failure = *failed;
+                                        else sparse.reset();
+                                    }
+                                }
+                            }
+                        }
+                    } catch (const std::bad_alloc &) {
+                        // Both original and candidate fills are temporarily
+                        // resident. The ordinary route frees the original first.
+                        sparse.reset();
+                    } catch (const SlicingError &) {
+                        sparse.reset();
+                        // A hypothetical frozen model can be invalid while
+                        // the real one would simply differ. Original route
+                        // decides this after restoring untouched base geometry.
+                    } catch (...) {
+                        m_bridge_aware_cubic_plans = std::move(previous);
+                        demand_indices.swap(previous_indices);
+                        throw;
+                    }
+                    const bool audit = sparse && active_profile && active_profile->audit_sparse_rejections;
+                    if (sparse) {
+                        // If any actual checked Target differs from its frozen
+                        // version the existing model gate rejects. Otherwise
+                        // this fresh failure is on precisely the required path.
+                        if (active_profile) {
+                            ++active_profile->sparse_probe_rejections;
+                            active_profile->sparse_probe_would_skip_generation_layers += changed.size() - 1;
+                            active_profile->sparse_probe_would_skip_rollback_layers += changed.size();
+                        }
+                        if (!audit) {
+                            if (active_profile) {
+                                ++active_profile->rejected;
+                                ++active_profile->emission_rejected_without_projection;
+                                active_profile->sparse_probe_saved_generation_layers += changed.size() - 1;
+                                active_profile->sparse_probe_saved_rollback_layers += changed.size();
+                            }
+                            m_bridge_aware_cubic_plans = std::move(previous);
+                            demand_indices.swap(previous_indices);
+                            continue;
+                        }
+                    }
                     emission_reuse.save(*this, changed, previous);
-                    const BridgeAwareCubic::ModelFailureReplay::Key candidate_key{candidate.region, candidate.refinement.id};
-                    const bool verified = check_changed_layers(changed, &candidate_key);
+                    bool audit_matched = false;
+                    bool ordinary_verified = false;
+                    std::exception_ptr audit_error;
+                    try {
+                        ordinary_verified = check_changed_layers(changed, &candidate_key, &trial_budget,
+                            audit ? &*sparse : nullptr, &audit_matched);
+                    } catch (...) {
+                        if (!audit) throw;
+                        // Diagnostic generation/checks run only to challenge a
+                        // known rejection. Route their exceptions through the
+                        // same rollback before propagating the original error.
+                        audit_error = std::current_exception();
+                    }
+                    const bool bad_audit = audit && (audit_error || !audit_matched || ordinary_verified);
+                    if (audit && !bad_audit) ++active_profile->sparse_probe_audits;
+                    const bool verified = ordinary_verified && !bad_audit;
                     if (active_profile) verified ? ++active_profile->accepted : ++active_profile->rejected;
                     if (verified) {
                         accepted = true;
@@ -4806,7 +5024,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                     }
                     else {
                         m_bridge_aware_cubic_plans = std::move(previous);
-                        demand_indices = previous_indices;
+                        demand_indices.swap(previous_indices);
                         emission_reuse.discard_candidate(changed);
                         ProfileScope profile(ProfilePhase::GenerateRollback);
                         for (size_t index : changed) {
@@ -4816,6 +5034,11 @@ void PrintObject::prepare_bridge_aware_cubic()
                             emission_reuse.restore(*m_layers[index], index);
                         }
                         emission_reuse.accept(changed);
+                    }
+                    if (bad_audit) {
+                        if (audit_error) std::rethrow_exception(audit_error);
+                        ++active_profile->sparse_probe_audit_mismatches;
+                        throw std::logic_error("Sparse rejection and full candidate disagree on the same model witness.");
                     }
                 }
                 // A shared interface partition is a complete construction
