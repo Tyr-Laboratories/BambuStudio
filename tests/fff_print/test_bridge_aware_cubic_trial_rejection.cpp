@@ -241,6 +241,11 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
             CAPTURE(counter);
             REQUIRE(result.counters.at(counter).get<size_t>() == 0);
         }
+        for (const char *counter : {"model_replay_probes", "model_replay_rejections", "model_replay_passes",
+                                   "model_replay_unavailable", "model_replay_stores", "model_replay_entries"}) {
+            CAPTURE(counter);
+            REQUIRE(result.counters.at(counter).get<size_t>() == 0);
+        }
     } else {
         REQUIRE(result.counters.at("early_trial_rejections").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_cache_hits").get<size_t>() > 0);
@@ -250,6 +255,12 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
         REQUIRE(result.counters.at("model_cache_vertices").get<size_t>() <= 200000);
         REQUIRE(result.counters.at("model_cache_items").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_cache_items").get<size_t>() <= 20000);
+        // A remembered failure only proposes a new physical check. Exercise
+        // both that check and a newly verified rejection on this real fixture.
+        REQUIRE(result.counters.at("model_replay_probes").get<size_t>() > 0);
+        REQUIRE(result.counters.at("model_replay_rejections").get<size_t>() > 0);
+        REQUIRE(result.counters.at("model_replay_stores").get<size_t>() > 0);
+        REQUIRE(result.counters.at("model_replay_entries").get<size_t>() <= 4096);
     }
     return result;
 }

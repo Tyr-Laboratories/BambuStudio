@@ -11,6 +11,7 @@
 #include "Fill/BridgeAwareCubicDependencies.hpp"
 #include "Fill/BridgeAwareCubicSerialization.hpp"
 #include "Fill/BridgeAwareCubicModelProofCache.hpp"
+#include "Fill/BridgeAwareCubicFailureReplay.hpp"
 #include "Fill/BridgeAwareCubicCertificate.hpp"
 #include "Fill/BridgeAwareCubicOwnerBounds.hpp"
 
@@ -46,7 +47,7 @@ enum class ProfilePhase {
     GenerateFull, GenerateChanged, GenerateRollback,
     CollectModel, CollectConstruction, CheckModel, CheckConstruction, CheckMixed,
     PrepareModelTargets, CompareFinalProof, CaptureFinalProof, FinalProof, Sweep,
-    ConstructionSections, ConstructionMatch, ConstructionOwners, ConstructionAdd, Count
+    ConstructionSections, ConstructionMatch, ConstructionOwners, ConstructionAdd, ModelReplay, Count
 };
 
 struct ProfileMetric {
@@ -64,6 +65,8 @@ struct ProfileState {
     std::set<std::tuple<size_t, unsigned, std::array<int64_t, 3>>> candidates;
     uint64_t trials = 0, accepted = 0, rejected = 0, repeated = 0, closure_trials = 0;
     uint64_t early_trial_rejections = 0;
+    uint64_t model_replay_probes = 0, model_replay_rejections = 0, model_replay_passes = 0;
+    uint64_t model_replay_unavailable = 0, model_replay_stores = 0, model_replay_entries = 0;
     uint64_t whole_support_queries = 0, whole_support_proofs = 0, whole_support_segments = 0;
     uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
     uint64_t model_layer_proof_hits = 0, model_layer_proof_misses = 0, model_layer_proof_publications = 0;
@@ -123,6 +126,12 @@ struct ProfileState {
                     << ",\"rejected\":" << rejected << ",\"repeated_cell_trials\":" << repeated
                     << ",\"closure_trials\":" << closure_trials
                     << ",\"early_trial_rejections\":" << early_trial_rejections
+                    << ",\"model_replay_probes\":" << model_replay_probes
+                    << ",\"model_replay_rejections\":" << model_replay_rejections
+                    << ",\"model_replay_passes\":" << model_replay_passes
+                    << ",\"model_replay_unavailable\":" << model_replay_unavailable
+                    << ",\"model_replay_stores\":" << model_replay_stores
+                    << ",\"model_replay_entries\":" << model_replay_entries
                     << ",\"full_trial_checks\":" << (full_trial_checks ? "true" : "false")
                     << ",\"model_cache_hits\":" << model_cache_hits << ",\"model_cache_fallbacks\":" << model_cache_fallbacks
                     << ",\"model_cache_vertices\":" << model_cache_vertices << ",\"model_cache_items\":" << model_cache_items
@@ -141,7 +150,7 @@ struct ProfileState {
                     "generate_full", "generate_changed", "generate_rollback", "collect_model", "collect_construction",
                     "check_model", "check_construction", "check_mixed", "prepare_model_targets", "compare_final_proof",
                     "capture_final_proof", "final_proof", "coarsening_sweep", "construction_sections",
-                    "construction_match", "construction_owners", "construction_add"};
+                    "construction_match", "construction_owners", "construction_add", "model_failure_replay"};
                 bool first = true;
                 for (size_t i = 0; i < metrics.size(); ++i) {
                     const auto &metric = metrics[i];
@@ -880,11 +889,19 @@ struct Failure {
 
 enum class TargetCheck { CollectFailures, RejectTrial };
 struct PreparedModelView;
+struct TargetCheckContext {
+    BridgeAwareCubicValidation::WorkBudget *budget = nullptr;
+    const BridgeAwareCubic::ModelFailureReplay::Probe *probe = nullptr;
+    const std::vector<size_t> *frozen_indices = nullptr;
+    std::optional<BridgeAwareCubic::ModelFailureReplay::Hint> *first_failure = nullptr;
+    bool *probe_checked = nullptr;
+};
 
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
                                    const PrintObject *phase_object = nullptr,
                                    TargetCheck mode = TargetCheck::CollectFailures,
-                                   const PreparedModelView *prepared_model = nullptr);
+                                   const PreparedModelView *prepared_model = nullptr,
+                                   const TargetCheckContext *context = nullptr);
 
 [[noreturn]] void fail(const PrintObject &object, const Failure &failure);
 
@@ -1841,10 +1858,17 @@ std::unique_ptr<const PreparedModelTargets> prepare_model_targets(const PrintObj
 
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
                                    const PrintObject *phase_object, TargetCheck mode,
-                                   const PreparedModelView *prepared_model)
+                                   const PreparedModelView *prepared_model, const TargetCheckContext *context)
 {
     std::vector<Failure> failures;
-    BridgeAwareCubicValidation::WorkBudget budget;
+    BridgeAwareCubicValidation::WorkBudget local_budget;
+    auto &budget = context && context->budget ? *context->budget : local_budget;
+    const auto *probe = context && mode == TargetCheck::RejectTrial ? context->probe : nullptr;
+    if (context && context->probe_checked) *context->probe_checked = false;
+    // The filter controls traversal only. All model groups remain present for
+    // per-path selection and the full physical support-complement window.
+    if (probe && (probe->target >= targets.size() || targets[probe->target].dependency ||
+                  probe->path >= targets[probe->target].paths.size())) return failures;
     ProfilePhase kind = !targets.empty() && targets.front().dependency ? ProfilePhase::CheckConstruction : ProfilePhase::CheckModel;
     if (active_profile && std::any_of(targets.begin(), targets.end(), [&](const auto &target) {
         return target.dependency != (kind == ProfilePhase::CheckConstruction);
@@ -1875,6 +1899,7 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
     // geometry itself is checked without a hypothetical XY displacement.
     for (const auto &phase : phases) {
         ++output_phase;
+        if (probe && !probe->includes_phase(phase)) continue;
         const Point origin = phase(Point(0, 0));
         const auto *cached_phase = use_model_cache ? &prepared_model->snapshot->phases[output_phase - 1] : nullptr;
         const auto emitted_path = [&](const ExtrusionPath &source) {
@@ -1918,11 +1943,12 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
         size_t proof_layer_end = 0;
         const auto cancel = [&] { if (object.print()->canceled()) throw CanceledException(); };
         for (size_t target_index = 0; target_index < targets.size(); ++target_index) {
+            if (probe && probe->target != target_index) continue;
             const Target &target = targets[target_index];
             const size_t frozen_index = cached_phase ? prepared_model->frozen_indices.at(target_index) : 0;
             if (object.print()->canceled()) throw CanceledException();
             const Layer &lower = *object.layers()[target.upper_layer - 1];
-            if (cached_phase && prepared_model->proofs && target_index >= proof_layer_end) {
+            if (!probe && cached_phase && prepared_model->proofs && target_index >= proof_layer_end) {
                 layer_proof = {};
                 proof_sources.clear();
                 proof_targets.clear();
@@ -1989,6 +2015,8 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
             BridgeAwareCubicValidation::Result result;
             Polylines verified_paths(target.paths.size());
             for (size_t index = 0; index < target.paths.size(); ++index) {
+                if (probe && probe->path != index) continue;
+                if (probe && context->probe_checked) *context->probe_checked = true;
                 ExtrusionPath uncached_upper;
                 const ExtrusionPath &upper = cached_phase ? cached_phase->extrusions.at(frozen_index).at(index) :
                     (uncached_upper = emitted_path(target.extrusions.at(index)));
@@ -2116,6 +2144,13 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                 // the growing aggregate after every successful path would make
                 // accepted trials quadratic in their target-group size.
                 const bool path_rejects_trial = mode == TargetCheck::RejectTrial && !checked.passed();
+                if (path_rejects_trial && !target.dependency && context && context->first_failure &&
+                    !context->first_failure->has_value() && context->frozen_indices &&
+                    context->frozen_indices->size() == targets.size()) {
+                    if (const auto failure_kind = BridgeAwareCubic::ModelFailureReplay::failure_kind(checked))
+                        *context->first_failure = BridgeAwareCubic::ModelFailureReplay::Hint{
+                            context->frozen_indices->at(target_index), index, phase, *failure_kind};
+                }
                 result.input_valid &= checked.input_valid;
                 result.completed &= checked.completed;
                 result.resource_limited |= checked.resource_limited;
@@ -2136,13 +2171,13 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     return failures;
                 }
             }
-            layer_proof.record(frozen_index, result);
+            if (!probe) layer_proof.record(frozen_index, result);
             if (!result.passed()) {
                 const bool incomplete = !result.input_valid || !result.completed;
                 failures.push_back({target, std::move(result), std::move(verified_paths)});
                 if (incomplete) return failures;
             }
-            if (target_index + 1 == proof_layer_end) {
+            if (!probe && target_index + 1 == proof_layer_end) {
                 layer_proof.commit();
                 layer_proof = {};
             }
@@ -3131,6 +3166,7 @@ void PrintObject::prepare_bridge_aware_cubic()
             const auto prepared_roofs = active_profile && active_profile->full_trial_checks ? nullptr :
                 prepare_model_targets(*this, roofs);
             const auto model_proofs = prepare_model_proofs(*this, prepared_roofs.get(), roofs);
+            BridgeAwareCubic::ModelFailureReplay model_replay;
             size_t trials = 0;
             const auto changed_plan_layers = [&](const auto &previous, const auto &previous_indices) {
                 std::set<size_t> changed;
@@ -3233,7 +3269,8 @@ void PrintObject::prepare_bridge_aware_cubic()
                 }
                 return true;
             };
-            const auto check_changed_layers = [&](const std::set<size_t> &changed) {
+            const auto check_changed_layers = [&](const std::set<size_t> &changed,
+                                                   const BridgeAwareCubic::ModelFailureReplay::Key *candidate_key = nullptr) {
                 std::set<size_t> checked_layers;
                 {
                     ProfileScope profile(ProfilePhase::GenerateChanged);
@@ -3254,11 +3291,60 @@ void PrintObject::prepare_bridge_aware_cubic()
                 const auto actual = collect_targets(*this, false, false, &checked_layers);
                 // Coarsening may remove support, never adopt a different
                 // required model path to avoid its frozen support obligation.
-                if (!same_model_targets(selected, actual)) return false;
+                if (!same_model_targets(selected, actual)) {
+                    if (candidate_key) model_replay.erase(*candidate_key);
+                    if (active_profile) active_profile->model_replay_entries = model_replay.size();
+                    return false;
+                }
                 const TargetCheck mode = active_profile && active_profile->full_trial_checks ?
                     TargetCheck::CollectFailures : TargetCheck::RejectTrial;
                 const PreparedModelView prepared_view{prepared_roofs.get(), frozen_indices, model_proofs.get()};
-                auto rejected = check_targets(*this, actual, nullptr, mode, prepared_roofs ? &prepared_view : nullptr);
+                BridgeAwareCubicValidation::WorkBudget model_budget;
+                std::optional<BridgeAwareCubic::ModelFailureReplay::Hint> first_model_failure;
+                TargetCheckContext context{&model_budget, nullptr, &frozen_indices, &first_model_failure, nullptr};
+                const bool replay_enabled = candidate_key && mode == TargetCheck::RejectTrial;
+                const auto remember_failure = [&] {
+                    if (replay_enabled && first_model_failure && model_replay.remember(*candidate_key, *first_model_failure) && active_profile)
+                        ++active_profile->model_replay_stores;
+                    if (active_profile) active_profile->model_replay_entries = model_replay.size();
+                };
+                std::vector<Failure> rejected;
+                if (replay_enabled) {
+                    const auto previous = model_replay.find(*candidate_key);
+                    // A failed old hint must not survive a passing new model
+                    // check and then masquerade as a construction rejection.
+                    model_replay.erase(*candidate_key);
+                    if (previous) {
+                        const auto probe = BridgeAwareCubic::ModelFailureReplay::resolve(*previous, frozen_indices,
+                            [&](size_t index) { return actual[index].paths.size(); }, model_budget,
+                            [&] { throw_if_canceled(); });
+                        if (probe) {
+                            bool checked = false;
+                            TargetCheckContext probe_context{&model_budget, &*probe, &frozen_indices, &first_model_failure, &checked};
+                            // Same full target view and physical domain, but no
+                            // successful-layer proof lookup or publication.
+                            const PreparedModelView probe_view{prepared_roofs.get(), frozen_indices, nullptr};
+                            if (active_profile) ++active_profile->model_replay_probes;
+                            {
+                                ProfileScope replay_profile(ProfilePhase::ModelReplay, &model_budget);
+                                rejected = check_targets(*this, actual, nullptr, mode,
+                                    prepared_roofs ? &probe_view : nullptr, &probe_context);
+                            }
+                            for (const Failure &failure : rejected)
+                                if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
+                            if (!rejected.empty()) {
+                                if (active_profile) ++active_profile->model_replay_rejections;
+                                remember_failure();
+                                return false;
+                            }
+                            if (active_profile) checked ? ++active_profile->model_replay_passes : ++active_profile->model_replay_unavailable;
+                        } else if (active_profile) ++active_profile->model_replay_unavailable;
+                    }
+                }
+                // A passing/missing probe proves nothing about other paths.
+                // Perform the original complete model check with the same
+                // remaining budget; no performed probe work is refunded.
+                rejected = check_targets(*this, actual, nullptr, mode, prepared_roofs ? &prepared_view : nullptr, &context);
                 if (active_profile && model_proofs) {
                     const auto stats = model_proofs->statistics();
                     active_profile->model_layer_proof_hits = stats.hits;
@@ -3267,9 +3353,15 @@ void PrintObject::prepare_bridge_aware_cubic()
                     active_profile->model_layer_proof_vertices = stats.vertices;
                     active_profile->model_layer_proof_items = stats.items;
                 }
-                if (rejected.empty()) rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers), nullptr, mode);
                 for (const Failure &failure : rejected)
                     if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
+                if (!rejected.empty()) remember_failure();
+                else {
+                    rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers), nullptr, mode);
+                    for (const Failure &failure : rejected)
+                        if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
+                    if (active_profile) active_profile->model_replay_entries = model_replay.size();
+                }
                 return rejected.empty();
             };
             bool accepted;
@@ -3312,7 +3404,8 @@ void PrintObject::prepare_bridge_aware_cubic()
                     }
                     prune_dependencies();
                     const auto changed = changed_plan_layers(previous, previous_indices);
-                    const bool verified = check_changed_layers(changed);
+                    const BridgeAwareCubic::ModelFailureReplay::Key candidate_key{candidate.region, candidate.refinement.id};
+                    const bool verified = check_changed_layers(changed, &candidate_key);
                     if (active_profile) verified ? ++active_profile->accepted : ++active_profile->rejected;
                     if (verified) accepted = true;
                     else {
