@@ -1,5 +1,6 @@
 #include "BridgeAwareCubicContact.hpp"
 #include "BridgeAwareCubicValidation.hpp"
+#include "BridgeAwareCubicSerialization.hpp"
 
 #include "../ClipperUtils.hpp"
 #include "../Geometry/ConvexHull.hpp"
@@ -561,6 +562,11 @@ struct PreparedLower {
     SectionIndex index;
 };
 
+size_t prepared_lower_contact_units(const PreparedLower &prepared) noexcept
+{
+    return prepared.admission_vertices;
+}
+
 // Store values, never section indices or snapshot addresses. Canonical section
 // indices may shift when unrelated lower material changes. The Scalar radius
 // is compared as a number: long double may contain indeterminate padding.
@@ -576,6 +582,29 @@ struct QuerySignature {
 };
 
 size_t query_signature_units(const QuerySignature &signature) noexcept { return signature.units; }
+
+// Compact canonical geometry is independently owned. The weak token binds
+// capture/lookup to a particular immutable preparation without retaining its
+// input admission, spatial index or duplicated corner vectors.
+struct CanonicalLowerEpoch {
+    std::weak_ptr<const PreparedLower> source;
+    BridgeAwareCubic::SerializedXY phase;
+    double upper_print_z = 0., contact_z = 0.;
+    float upper_height = 0.f;
+    std::vector<LowerSection> sections;
+    size_t bytes = 0;
+};
+struct CanonicalLowerDelta {
+    CanonicalLowerEpochPtr before, after;
+    EpochRelation relation = EpochRelation::Incompatible;
+    std::vector<size_t> removed, added;
+    size_t bytes = 0, resident_bytes = 0;
+};
+struct EpochQuerySignature {
+    CanonicalLowerEpochPtr epoch;
+    QuerySignaturePtr raw;
+    size_t units = 0;
+};
 
 struct QueryCacheData {
     using Key = std::tuple<size_t, Scalar, Scalar, double>;
@@ -931,6 +960,26 @@ bool prove_entire_path(PathContact &result, const PreparedLower &prepared, const
     return true;
 }
 
+// Shared by ordinary canonical enumeration and epoch dirty-axis discovery.
+// The exact reserve and both finite-axis normal tests must remain identical.
+bool query_section_candidate(const LowerSection &lower, const Point &a, const Point &b,
+                             V u, Scalar length, Scalar upper_radius,
+                             Scalar &lower_length, Budget &budget)
+{
+    budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+    budget.consume();
+    const Scalar reach = lower.radius + upper_radius + 4;
+    if (std::max(a.x(), b.x()) + reach < std::min(lower.a.x(), lower.b.x()) ||
+        std::min(a.x(), b.x()) - reach > std::max(lower.a.x(), lower.b.x()) ||
+        std::max(a.y(), b.y()) + reach < std::min(lower.a.y(), lower.b.y()) ||
+        std::min(a.y(), b.y()) - reach > std::max(lower.a.y(), lower.b.y()))
+        return false;
+    const V lower_delta = V(lower.b) - V(lower.a);
+    lower_length = std::sqrt(dot(lower_delta, lower_delta));
+    return !separated_normal(a, u, length, lower.a, lower.b, reach, budget) &&
+           !separated_normal(lower.a, lower_delta, lower_length, a, b, reach, budget);
+}
+
 // The only candidate enumeration used by ordinary contact generation and its
 // optional query identity. Both retain canonical merged-section order and the
 // exact original broad/narrow rejection predicates. A visitor may stop after
@@ -953,18 +1002,8 @@ bool visit_query_sections(const PreparedLower &prepared, const Point &a, const P
         if ((i & 255) == 0) poll();
         const size_t lower_index = indexed ? candidates[i] : i;
         const LowerSection &lower = prepared.sections[lower_index];
-        budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
-        budget.consume();
-        const Scalar reach = lower.radius + upper_radius + 4;
-        if (std::max(a.x(), b.x()) + reach < std::min(lower.a.x(), lower.b.x()) ||
-            std::min(a.x(), b.x()) - reach > std::max(lower.a.x(), lower.b.x()) ||
-            std::max(a.y(), b.y()) + reach < std::min(lower.a.y(), lower.b.y()) ||
-            std::min(a.y(), b.y()) - reach > std::max(lower.a.y(), lower.b.y()))
-            continue;
-        const V lower_delta = V(lower.b) - V(lower.a);
-        const Scalar lower_length = std::sqrt(dot(lower_delta, lower_delta));
-        if (separated_normal(a, u, length, lower.a, lower.b, reach, budget) ||
-            separated_normal(lower.a, lower_delta, lower_length, a, b, reach, budget))
+        Scalar lower_length = 0.;
+        if (!query_section_candidate(lower, a, b, u, length, upper_radius, lower_length, budget))
             continue;
         if (!visit(lower_index, lower, length, lower_length)) return false;
     }
@@ -1094,6 +1133,55 @@ bool signature_upper_matches(const QuerySignature &signature, const PreparedLowe
 }
 } // namespace
 
+namespace {
+QuerySignaturePtr capture_signature_impl(const PreparedLower &prepared, const ExtrusionPath &upper,
+    double upper_print_z, double tolerance, Budget &budget, size_t capacity_units,
+    const QuerySignatureCancel &cancel, QueryCacheData *cache_data)
+{
+    signature_poll(cancel);
+    if (!signature_arguments(prepared, upper, upper_print_z, tolerance, budget, cache_data)) return {};
+    signature_poll(cancel);
+    const size_t capacity = std::min(capacity_units, max_vertices);
+    size_t units = 0;
+    admit_signature(16, capacity, units, budget); // All owned metadata/containers.
+    auto signature = std::make_shared<QuerySignature>();
+    const Points &points = upper.polyline.points;
+    admit_signature(points.size(), capacity, units, budget);
+    signature->upper_points = points;
+    if (signature->upper_points.capacity() > points.size())
+        admit_signature(signature->upper_points.capacity() - points.size(), capacity, units, budget);
+    signature->width = upper.width;
+    signature->height = upper.height;
+    signature->mm3_per_mm = upper.mm3_per_mm;
+    signature->role = upper.role();
+    signature->upper_print_z = upper_print_z;
+    signature->tolerance = tolerance;
+    signature->contact_z = prepared.status.contact_z;
+    const Scalar radius = .5L * snapped_section(upper, upper_print_z, signature->contact_z) / SCALING_FACTOR;
+    std::vector<size_t> candidates;
+    const auto poll = [&] { signature_poll(cancel); };
+    for (size_t i = 1; i < points.size(); ++i) {
+        poll();
+        budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+        budget.consume();
+        if (points[i - 1] == points[i]) continue;
+        // Admission includes spare vector capacity, not just used records.
+        grow_signature(signature->segments, 2, capacity, units, budget);
+        signature->segments.push_back({i - 1, {}});
+        auto &segment = signature->segments.back();
+        visit_query_sections(prepared, points[i - 1], points[i], radius, candidates, budget,
+            [&](size_t, const LowerSection &lower, Scalar, Scalar) {
+                grow_signature(segment.sections, 3, capacity, units, budget);
+                segment.sections.push_back({lower.a, lower.b, lower.radius});
+                return true;
+            }, poll);
+    }
+    signature_poll(cancel);
+    signature->units = units;
+    return signature;
+}
+} // namespace
+
 QuerySignaturePtr capture_query_signature(const PreparedLower &prepared, const ExtrusionPath &upper,
                                            double upper_print_z, double tolerance,
                                            BridgeAwareCubicValidation::WorkBudget *shared,
@@ -1105,47 +1193,8 @@ QuerySignaturePtr capture_query_signature(const PreparedLower &prepared, const E
     QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
     CacheScope cache_scope(budget, cache_data);
     try {
-        signature_poll(cancel);
-        if (!signature_arguments(prepared, upper, upper_print_z, tolerance, budget, cache_data)) return {};
-        signature_poll(cancel);
-        const size_t capacity = std::min(capacity_units, max_vertices);
-        size_t units = 0;
-        admit_signature(16, capacity, units, budget); // All owned metadata/containers.
-        auto signature = std::make_shared<QuerySignature>();
-        const Points &points = upper.polyline.points;
-        admit_signature(points.size(), capacity, units, budget);
-        signature->upper_points = points;
-        if (signature->upper_points.capacity() > points.size())
-            admit_signature(signature->upper_points.capacity() - points.size(), capacity, units, budget);
-        signature->width = upper.width;
-        signature->height = upper.height;
-        signature->mm3_per_mm = upper.mm3_per_mm;
-        signature->role = upper.role();
-        signature->upper_print_z = upper_print_z;
-        signature->tolerance = tolerance;
-        signature->contact_z = prepared.status.contact_z;
-        const Scalar radius = .5L * snapped_section(upper, upper_print_z, signature->contact_z) / SCALING_FACTOR;
-        std::vector<size_t> candidates;
-        const auto poll = [&] { signature_poll(cancel); };
-        for (size_t i = 1; i < points.size(); ++i) {
-            poll();
-            budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
-            budget.consume();
-            if (points[i - 1] == points[i]) continue;
-            // Admission includes spare vector capacity, not just used records.
-            grow_signature(signature->segments, 2, capacity, units, budget);
-            signature->segments.push_back({i - 1, {}});
-            auto &segment = signature->segments.back();
-            visit_query_sections(prepared, points[i - 1], points[i], radius, candidates, budget,
-                [&](size_t, const LowerSection &lower, Scalar, Scalar) {
-                    grow_signature(segment.sections, 3, capacity, units, budget);
-                    segment.sections.push_back({lower.a, lower.b, lower.radius});
-                    return true;
-                }, poll);
-        }
-        signature_poll(cancel);
-        signature->units = units;
-        return signature;
+        return capture_signature_impl(prepared, upper, upper_print_z, tolerance,
+                                      budget, capacity_units, cancel, cache_data);
     } catch (const SignatureCanceled &canceled) {
         std::rethrow_exception(canceled.exception);
     } catch (const SignatureUnavailable &) {
@@ -1204,6 +1253,402 @@ bool matches_query_signature(const QuerySignature &signature, const PreparedLowe
     } catch (const std::exception &) {
         return false;
     }
+}
+
+namespace {
+constexpr size_t epoch_control_bytes = 128;
+constexpr size_t epoch_max_bytes = 24 * 1024 * 1024;
+
+size_t contact_units(size_t bytes) noexcept
+{
+    return bytes / sizeof(Point) + (bytes % sizeof(Point) != 0);
+}
+
+template<class T>
+bool same_owner(const std::shared_ptr<const T> &a, const std::shared_ptr<const T> &b) noexcept
+{
+    return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a);
+}
+
+bool epoch_phase_valid(const BridgeAwareCubic::SerializedXY &phase) noexcept
+{
+    return phase.shift.allFinite() && phase.nozzle_offset.allFinite() && phase.plate_origin.allFinite();
+}
+
+bool epoch_phase_equal(const BridgeAwareCubic::SerializedXY &a,
+                       const BridgeAwareCubic::SerializedXY &b) noexcept
+{
+    for (size_t axis = 0; axis < 2; ++axis)
+        if (a.shift[axis] != b.shift[axis] || a.nozzle_offset[axis] != b.nozzle_offset[axis] ||
+            a.plate_origin[axis] != b.plate_origin[axis]) return false;
+    return true;
+}
+
+bool epoch_source_valid(const PreparedLowerPtr &prepared, QueryCacheData *cache) noexcept
+{
+    return prepared && prepared->status.input_valid && prepared->status.completed &&
+        !prepared->status.resource_limited && prepared->status.failure_reason.empty() &&
+        std::isfinite(prepared->status.contact_z) &&
+        (cache == nullptr || same_owner(prepared, cache->prepared));
+}
+
+// Retained arguments consume residency, not another allocation/work charge.
+// Optional query masks can be evicted just as for any ordinary allocation.
+void admit_epoch_resident(size_t units, Budget &budget)
+{
+    if (budget.cache != nullptr) ensure_query_capacity(budget.cache, units, budget);
+    if (units > max_vertices - budget.vertices) throw SignatureUnavailable{};
+    budget.vertices += units;
+}
+
+struct EpochBytes {
+    size_t capacity, used;
+    explicit EpochBytes(EpochLimits limits) : capacity(limits.capacity_bytes), used(limits.other_retained_bytes)
+    {
+        if (capacity > epoch_max_bytes || used > capacity) throw SignatureUnavailable{};
+    }
+    size_t add(size_t count, size_t element = 1)
+    {
+        if (element == 0 || count > (capacity - used) / element) throw SignatureUnavailable{};
+        const size_t bytes = count * element;
+        used += bytes;
+        return bytes;
+    }
+};
+
+void admit_epoch_owned(EpochBytes &bytes, Budget &budget, size_t &owned,
+                       size_t count, size_t element = 1)
+{
+    const size_t previous_units = contact_units(owned);
+    owned += bytes.add(count, element);
+    budget.allocate(contact_units(owned) - previous_units);
+}
+
+template<class T>
+void reserve_epoch_records(std::vector<T> &records, size_t count, EpochBytes &bytes,
+                           Budget &budget, size_t &owned)
+{
+    // These arrays are reserved once from exact counts, so there is no live
+    // old/new growth buffer. Report any implementation-added spare capacity.
+    admit_epoch_owned(bytes, budget, owned, count, sizeof(T));
+    records.reserve(count);
+    if (records.capacity() > count)
+        admit_epoch_owned(bytes, budget, owned, records.capacity() - count, sizeof(T));
+}
+
+bool epoch_keys_equal(const CanonicalLowerEpoch &a, const CanonicalLowerEpoch &b) noexcept
+{
+    return a.upper_print_z == b.upper_print_z && a.upper_height == b.upper_height &&
+        a.contact_z == b.contact_z && epoch_phase_equal(a.phase, b.phase);
+}
+
+// This agrees with the prepared canonical ordering. Whole merged endpoints
+// participate, so a remote extension/split removes the whole old record.
+int epoch_section_compare(const LowerSection &a, const LowerSection &b, Budget &budget)
+{
+    budget.consume(4);
+    const auto ka = a.line_key(), kb = b.line_key();
+    if (ka != kb) return ka < kb ? -1 : 1;
+    if (a.a != b.a) return point_less(a.a, b.a) ? -1 : 1;
+    if (a.b != b.b) return point_less(a.b, b.b) ? -1 : 1;
+    return 0;
+}
+
+bool epoch_corners_equal(const LowerSection &a, const LowerSection &b, Budget &budget)
+{
+    budget.consume();
+    if (a.corners.size() != b.corners.size()) return false;
+    for (size_t i = 0; i < a.corners.size(); ++i) {
+        budget.consume(2);
+        if (a.corners[i].x != b.corners[i].x || a.corners[i].y != b.corners[i].y) return false;
+    }
+    return true;
+}
+
+template<class Removed, class Added>
+void visit_epoch_changes(const CanonicalLowerEpoch &before, const CanonicalLowerEpoch &after,
+                         Budget &budget, const QuerySignatureCancel &cancel,
+                         Removed &&removed, Added &&added)
+{
+    size_t i = 0, j = 0, visited = 0;
+    while (i < before.sections.size() || j < after.sections.size()) {
+        if ((visited++ & 255) == 0) signature_poll(cancel);
+        budget.consume();
+        if (i == before.sections.size()) { added(j++); continue; }
+        if (j == after.sections.size()) { removed(i++); continue; }
+        const auto &a = before.sections[i];
+        const auto &b = after.sections[j];
+        const int order = epoch_section_compare(a, b, budget);
+        if (order < 0) removed(i++);
+        else if (order > 0) added(j++);
+        else {
+            if (!epoch_corners_equal(a, b, budget)) { removed(i); added(j); }
+            ++i; ++j;
+        }
+    }
+}
+
+void admit_delta_arguments(const CanonicalLowerEpochPtr &before, const CanonicalLowerEpochPtr &after,
+                           EpochBytes &bytes, Budget &budget)
+{
+    bytes.add(before->bytes);
+    admit_epoch_resident(contact_units(before->bytes), budget);
+    if (!same_owner(before, after)) {
+        bytes.add(after->bytes);
+        admit_epoch_resident(contact_units(after->bytes), budget);
+    }
+}
+
+constexpr size_t bound_wrapper_units =
+    (sizeof(EpochQuerySignature) + epoch_control_bytes + sizeof(Point) - 1) / sizeof(Point);
+} // namespace
+
+bool lower_epoch_source_matches(const CanonicalLowerEpoch &epoch, const PreparedLowerPtr &prepared,
+    const BridgeAwareCubic::SerializedXY &phase) noexcept
+{
+    return prepared && epoch_phase_valid(phase) && epoch_phase_equal(epoch.phase, phase) &&
+        same_owner(epoch.source.lock(), prepared);
+}
+size_t lower_epoch_owned_bytes(const CanonicalLowerEpoch &epoch) noexcept { return epoch.bytes; }
+size_t lower_epoch_resident_bytes(const CanonicalLowerEpoch &epoch) noexcept { return epoch.bytes; }
+size_t lower_epoch_contact_units(const CanonicalLowerEpoch &epoch) noexcept { return contact_units(epoch.bytes); }
+EpochRelation lower_epoch_relation(const CanonicalLowerDelta &delta) noexcept { return delta.relation; }
+const CanonicalLowerEpochPtr &lower_epoch_before(const CanonicalLowerDelta &delta) noexcept { return delta.before; }
+const CanonicalLowerEpochPtr &lower_epoch_after(const CanonicalLowerDelta &delta) noexcept { return delta.after; }
+size_t lower_delta_owned_bytes(const CanonicalLowerDelta &delta) noexcept { return delta.bytes; }
+size_t lower_delta_resident_bytes(const CanonicalLowerDelta &delta) noexcept { return delta.resident_bytes; }
+size_t lower_delta_owned_contact_units(const CanonicalLowerDelta &delta) noexcept { return contact_units(delta.bytes); }
+const CanonicalLowerEpochPtr &query_signature_epoch(const EpochQuerySignature &bound) noexcept { return bound.epoch; }
+const QuerySignaturePtr &epoch_query_signature_raw(const EpochQuerySignature &bound) noexcept { return bound.raw; }
+size_t epoch_query_signature_units(const EpochQuerySignature &bound) noexcept { return bound.units; }
+
+CanonicalLowerEpochPtr capture_lower_epoch(const PreparedLowerPtr &prepared,
+    const BridgeAwareCubic::SerializedXY &phase, EpochLimits limits,
+    BridgeAwareCubicValidation::WorkBudget *shared, const QuerySignatureCancel &cancel, QueryCache *cache)
+{
+    Budget budget(shared);
+    QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
+    CacheScope scope(budget, cache_data);
+    try {
+        signature_poll(cancel);
+        budget.consume(16);
+        if (!epoch_source_valid(prepared, cache_data) || !epoch_phase_valid(phase)) return {};
+        budget.vertices = prepared->admission_vertices;
+        admit_epoch_resident(limits.other_contact_units, budget);
+        EpochBytes bytes(limits);
+        size_t owned = 0;
+        // prepare_lower uses make_shared. A weak token releases all old
+        // geometry on source destruction, but keeps that combined fixed-size
+        // object/control allocation alive. Reserve it here, even when several
+        // compact epochs conservatively charge the same weak source twice.
+        admit_epoch_owned(bytes, budget, owned,
+            sizeof(CanonicalLowerEpoch) + sizeof(PreparedLower) + 2 * epoch_control_bytes);
+        auto epoch = std::make_shared<CanonicalLowerEpoch>();
+        epoch->source = prepared;
+        epoch->phase = phase;
+        epoch->upper_print_z = prepared->upper_print_z;
+        epoch->upper_height = prepared->upper_height;
+        epoch->contact_z = prepared->status.contact_z;
+        reserve_epoch_records(epoch->sections, prepared->sections.size(), bytes, budget, owned);
+        for (size_t i = 0; i < prepared->sections.size(); ++i) {
+            if ((i & 255) == 0) signature_poll(cancel);
+            budget.consume(4);
+            const auto &source = prepared->sections[i];
+            epoch->sections.push_back({source.a, source.b, source.radius, {}});
+            auto &target = epoch->sections.back();
+            reserve_epoch_records(target.corners, source.corners.size(), bytes, budget, owned);
+            for (V corner : source.corners) {
+                budget.consume(2);
+                target.corners.push_back(corner);
+            }
+        }
+        signature_poll(cancel);
+        epoch->bytes = owned;
+        return epoch;
+    } catch (const SignatureCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const SignatureUnavailable &) {
+    } catch (const Limit &) {
+    } catch (const std::bad_alloc &) {
+    } catch (const std::length_error &) {
+    }
+    return {};
+}
+
+CanonicalLowerDeltaPtr compare_lower_epochs(const CanonicalLowerEpochPtr &before,
+    const CanonicalLowerEpochPtr &after, EpochLimits limits,
+    BridgeAwareCubicValidation::WorkBudget *shared, const QuerySignatureCancel &cancel)
+{
+    Budget budget(shared);
+    try {
+        signature_poll(cancel);
+        budget.consume(16);
+        if (!before || !after) return {};
+        admit_epoch_resident(limits.other_contact_units, budget);
+        EpochBytes bytes(limits);
+        admit_delta_arguments(before, after, bytes, budget);
+        size_t owned = 0;
+        admit_epoch_owned(bytes, budget, owned, sizeof(CanonicalLowerDelta) + epoch_control_bytes);
+        auto delta = std::make_shared<CanonicalLowerDelta>();
+        delta->before = before;
+        delta->after = after;
+        if (epoch_keys_equal(*before, *after)) {
+            size_t removed = 0, added = 0;
+            if (!same_owner(before, after))
+                visit_epoch_changes(*before, *after, budget, cancel,
+                    [&](size_t) { ++removed; }, [&](size_t) { ++added; });
+            delta->relation = removed == 0 && added == 0 ? EpochRelation::Identical : EpochRelation::Changed;
+            reserve_epoch_records(delta->removed, removed, bytes, budget, owned);
+            reserve_epoch_records(delta->added, added, bytes, budget, owned);
+            if (delta->relation == EpochRelation::Changed)
+                visit_epoch_changes(*before, *after, budget, cancel,
+                    [&](size_t index) { delta->removed.push_back(index); },
+                    [&](size_t index) { delta->added.push_back(index); });
+        }
+        signature_poll(cancel);
+        delta->bytes = owned;
+        // Excludes unrelated retained bytes; includes distinct owned arguments.
+        delta->resident_bytes = bytes.used - limits.other_retained_bytes;
+        return delta;
+    } catch (const SignatureCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const SignatureUnavailable &) {
+    } catch (const Limit &) {
+    } catch (const std::bad_alloc &) {
+    } catch (const std::length_error &) {
+    }
+    return {};
+}
+
+EpochQuerySignaturePtr capture_epoch_query_signature(const CanonicalLowerEpochPtr &epoch,
+    const PreparedLowerPtr &prepared, const BridgeAwareCubic::SerializedXY &phase,
+    const ExtrusionPath &upper, double upper_print_z, double tolerance,
+    BridgeAwareCubicValidation::WorkBudget *shared, size_t capacity_units,
+    const QuerySignatureCancel &cancel, QueryCache *cache)
+{
+    Budget budget(shared);
+    QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
+    CacheScope scope(budget, cache_data);
+    try {
+        signature_poll(cancel);
+        budget.consume(16);
+        if (!epoch || !lower_epoch_source_matches(*epoch, prepared, phase) ||
+            !epoch_source_valid(prepared, cache_data) || capacity_units < bound_wrapper_units) return {};
+        budget.vertices = prepared->admission_vertices;
+        admit_epoch_resident(contact_units(epoch->bytes), budget);
+        budget.allocate(bound_wrapper_units);
+        auto raw = capture_signature_impl(*prepared, upper, upper_print_z, tolerance, budget,
+            std::min(capacity_units, max_vertices) - bound_wrapper_units, cancel, cache_data);
+        if (!raw) return {};
+        signature_poll(cancel);
+        auto bound = std::make_shared<EpochQuerySignature>();
+        bound->epoch = epoch;
+        bound->raw = std::move(raw);
+        bound->units = bound->raw->units + bound_wrapper_units;
+        return bound;
+    } catch (const SignatureCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const SignatureUnavailable &) {
+    } catch (const Limit &) {
+    } catch (const std::bad_alloc &) {
+    } catch (const std::length_error &) {
+    }
+    return {};
+}
+
+EpochQueryAdvance advance_epoch_query_signature(const EpochQuerySignature &bound,
+    const CanonicalLowerDelta &delta, const PreparedLowerPtr &current_prepared,
+    const BridgeAwareCubic::SerializedXY &phase, EpochLimits limits,
+    BridgeAwareCubicValidation::WorkBudget *shared, const QuerySignatureCancel &cancel, QueryCache *cache)
+{
+    Budget budget(shared);
+    QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
+    CacheScope scope(budget, cache_data);
+    try {
+        signature_poll(cancel);
+        budget.consume(16);
+        if (!bound.raw || !same_owner(bound.epoch, delta.before) ||
+            !lower_epoch_source_matches(*delta.after, current_prepared, phase) ||
+            !epoch_source_valid(current_prepared, cache_data)) return {};
+        budget.vertices = current_prepared->admission_vertices;
+        admit_epoch_resident(limits.other_contact_units, budget);
+        EpochBytes bytes(limits);
+        admit_delta_arguments(delta.before, delta.after, bytes, budget);
+        bytes.add(delta.bytes);
+        admit_epoch_resident(contact_units(delta.bytes), budget);
+        if (delta.relation == EpochRelation::Incompatible)
+            return {QueryImpact::Changed, {}};
+        const auto &raw = *bound.raw;
+        if (raw.upper_print_z != delta.after->upper_print_z || raw.height != delta.after->upper_height ||
+            raw.contact_z != delta.after->contact_z) return {};
+        // Reuse precisely the ordinary radius calculation, with no point copy.
+        const ExtrusionPath upper(raw.role, raw.mm3_per_mm, raw.width, raw.height);
+        const Scalar radius = .5L * snapped_section(upper, raw.upper_print_z, raw.contact_z) / SCALING_FACTOR;
+        if (delta.relation == EpochRelation::Changed) {
+            for (size_t i = 1; i < raw.upper_points.size(); ++i) {
+                signature_poll(cancel);
+                budget.consume();
+                const Point &a = raw.upper_points[i - 1], &b = raw.upper_points[i];
+                if (a == b) continue;
+                const V u = V(b) - V(a);
+                const Scalar length = std::sqrt(dot(u, u));
+                const auto dirty = [&](const CanonicalLowerEpoch &epoch, const std::vector<size_t> &indices) {
+                    for (size_t j = 0; j < indices.size(); ++j) {
+                        if ((j & 255) == 0) signature_poll(cancel);
+                        Scalar lower_length = 0.;
+                        if (query_section_candidate(epoch.sections[indices[j]], a, b, u, length,
+                                                    radius, lower_length, budget)) return true;
+                    }
+                    return false;
+                };
+                if (dirty(*delta.before, delta.removed) || dirty(*delta.after, delta.added))
+                    return {QueryImpact::Changed, {}};
+            }
+        }
+        budget.allocate(bound_wrapper_units);
+        signature_poll(cancel);
+        auto advanced = std::make_shared<EpochQuerySignature>();
+        advanced->epoch = delta.after;
+        advanced->raw = bound.raw;
+        advanced->units = bound.units;
+        return {QueryImpact::Unaffected, std::move(advanced)};
+    } catch (const SignatureCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const SignatureUnavailable &) {
+    } catch (const Limit &) {
+    } catch (const std::bad_alloc &) {
+    } catch (const std::length_error &) {
+    }
+    return {};
+}
+
+bool matches_epoch_query_signature(const EpochQuerySignature &bound,
+    const PreparedLowerPtr &current_prepared, const BridgeAwareCubic::SerializedXY &phase,
+    const ExtrusionPath &upper, double upper_print_z, double tolerance,
+    BridgeAwareCubicValidation::WorkBudget *shared, const QuerySignatureCancel &cancel, QueryCache *cache)
+{
+    Budget budget(shared);
+    QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
+    CacheScope scope(budget, cache_data);
+    try {
+        signature_poll(cancel);
+        budget.consume(16);
+        if (!bound.epoch || !bound.raw || !lower_epoch_source_matches(*bound.epoch, current_prepared, phase) ||
+            !epoch_source_valid(current_prepared, cache_data)) return false;
+        budget.vertices = current_prepared->admission_vertices;
+        admit_epoch_resident(contact_units(bound.epoch->bytes), budget);
+        const bool same = signature_arguments(*current_prepared, upper, upper_print_z, tolerance, budget, cache_data) &&
+            signature_upper_matches(*bound.raw, *current_prepared, upper, upper_print_z, tolerance, budget, cancel);
+        signature_poll(cancel);
+        return same;
+    } catch (const SignatureCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const SignatureUnavailable &) {
+    } catch (const Limit &) {
+    } catch (const std::bad_alloc &) {
+    } catch (const std::length_error &) {
+    }
+    return false;
 }
 
 PreparedLowerPtr prepare_lower(const std::vector<Bead> &deposited, double upper_print_z,

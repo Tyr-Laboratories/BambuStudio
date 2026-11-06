@@ -39,6 +39,7 @@
 namespace Slic3r {
 namespace {
 namespace Dependency = BridgeAwareCubic::Dependencies;
+namespace Contact = BridgeAwareCubicContact;
 
 // Opt-in, aggregate-only profiling. Set BAC_PROFILE_FILE to a unique JSONL
 // destination; BAC_PROFILE_STAGE is an optional caller label (e.g. export).
@@ -84,9 +85,14 @@ struct ProfileState {
     uint64_t model_layer_proof_vertices = 0, model_layer_proof_items = 0;
     uint64_t span_proof_hits = 0, span_proof_misses = 0, span_proof_publications = 0, span_proof_evictions = 0;
     uint64_t span_proof_entries = 0, span_proof_units = 0;
+    uint64_t contact_epoch_captures = 0, contact_epoch_transitions = 0, contact_epoch_fallbacks = 0;
+    uint64_t contact_epoch_peak_bytes = 0;
+    uint64_t span_epoch_hits = 0, span_epoch_advances = 0, span_epoch_audits = 0, span_epoch_audit_mismatches = 0;
+    uint64_t span_epoch_raw_checks = 0, contact_epoch_peak_slots = 0;
     uint64_t final_proof_hits = 0, final_proof_misses = 0, final_proof_publications = 0, final_proof_bytes = 0;
     bool full_trial_checks = false;
     bool audit_emission_collection = false;
+    bool audit_contact_epochs = false;
     bool truncated = false;
     std::string file, stage;
     const char *session;
@@ -183,6 +189,16 @@ struct ProfileState {
                     << ",\"span_proof_evictions\":" << span_proof_evictions
                     << ",\"span_proof_entries\":" << span_proof_entries
                     << ",\"span_proof_units\":" << span_proof_units
+                    << ",\"contact_epoch_captures\":" << contact_epoch_captures
+                    << ",\"contact_epoch_transitions\":" << contact_epoch_transitions
+                    << ",\"contact_epoch_fallbacks\":" << contact_epoch_fallbacks
+                    << ",\"contact_epoch_peak_bytes\":" << contact_epoch_peak_bytes
+                    << ",\"span_epoch_hits\":" << span_epoch_hits
+                    << ",\"span_epoch_advances\":" << span_epoch_advances
+                    << ",\"span_epoch_audits\":" << span_epoch_audits
+                    << ",\"span_epoch_audit_mismatches\":" << span_epoch_audit_mismatches
+                    << ",\"span_epoch_raw_checks\":" << span_epoch_raw_checks
+                    << ",\"contact_epoch_peak_slots\":" << contact_epoch_peak_slots
                     << ",\"whole_support_queries\":" << whole_support_queries
                     << ",\"whole_support_proofs\":" << whole_support_proofs
                     << ",\"whole_support_segments\":" << whole_support_segments
@@ -239,6 +255,8 @@ public:
                 state->full_trial_checks = full[0] == '1' && full[1] == '\0';
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_EMISSION_COLLECTION"))
                 state->audit_emission_collection = audit[0] == '1' && audit[1] == '\0';
+            if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_CONTACT_EPOCHS"))
+                state->audit_contact_epochs = audit[0] == '1' && audit[1] == '\0';
             static std::atomic<uint64_t> sequence{0};
             state->sequence = ++sequence;
             if (const char *stage = std::getenv("BAC_PROFILE_STAGE"))
@@ -450,7 +468,10 @@ ActiveAttachments active_attachments(const Layer &layer)
 // including layers currently regenerated in parallel. A second equal allowance
 // bounds transient caller views/copies; builder and filler scratch share the
 // first allowance with retained ledgers. No global mutable accounting is used.
-constexpr size_t emission_allowance = 24 * 1024 * 1024;
+// Canonical material identities borrow two MiB from this existing allowance;
+// neither coarsening nor parallel generation receives another metadata pool.
+constexpr size_t contact_epoch_allowance = 2 * 1024 * 1024;
+constexpr size_t emission_allowance = 24 * 1024 * 1024 - contact_epoch_allowance;
 constexpr size_t emission_context_slot_bytes = 512;
 
 size_t emission_quota(const Layer &layer)
@@ -1299,6 +1320,137 @@ struct Failure {
 
 enum class TargetCheck { CollectFailures, RejectTrial };
 struct PreparedModelView;
+
+// Sequential coarsening only. Each exact plane/phase slot owns its last
+// observed complete material, which may belong to a rejected trial. A later
+// observation must compare that material with freshly prepared actual fills;
+// restoring Plans never relabels a proof. Only the active plane retains a
+// previous epoch and delta. Unvisited old bindings are demoted before release.
+class ContactEpochReuse {
+    using Epoch = Contact::CanonicalLowerEpochPtr;
+    using Cache = BridgeAwareCubic::SpanProofCache;
+    using Key = std::tuple<size_t, double, double, double, double, double, double, double, float>;
+    using Slots = std::map<Key, Epoch>;
+    static constexpr size_t context_bytes = 512, slot_bytes = 256;
+    const PrintObject &m_object;
+    Cache &m_cache;
+    Slots m_slots;
+    Epoch m_previous;
+    Contact::CanonicalLowerDeltaPtr m_transition;
+
+    size_t metadata(size_t extra_slots = 0) const noexcept
+    { return context_bytes + (m_slots.size() + extra_slots) * slot_bytes; }
+
+    std::optional<Cache::EpochContext> unavailable() const noexcept
+    {
+        if (active_profile) ++active_profile->contact_epoch_fallbacks;
+        return {};
+    }
+
+    void note_peak(size_t bytes) const noexcept
+    {
+        if (active_profile)
+            active_profile->contact_epoch_peak_bytes = std::max<uint64_t>(active_profile->contact_epoch_peak_bytes, bytes);
+    }
+
+public:
+    ContactEpochReuse(const PrintObject &object, Cache &cache) : m_object(object), m_cache(cache)
+    {
+        // Include tree-node links/allocator overhead and temporary node/handle
+        // views conservatively. Registry nodes live in the existing fact cap.
+        static_assert(sizeof(Slots::value_type) + 8 * sizeof(void *) <= slot_bytes);
+        static_assert(sizeof(ContactEpochReuse) + sizeof(Cache::EpochContext) + 8 * sizeof(Epoch) <= context_bytes);
+    }
+
+    std::optional<Cache::EpochContext> observe(size_t lower_layer,
+        const BridgeAwareCubic::SerializedXY &phase, double upper_z, float upper_height,
+        const Contact::PreparedLowerPtr &prepared, Contact::QueryCache *queries,
+        BridgeAwareCubicValidation::WorkBudget &budget)
+    {
+        const auto cancel = [&] { if (m_object.print()->canceled()) throw CanceledException(); };
+        try {
+            cancel();
+            if (!prepared || !std::isfinite(upper_z) || !std::isfinite(upper_height) ||
+                !phase.shift.allFinite() || !phase.nozzle_offset.allFinite() || !phase.plate_origin.allFinite())
+                return unavailable();
+            // Retirement precharges its complete nonallocating scan. If it
+            // cannot finish, retain both registry entries and their accounting;
+            // do not accumulate a second pending transition.
+            if (m_previous && !m_cache.retire_epochs({m_previous}, &budget, cancel)) return unavailable();
+            m_previous.reset();
+            m_transition.reset();
+
+            size_t levels = 1;
+            for (size_t count = m_slots.size(); count > 0; count >>= 1) ++levels;
+            // Bound red-black-tree comparisons, complete tuple keys, staging
+            // and commit before any optional mutation.
+            if (!emission_charge(m_object, budget, 32 * (2 * levels + 2))) return unavailable();
+            const Key key{lower_layer, phase.shift.x(), phase.shift.y(), phase.nozzle_offset.x(),
+                phase.nozzle_offset.y(), phase.plate_origin.x(), phase.plate_origin.y(), upper_z, upper_height};
+            auto found = m_slots.find(key);
+            const bool new_slot = found == m_slots.end();
+            if (new_slot && m_slots.size() >= (contact_epoch_allowance - context_bytes) / slot_bytes)
+                return unavailable();
+            const size_t meta = metadata(new_slot ? 1 : 0);
+            const size_t retained = m_cache.statistics().epoch_resident_bytes;
+            if (retained > contact_epoch_allowance - meta) return unavailable();
+
+            const Epoch before = new_slot ? Epoch{} : found->second;
+            if (before && Contact::lower_epoch_source_matches(*before, prepared, phase))
+                return Cache::EpochContext{prepared, before, {},
+                    {contact_epoch_allowance, meta + retained - Contact::lower_epoch_resident_bytes(*before), 0}};
+
+            // Every role/region has already participated in prepare_lower.
+            // The capture admits new storage beside every old registered epoch.
+            Epoch after = Contact::capture_lower_epoch(prepared, phase,
+                {contact_epoch_allowance, meta + retained, 0}, &budget, cancel, queries);
+            if (!after) return unavailable();
+            if (active_profile) ++active_profile->contact_epoch_captures;
+            const size_t after_bytes = Contact::lower_epoch_resident_bytes(*after);
+            const size_t before_bytes = before ? Contact::lower_epoch_resident_bytes(*before) : 0;
+            if (before_bytes > retained || after_bytes > contact_epoch_allowance - meta - retained)
+                return unavailable();
+            note_peak(meta + retained + after_bytes);
+            Contact::CanonicalLowerDeltaPtr difference;
+            if (before) {
+                const size_t other_contact = Contact::prepared_lower_contact_units(*prepared) +
+                    (queries ? queries->statistics().resident_units : 0);
+                difference = Contact::compare_lower_epochs(before, after,
+                    {contact_epoch_allowance, meta + retained - before_bytes, other_contact}, &budget, cancel);
+                // An unavailable difference grants no transport. Fresh passed
+                // checks may still bind to the new complete material identity.
+                if (difference && active_profile) ++active_profile->contact_epoch_transitions;
+            }
+            const size_t delta_bytes = difference ? Contact::lower_delta_owned_bytes(*difference) : 0;
+            if (delta_bytes > contact_epoch_allowance - meta - retained - after_bytes) return unavailable();
+            note_peak(meta + retained + after_bytes + delta_bytes);
+
+            // Allocate a missing tree node privately before registry admission.
+            // The final transfer/replacement and handle publication cannot
+            // allocate or poll after the registry has committed its reference.
+            Slots staged;
+            if (new_slot) staged.emplace(key, after);
+            if (!m_cache.admit_epochs({after},
+                    {contact_epoch_allowance, meta + delta_bytes, 0}, &budget, cancel)) return unavailable();
+            if (new_slot) m_slots.insert(staged.extract(staged.begin()));
+            else found->second = after;
+            if (active_profile)
+                active_profile->contact_epoch_peak_slots = std::max<uint64_t>(active_profile->contact_epoch_peak_slots, m_slots.size());
+            m_previous = before;
+            m_transition = difference;
+            // Epoch operations charge their own before/after arguments once;
+            // unrelated retained slots occupy only the object metadata share.
+            // Without a delta there is no argument owning the still-retained
+            // previous epoch, so it remains part of the OTHER storage.
+            const size_t query_other = meta + retained - (difference ? before_bytes : 0);
+            return Cache::EpochContext{prepared, std::move(after), std::move(difference),
+                {contact_epoch_allowance, query_other, 0}};
+        } catch (const std::bad_alloc &) {
+            return unavailable();
+        }
+    }
+};
+
 struct TargetCheckContext {
     BridgeAwareCubicValidation::WorkBudget *budget = nullptr;
     const BridgeAwareCubic::ModelFailureReplay::Probe *probe = nullptr;
@@ -1306,6 +1458,7 @@ struct TargetCheckContext {
     std::optional<BridgeAwareCubic::ModelFailureReplay::Hint> *first_failure = nullptr;
     bool *probe_checked = nullptr;
     BridgeAwareCubic::SpanProofCache *span_proofs = nullptr;
+    ContactEpochReuse *contact_epochs = nullptr;
 };
 
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
@@ -2282,6 +2435,7 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
     const auto *probe = context && mode == TargetCheck::RejectTrial ? context->probe : nullptr;
     auto *span_proofs = context && !probe && mode == TargetCheck::RejectTrial &&
         !(active_profile && active_profile->full_trial_checks) ? context->span_proofs : nullptr;
+    auto *contact_epochs = span_proofs ? context->contact_epochs : nullptr;
     const auto profile_span_proofs = [&] {
         if (active_profile && span_proofs) {
             const auto stats = span_proofs->statistics();
@@ -2291,6 +2445,11 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
             active_profile->span_proof_evictions = stats.evictions;
             active_profile->span_proof_entries = stats.entries;
             active_profile->span_proof_units = stats.units;
+            active_profile->span_epoch_hits = stats.epoch_hits;
+            active_profile->span_epoch_advances = stats.advances;
+            active_profile->span_epoch_audits = stats.epoch_audits;
+            active_profile->span_epoch_audit_mismatches = stats.epoch_audit_mismatches;
+            active_profile->span_epoch_raw_checks = stats.raw_checks;
         }
     };
     if (context && context->probe_checked) *context->probe_checked = false;
@@ -2363,6 +2522,8 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
         std::map<double, BridgeAwareCubicValidation::PreparedGeometryPtr> prepared;
         std::map<std::pair<double, float>, BridgeAwareCubicContact::PreparedLowerPtr> prepared_lower;
         std::unique_ptr<BridgeAwareCubicContact::QueryCache> contact_queries;
+        std::optional<BridgeAwareCubic::SpanProofCache::EpochContext> span_epoch;
+        bool epoch_attempted = false;
         // The source pointers and budget outlive the transaction. Publication
         // is possible only after every ordered frozen group on this layer has
         // passed; a partial view or rejected path cannot produce a cache hit.
@@ -2428,6 +2589,8 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                 // The prepared sections own their snapshot, but clearing all
                 // lower-geometry caches before replacing it makes the lifetime
                 // and output-phase boundary explicit.
+                span_epoch.reset();
+                epoch_attempted = false;
                 contact_queries.reset();
                 prepared_lower.clear();
                 prepared.clear();
@@ -2466,6 +2629,8 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                         // Keep one resident snapshot so the helper's combined
                         // prepared-plus-query allocation admission remains the
                         // complete allowance, rather than one per cached key.
+                        span_epoch.reset();
+                        epoch_attempted = false;
                         contact_queries.reset();
                         prepared_lower.clear();
                         found = prepared_lower.emplace(key, BridgeAwareCubicContact::prepare_lower(
@@ -2476,6 +2641,8 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                 } else {
                     // Invalid floating values must not enter an ordered key.
                     // Retain the contact helper's normal invalid-input result.
+                    span_epoch.reset();
+                    epoch_attempted = false;
                     contact_queries.reset();
                     prepared_lower.clear();
                     lower_contact = BridgeAwareCubicContact::prepare_lower(prior_beads, upper_z, upper.height, &budget);
@@ -2486,12 +2653,19 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     target.bridge_followup ? BridgeAwareCubic::SpanProofCache::Kind::BridgeFollowup :
                     BridgeAwareCubic::SpanProofCache::Kind::Ineligible;
                 const bool reuse_span = span_proofs && span_kind != BridgeAwareCubic::SpanProofCache::Kind::Ineligible;
+                if (reuse_span && contact_epochs && !epoch_attempted) {
+                    epoch_attempted = true;
+                    span_epoch = contact_epochs->observe(target.upper_layer - 1, phase, upper_z, upper.height,
+                        lower_contact, contact_queries.get(), budget);
+                }
                 const BridgeAwareCubic::SpanProofCache::Query span_query{span_kind, phase, target.gap,
-                    target.path_widths[index], path_selection, *lower_contact, upper, upper_z, contact_queries.get()};
+                    target.path_widths[index], path_selection, *lower_contact, upper, upper_z, contact_queries.get(),
+                    span_epoch ? &*span_epoch : nullptr, active_profile && active_profile->audit_contact_epochs};
                 if (reuse_span) {
-                    // Re-discover all current contact candidates, including
-                    // material in formerly empty space, before reusing a fact
-                    // about this complete path and its full selection policy.
+                    // The complete lower transition includes newly occupied
+                    // absence regions and whole merged axes. Only a proven
+                    // unaffected complete query can bypass fresh discovery;
+                    // every unavailable/changed identity retains that fallback.
                     const bool matched = span_proofs->matches(span_query, &budget, cancel);
                     profile_span_proofs();
                     if (matched) continue;
@@ -3831,6 +4005,7 @@ void PrintObject::prepare_bridge_aware_cubic()
             const auto model_proofs = prepare_model_proofs(*this, prepared_roofs.get(), roofs);
             BridgeAwareCubic::ModelFailureReplay model_replay;
             BridgeAwareCubic::SpanProofCache span_proofs;
+            ContactEpochReuse contact_epochs(*this, span_proofs);
             EmissionReuseContext emission_reuse(*this);
             size_t trials = 0;
             const auto changed_plan_layers = [&](const auto &previous, const auto &previous_indices) {
@@ -3974,7 +4149,8 @@ void PrintObject::prepare_bridge_aware_cubic()
                 const PreparedModelView prepared_view{prepared_roofs.get(), frozen_indices, model_proofs.get()};
                 BridgeAwareCubicValidation::WorkBudget model_budget;
                 std::optional<BridgeAwareCubic::ModelFailureReplay::Hint> first_model_failure;
-                TargetCheckContext context{&model_budget, nullptr, &frozen_indices, &first_model_failure, nullptr, &span_proofs};
+                TargetCheckContext context{&model_budget, nullptr, &frozen_indices, &first_model_failure, nullptr,
+                    &span_proofs, &contact_epochs};
                 const bool replay_enabled = candidate_key && mode == TargetCheck::RejectTrial;
                 const auto remember_failure = [&] {
                     if (replay_enabled && first_model_failure && model_replay.remember(*candidate_key, *first_model_failure) && active_profile)
@@ -4035,6 +4211,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                 else {
                     TargetCheckContext construction_context;
                     construction_context.span_proofs = &span_proofs;
+                    construction_context.contact_epochs = &contact_epochs;
                     const auto construction_targets = collect_targets(*this, true, false, &checked_layers,
                         ConstructionCollection::Emitted, nullptr, &emission_reuse);
                     if (active_profile && active_profile->audit_emission_collection) {

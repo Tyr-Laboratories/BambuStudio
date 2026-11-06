@@ -41,7 +41,7 @@ struct TrialEnvironment {
     TrialEnvironment()
     {
         for (const char *name : {"BAC_PROFILE_FILE", "BAC_PROFILE_STAGE", "BAC_PROFILE_FULL_TRIAL_CHECKS",
-                                 "BAC_PROFILE_AUDIT_EMISSION_COLLECTION"}) {
+                                 "BAC_PROFILE_AUDIT_EMISSION_COLLECTION", "BAC_PROFILE_AUDIT_CONTACT_EPOCHS"}) {
             const char *value = std::getenv(name);
             previous.emplace(name, value == nullptr ? std::nullopt : std::optional<std::string>(value));
         }
@@ -64,6 +64,7 @@ struct TrialEnvironment {
         REQUIRE(set("BAC_PROFILE_STAGE", "process") == 0);
         REQUIRE(set("BAC_PROFILE_FULL_TRIAL_CHECKS", exhaustive ? "1" : nullptr) == 0);
         REQUIRE(set("BAC_PROFILE_AUDIT_EMISSION_COLLECTION", exhaustive ? nullptr : "1") == 0);
+        REQUIRE(set("BAC_PROFILE_AUDIT_CONTACT_EPOCHS", exhaustive ? nullptr : "1") == 0);
         return file;
     }
 };
@@ -258,6 +259,11 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
             CAPTURE(counter);
             REQUIRE(result.counters.at(counter).get<size_t>() == 0);
         }
+        for (const char *counter : {"contact_epoch_captures", "contact_epoch_transitions", "contact_epoch_peak_bytes",
+                                   "span_epoch_hits", "span_epoch_advances", "span_epoch_audits"}) {
+            CAPTURE(counter);
+            REQUIRE(result.counters.at(counter).get<size_t>() == 0);
+        }
     } else {
         REQUIRE(result.counters.at("early_trial_rejections").get<size_t>() > 0);
         REQUIRE(result.counters.at("model_cache_hits").get<size_t>() > 0);
@@ -294,6 +300,16 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
         REQUIRE(result.counters.at("emission_rollback_mismatches").get<size_t>() == 0);
         REQUIRE(result.counters.at("emission_rejected_without_projection").get<size_t>() > 0);
         REQUIRE(result.counters.at("emission_collection_audits").get<size_t>() > 0);
+        // The retained material identity must be exercised on real trial
+        // generations, with each fast hit compared against fresh discovery.
+        for (const char *counter : {"contact_epoch_captures", "contact_epoch_transitions",
+                                   "span_epoch_hits", "span_epoch_advances", "span_epoch_audits"}) {
+            CAPTURE(counter);
+            REQUIRE(result.counters.at(counter).get<size_t>() > 0);
+        }
+        REQUIRE(result.counters.at("span_epoch_audit_mismatches").get<size_t>() == 0);
+        REQUIRE(result.counters.at("contact_epoch_peak_bytes").get<size_t>() > 0);
+        REQUIRE(result.counters.at("contact_epoch_peak_bytes").get<size_t>() <= 2 * 1024 * 1024);
     }
     return result;
 }

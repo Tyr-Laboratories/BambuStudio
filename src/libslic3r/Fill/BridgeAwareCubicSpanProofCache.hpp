@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <vector>
 
 namespace Slic3r { namespace BridgeAwareCubic {
 
@@ -27,6 +28,15 @@ class SpanProofCache {
 public:
     enum class Kind { Ineligible, Construction, BridgeFollowup };
     using Cancel = std::function<void()>;
+    // Borrowed by one lookup/publication. The epoch must already have been
+    // admitted below. Prepared ownership is checked against Query::lower;
+    // neither this context nor an emission delta can relabel an old fact.
+    struct EpochContext {
+        BridgeAwareCubicContact::PreparedLowerPtr prepared;
+        BridgeAwareCubicContact::CanonicalLowerEpochPtr current;
+        BridgeAwareCubicContact::CanonicalLowerDeltaPtr transition;
+        BridgeAwareCubicContact::EpochLimits limits;
+    };
     struct Query {
         Kind kind;
         const SerializedXY &phase;
@@ -36,10 +46,22 @@ public:
         const ExtrusionPath &upper;
         double upper_z;
         BridgeAwareCubicContact::QueryCache *contact_cache = nullptr;
+        const EpochContext *epochs = nullptr;
+        // Hidden differential audit only: every epoch hit must also pass the
+        // original fresh raw-signature query with this same remaining budget.
+        // False reference comparison throws (mismatch OR unavailable reference);
+        // it cannot turn an incomplete audit into a silently accepted hit.
+        bool audit_epoch_hits = false;
     };
     struct Statistics {
         size_t hits = 0, misses = 0, publications = 0, evictions = 0;
         size_t entries = 0, units = 0;
+        size_t epoch_hits = 0, advances = 0, raw_checks = 0;
+        size_t epoch_audits = 0, epoch_audit_mismatches = 0;
+        size_t admitted_epochs = 0, epoch_resident_bytes = 0;
+        // Wrapper/control storage only; each entry's shared raw payload is
+        // counted once in units, even when two bound handles reference it.
+        size_t bound_handles = 0, bound_units = 0;
     };
 
     explicit SpanProofCache(size_t max_units = 200000, size_t max_entries = 20000)
@@ -47,6 +69,121 @@ public:
           m_max_entries(std::min(max_entries, size_t(20000))) {}
     SpanProofCache(const SpanProofCache &) = delete;
     SpanProofCache &operator=(const SpanProofCache &) = delete;
+
+    // Atomically retain distinct epochs from the caller's EXISTING metadata
+    // allowance. Count the union of previously admitted and supplied epochs
+    // once; limits.other_retained_bytes excludes that union but includes all
+    // other live layer/epoch/delta storage. Registry metadata and all staged
+    // binding handles remain under the existing fact-unit allowance. Admission
+    // never grants support, and publication may retain at most two epoch
+    // bindings for one raw signature (last observed and active transition).
+    bool admit_epochs(const std::vector<BridgeAwareCubicContact::CanonicalLowerEpochPtr> &epochs,
+                      BridgeAwareCubicContact::EpochLimits limits,
+                      BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+                      const Cancel &cancel = {})
+    {
+        Work work(budget, cancel);
+        try {
+            work.poll();
+            work.charge();
+            if (epochs.size() > max_items || m_max_entries == 0 ||
+                limits.other_retained_bytes > limits.capacity_bytes ||
+                m_statistics.epoch_resident_bytes > limits.capacity_bytes - limits.other_retained_bytes)
+                return false;
+            size_t retained_bytes = m_statistics.epoch_resident_bytes;
+            size_t staged_units = 0;
+            Epochs staged;
+            for (const auto &epoch : epochs) {
+                work.charge();
+                if (!epoch) return false;
+                if (contains_epoch(m_epochs, epoch, work) || contains_epoch(staged, epoch, work)) continue;
+                const size_t bytes = BridgeAwareCubicContact::lower_epoch_resident_bytes(*epoch);
+                if (bytes == 0 || bytes > limits.capacity_bytes - limits.other_retained_bytes - retained_bytes ||
+                    m_epochs.size() + staged.size() >= m_max_entries ||
+                    epoch_registry_units > m_max_units - m_statistics.units - staged_units)
+                    return false;
+                // Metadata is pre-admitted before allocating a node; epoch
+                // arrays are shared and counted once in the byte-pool union.
+                work.charge(epoch_registry_units);
+                staged.push_back({epoch, bytes});
+                staged_units += epoch_registry_units;
+                retained_bytes += bytes;
+            }
+            work.poll();
+            m_epochs.splice(m_epochs.end(), staged);
+            m_statistics.units += staged_units;
+            m_statistics.admitted_epochs = m_epochs.size();
+            m_statistics.epoch_resident_bytes = retained_bytes;
+            return true;
+        } catch (const Canceled &canceled) {
+            std::rethrow_exception(canceled.exception);
+        } catch (const Unavailable &) {
+        } catch (const std::bad_alloc &) {
+        }
+        return false;
+    }
+
+    // Precharge a nonallocating scan, then atomically remove these registry
+    // references and their optional bindings. Exact raw signatures/policy keys
+    // survive for ordinary fresh-discovery fallback. Failure/cancellation
+    // changes nothing: the caller MUST keep old bytes accounted until this
+    // succeeds (or destroys the complete optional cache at a safe boundary).
+    bool retire_epochs(const std::vector<BridgeAwareCubicContact::CanonicalLowerEpochPtr> &epochs,
+                       BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+                       const Cancel &cancel = {})
+    {
+        Work work(budget, cancel);
+        try {
+            work.poll();
+            work.charge();
+            if (epochs.size() > max_items) return false;
+            for (const auto &epoch : epochs) { work.charge(); if (!epoch) return false; }
+            // Charge both traversals before changing any handles. The second
+            // traversal performs only fixed comparisons and noexcept releases;
+            // no cancellation, allocation or work failure can interrupt it.
+            for (const auto &entry : m_entries) {
+                work.charge(2);
+                for (const auto &bound : entry.bindings) {
+                    work.charge(2);
+                    if (bound && requested_epoch(BridgeAwareCubicContact::query_signature_epoch(*bound), epochs, &work))
+                        work.charge(4); // Wrapper releases; entry still owns the complete raw payload.
+                }
+            }
+            for (const auto &admitted : m_epochs) {
+                work.charge(2);
+                if (requested_epoch(admitted.epoch, epochs, &work)) work.charge(epoch_registry_units);
+            }
+            work.poll();
+            for (auto &entry : m_entries) {
+                const size_t old_contact_units = contact_units(entry);
+                for (auto &bound : entry.bindings) {
+                    if (bound && requested_epoch(BridgeAwareCubicContact::query_signature_epoch(*bound), epochs)) {
+                        const size_t units = BridgeAwareCubicContact::epoch_query_signature_units(*bound) - entry.raw_units;
+                        entry.binding_units -= units;
+                        m_statistics.bound_units -= units;
+                        --m_statistics.bound_handles;
+                        bound.reset();
+                    }
+                }
+                const size_t released = old_contact_units - contact_units(entry);
+                entry.units -= released;
+                m_statistics.units -= released;
+            }
+            for (auto it = m_epochs.begin(); it != m_epochs.end();) {
+                if (requested_epoch(it->epoch, epochs)) {
+                    m_statistics.epoch_resident_bytes -= it->bytes;
+                    m_statistics.units -= epoch_registry_units;
+                    it = m_epochs.erase(it);
+                } else ++it;
+            }
+            m_statistics.admitted_epochs = m_epochs.size();
+            return true;
+        } catch (const Canceled &canceled) {
+            std::rethrow_exception(canceled.exception);
+        } catch (const Unavailable &) {
+        }
+        return false;
+    }
 
     bool matches(const Query &query, BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
                  const Cancel &cancel = {})
@@ -58,11 +195,22 @@ public:
             auto bucket = find(description.hash, work);
             if (bucket != m_index.end()) {
                 for (size_t i = 0; i < bucket->second.size; ++i) {
-                    const Entry &entry = *bucket->second.entries[i];
-                    if (same_key(entry, query, description, work) &&
-                        BridgeAwareCubicContact::matches_query_signature(*entry.signature,
+                    Entry &entry = *bucket->second.entries[i];
+                    if (!same_key(entry, query, description, work)) continue;
+                    if (matches_epoch(entry, query, work)) {
+                        ++m_statistics.epoch_hits;
+                        ++m_statistics.hits;
+                        return true;
+                    }
+                    ++m_statistics.raw_checks;
+                    if (BridgeAwareCubicContact::matches_query_signature(*entry.signature,
                             query.lower, query.upper, query.upper_z, 0., work.budget(),
                             [&] { work.poll(); }, query.contact_cache)) {
+                        // After retirement an exact raw fact can be bound to
+                        // the new admitted source, but only by fresh capture.
+                        // The resulting raw identity replaces the old one in
+                        // the same atomic operation; no mismatched pair lives.
+                        bind_after_raw_match(entry, query, work);
                         ++m_statistics.hits;
                         return true;
                     }
@@ -99,16 +247,33 @@ public:
             const size_t available = m_max_units - m_statistics.units;
             if (description.key_units >= available) return false;
             const size_t signature_capacity = std::min(size_t(8192), available - description.key_units);
-            auto signature = BridgeAwareCubicContact::capture_query_signature(query.lower,
+            BridgeAwareCubicContact::EpochQuerySignaturePtr bound;
+            BridgeAwareCubicContact::QuerySignaturePtr signature;
+            if (valid_epoch_context(query, work)) {
+                const auto &epochs = *query.epochs;
+                bound = BridgeAwareCubicContact::capture_epoch_query_signature(epochs.current,
+                    epochs.prepared, query.phase, query.upper, query.upper_z, 0., work.budget(),
+                    signature_capacity, [&] { work.poll(); }, query.contact_cache);
+                if (bound) signature = BridgeAwareCubicContact::epoch_query_signature_raw(*bound);
+            }
+            if (!signature) signature = BridgeAwareCubicContact::capture_query_signature(query.lower,
                 query.upper, query.upper_z, 0., work.budget(), signature_capacity,
                 [&] { work.poll(); }, query.contact_cache);
             if (!signature) return false;
             const size_t signature_units = BridgeAwareCubicContact::query_signature_units(*signature);
-            if (signature_units > signature_capacity) return false;
+            const size_t retained_signature_units = bound ?
+                BridgeAwareCubicContact::epoch_query_signature_units(*bound) : signature_units;
+            if ((bound && retained_signature_units <= signature_units) || retained_signature_units > signature_capacity)
+                return false;
 
             Entry staged(query, description);
             staged.signature = std::move(signature);
-            staged.units = description.key_units + signature_units;
+            staged.raw_units = signature_units;
+            staged.units = description.key_units + retained_signature_units;
+            if (bound) {
+                staged.binding_units = retained_signature_units - signature_units;
+                staged.bindings[0] = std::move(bound);
+            }
             copy_key(staged, query, work);
             auto bucket = find(description.hash, work);
             Iterator victim = m_entries.end();
@@ -160,6 +325,8 @@ public:
             auto added = std::prev(m_entries.end());
             bucket->second.entries[bucket->second.size++] = added;
             m_statistics.units += added->units;
+            m_statistics.bound_units += added->binding_units;
+            for (const auto &binding : added->bindings) if (binding) ++m_statistics.bound_handles;
             m_statistics.entries = m_entries.size();
             ++m_statistics.publications;
             return true;
@@ -177,9 +344,14 @@ private:
     // Conservative metadata allowance for the key, signature handle, list
     // node and a whole two-version map node (even when two facts share it).
     static constexpr size_t metadata_units = 64;
+    static constexpr size_t epoch_registry_units = 16;
     static constexpr coord_t coordinate_limit = std::numeric_limits<coord_t>::max() / 4;
     struct Unavailable {};
     struct Canceled { std::exception_ptr exception; };
+    struct AuditFailure : std::exception {
+        const char *what() const noexcept override
+        { return "Span epoch audit mismatch or unavailable raw-signature reference"; }
+    };
 
     class Work {
     public:
@@ -215,13 +387,14 @@ private:
         Kind kind;
         SerializedXY phase;
         double gap, selection_width;
-        size_t hash, point_count, shape_count, units = 0;
+        size_t hash, point_count, shape_count, units = 0, raw_units = 0, binding_units = 0;
         // Exact-sized arrays avoid unaccounted nested-vector spare capacity.
         // Shapes store polygon count, then contour size / hole count / hole
         // sizes per polygon. All original ring and point order is preserved.
         std::unique_ptr<Point[]> points;
         std::unique_ptr<size_t[]> shapes;
         BridgeAwareCubicContact::QuerySignaturePtr signature;
+        std::array<BridgeAwareCubicContact::EpochQuerySignaturePtr, 2> bindings;
         Entry(const Query &query, const Description &description)
             : kind(query.kind), phase(query.phase), gap(query.gap), selection_width(query.selection_width),
               hash(description.hash), point_count(description.points), shape_count(description.shapes) {}
@@ -230,10 +403,164 @@ private:
     using Iterator = Entries::iterator;
     struct Bucket { std::array<Iterator, 2> entries; size_t size = 0; };
     using Index = std::map<size_t, Bucket>;
+    struct AdmittedEpoch {
+        BridgeAwareCubicContact::CanonicalLowerEpochPtr epoch;
+        size_t bytes;
+    };
+    using Epochs = std::list<AdmittedEpoch>;
+    static_assert(sizeof(Entry) + sizeof(Index::value_type) + 10 * sizeof(void *) <= metadata_units * sizeof(Point),
+                  "Span entry and container metadata must fit their admitted units");
+    static_assert(sizeof(AdmittedEpoch) + 6 * sizeof(void *) <= epoch_registry_units * sizeof(Point),
+                  "Epoch registry node and allocation allowance must fit their admitted units");
     size_t m_max_units, m_max_entries;
     Entries m_entries;
     Index m_index;
+    Epochs m_epochs;
     Statistics m_statistics;
+
+    static size_t contact_units(const Entry &entry) noexcept
+    {
+        return entry.raw_units + entry.binding_units;
+    }
+    static bool contains_epoch(const Epochs &epochs,
+        const BridgeAwareCubicContact::CanonicalLowerEpochPtr &wanted, Work &work)
+    {
+        for (const auto &entry : epochs) { work.charge(); if (entry.epoch == wanted) return true; }
+        return false;
+    }
+    static bool requested_epoch(const BridgeAwareCubicContact::CanonicalLowerEpochPtr &wanted,
+        const std::vector<BridgeAwareCubicContact::CanonicalLowerEpochPtr> &epochs, Work *work = nullptr)
+    {
+        for (const auto &epoch : epochs) {
+            if (work) work->charge(2); // This preflight and the identical commit scan.
+            if (epoch == wanted) return true;
+        }
+        return false;
+    }
+    bool valid_epoch_context(const Query &query, Work &work) const
+    {
+        if (query.epochs == nullptr) return false;
+        work.charge();
+        return query.epochs->current && query.epochs->prepared &&
+            query.epochs->prepared.get() == &query.lower &&
+            contains_epoch(m_epochs, query.epochs->current, work) &&
+            BridgeAwareCubicContact::lower_epoch_source_matches(*query.epochs->current,
+                query.epochs->prepared, query.phase);
+    }
+    void audit_epoch(const Entry &entry, const Query &query, Work &work)
+    {
+        if (!query.audit_epoch_hits) return;
+        ++m_statistics.epoch_audits;
+        ++m_statistics.raw_checks;
+        if (!BridgeAwareCubicContact::matches_query_signature(*entry.signature,
+                query.lower, query.upper, query.upper_z, 0., work.budget(),
+                [&] { work.poll(); }, query.contact_cache)) {
+            ++m_statistics.epoch_audit_mismatches;
+            throw AuditFailure{};
+        }
+    }
+    bool matches_epoch(Entry &entry, const Query &query, Work &work)
+    {
+        if (!valid_epoch_context(query, work)) return false;
+        const auto &epochs = *query.epochs;
+        for (const auto &bound : entry.bindings) {
+            work.charge();
+            if (bound && BridgeAwareCubicContact::query_signature_epoch(*bound) == epochs.current &&
+                BridgeAwareCubicContact::epoch_query_signature_raw(*bound) == entry.signature &&
+                BridgeAwareCubicContact::matches_epoch_query_signature(*bound, epochs.prepared,
+                    query.phase, query.upper, query.upper_z, 0., work.budget(),
+                    [&] { work.poll(); }, query.contact_cache)) {
+                work.poll();
+                audit_epoch(entry, query, work);
+                work.poll();
+                return true;
+            }
+        }
+        if (!epochs.transition || BridgeAwareCubicContact::lower_epoch_after(*epochs.transition) != epochs.current)
+            return false;
+        const auto &before = BridgeAwareCubicContact::lower_epoch_before(*epochs.transition);
+        if (!before || !contains_epoch(m_epochs, before, work)) return false;
+        size_t available_slot = entry.bindings.size();
+        for (size_t i = 0; i < entry.bindings.size(); ++i) {
+            work.charge();
+            if (!entry.bindings[i]) { available_slot = i; break; }
+        }
+        // Never displace the last-observed binding merely to attempt a new
+        // optional query. Plane retirement makes room at an explicit boundary.
+        if (available_slot == entry.bindings.size()) return false;
+        for (const auto &bound : entry.bindings) {
+            work.charge();
+            if (!bound || BridgeAwareCubicContact::query_signature_epoch(*bound) != before ||
+                BridgeAwareCubicContact::epoch_query_signature_raw(*bound) != entry.signature) continue;
+            const size_t bound_units = BridgeAwareCubicContact::epoch_query_signature_units(*bound);
+            if (bound_units <= entry.raw_units) return false;
+            // Advance shares this exact raw object and allocates only another
+            // wrapper of the same type. Admit its storage before the call;
+            // never charge the already retained raw arrays a second time.
+            const size_t reserve = bound_units - entry.raw_units;
+            if (reserve > m_max_units - m_statistics.units) return false;
+            auto advanced = BridgeAwareCubicContact::advance_epoch_query_signature(*bound,
+                *epochs.transition, epochs.prepared, query.phase, epochs.limits, work.budget(),
+                [&] { work.poll(); }, query.contact_cache);
+            if (advanced.impact != BridgeAwareCubicContact::QueryImpact::Unaffected || !advanced.signature)
+                return false;
+            const size_t advanced_units = BridgeAwareCubicContact::epoch_query_signature_units(*advanced.signature);
+            if (advanced_units <= entry.raw_units || advanced_units - entry.raw_units > reserve ||
+                BridgeAwareCubicContact::query_signature_epoch(*advanced.signature) != epochs.current ||
+                BridgeAwareCubicContact::epoch_query_signature_raw(*advanced.signature) != entry.signature ||
+                !BridgeAwareCubicContact::matches_epoch_query_signature(*advanced.signature,
+                    epochs.prepared, query.phase, query.upper, query.upper_z, 0., work.budget(),
+                    [&] { work.poll(); }, query.contact_cache)) return false;
+            const size_t units = advanced_units - entry.raw_units;
+            work.charge(); // Nonthrowing handle/statistics commit below.
+            work.poll();
+            audit_epoch(entry, query, work);
+            work.poll();
+            entry.bindings[available_slot] = std::move(advanced.signature);
+            entry.binding_units += units;
+            entry.units += units;
+            m_statistics.units += units;
+            m_statistics.bound_units += units;
+            ++m_statistics.bound_handles;
+            ++m_statistics.advances;
+            return true;
+        }
+        return false;
+    }
+    void bind_after_raw_match(Entry &entry, const Query &query, Work &work)
+    {
+        try {
+            if (entry.binding_units != 0 || !valid_epoch_context(query, work)) return;
+            const size_t capacity = std::min(size_t(8192), m_max_units - m_statistics.units);
+            if (capacity == 0) return;
+            const auto &epochs = *query.epochs;
+            auto bound = BridgeAwareCubicContact::capture_epoch_query_signature(epochs.current,
+                epochs.prepared, query.phase, query.upper, query.upper_z, 0., work.budget(), capacity,
+                [&] { work.poll(); }, query.contact_cache);
+            if (!bound) return;
+            const auto &raw = BridgeAwareCubicContact::epoch_query_signature_raw(*bound);
+            const size_t units = BridgeAwareCubicContact::epoch_query_signature_units(*bound);
+            if (!raw || units <= BridgeAwareCubicContact::query_signature_units(*raw) || units > capacity ||
+                BridgeAwareCubicContact::query_signature_epoch(*bound) != epochs.current) return;
+            work.charge(entry.raw_units + 1);
+            work.poll();
+            const size_t old_units = entry.raw_units;
+            // Fresh raw equality above proved this same policy fact; capture
+            // describes that same immutable query. Replace raw and binding
+            // together so every retained binding shares entry.signature.
+            entry.signature = raw;
+            entry.raw_units = BridgeAwareCubicContact::query_signature_units(*raw);
+            entry.bindings[0] = std::move(bound);
+            entry.binding_units = units - entry.raw_units;
+            entry.units = entry.units - old_units + units;
+            m_statistics.units = m_statistics.units - old_units + units;
+            m_statistics.bound_units += entry.binding_units;
+            ++m_statistics.bound_handles;
+        } catch (const Unavailable &) {
+            // Optional rebinding cannot undo the already complete raw match.
+        } catch (const std::bad_alloc &) {
+        }
+    }
 
     template<class T> static void hash_value(size_t &hash, const T &value, Work &work)
     {
@@ -399,6 +726,8 @@ private:
         }
         if (bucket->second.size == 0) m_index.erase(bucket);
         m_statistics.units -= entry->units;
+        m_statistics.bound_units -= entry->binding_units;
+        for (const auto &bound : entry->bindings) if (bound) --m_statistics.bound_handles;
         m_entries.erase(entry);
         m_statistics.entries = m_entries.size();
         ++m_statistics.evictions;

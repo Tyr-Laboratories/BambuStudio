@@ -12,6 +12,7 @@
 #include <vector>
 
 namespace Slic3r { namespace BridgeAwareCubicValidation { struct WorkBudget; }}
+namespace Slic3r { namespace BridgeAwareCubic { struct SerializedXY; }}
 
 namespace Slic3r { namespace BridgeAwareCubicContact {
 
@@ -84,6 +85,11 @@ using PreparedLowerPtr = std::shared_ptr<const PreparedLower>;
 PreparedLowerPtr prepare_lower(const std::vector<Bead> &deposited,
                                double upper_print_z, float upper_height,
                                BridgeAwareCubicValidation::WorkBudget *budget = nullptr);
+// Existing validated-input plus owned-geometry admission, without recharging
+// preparation work. Epoch comparison has no prepared/cache argument; include
+// this and live cache resident_units in its other_contact_units when retained
+// by the caller across that comparison. Other epoch operations admit them.
+size_t prepared_lower_contact_units(const PreparedLower &) noexcept;
 
 // Optional identity for one complete ContactsOnly query, not a support proof.
 // Own the exact upper inputs and the ordered canonical lower sections used by
@@ -116,6 +122,112 @@ bool matches_query_signature(const QuerySignature &signature, const PreparedLowe
                              QueryCache *cache = nullptr);
 size_t query_signature_units(const QuerySignature &signature) noexcept;
 
+// Optional coarsening-local identities, never deposited-support proofs. The
+// caller must prepare the COMPLETE emitted lower layer, across all roles and
+// regions, in this exact serialized phase. Source-frame emission deltas cannot
+// substitute for that preparation. Unknown/invalid/incomplete preparation is
+// unavailable, not a valid empty physical epoch.
+struct CanonicalLowerEpoch;
+struct CanonicalLowerDelta;
+struct EpochQuerySignature;
+using CanonicalLowerEpochPtr = std::shared_ptr<const CanonicalLowerEpoch>;
+using CanonicalLowerDeltaPtr = std::shared_ptr<const CanonicalLowerDelta>;
+using EpochQuerySignaturePtr = std::shared_ptr<const EpochQuerySignature>;
+
+struct EpochLimits {
+    // A caller-granted share of the EXISTING object metadata allowance, not
+    // a new allowance. Arguments are charged once per distinct owned epoch;
+    // other_retained_bytes excludes those arguments but includes other live
+    // epoch/delta allocations charged to this share. Staging/scratch also fit.
+    size_t capacity_bytes = 0;
+    size_t other_retained_bytes = 0;
+    // OTHER epoch geometry actively used by this operation, in existing
+    // Contact vertex units; excludes argument epochs charged internally.
+    // Do not pass the whole retained registry or unrelated source metadata:
+    // ordinary Contact admission remains per preparation/query.
+    size_t other_contact_units = 0;
+};
+
+enum class EpochRelation { Identical, Changed, Incompatible };
+enum class QueryImpact { Unaffected, Changed, Unavailable };
+struct EpochQueryAdvance {
+    QueryImpact impact = QueryImpact::Unavailable;
+    // Present ONLY after a complete unaffected check and exact before/after
+    // provenance checks. This newly bound identity is still not a span proof.
+    EpochQuerySignaturePtr signature;
+};
+
+// Owns exact canonical endpoints, numeric radii and copied derived corners,
+// along with exact phase components/plane keys. The prepared source is weakly
+// identified by shared ownership, so old corners/index storage is not retained.
+CanonicalLowerEpochPtr capture_lower_epoch(const PreparedLowerPtr &prepared,
+    const BridgeAwareCubic::SerializedXY &phase, EpochLimits limits,
+    BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+    const QuerySignatureCancel &cancel = {}, QueryCache *cache = nullptr);
+bool lower_epoch_source_matches(const CanonicalLowerEpoch &, const PreparedLowerPtr &,
+    const BridgeAwareCubic::SerializedXY &) noexcept;
+size_t lower_epoch_owned_bytes(const CanonicalLowerEpoch &) noexcept;
+size_t lower_epoch_resident_bytes(const CanonicalLowerEpoch &) noexcept;
+// Conservative Contact admission units: ceil(owned_bytes / sizeof(Point)).
+// Byte counts include object/control allowances, the weak source's retained
+// make_shared object/control allocation, and allocated vector capacity. They
+// do not claim allocator bookkeeping or total process-memory accounting.
+size_t lower_epoch_contact_units(const CanonicalLowerEpoch &) noexcept;
+
+// Different exact phase/upper/contact-plane keys produce Incompatible. For
+// compatible epochs compare WHOLE canonical sections, including copied corners.
+// Both removed and added complete axes participate in dirty-query discovery;
+// never clip them to a source fragment, changed bbox, demand or cell.
+CanonicalLowerDeltaPtr compare_lower_epochs(const CanonicalLowerEpochPtr &before,
+    const CanonicalLowerEpochPtr &after, EpochLimits limits,
+    BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+    const QuerySignatureCancel &cancel = {});
+EpochRelation lower_epoch_relation(const CanonicalLowerDelta &) noexcept;
+const CanonicalLowerEpochPtr &lower_epoch_before(const CanonicalLowerDelta &) noexcept;
+const CanonicalLowerEpochPtr &lower_epoch_after(const CanonicalLowerDelta &) noexcept;
+size_t lower_delta_owned_bytes(const CanonicalLowerDelta &) noexcept;
+size_t lower_delta_resident_bytes(const CanonicalLowerDelta &) noexcept;
+// Only delta-owned records; add each distinct argument epoch exactly once.
+size_t lower_delta_owned_contact_units(const CanonicalLowerDelta &) noexcept;
+
+// Capture the ordinary whole-query signature from the SAME immutable prepared
+// source bound to epoch. The proof adapter invokes this only after that exact
+// complete span-only check passes, and separately owns gap/demand/kind policy.
+EpochQuerySignaturePtr capture_epoch_query_signature(const CanonicalLowerEpochPtr &epoch,
+    const PreparedLowerPtr &prepared, const BridgeAwareCubic::SerializedXY &phase,
+    const ExtrusionPath &upper, double upper_print_z, double xy_tolerance_mm,
+    BridgeAwareCubicValidation::WorkBudget *budget = nullptr, size_t capacity_units = 8192,
+    const QuerySignatureCancel &cancel = {}, QueryCache *cache = nullptr);
+const CanonicalLowerEpochPtr &query_signature_epoch(const EpochQuerySignature &) noexcept;
+// Allows safe demotion to the original exhaustive-signature lookup when an
+// epoch is retired. The immutable raw signature cannot relabel a bound epoch.
+const QuerySignaturePtr &epoch_query_signature_raw(const EpochQuerySignature &) noexcept;
+// Raw signature plus binding wrapper/control allowance, excluding transitive
+// canonical epoch geometry charged once by the caller's shared byte budget.
+// Advancement shares the identical raw signature. Callers may conservatively
+// charge this full count again, or charge only units - raw.units after proving
+// exact shared raw ownership; initial/fresh capture must admit its new raw copy.
+size_t epoch_query_signature_units(const EpochQuerySignature &) noexcept;
+
+// Requires bound.epoch == delta.before, and the supplied current prepared
+// ownership/phase to match delta.after. Tests every retained positive upper
+// segment against old AND new dirty sections, including zero-radius axes and
+// endpoints. No caller can directly relabel a bound signature's epoch.
+// The current upper may differ later: matches_epoch_query_signature must still
+// compare it freshly before any use of the transported span fact.
+// Failure never mutates the old handle. Caller admits the staged binding under
+// its existing span-fact allowance separately from EpochLimits geometry bytes.
+EpochQueryAdvance advance_epoch_query_signature(const EpochQuerySignature &bound,
+    const CanonicalLowerDelta &delta, const PreparedLowerPtr &current_prepared,
+    const BridgeAwareCubic::SerializedXY &phase, EpochLimits limits,
+    BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+    const QuerySignatureCancel &cancel = {}, QueryCache *cache = nullptr);
+bool matches_epoch_query_signature(const EpochQuerySignature &bound,
+    const PreparedLowerPtr &current_prepared, const BridgeAwareCubic::SerializedXY &phase,
+    const ExtrusionPath &upper, double upper_print_z, double xy_tolerance_mm,
+    BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+    const QuerySignatureCancel &cancel = {}, QueryCache *cache = nullptr);
+
 struct QueryCacheData;
 struct QueryCacheStatistics {
     size_t hits = 0, misses = 0, evictions = 0, resident_units = 0;
@@ -143,6 +255,18 @@ private:
     friend QuerySignaturePtr capture_query_signature(const PreparedLower &, const ExtrusionPath &, double, double,
         BridgeAwareCubicValidation::WorkBudget *, size_t, const QuerySignatureCancel &, QueryCache *);
     friend bool matches_query_signature(const QuerySignature &, const PreparedLower &, const ExtrusionPath &, double, double,
+        BridgeAwareCubicValidation::WorkBudget *, const QuerySignatureCancel &, QueryCache *);
+    friend CanonicalLowerEpochPtr capture_lower_epoch(const PreparedLowerPtr &,
+        const BridgeAwareCubic::SerializedXY &, EpochLimits, BridgeAwareCubicValidation::WorkBudget *,
+        const QuerySignatureCancel &, QueryCache *);
+    friend EpochQuerySignaturePtr capture_epoch_query_signature(const CanonicalLowerEpochPtr &,
+        const PreparedLowerPtr &, const BridgeAwareCubic::SerializedXY &, const ExtrusionPath &, double, double,
+        BridgeAwareCubicValidation::WorkBudget *, size_t, const QuerySignatureCancel &, QueryCache *);
+    friend EpochQueryAdvance advance_epoch_query_signature(const EpochQuerySignature &, const CanonicalLowerDelta &,
+        const PreparedLowerPtr &, const BridgeAwareCubic::SerializedXY &, EpochLimits,
+        BridgeAwareCubicValidation::WorkBudget *, const QuerySignatureCancel &, QueryCache *);
+    friend bool matches_epoch_query_signature(const EpochQuerySignature &, const PreparedLowerPtr &,
+        const BridgeAwareCubic::SerializedXY &, const ExtrusionPath &, double, double,
         BridgeAwareCubicValidation::WorkBudget *, const QuerySignatureCancel &, QueryCache *);
 };
 

@@ -111,7 +111,9 @@ add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cu
     test_bridge_aware_cubic_failure_replay.cpp
     test_bridge_aware_cubic_containment.cpp
     test_bridge_aware_cubic_query_signature.cpp
+    test_bridge_aware_cubic_contact_epoch.cpp
     test_bridge_aware_cubic_span_proof_cache.cpp
+    test_bridge_aware_cubic_span_epoch.cpp
     test_bridge_aware_cubic_certificate_export.cpp test_bridge_aware_cubic_owner_bounds.cpp
     test_gcode_z_parsing.cpp)
 target_link_libraries(bridge_aware_cubic_tests test_common libslic3r slicer_test_support)
