@@ -42,7 +42,7 @@ struct TrialEnvironment {
     {
         for (const char *name : {"BAC_PROFILE_FILE", "BAC_PROFILE_STAGE", "BAC_PROFILE_FULL_TRIAL_CHECKS",
                                  "BAC_PROFILE_AUDIT_EMISSION_COLLECTION", "BAC_PROFILE_AUDIT_CONTACT_EPOCHS",
-                                 "BAC_PROFILE_AUDIT_COMPLETE_SPANS"}) {
+                                 "BAC_PROFILE_AUDIT_COMPLETE_SPANS", "BAC_PROFILE_AUDIT_CONTACT_ARTIFACTS"}) {
             const char *value = std::getenv(name);
             previous.emplace(name, value == nullptr ? std::nullopt : std::optional<std::string>(value));
         }
@@ -67,6 +67,7 @@ struct TrialEnvironment {
         REQUIRE(set("BAC_PROFILE_AUDIT_EMISSION_COLLECTION", exhaustive ? nullptr : "1") == 0);
         REQUIRE(set("BAC_PROFILE_AUDIT_CONTACT_EPOCHS", exhaustive ? nullptr : "1") == 0);
         REQUIRE(set("BAC_PROFILE_AUDIT_COMPLETE_SPANS", exhaustive ? nullptr : "1") == 0);
+        REQUIRE(set("BAC_PROFILE_AUDIT_CONTACT_ARTIFACTS", exhaustive ? nullptr : "1") == 0);
         return file;
     }
 };
@@ -263,7 +264,11 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
         }
         for (const char *counter : {"contact_epoch_captures", "contact_epoch_transitions", "contact_epoch_peak_bytes",
                                    "span_epoch_hits", "span_epoch_advances", "span_epoch_audits",
-                                   "complete_span_queries", "complete_span_proofs", "complete_span_audits"}) {
+                                   "complete_span_queries", "complete_span_proofs", "complete_span_audits",
+                                   "contact_artifact_hits", "contact_artifact_misses", "contact_artifact_publications",
+                                   "contact_artifact_evictions", "contact_artifact_entries", "contact_artifact_resident_bytes",
+                                   "contact_artifact_peak_bytes", "contact_artifact_staged_peak_bytes", "contact_artifact_signature_misses",
+                                   "contact_artifact_audits", "contact_artifact_audit_mismatches", "contact_artifact_current_cell_checks"}) {
             CAPTURE(counter);
             REQUIRE(result.counters.at(counter).get<size_t>() == 0);
         }
@@ -316,6 +321,18 @@ TrialResult run_trial_mode(Model &model, const DynamicPrintConfig &config, const
             REQUIRE(result.counters.at(counter).get<size_t>() > 0);
         }
         REQUIRE(result.counters.at("complete_span_audit_mismatches").get<size_t>() == 0);
+        for (const char *counter : {"contact_artifact_hits", "contact_artifact_misses", "contact_artifact_publications",
+                                   "contact_artifact_entries", "contact_artifact_resident_bytes", "contact_artifact_peak_bytes"}) {
+            CAPTURE(counter);
+            REQUIRE(result.counters.at(counter).get<size_t>() > 0);
+        }
+        // Every reused nonempty selection still receives the current physical
+        // cell check, and every audited hit recomputes the original artifacts.
+        REQUIRE(result.counters.at("contact_artifact_current_cell_checks") == result.counters.at("contact_artifact_hits"));
+        REQUIRE(result.counters.at("contact_artifact_audits") == result.counters.at("contact_artifact_hits"));
+        REQUIRE(result.counters.at("contact_artifact_audit_mismatches").get<size_t>() == 0);
+        REQUIRE(result.counters.at("contact_artifact_peak_bytes").get<size_t>() <= 4 * 1024 * 1024);
+        REQUIRE(result.counters.at("contact_artifact_staged_peak_bytes").get<size_t>() <= 4 * 1024 * 1024);
         REQUIRE(result.counters.at("contact_epoch_peak_bytes").get<size_t>() > 0);
         REQUIRE(result.counters.at("contact_epoch_peak_bytes").get<size_t>() <= 2 * 1024 * 1024);
     }

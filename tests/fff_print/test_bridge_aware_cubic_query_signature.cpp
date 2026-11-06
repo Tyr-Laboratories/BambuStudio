@@ -326,3 +326,265 @@ TEST_CASE("Contact query signature cancellation propagates during capture and wa
     CHECK_THROWS_AS(Contact::capture_query_signature(*first, upper, .4, 0., &budget, 8192, allocation_named_cancel), std::bad_alloc);
     CHECK_THROWS_AS(Contact::matches_query_signature(*signature, *first, upper, .4, 0., &budget, allocation_named_cancel), std::bad_alloc);
 }
+
+namespace {
+size_t active_contact_units(const Contact::PathContact &contact)
+{
+    size_t count = contact.segments.size();
+    for (const auto &segment : contact.segments) {
+        count += segment.line_contacts.size();
+        for (const auto &mask : segment.centerline_support) {
+            count += mask.contour.points.size();
+            for (const auto &hole : mask.holes) count += hole.points.size();
+        }
+    }
+    return count;
+}
+void add_stationary_input(std::vector<ExtrusionPath> &lower, size_t points)
+{
+    REQUIRE(points >= 2);
+    auto ignored = bead({{200., 200.}, {200., 200.}});
+    ignored.polyline.points.resize(points, ignored.polyline.points.front());
+    lower.push_back(std::move(ignored));
+}
+}
+
+TEST_CASE("Retained contact lookup freshly compares contributing material",
+          "[BridgeAwareCubic][QuerySignature][RetainedContact]")
+{
+    const auto upper = bead({{0., 0.}, {5., 0.}, {5., 0.}, {10., 0.}});
+    std::vector<ExtrusionPath> lower{bead({{0., -1.}, {0., 1.}}), bead({{5., -1.}, {5., 1.}}),
+                                    bead({{10., -1.}, {10., 1.}})};
+    for (size_t i = 0; i < 80; ++i) lower.push_back(bead({{double(i), 20.}, {double(i), 21.}}));
+    const auto baseline = prepare(lower, upper);
+    const auto signature = Contact::capture_query_signature(*baseline, upper, .4, 0.);
+    REQUIRE(signature);
+    const auto retained = contacts(*baseline, upper);
+    REQUIRE(retained.input_valid);
+    REQUIRE(retained.completed);
+    REQUIRE(Contact::matches_query_signature_with_contact(*signature, *baseline, upper, .4, 0., retained));
+    bool equal = true;
+    SECTION("distant material and canonical index order change") {
+        lower.back() = bead({{-20., 30.}, {-20., 31.}});
+        std::reverse(lower.begin(), lower.end());
+    }
+    SECTION("a new contributing axis occupies previously empty space") {
+        lower.push_back(bead({{2., -1.}, {2., 1.}}));
+        equal = false;
+    }
+    SECTION("an existing contributing axis disappears") {
+        lower.erase(lower.begin() + 1);
+        equal = false;
+    }
+    const auto current = prepare(lower, upper);
+    CHECK(Contact::matches_query_signature(*signature, *current, upper, .4, 0.) == equal);
+    CHECK(Contact::matches_query_signature_with_contact(*signature, *current, upper, .4, 0., retained) == equal);
+    if (equal) same_contacts(contacts(*current, upper), retained);
+    same_contacts(contacts(*baseline, upper), retained);
+}
+
+TEST_CASE("Retained contact lookup rejects invalid and mismatched payload metadata",
+          "[BridgeAwareCubic][QuerySignature][RetainedContact]")
+{
+    const auto upper = bead({{0., 0.}, {5., 0.}, {5., 0.}, {10., 0.}});
+    const auto prepared = prepare({bead({{-1., 0.}, {11., 0.}})}, upper);
+    const auto signature = Contact::capture_query_signature(*prepared, upper, .4, 0.);
+    REQUIRE(signature);
+    auto retained = contacts(*prepared, upper);
+    REQUIRE(Contact::matches_query_signature_with_contact(*signature, *prepared, upper, .4, 0., retained));
+    SECTION("invalid") { retained.input_valid = false; }
+    SECTION("incomplete") { retained.completed = false; }
+    SECTION("resource limited") { retained.resource_limited = true; }
+    SECTION("failure reason") { retained.failure_reason = "incomplete source"; }
+    SECTION("changed plane") { retained.contact_z = std::nextafter(retained.contact_z, 1.); }
+    SECTION("nonfinite plane") { retained.contact_z = std::numeric_limits<double>::quiet_NaN(); }
+    SECTION("changed tolerance") { retained.coordinate_uncertainty_mm = .001; }
+    SECTION("nonfinite tolerance") { retained.coordinate_uncertainty_mm = std::numeric_limits<double>::infinity(); }
+    SECTION("wrong positive original segment") { retained.segments.back().segment_index = 1; }
+    SECTION("missing positive segment") { retained.segments.pop_back(); }
+    SECTION("extra positive segment") { retained.segments.push_back(retained.segments.back()); }
+    SECTION("physical footprint present") {
+        retained = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::Full);
+        REQUIRE_FALSE(retained.physical_footprint.empty());
+    }
+    SECTION("physical lines present") { retained.physical_lines.push_back(upper.polyline); }
+    SECTION("mask coordinate out of bounds") {
+        REQUIRE_FALSE(retained.segments.front().centerline_support.empty());
+        retained.segments.front().centerline_support.front().contour.points.front().x() = std::numeric_limits<coord_t>::max();
+    }
+    SECTION("invalid mask ring") { retained.segments.front().centerline_support.front().contour.points.resize(2); }
+    SECTION("nonfinite anchor uncertainty") {
+        REQUIRE_FALSE(retained.segments.front().line_contacts.empty());
+        retained.segments.front().line_contacts.front().position_uncertainty_mm = std::numeric_limits<double>::quiet_NaN();
+    }
+    CHECK_FALSE(Contact::matches_query_signature_with_contact(*signature, *prepared, upper, .4, 0., retained));
+    CHECK(Contact::matches_query_signature(*signature, *prepared, upper, .4, 0.));
+}
+
+TEST_CASE("Retained contact admission shares prepared upper output and evictable mask residency",
+          "[BridgeAwareCubic][QuerySignature][RetainedContact]")
+{
+    const bool over = GENERATE(false, true);
+    const auto upper = bead({{0., 0.}, {10., 0.}});
+    std::vector<ExtrusionPath> lower{bead({{-1., 0.}, {11., 0.}}),
+                                    bead({{100., -1.}, {100., 1.}}, .2f, .2f)};
+    const auto baseline = prepare(lower, upper);
+    const auto retained = contacts(*baseline, upper);
+    REQUIRE(retained.completed);
+    const size_t output = active_contact_units(retained);
+    REQUIRE(output > 1);
+    const auto signature = Contact::capture_query_signature(*baseline, upper, .4, 0.);
+    REQUIRE(signature);
+    const size_t desired = 200000 - upper.polyline.size() - output + size_t(over);
+    add_stationary_input(lower, desired - Contact::prepared_lower_contact_units(*baseline));
+    const auto current = prepare(lower, upper);
+    REQUIRE(Contact::prepared_lower_contact_units(*current) == desired);
+    REQUIRE(Contact::matches_query_signature(*signature, *current, upper, .4, 0.));
+    Contact::QueryCache masks(current);
+    const auto circular = bead({{99., 0.}, {101., 0.}}, .2f, .2f);
+    const auto warm = Contact::footprint(*current, circular, .4, 0., Contact::FootprintMode::ContactsOnly, nullptr, &masks);
+    REQUIRE(warm.input_valid);
+    REQUIRE(warm.completed);
+    REQUIRE(masks.statistics().resident_units > 0);
+    const size_t evictions = masks.statistics().evictions;
+    CHECK(Contact::matches_query_signature_with_contact(*signature, *current, upper, .4, 0., retained,
+                                                        nullptr, {}, &masks) == !over);
+    if (!over) {
+        CHECK(masks.statistics().evictions > evictions);
+        CHECK(masks.statistics().resident_units == 0);
+        same_contacts(contacts(*current, upper), retained);
+    }
+    CHECK(Contact::matches_query_signature(*signature, *current, upper, .4, 0.));
+}
+
+TEST_CASE("Retained contact admission includes indexed candidate scratch at its active peak",
+          "[BridgeAwareCubic][QuerySignature][RetainedContact]")
+{
+    const bool over = GENERATE(false, true);
+    std::vector<ExtrusionPath> lower;
+    for (int i = -100; i <= 100; ++i) {
+        auto strand = bead({{-100., -50.}, {100., 50.}});
+        strand.polyline.points = {Point(-10000000, -5000000 + 50000 * i),
+                                  Point(10000000, 5000000 + 50000 * i)};
+        lower.push_back(std::move(strand));
+    }
+    const auto upper = bead({{-1., -.5}, {1., .5}});
+    const auto baseline = prepare(lower, upper);
+    const auto retained = contacts(*baseline, upper);
+    REQUIRE(retained.completed);
+    const auto signature = Contact::capture_query_signature(*baseline, upper, .4, 0.);
+    REQUIRE(signature);
+    // All 201 boxes overlap this slope-1/2 query. The exact normal tests keep
+    // only its central strand, but the index's full candidate buffer is live.
+    const size_t scratch = lower.size(), output = active_contact_units(retained);
+    REQUIRE(output > 1);
+    const size_t desired = 200000 - upper.polyline.size() - scratch - output + size_t(over);
+    add_stationary_input(lower, desired - Contact::prepared_lower_contact_units(*baseline));
+    const auto current = prepare(lower, upper);
+    REQUIRE(Contact::prepared_lower_contact_units(*current) == desired);
+    REQUIRE(Contact::matches_query_signature(*signature, *current, upper, .4, 0.));
+    CHECK(Contact::matches_query_signature_with_contact(*signature, *current, upper, .4, 0., retained) == !over);
+    const auto fresh = contacts(*current, upper);
+    CHECK(fresh.completed == !over);
+    if (!over) same_contacts(fresh, retained);
+    else CHECK(fresh.resource_limited);
+}
+
+TEST_CASE("Retained contact lookup keeps fresh upper lower and cache guards",
+          "[BridgeAwareCubic][QuerySignature][RetainedContact]")
+{
+    const auto good = bead({{0., 0.}, {10., 0.}});
+    std::vector<ExtrusionPath> lower{bead({{-1., 0.}, {11., 0.}})};
+    const auto baseline = prepare(lower, good);
+    const auto retained = contacts(*baseline, good);
+    const auto signature = Contact::capture_query_signature(*baseline, good, .4, 0.);
+    REQUIRE(signature);
+    REQUIRE(Contact::matches_query_signature_with_contact(*signature, *baseline, good, .4, 0., retained));
+    auto upper = good;
+    auto current = baseline;
+    double top = .4, tolerance = 0.;
+    SECTION("changed exact width") { upper.width = std::nextafter(upper.width, 1.f); }
+    SECTION("suppressed extrusion") { upper.set_force_no_extrusion(true); }
+    SECTION("reversed upper") { upper.reverse(); }
+    SECTION("different print Z") { top = std::nextafter(top, 1.); }
+    SECTION("different tolerance") { tolerance = .001; }
+    SECTION("fitted upper") { upper.polyline.fitting_result.emplace_back(); }
+    SECTION("invalid distant lower input") {
+        lower.push_back(bead({{100., 100.}, {101., 100.}}));
+        lower.back().mm3_per_mm = 0.;
+        current = prepare(lower, good);
+    }
+    CHECK_FALSE(Contact::matches_query_signature_with_contact(*signature, *current, upper, top, tolerance, retained));
+    const auto equivalent = prepare({lower.front()}, good);
+    Contact::QueryCache foreign(equivalent);
+    CHECK_FALSE(Contact::matches_query_signature_with_contact(*signature, *baseline, good, .4, 0., retained,
+                                                              nullptr, {}, &foreign));
+    CHECK(Contact::matches_query_signature_with_contact(*signature, *equivalent, good, .4, 0., retained,
+                                                        nullptr, {}, &foreign));
+}
+
+TEST_CASE("Retained contact admission preserves work and cancellation semantics",
+          "[BridgeAwareCubic][QuerySignature][RetainedContact]")
+{
+    auto upper = bead({{0., 0.}, {10., 0.}});
+    for (size_t i = 0; i < 128; ++i) upper.polyline.points.push_back(Point::new_scale(i % 2 ? 10. : 0., 0.));
+    const auto prepared = prepare({bead({{-1., 0.}, {11., 0.}})}, upper);
+    const auto retained = contacts(*prepared, upper);
+    REQUIRE(retained.completed);
+    const auto signature = Contact::capture_query_signature(*prepared, upper, .4, 0.);
+    REQUIRE(signature);
+    Validation::WorkBudget probe;
+    const size_t initial = probe.remaining_work;
+    REQUIRE(Contact::matches_query_signature_with_contact(*signature, *prepared, upper, .4, 0., retained, &probe));
+    const size_t needed = initial - probe.remaining_work;
+    REQUIRE(needed > 1);
+    Validation::WorkBudget exact{needed};
+    CHECK(Contact::matches_query_signature_with_contact(*signature, *prepared, upper, .4, 0., retained, &exact));
+    CHECK(exact.remaining_work == 0);
+    Validation::WorkBudget limited{needed - 1};
+    CHECK_FALSE(Contact::matches_query_signature_with_contact(*signature, *prepared, upper, .4, 0., retained, &limited));
+    CHECK(limited.remaining_work == 0);
+    size_t polls = 0;
+    const auto cancel = [&] { if (++polls == 2) throw std::runtime_error("retained contact canceled"); };
+    Validation::WorkBudget interrupted;
+    CHECK_THROWS_WITH(Contact::matches_query_signature_with_contact(*signature, *prepared, upper, .4, 0., retained,
+        &interrupted, cancel), "retained contact canceled");
+    CHECK(polls == 2);
+    CHECK(interrupted.remaining_work < initial);
+    const auto allocation_named_cancel = [] { throw std::bad_alloc(); };
+    CHECK_THROWS_AS(Contact::matches_query_signature_with_contact(*signature, *prepared, upper, .4, 0., retained,
+        nullptr, allocation_named_cancel), std::bad_alloc);
+    same_contacts(contacts(*prepared, upper), retained);
+    CHECK(Contact::matches_query_signature(*signature, *prepared, upper, .4, 0.));
+}
+
+TEST_CASE("Contact query signatures expose allocated byte storage separately from logical units",
+          "[BridgeAwareCubic][QuerySignature][RetainedContact]")
+{
+    const auto lower = bead({{-1., 0.}, {11., 0.}});
+    auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = prepare({lower}, upper);
+    const auto small = Contact::capture_query_signature(*prepared, upper, .4, 0.);
+    REQUIRE(small);
+    const size_t small_bytes = Contact::query_signature_resident_bytes(*small);
+    REQUIRE(small_bytes > 0);
+    const size_t capture_bytes = Contact::query_signature_capture_bytes(8192);
+    REQUIRE(capture_bytes > 0);
+    CHECK(small_bytes <= capture_bytes);
+    CHECK(Contact::query_signature_capture_bytes(0) == 0);
+    CHECK(Contact::query_signature_capture_bytes(200001) == 0);
+    CHECK(Contact::query_signature_capture_bytes(std::numeric_limits<size_t>::max()) == 0);
+    for (size_t i = 0; i < 128; ++i) upper.polyline.points.push_back(Point::new_scale(i % 2 ? 10. : 0., 0.));
+    const auto large = Contact::capture_query_signature(*prepared, upper, .4, 0.);
+    REQUIRE(large);
+    const size_t large_bytes = Contact::query_signature_resident_bytes(*large);
+    CHECK(large_bytes > small_bytes);
+    CHECK(large_bytes <= capture_bytes);
+    const size_t segments = upper.polyline.size() - 1;
+    // Minimum owned payload ignores all spare capacity and control/object
+    // metadata. Each positive segment owns a record and one exact section.
+    const size_t minimum = upper.polyline.size() * sizeof(Point) +
+        segments * (sizeof(size_t) + sizeof(std::vector<Point>) + 2 * sizeof(Point) + sizeof(long double));
+    CHECK(large_bytes >= minimum);
+    CHECK(Contact::matches_query_signature(*large, *prepared, upper, .4, 0.));
+}

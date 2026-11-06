@@ -121,6 +121,33 @@ bool matches_query_signature(const QuerySignature &signature, const PreparedLowe
                              const QuerySignatureCancel &cancel = {},
                              QueryCache *cache = nullptr);
 size_t query_signature_units(const QuerySignature &signature) noexcept;
+// Owned object/control allowance and allocated vector capacities, distinct
+// from the logical Contact units above. Zero means unavailable and must not be
+// admitted by a byte-bounded owner. No transitive prepared geometry is retained.
+size_t query_signature_resident_bytes(const QuerySignature &signature) noexcept;
+// Conservative peak signature-storage bytes at the given logical-unit
+// allowance, including old/new vector storage during growth. Ordinary Contact
+// preparation/query scratch remains under its existing per-operation budget.
+// Zero is unavailable (zero, oversized or overflowing allowance). Byte owners
+// reserve this before capture and replace it with resident_bytes on return.
+size_t query_signature_capture_bytes(size_t capacity_units) noexcept;
+
+// Exact fresh raw-signature lookup with active immutable ContactsOnly output
+// admitted in the SAME Contact budget as current preparation, upper input,
+// candidate scratch and live evictable mask cache. Derive units from retained
+// segments, line intervals and every mask contour/hole point; no asserted unit
+// count is accepted. Reject failed/incomplete/mismatched contact metadata,
+// incorrect positive original-segment correspondence, invalid finite bounds and any
+// physical output. This does not recompute or independently certify retained:
+// the caller must own the actual successful ContactsOnly result from the exact
+// original signature query, and retain its provenance and policy separately.
+// A false result is an optional miss; ordinary computation uses the SAME
+// remaining shared work. Cancellation propagates and retained is not modified.
+bool matches_query_signature_with_contact(const QuerySignature &signature,
+    const PreparedLower &prepared, const ExtrusionPath &upper,
+    double upper_print_z, double xy_tolerance_mm, const PathContact &retained,
+    BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+    const QuerySignatureCancel &cancel = {}, QueryCache *cache = nullptr);
 
 // Optional coarsening-local identities, never deposited-support proofs. The
 // caller must prepare the COMPLETE emitted lower layer, across all roles and
@@ -256,6 +283,8 @@ private:
         BridgeAwareCubicValidation::WorkBudget *, size_t, const QuerySignatureCancel &, QueryCache *);
     friend bool matches_query_signature(const QuerySignature &, const PreparedLower &, const ExtrusionPath &, double, double,
         BridgeAwareCubicValidation::WorkBudget *, const QuerySignatureCancel &, QueryCache *);
+    friend bool matches_query_signature_with_contact(const QuerySignature &, const PreparedLower &, const ExtrusionPath &,
+        double, double, const PathContact &, BridgeAwareCubicValidation::WorkBudget *, const QuerySignatureCancel &, QueryCache *);
     friend CanonicalLowerEpochPtr capture_lower_epoch(const PreparedLowerPtr &,
         const BridgeAwareCubic::SerializedXY &, EpochLimits, BridgeAwareCubicValidation::WorkBudget *,
         const QuerySignatureCancel &, QueryCache *);

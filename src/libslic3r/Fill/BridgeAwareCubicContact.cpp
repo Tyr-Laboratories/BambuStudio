@@ -5,6 +5,8 @@
 #include "../ClipperUtils.hpp"
 #include "../Geometry/ConvexHull.hpp"
 
+#include <boost/multiprecision/cpp_int.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -578,10 +580,30 @@ struct QuerySignature {
     double mm3_per_mm = 0., upper_print_z = 0., tolerance = 0., contact_z = 0.;
     ExtrusionRole role = erNone;
     std::vector<Segment> segments;
-    size_t units = 0;
+    size_t units = 0, resident_bytes = 0;
 };
 
 size_t query_signature_units(const QuerySignature &signature) noexcept { return signature.units; }
+size_t query_signature_resident_bytes(const QuerySignature &signature) noexcept { return signature.resident_bytes; }
+
+namespace {
+constexpr size_t signature_control_bytes = 128;
+constexpr size_t signature_fixed_bytes = sizeof(QuerySignature) + signature_control_bytes;
+constexpr size_t signature_bytes_per_unit = std::max({sizeof(Point),
+    (sizeof(QuerySignature::Segment) + 1) / 2, (sizeof(QuerySignature::Section) + 2) / 3});
+}
+
+size_t query_signature_capture_bytes(size_t capacity_units) noexcept
+{
+    if (capacity_units == 0 || capacity_units > max_vertices ||
+        capacity_units > (std::numeric_limits<size_t>::max() - signature_fixed_bytes) /
+            (2 * signature_bytes_per_unit))
+        return 0;
+    // Every owned vector is admitted in logical units; at most one growth
+    // temporarily holds its prior allocation beside the replacement. Reserve
+    // a second complete allowance rather than depending on growth position.
+    return signature_fixed_bytes + 2 * capacity_units * signature_bytes_per_unit;
+}
 
 // Compact canonical geometry is independently owned. The weak token binds
 // capture/lookup to a particular immutable preparation without retaining its
@@ -1074,6 +1096,79 @@ void signature_poll(const QuerySignatureCancel &cancel)
     }
 }
 
+// Retained arguments consume residency, not another allocation/work charge.
+// Optional query masks can be evicted just as for any ordinary allocation.
+void admit_signature_resident(size_t units, Budget &budget)
+{
+    if (budget.cache != nullptr) ensure_query_capacity(budget.cache, units, budget);
+    if (units > max_vertices - budget.vertices) throw SignatureUnavailable{};
+    budget.vertices += units;
+}
+
+bool admit_retained_contact(const PathContact &contact, const PreparedLower &prepared,
+                           const Points &points, double tolerance, Budget &budget,
+                           const QuerySignatureCancel &cancel)
+{
+    budget.consume(12);
+    if (!contact.input_valid || !contact.completed || contact.resource_limited || !contact.failure_reason.empty() ||
+        !std::isfinite(contact.contact_z) || contact.contact_z != prepared.status.contact_z ||
+        !std::isfinite(contact.coordinate_uncertainty_mm) || contact.coordinate_uncertainty_mm != tolerance ||
+        !contact.physical_footprint.empty() || !contact.physical_lines.empty())
+        return false;
+
+    admit_signature_resident(contact.segments.size(), budget);
+    const auto ring_valid = [&](const Polygon &ring) {
+        budget.consume();
+        if (ring.points.size() < 3) return false;
+        admit_signature_resident(ring.points.size(), budget);
+        for (size_t i = 0; i < ring.points.size(); ++i) {
+            if ((i & 255) == 0) signature_poll(cancel);
+            budget.consume();
+            const Point &point = ring.points[i];
+            if (point.x() < -coordinate_limit || point.x() > coordinate_limit ||
+                point.y() < -coordinate_limit || point.y() > coordinate_limit)
+                return false;
+        }
+        // Polygon validity below scans orientation once more.
+        budget.consume(ring.points.size());
+        return true;
+    };
+    size_t next = 0;
+    for (size_t i = 1; i < points.size(); ++i) {
+        signature_poll(cancel);
+        budget.consume();
+        if (points[i - 1] == points[i]) continue;
+        if (next == contact.segments.size()) return false;
+        const SegmentContact &segment = contact.segments[next++];
+        if (segment.segment_index != i - 1) return false;
+        for (const ExPolygon &polygon : segment.centerline_support) {
+            budget.consume();
+            if (!ring_valid(polygon.contour)) return false;
+            for (const Polygon &hole : polygon.holes)
+                if (!ring_valid(hole)) return false;
+            if (!polygon.is_valid()) return false;
+        }
+        admit_signature_resident(segment.line_contacts.size(), budget);
+        for (size_t j = 0; j < segment.line_contacts.size(); ++j) {
+            if ((j & 255) == 0) signature_poll(cancel);
+            budget.consume(9);
+            const ExactInterval &line = segment.line_contacts[j];
+            if (line.begin_denominator <= 0 || line.end_denominator <= 0 ||
+                line.begin_numerator < 0 || line.end_numerator < 0 ||
+                line.begin_numerator > line.begin_denominator || line.end_numerator > line.end_denominator ||
+                !std::isfinite(line.position_uncertainty_mm) || line.position_uncertainty_mm < 0. ||
+                line.position_uncertainty_mm > 2. * double(coordinate_limit) * SCALING_FACTOR)
+                return false;
+            // Each nonnegative int64 product fits exactly in signed 128 bits.
+            using Integer = boost::multiprecision::int128_t;
+            if (Integer(line.end_numerator) * line.begin_denominator <
+                Integer(line.begin_numerator) * line.end_denominator)
+                return false;
+        }
+    }
+    return next == contact.segments.size();
+}
+
 bool signature_arguments(const PreparedLower &prepared, const ExtrusionPath &upper,
                          double upper_print_z, double tolerance, Budget &budget,
                          QueryCacheData *cache)
@@ -1096,6 +1191,13 @@ void admit_signature(size_t count, size_t capacity, size_t &units, Budget &budge
     if (count > capacity - units) throw SignatureUnavailable{};
     budget.allocate(count);
     units += count;
+}
+
+void add_signature_bytes(size_t &bytes, size_t count, size_t element)
+{
+    if (count > (std::numeric_limits<size_t>::max() - bytes) / element)
+        throw SignatureUnavailable{};
+    bytes += count * element;
 }
 
 template<class T>
@@ -1157,6 +1259,8 @@ QuerySignaturePtr capture_signature_impl(const PreparedLower &prepared, const Ex
     signature->upper_print_z = upper_print_z;
     signature->tolerance = tolerance;
     signature->contact_z = prepared.status.contact_z;
+    size_t resident_bytes = signature_fixed_bytes;
+    add_signature_bytes(resident_bytes, signature->upper_points.capacity(), sizeof(Point));
     const Scalar radius = .5L * snapped_section(upper, upper_print_z, signature->contact_z) / SCALING_FACTOR;
     std::vector<size_t> candidates;
     const auto poll = [&] { signature_poll(cancel); };
@@ -1175,10 +1279,52 @@ QuerySignaturePtr capture_signature_impl(const PreparedLower &prepared, const Ex
                 segment.sections.push_back({lower.a, lower.b, lower.radius});
                 return true;
             }, poll);
+        add_signature_bytes(resident_bytes, segment.sections.capacity(), sizeof(QuerySignature::Section));
     }
     signature_poll(cancel);
     signature->units = units;
+    add_signature_bytes(resident_bytes, signature->segments.capacity(), sizeof(QuerySignature::Segment));
+    signature->resident_bytes = resident_bytes;
     return signature;
+}
+
+bool matches_signature_impl(const QuerySignature &signature, const PreparedLower &prepared,
+                            const ExtrusionPath &upper, double upper_print_z, double tolerance,
+                            Budget &budget, const QuerySignatureCancel &cancel,
+                            QueryCacheData *cache_data, const PathContact *retained)
+{
+    signature_poll(cancel);
+    if (!signature_arguments(prepared, upper, upper_print_z, tolerance, budget, cache_data) ||
+        !signature_upper_matches(signature, prepared, upper, upper_print_z, tolerance, budget, cancel))
+        return false;
+    const Points &points = upper.polyline.points;
+    if (retained != nullptr && !admit_retained_contact(*retained, prepared, points, tolerance, budget, cancel))
+        return false;
+    const Scalar radius = .5L * snapped_section(upper, upper_print_z, prepared.status.contact_z) / SCALING_FACTOR;
+    std::vector<size_t> candidates;
+    size_t segment_index = 0;
+    const auto poll = [&] { signature_poll(cancel); };
+    for (size_t i = 1; i < points.size(); ++i) {
+        poll();
+        budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+        budget.consume();
+        if (points[i - 1] == points[i]) continue;
+        if (segment_index == signature.segments.size()) return false;
+        const auto &segment = signature.segments[segment_index++];
+        budget.consume();
+        if (segment.original_index != i - 1) return false;
+        size_t section_index = 0;
+        if (!visit_query_sections(prepared, points[i - 1], points[i], radius, candidates, budget,
+            [&](size_t, const LowerSection &lower, Scalar, Scalar) {
+                budget.consume(3);
+                if (section_index == segment.sections.size()) return false;
+                const auto &expected = segment.sections[section_index++];
+                return expected.a == lower.a && expected.b == lower.b && expected.radius == lower.radius;
+            }, poll) || section_index != segment.sections.size())
+            return false;
+    }
+    signature_poll(cancel);
+    return segment_index == signature.segments.size();
 }
 } // namespace
 
@@ -1216,38 +1362,32 @@ bool matches_query_signature(const QuerySignature &signature, const PreparedLowe
     QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
     CacheScope cache_scope(budget, cache_data);
     try {
-        signature_poll(cancel);
-        if (!signature_arguments(prepared, upper, upper_print_z, tolerance, budget, cache_data) ||
-            !signature_upper_matches(signature, prepared, upper, upper_print_z, tolerance, budget, cancel))
-            return false;
-        const Points &points = upper.polyline.points;
-        const Scalar radius = .5L * snapped_section(upper, upper_print_z, prepared.status.contact_z) / SCALING_FACTOR;
-        std::vector<size_t> candidates;
-        size_t segment_index = 0;
-        const auto poll = [&] { signature_poll(cancel); };
-        for (size_t i = 1; i < points.size(); ++i) {
-            poll();
-            budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
-            budget.consume();
-            if (points[i - 1] == points[i]) continue;
-            if (segment_index == signature.segments.size()) return false;
-            const auto &segment = signature.segments[segment_index++];
-            budget.consume();
-            if (segment.original_index != i - 1) return false;
-            size_t section_index = 0;
-            if (!visit_query_sections(prepared, points[i - 1], points[i], radius, candidates, budget,
-                [&](size_t, const LowerSection &lower, Scalar, Scalar) {
-                    budget.consume(3);
-                    if (section_index == segment.sections.size()) return false;
-                    const auto &expected = segment.sections[section_index++];
-                    return expected.a == lower.a && expected.b == lower.b && expected.radius == lower.radius;
-                }, poll) || section_index != segment.sections.size())
-                return false;
-        }
-        signature_poll(cancel);
-        return segment_index == signature.segments.size();
+        return matches_signature_impl(signature, prepared, upper, upper_print_z, tolerance,
+                                      budget, cancel, cache_data, nullptr);
     } catch (const SignatureCanceled &canceled) {
         std::rethrow_exception(canceled.exception);
+    } catch (const Limit &) {
+        return false;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+bool matches_query_signature_with_contact(const QuerySignature &signature, const PreparedLower &prepared,
+    const ExtrusionPath &upper, double upper_print_z, double tolerance, const PathContact &retained,
+    BridgeAwareCubicValidation::WorkBudget *shared, const QuerySignatureCancel &cancel, QueryCache *cache)
+{
+    Budget budget(shared);
+    budget.vertices = prepared.admission_vertices;
+    QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
+    CacheScope cache_scope(budget, cache_data);
+    try {
+        return matches_signature_impl(signature, prepared, upper, upper_print_z, tolerance,
+                                      budget, cancel, cache_data, &retained);
+    } catch (const SignatureCanceled &canceled) {
+        std::rethrow_exception(canceled.exception);
+    } catch (const SignatureUnavailable &) {
+        return false;
     } catch (const Limit &) {
         return false;
     } catch (const std::exception &) {
@@ -1296,9 +1436,7 @@ bool epoch_source_valid(const PreparedLowerPtr &prepared, QueryCacheData *cache)
 // Optional query masks can be evicted just as for any ordinary allocation.
 void admit_epoch_resident(size_t units, Budget &budget)
 {
-    if (budget.cache != nullptr) ensure_query_capacity(budget.cache, units, budget);
-    if (units > max_vertices - budget.vertices) throw SignatureUnavailable{};
-    budget.vertices += units;
+    admit_signature_resident(units, budget);
 }
 
 struct EpochBytes {

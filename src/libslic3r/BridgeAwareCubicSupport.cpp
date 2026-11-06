@@ -12,6 +12,7 @@
 #include "Fill/BridgeAwareCubicSerialization.hpp"
 #include "Fill/BridgeAwareCubicModelProofCache.hpp"
 #include "Fill/BridgeAwareCubicSpanProofCache.hpp"
+#include "Fill/BridgeAwareCubicContactArtifactCache.hpp"
 #include "Fill/BridgeAwareCubicEmissionLedger.hpp"
 #include "Fill/BridgeAwareCubicFailureReplay.hpp"
 #include "Fill/BridgeAwareCubicContainment.hpp"
@@ -52,7 +53,8 @@ enum class ProfilePhase {
     GenerateFull, GenerateChanged, GenerateRollback,
     CollectModel, CollectConstruction, CheckModel, CheckConstruction, CheckMixed,
     PrepareModelTargets, CompareFinalProof, CaptureFinalProof, FinalProof, Sweep,
-    ConstructionSections, ConstructionMatch, ConstructionOwners, ConstructionAdd, ModelReplay, Count
+    ConstructionSections, ConstructionMatch, ConstructionOwners, ConstructionAdd, ModelReplay,
+    ContactArtifactLookup, ContactArtifactPublish, Count
 };
 
 struct ProfileMetric {
@@ -82,6 +84,10 @@ struct ProfileState {
     uint64_t whole_support_queries = 0, whole_support_proofs = 0, whole_support_segments = 0;
     uint64_t complete_span_queries = 0, complete_span_proofs = 0, complete_span_audits = 0;
     uint64_t complete_span_audit_mismatches = 0;
+    uint64_t contact_artifact_hits = 0, contact_artifact_misses = 0, contact_artifact_publications = 0;
+    uint64_t contact_artifact_evictions = 0, contact_artifact_entries = 0, contact_artifact_resident_bytes = 0;
+    uint64_t contact_artifact_peak_bytes = 0, contact_artifact_staged_peak_bytes = 0, contact_artifact_signature_misses = 0;
+    uint64_t contact_artifact_audits = 0, contact_artifact_audit_mismatches = 0, contact_artifact_current_cell_checks = 0;
     uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
     uint64_t model_layer_proof_hits = 0, model_layer_proof_misses = 0, model_layer_proof_publications = 0;
     uint64_t model_layer_proof_vertices = 0, model_layer_proof_items = 0;
@@ -96,6 +102,7 @@ struct ProfileState {
     bool audit_emission_collection = false;
     bool audit_contact_epochs = false;
     bool audit_complete_spans = false;
+    bool audit_contact_artifacts = false;
     bool truncated = false;
     std::string file, stage;
     const char *session;
@@ -206,6 +213,18 @@ struct ProfileState {
                     << ",\"complete_span_proofs\":" << complete_span_proofs
                     << ",\"complete_span_audits\":" << complete_span_audits
                     << ",\"complete_span_audit_mismatches\":" << complete_span_audit_mismatches
+                    << ",\"contact_artifact_hits\":" << contact_artifact_hits
+                    << ",\"contact_artifact_misses\":" << contact_artifact_misses
+                    << ",\"contact_artifact_publications\":" << contact_artifact_publications
+                    << ",\"contact_artifact_evictions\":" << contact_artifact_evictions
+                    << ",\"contact_artifact_entries\":" << contact_artifact_entries
+                    << ",\"contact_artifact_resident_bytes\":" << contact_artifact_resident_bytes
+                    << ",\"contact_artifact_peak_bytes\":" << contact_artifact_peak_bytes
+                    << ",\"contact_artifact_staged_peak_bytes\":" << contact_artifact_staged_peak_bytes
+                    << ",\"contact_artifact_signature_misses\":" << contact_artifact_signature_misses
+                    << ",\"contact_artifact_audits\":" << contact_artifact_audits
+                    << ",\"contact_artifact_audit_mismatches\":" << contact_artifact_audit_mismatches
+                    << ",\"contact_artifact_current_cell_checks\":" << contact_artifact_current_cell_checks
                     << ",\"whole_support_queries\":" << whole_support_queries
                     << ",\"whole_support_proofs\":" << whole_support_proofs
                     << ",\"whole_support_segments\":" << whole_support_segments
@@ -224,7 +243,8 @@ struct ProfileState {
                     "generate_full", "generate_changed", "generate_rollback", "collect_model", "collect_construction",
                     "check_model", "check_construction", "check_mixed", "prepare_model_targets", "compare_final_proof",
                     "capture_final_proof", "final_proof", "coarsening_sweep", "construction_sections",
-                    "construction_match", "construction_owners", "construction_add", "model_failure_replay"};
+                    "construction_match", "construction_owners", "construction_add", "model_failure_replay",
+                    "contact_artifact_lookup", "contact_artifact_publish"};
                 bool first = true;
                 for (size_t i = 0; i < metrics.size(); ++i) {
                     const auto &metric = metrics[i];
@@ -266,6 +286,8 @@ public:
                 state->audit_contact_epochs = audit[0] == '1' && audit[1] == '\0';
             if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_COMPLETE_SPANS"))
                 state->audit_complete_spans = audit[0] == '1' && audit[1] == '\0';
+            if (const char *audit = std::getenv("BAC_PROFILE_AUDIT_CONTACT_ARTIFACTS"))
+                state->audit_contact_artifacts = audit[0] == '1' && audit[1] == '\0';
             static std::atomic<uint64_t> sequence{0};
             state->sequence = ++sequence;
             if (const char *stage = std::getenv("BAC_PROFILE_STAGE"))
@@ -477,10 +499,11 @@ ActiveAttachments active_attachments(const Layer &layer)
 // including layers currently regenerated in parallel. A second equal allowance
 // bounds transient caller views/copies; builder and filler scratch share the
 // first allowance with retained ledgers. No global mutable accounting is used.
-// Canonical material identities borrow two MiB from this existing allowance;
-// neither coarsening nor parallel generation receives another metadata pool.
+// Canonical material identities and immutable direct-roof calculations share
+// this existing allowance; neither generation nor coarsening adds a pool.
 constexpr size_t contact_epoch_allowance = 2 * 1024 * 1024;
-constexpr size_t emission_allowance = 24 * 1024 * 1024 - contact_epoch_allowance;
+constexpr size_t contact_artifact_allowance = 4 * 1024 * 1024;
+constexpr size_t emission_allowance = 24 * 1024 * 1024 - contact_epoch_allowance - contact_artifact_allowance;
 constexpr size_t emission_context_slot_bytes = 512;
 
 size_t emission_quota(const Layer &layer)
@@ -1468,6 +1491,7 @@ struct TargetCheckContext {
     bool *probe_checked = nullptr;
     BridgeAwareCubic::SpanProofCache *span_proofs = nullptr;
     ContactEpochReuse *contact_epochs = nullptr;
+    BridgeAwareCubic::ContactArtifactCache *contact_artifacts = nullptr;
 };
 
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
@@ -2434,6 +2458,51 @@ std::unique_ptr<const PreparedModelTargets> prepare_model_targets(const PrintObj
     return result;
 }
 
+// Diagnostic comparison allocates no geometry. Every field and ordered ring,
+// point and rational contact event is checked using the shared remaining work.
+bool same_contact_artifact(const PrintObject &object, BridgeAwareCubicValidation::WorkBudget &budget,
+                           const Contact::PathContact &a, const ExPolygons &selected_a,
+                           const Contact::PathContact &b, const ExPolygons &selected_b)
+{
+    const auto charge = [&](size_t count = 1) { return emission_charge(object, budget, count); };
+    const auto same_points = [&](const Points &left, const Points &right) {
+        if (!charge() || left.size() != right.size()) return false;
+        for (size_t i = 0; i < left.size(); ++i)
+            if (!charge() || left[i] != right[i]) return false;
+        return true;
+    };
+    const auto same_polygons = [&](const ExPolygons &left, const ExPolygons &right) {
+        if (!charge() || left.size() != right.size()) return false;
+        for (size_t i = 0; i < left.size(); ++i) {
+            if (!charge() || left[i].holes.size() != right[i].holes.size() ||
+                !same_points(left[i].contour.points, right[i].contour.points)) return false;
+            for (size_t j = 0; j < left[i].holes.size(); ++j)
+                if (!same_points(left[i].holes[j].points, right[i].holes[j].points)) return false;
+        }
+        return true;
+    };
+    // An unavailable reference is an audit failure, including one that ran out
+    // of work. ContactsOnly must not carry any physical-cell wall geometry.
+    if (!charge(12) || !a.input_valid || !b.input_valid || !a.completed || !b.completed ||
+        a.resource_limited || b.resource_limited || a.failure_reason != b.failure_reason ||
+        a.contact_z != b.contact_z || a.coordinate_uncertainty_mm != b.coordinate_uncertainty_mm ||
+        !a.physical_footprint.empty() || !b.physical_footprint.empty() ||
+        !a.physical_lines.empty() || !b.physical_lines.empty() || a.segments.size() != b.segments.size()) return false;
+    for (size_t i = 0; i < a.segments.size(); ++i) {
+        const auto &left = a.segments[i], &right = b.segments[i];
+        if (!charge(2) || left.segment_index != right.segment_index ||
+            left.line_contacts.size() != right.line_contacts.size() ||
+            !same_polygons(left.centerline_support, right.centerline_support)) return false;
+        for (size_t j = 0; j < left.line_contacts.size(); ++j) {
+            const auto &x = left.line_contacts[j], &y = right.line_contacts[j];
+            if (!charge(5) || x.begin_numerator != y.begin_numerator || x.begin_denominator != y.begin_denominator ||
+                x.end_numerator != y.end_numerator || x.end_denominator != y.end_denominator ||
+                x.position_uncertainty_mm != y.position_uncertainty_mm) return false;
+        }
+    }
+    return same_polygons(selected_a, selected_b);
+}
+
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
                                    const PrintObject *phase_object, TargetCheck mode,
                                    const PreparedModelView *prepared_model, const TargetCheckContext *context)
@@ -2445,6 +2514,22 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
     auto *span_proofs = context && !probe && mode == TargetCheck::RejectTrial &&
         !(active_profile && active_profile->full_trial_checks) ? context->span_proofs : nullptr;
     auto *contact_epochs = span_proofs ? context->contact_epochs : nullptr;
+    auto *contact_artifacts = context && !probe && mode == TargetCheck::RejectTrial &&
+        !(active_profile && active_profile->full_trial_checks) ? context->contact_artifacts : nullptr;
+    const auto profile_contact_artifacts = [&] {
+        if (active_profile && contact_artifacts) {
+            const auto stats = contact_artifacts->statistics();
+            active_profile->contact_artifact_hits = stats.hits;
+            active_profile->contact_artifact_misses = stats.misses;
+            active_profile->contact_artifact_publications = stats.publications;
+            active_profile->contact_artifact_evictions = stats.evictions;
+            active_profile->contact_artifact_entries = stats.entries;
+            active_profile->contact_artifact_resident_bytes = stats.resident_bytes;
+            active_profile->contact_artifact_peak_bytes = stats.peak_bytes;
+            active_profile->contact_artifact_staged_peak_bytes = stats.staged_peak_bytes;
+            active_profile->contact_artifact_signature_misses = stats.signature_misses;
+        }
+    };
     const auto profile_span_proofs = [&] {
         if (active_profile && span_proofs) {
             const auto stats = span_proofs->statistics();
@@ -2685,12 +2770,50 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                 // may omit the normal physical-demand and cell checks.
                 const bool allow_whole_support = (target.dependency || target.bridge_followup) &&
                     !(active_profile && active_profile->full_trial_checks);
-                const auto support_query = !allow_whole_support ?
-                    BridgeAwareCubicContact::SupportQuery{BridgeAwareCubicContact::footprint(*lower_contact, upper, upper_z, 0.,
-                        BridgeAwareCubicContact::FootprintMode::ContactsOnly, &budget, contact_queries.get()), false} :
-                    BridgeAwareCubicContact::footprint_for_support(*lower_contact, upper, upper_z, 0.,
-                        &budget, contact_queries.get());
-                const auto &contact = support_query.contact;
+                using ArtifactCache = BridgeAwareCubic::ContactArtifactCache;
+                const bool reuse_artifact = contact_artifacts && cached_phase && !target.dependency && !target.bridge_followup;
+                ArtifactCache::Query artifact_query{reuse_artifact ? ArtifactCache::Purpose::DirectRoof : ArtifactCache::Purpose::Ineligible,
+                    phase, target.gap, target.path_widths[index], path_selection, *lower_contact, upper, upper_z, contact_queries.get()};
+                ArtifactCache::Handle artifact;
+                if (reuse_artifact) {
+                    ProfileScope lookup(ProfilePhase::ContactArtifactLookup, &budget);
+                    artifact = contact_artifacts->find(artifact_query, &budget, cancel);
+                    profile_contact_artifacts();
+                }
+                BridgeAwareCubicContact::SupportQuery support_query;
+                if (!artifact)
+                    support_query = !allow_whole_support ?
+                        BridgeAwareCubicContact::SupportQuery{BridgeAwareCubicContact::footprint(*lower_contact, upper, upper_z, 0.,
+                            BridgeAwareCubicContact::FootprintMode::ContactsOnly, &budget, contact_queries.get()), false} :
+                        BridgeAwareCubicContact::footprint_for_support(*lower_contact, upper, upper_z, 0.,
+                            &budget, contact_queries.get());
+                const auto &contact = artifact ? artifact->contact() : support_query.contact;
+                const auto select_unsupported = [&](const Contact::PathContact &value) {
+                    Polylines unsupported;
+                    for (const auto &segment : value.segments) {
+                        const size_t i = segment.segment_index;
+                        append(unsupported, diff_pl(Polylines{Polyline(Points{upper.polyline.points[i], upper.polyline.points[i + 1]})},
+                                                    segment.centerline_support));
+                    }
+                    if (!value.input_valid || !value.completed || value.segments.empty()) unsupported = {upper.polyline};
+                    return intersection_ex(path_selection, union_ex(offset(unsupported, scale_(.5 * target.path_widths[index]))));
+                };
+                if (artifact && active_profile && active_profile->audit_contact_artifacts) {
+                    ++active_profile->contact_artifact_audits;
+                    // Release mask residency before deliberately recomputing
+                    // without either cache. The borrowed artifact stays charged
+                    // to its own bounded share throughout the comparison.
+                    contact_queries.reset();
+                    const auto fresh = Contact::footprint(*lower_contact, upper, upper_z, 0.,
+                        Contact::FootprintMode::ContactsOnly, &budget, nullptr);
+                    const auto selected = fresh.input_valid && fresh.completed ? select_unsupported(fresh) : ExPolygons{};
+                    if (!same_contact_artifact(object, budget, contact, artifact->selected(), fresh, selected)) {
+                        ++active_profile->contact_artifact_audit_mismatches;
+                        throw std::runtime_error("Bridge aware cubic contact artifact audit failed against uncached geometry.");
+                    }
+                    contact_queries = make_contact_query_cache(lower_contact);
+                    artifact_query.contact_cache = contact_queries.get();
+                }
                 if (active_profile && allow_whole_support) {
                     ++active_profile->whole_support_queries;
                     if (support_query.entire_path_supported) {
@@ -2730,15 +2853,8 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                     checked = BridgeAwareCubicValidation::validate_contacts({}, {},
                         {upper.polyline}, {}, target.gap, 0., {contact}, &budget);
                 } else if (!complete_span_proved || audit_complete_span) {
-                    Polylines unsupported;
-                    for (const auto &segment : contact.segments) {
-                        const size_t i = segment.segment_index;
-                        append(unsupported, diff_pl(Polylines{Polyline(Points{upper.polyline.points[i], upper.polyline.points[i + 1]})},
-                                                    segment.centerline_support));
-                    }
-                    if (!contact.input_valid || !contact.completed || contact.segments.empty()) unsupported = {upper.polyline};
-                    const ExPolygons selected = intersection_ex(path_selection,
-                        union_ex(offset(unsupported, scale_(.5 * target.path_widths[index]))));
+                    ExPolygons computed_selection;
+                    const ExPolygons &selected = artifact ? artifact->selected() : (computed_selection = select_unsupported(contact));
                     if (target.bridge_followup || target.dependency || selected.empty() || !contact.input_valid || !contact.completed) {
                         // Construction and follow-up paths require actual prior
                         // anchors and bounded complete air runs. They do not turn
@@ -2771,6 +2887,10 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                             found = prepared.emplace(contact.contact_z,
                                 BridgeAwareCubicValidation::prepare_geometry(domain, physical.physical_footprint, &budget)).first;
                         }
+                        // An artifact never certifies a cell. This geometry
+                        // belongs to the current lower material and complete
+                        // current layer envelope, even when contacts match.
+                        if (artifact && active_profile) ++active_profile->contact_artifact_current_cell_checks;
                         if (active_profile && active_profile->full_trial_checks)
                             checked = BridgeAwareCubicValidation::validate_prepared_contacts(*found->second,
                                 {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
@@ -2780,6 +2900,15 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                         else
                             checked = BridgeAwareCubicValidation::validate_prepared_contact_failures(*found->second,
                                 {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                    }
+                    if (reuse_artifact && !artifact && !selected.empty() && contact.input_valid && contact.completed &&
+                        checked.input_valid && checked.completed) {
+                        // Contact/selection computations remain exact even if
+                        // current cell validation rejects this trial. The
+                        // artifact stores no validation result or cell domain.
+                        ProfileScope publication(ProfilePhase::ContactArtifactPublish, &budget);
+                        contact_artifacts->publish(artifact_query, contact, selected, &budget, cancel);
+                        profile_contact_artifacts();
                     }
                 }
                 if (audit_complete_span) {
@@ -4040,6 +4169,7 @@ void PrintObject::prepare_bridge_aware_cubic()
             BridgeAwareCubic::ModelFailureReplay model_replay;
             BridgeAwareCubic::SpanProofCache span_proofs;
             ContactEpochReuse contact_epochs(*this, span_proofs);
+            BridgeAwareCubic::ContactArtifactCache contact_artifacts(contact_artifact_allowance);
             EmissionReuseContext emission_reuse(*this);
             size_t trials = 0;
             const auto changed_plan_layers = [&](const auto &previous, const auto &previous_indices) {
@@ -4184,7 +4314,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                 BridgeAwareCubicValidation::WorkBudget model_budget;
                 std::optional<BridgeAwareCubic::ModelFailureReplay::Hint> first_model_failure;
                 TargetCheckContext context{&model_budget, nullptr, &frozen_indices, &first_model_failure, nullptr,
-                    &span_proofs, &contact_epochs};
+                    &span_proofs, &contact_epochs, &contact_artifacts};
                 const bool replay_enabled = candidate_key && mode == TargetCheck::RejectTrial;
                 const auto remember_failure = [&] {
                     if (replay_enabled && first_model_failure && model_replay.remember(*candidate_key, *first_model_failure) && active_profile)

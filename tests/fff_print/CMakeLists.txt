@@ -112,6 +112,7 @@ add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cu
     test_bridge_aware_cubic_failure_replay.cpp
     test_bridge_aware_cubic_containment.cpp
     test_bridge_aware_cubic_query_signature.cpp
+    test_bridge_aware_cubic_contact_artifact.cpp
     test_bridge_aware_cubic_contact_epoch.cpp
     test_bridge_aware_cubic_span_proof_cache.cpp
     test_bridge_aware_cubic_span_epoch.cpp
