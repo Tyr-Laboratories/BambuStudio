@@ -42,6 +42,7 @@ class SupportLayer;
 class TreeSupportData;
 class TreeSupport;
 class ExtrusionLayers;
+namespace BridgeAwareCubic { class DepositionStateSnapshot; }
 
 #define MARGIN_HEIGHT   1.5
 #define MAX_OUTER_NOZZLE_RADIUS   4
@@ -609,6 +610,7 @@ private:
     void prepare_infill();
     void prepare_bridge_aware_cubic();
     void validate_bridge_aware_cubic() const;
+    void clear_bridge_aware_cubic_certificate() const;
     void infill();
     void ironing();
     void generate_support_material();
@@ -694,6 +696,9 @@ private:
     bool m_cached_infill_dependencies_missing = false;
     std::vector<std::unique_ptr<BridgeAwareCubic::Plan>> m_bridge_aware_cubic_plans;
     std::vector<std::vector<ExPolygons>> m_bridge_aware_cubic_reservations;
+    // Exact owned state from a complete successful proof; shared callers use
+    // the geometry object's handle. Access through atomic shared_ptr helpers.
+    mutable std::shared_ptr<const BridgeAwareCubic::DepositionStateSnapshot> m_bridge_aware_cubic_certificate;
 
     std::vector < VolumeSlices >            firstLayerObjSliceByVolume;
     std::vector<groupedVolumeSlices>        firstLayerObjSliceByGroups;

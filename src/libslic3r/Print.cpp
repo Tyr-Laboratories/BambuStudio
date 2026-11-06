@@ -1907,12 +1907,14 @@ void Print::auto_assign_extruders(ModelObject* model_object) const
 
 void  PrintObject::set_shared_object(PrintObject *object)
 {
+    clear_bridge_aware_cubic_certificate();
     m_shared_object = object;
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": this=%1%, found shared object from %2%")%this%m_shared_object;
 }
 
 void  PrintObject::clear_shared_object()
 {
+    clear_bridge_aware_cubic_certificate();
     if (m_shared_object) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": this=%1%, clear previous shared object data %2%")%this %m_shared_object;
         m_layers.clear();
@@ -1927,6 +1929,7 @@ void  PrintObject::clear_shared_object()
 void  PrintObject::copy_layers_from_shared_object()
 {
     if (m_shared_object) {
+        clear_bridge_aware_cubic_certificate();
         m_layers.clear();
         m_support_layers.clear();
 

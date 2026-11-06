@@ -131,6 +131,10 @@ public:
     const std::vector<size_t>& active_demands() const;
     // Exact immutable trial copy, including accepted collapses.
     Plan clone() const;
+    // Retains this exact immutable implementation after the Plan is destroyed.
+    // Clones share the token; every rebuild receives a new identity. A token
+    // identifies construction geometry, not a deposited-material certificate.
+    std::shared_ptr<const void> immutable_identity() const noexcept;
     // Rebuild after external dependency filtering while preserving accepted
     // collapses and all unreplaced payloads. These remain uncertified trials.
     // Use a fresh constructor for new target geometry that may need regrowth.
@@ -152,8 +156,8 @@ public:
 
 private:
     struct Impl;
-    explicit Plan(std::unique_ptr<const Impl> implementation);
-    std::unique_ptr<const Impl> m_impl;
+    explicit Plan(std::shared_ptr<const Impl> implementation);
+    std::shared_ptr<const Impl> m_impl;
 };
 
 }} // namespace Slic3r::BridgeAwareCubic

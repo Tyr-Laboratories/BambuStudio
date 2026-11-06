@@ -111,6 +111,35 @@ Result validate_prepared_contacts(const PreparedGeometry &prepared,
                                   const std::vector<BridgeAwareCubicContact::PathContact> &contacts,
                                   WorkBudget *budget = nullptr);
 
+// Coarsening trial decisions only. Check every contact and every potentially
+// failing whole cell exactly as above, but omit selection/copying of prepared
+// cells already known to be closed and within the permitted gap. With enough
+// work allowance, passed() is identical to exhaustive validation. The returned
+// void cells and maximum diameter describe failing cells only; do not use this
+// result for repair discovery, final verification or complete diagnostics.
+// All performed work retains the same shared limits and incomplete status.
+Result validate_prepared_contacts_for_trial(const PreparedGeometry &prepared,
+                                            const Polylines &required_paths,
+                                            const ExPolygons &demand,
+                                            double max_gap_mm,
+                                            double geometry_tolerance_mm,
+                                            const std::vector<BridgeAwareCubicContact::PathContact> &contacts,
+                                            WorkBudget *budget = nullptr);
+
+// Complete acceptance and failure evidence with the same maximum-opening and
+// contact metrics as exhaustive validation. Return only selected failing void
+// cells; all contact runs remain present. A safe closed cell needs exact
+// selection only when its diameter could increase the selected maximum. Use
+// this when consumers need failing geometry and complete metrics, but do not
+// need a list of passing cells. The exhaustive API above is unchanged.
+Result validate_prepared_contact_failures(const PreparedGeometry &prepared,
+                                          const Polylines &required_paths,
+                                          const ExPolygons &demand,
+                                          double max_gap_mm,
+                                          double geometry_tolerance_mm,
+                                          const std::vector<BridgeAwareCubicContact::PathContact> &contacts,
+                                          WorkBudget *budget = nullptr);
+
 }} // namespace Slic3r::BridgeAwareCubicValidation
 
 #endif

@@ -57,6 +57,15 @@ struct PathContact {
     std::vector<SegmentContact> segments;
 };
 
+struct SupportQuery {
+    PathContact contact;
+    // A complete, demand-independent proof of continuous support. An ordinary
+    // passing bridge with air between its anchors does not set this flag.
+    // This proves path spans only: it never certifies physical cells or
+    // discharges an independent, nonempty model-cell demand.
+    bool entire_path_supported = false;
+};
+
 // Rounded-rectangle bead section, using actual emitted width and height.
 // The top and bottom flat widths are width-height; width==height is circular.
 // Returns zero outside the closed Z interval; invalid dimensions return NaN.
@@ -75,6 +84,32 @@ PreparedLowerPtr prepare_lower(const std::vector<Bead> &deposited,
                                double upper_print_z, float upper_height,
                                BridgeAwareCubicValidation::WorkBudget *budget = nullptr);
 
+struct QueryCacheData;
+struct QueryCacheStatistics {
+    size_t hits = 0, misses = 0, evictions = 0, resident_units = 0;
+};
+
+// Optional, caller-owned acceleration for sequential queries on one immutable
+// prepared snapshot. Exact computed transverse/reserve values identify masks;
+// line-contact witnesses are always recomputed. Capacity includes an entry
+// unit even for empty masks. Entries are evicted before they can prevent an
+// otherwise admissible query. Destroy this cache before replacing its snapshot.
+class QueryCache {
+public:
+    explicit QueryCache(PreparedLowerPtr prepared, size_t capacity_units = 8192);
+    ~QueryCache();
+    QueryCache(const QueryCache &) = delete;
+    QueryCache &operator=(const QueryCache &) = delete;
+    QueryCacheStatistics statistics() const;
+private:
+    std::unique_ptr<QueryCacheData> m_data;
+    friend PathContact footprint(const PreparedLower &, const ExtrusionPath &, double, double,
+                                 FootprintMode, BridgeAwareCubicValidation::WorkBudget *, QueryCache *);
+    friend SupportQuery footprint_for_support(const PreparedLower &, const ExtrusionPath &, double, double,
+                                              BridgeAwareCubicValidation::WorkBudget *, QueryCache *);
+    friend PathContact physical_sections(const PreparedLower &, BridgeAwareCubicValidation::WorkBudget *, QueryCache *);
+};
+
 // The upper elevation and float height must exactly match the prepared key.
 // Upper path validity, width, direction and XY tolerance remain per query.
 PathContact footprint(const PreparedLower &deposited,
@@ -82,7 +117,32 @@ PathContact footprint(const PreparedLower &deposited,
                       double upper_print_z,
                       double xy_tolerance_mm,
                       FootprintMode mode = FootprintMode::Full,
-                      BridgeAwareCubicValidation::WorkBudget *budget = nullptr);
+                      BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+                      QueryCache *cache = nullptr);
+
+// ContactsOnly query with an optional exact whole-path proof before exhaustive
+// contact generation. The shortcut requires zero XY tolerance and an exact
+// finite collinear lower witness covering every original positive segment.
+// Failed probes allocate no masks and retain the ordinary exhaustive output;
+// the spent probe work remains charged. Preparation, query guards and shared
+// limits are identical to footprint(). A successful certificate contains only
+// full-span line contacts, not physical material usable for cell boundaries.
+// Model-cell obligations still require their full physical geometry check even
+// when entire_path_supported is true (including purely linear lower contact).
+SupportQuery footprint_for_support(const PreparedLower &deposited,
+                                   const ExtrusionPath &upper,
+                                   double upper_print_z,
+                                   double xy_tolerance_mm,
+                                   BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+                                   QueryCache *cache = nullptr);
+
+// Exact Full-mode physical material only, without a redundant upper-path
+// contact query. Status and plane come from the prepared key; no segments are
+// returned, so this is not a path-contact certificate. Supply the live query
+// cache, if any, to include its residency in the same allocation allowance.
+PathContact physical_sections(const PreparedLower &prepared,
+                              BridgeAwareCubicValidation::WorkBudget *budget = nullptr,
+                              QueryCache *cache = nullptr);
 
 // All physical material in one result belongs to one common plane. Heights
 // differing only by float representation error are snapped at a tangent plane;

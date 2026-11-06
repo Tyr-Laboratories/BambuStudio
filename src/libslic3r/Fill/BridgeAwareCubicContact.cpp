@@ -5,10 +5,13 @@
 #include "../Geometry/ConvexHull.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <exception>
 #include <limits>
+#include <map>
 #include <numeric>
+#include <stdexcept>
 #include <tuple>
 
 namespace Slic3r { namespace BridgeAwareCubicContact {
@@ -25,9 +28,12 @@ struct Limit {
     LimitKind kind = LimitKind::LocalWork;
     size_t used = 0, requested = 0;
 };
+struct Budget;
+void ensure_query_capacity(QueryCacheData *, size_t, Budget &);
 struct Budget {
     size_t work = 0, vertices = 0;
     BridgeAwareCubicValidation::WorkBudget *aggregate = nullptr;
+    QueryCacheData *cache = nullptr;
     BridgeAwareCubicValidation::WorkCategory category = BridgeAwareCubicValidation::WorkCategory::ContactInput;
     explicit Budget(BridgeAwareCubicValidation::WorkBudget *shared = nullptr) : aggregate(shared) {}
     void consume(size_t n = 1)
@@ -48,6 +54,8 @@ struct Budget {
     }
     void allocate(size_t n)
     {
+        if (cache != nullptr)
+            ensure_query_capacity(cache, n, *this);
         if (n > max_vertices - vertices)
             throw Limit{LimitKind::Vertices, vertices, n};
         consume(n);
@@ -173,6 +181,152 @@ struct LowerSection {
     }
 };
 
+// Immutable broad phase over the already validated, canonically ordered
+// sections. Extra diagonal projections are used only when they prove the
+// existing upper-normal rejection; otherwise queries use the original XY
+// reach test. This preserves even masks which do not meet the upper axis.
+class SectionIndex {
+    struct Node {
+        std::array<int64_t, 4> low, high;
+        Scalar radius = 0;
+        size_t begin = 0, end = 0, left = 0, right = 0;
+    };
+    std::vector<size_t> m_order;
+    std::vector<Node> m_nodes;
+
+    static std::array<int64_t, 4> projection(const Point &p)
+    {
+        return {{p.x(), p.y(), int64_t(p.x()) + p.y(), int64_t(p.x()) - p.y()}};
+    }
+
+    size_t build(const std::vector<LowerSection> &sections, size_t begin, size_t end, Budget &budget)
+    {
+        budget.consume(end - begin);
+        Node node;
+        node.begin = begin;
+        node.end = end;
+        node.low.fill(std::numeric_limits<int64_t>::max());
+        node.high.fill(std::numeric_limits<int64_t>::min());
+        auto center_low = node.low, center_high = node.high;
+        for (size_t i = begin; i < end; ++i) {
+            const LowerSection &section = sections[m_order[i]];
+            const auto a = projection(section.a), b = projection(section.b);
+            node.radius = std::max(node.radius, section.radius);
+            for (size_t axis = 0; axis < 4; ++axis) {
+                node.low[axis] = std::min(node.low[axis], std::min(a[axis], b[axis]));
+                node.high[axis] = std::max(node.high[axis], std::max(a[axis], b[axis]));
+                center_low[axis] = std::min(center_low[axis], a[axis] + b[axis]);
+                center_high[axis] = std::max(center_high[axis], a[axis] + b[axis]);
+            }
+        }
+        budget.allocate(1);
+        const size_t index = m_nodes.size();
+        m_nodes.push_back(node);
+        if (end - begin > 8) {
+            size_t axis = 0;
+            Scalar greatest = -1;
+            for (size_t i = 0; i < 4; ++i) {
+                const Scalar span = center_high[i] - center_low[i];
+                const Scalar extent = span * span / (i < 2 ? 1 : 2);
+                if (extent > greatest) { axis = i; greatest = extent; }
+            }
+            const size_t middle = begin + (end - begin) / 2;
+            std::nth_element(m_order.begin() + begin, m_order.begin() + middle, m_order.begin() + end,
+                [&](size_t a, size_t b) {
+                    budget.consume();
+                    const int64_t ca = projection(sections[a].a)[axis] + projection(sections[a].b)[axis];
+                    const int64_t cb = projection(sections[b].a)[axis] + projection(sections[b].b)[axis];
+                    return ca < cb || (ca == cb && a < b);
+                });
+            const size_t left = build(sections, begin, middle, budget);
+            const size_t right = build(sections, middle, end, budget);
+            m_nodes[index].left = left;
+            m_nodes[index].right = right;
+        }
+        return index;
+    }
+
+    static bool disjoint(const Node &node, const Point &a, const Point &b,
+                         V direction, Scalar length, Scalar upper_radius)
+    {
+        const Scalar reach = node.radius + upper_radius + 4;
+        if (std::max(a.x(), b.x()) + reach < node.low[0] ||
+            std::min(a.x(), b.x()) - reach > node.high[0] ||
+            std::max(a.y(), b.y()) + reach < node.low[1] ||
+            std::min(a.y(), b.y()) - reach > node.high[1])
+            return true;
+        size_t axis;
+        int64_t coefficient;
+        if (direction.x == direction.y) {
+            axis = 3;
+            coefficient = -int64_t(direction.x);
+        } else if (direction.x == -direction.y) {
+            axis = 2;
+            coefficient = int64_t(direction.x);
+        } else return false;
+        const int64_t origin = projection(a)[axis];
+        // These products have the same coordinate-derived bound as icross.
+        Scalar first = Scalar(coefficient * (node.low[axis] - origin));
+        Scalar last = Scalar(coefficient * (node.high[axis] - origin));
+        if (first > last) std::swap(first, last);
+        const Scalar limit = reach * length;
+        // At least the rounding allowance of every original per-pair normal
+        // test, including a pair with both endpoints at one extreme.
+        const Scalar error = 64 * std::numeric_limits<Scalar>::epsilon() *
+            (2 * std::max(std::abs(first), std::abs(last)) + std::abs(limit) + 1);
+        return first > limit + error || last < -limit - error;
+    }
+
+    void query(size_t index, const Point &a, const Point &b, V direction, Scalar length,
+               Scalar upper_radius, std::vector<size_t> &result, Budget &budget) const
+    {
+        budget.consume();
+        const Node &node = m_nodes[index];
+        if (disjoint(node, a, b, direction, length, upper_radius)) return;
+        if (node.end - node.begin > 8) {
+            query(node.left, a, b, direction, length, upper_radius, result, budget);
+            query(node.right, a, b, direction, length, upper_radius, result, budget);
+        } else for (size_t i = node.begin; i < node.end; ++i) {
+            if (result.size() == result.capacity()) {
+                // One query-wide scratch buffer is reused by every upper
+                // segment. Admit retained storage only when capacity grows;
+                // clearing its entries does not release that admission.
+                const size_t old_capacity = result.capacity();
+                const size_t requested = std::min(m_order.size(), std::max(size_t(8), 2 * old_capacity));
+                budget.allocate(requested - old_capacity);
+                result.reserve(requested);
+                if (result.capacity() > requested)
+                    budget.allocate(result.capacity() - requested);
+            }
+            budget.consume(); // Every candidate push remains charged on reuse.
+            result.push_back(m_order[i]);
+        }
+    }
+
+public:
+    void prepare(const std::vector<LowerSection> &sections, Budget &budget)
+    {
+        if (sections.size() <= 64) return;
+        budget.allocate(sections.size());
+        m_order.resize(sections.size());
+        std::iota(m_order.begin(), m_order.end(), size_t(0));
+        build(sections, 0, sections.size(), budget);
+    }
+
+    bool empty() const { return m_nodes.empty(); }
+
+    void candidates(const Point &a, const Point &b, V direction, Scalar length,
+                    Scalar upper_radius, std::vector<size_t> &result, Budget &budget) const
+    {
+        result.clear();
+        query(0, a, b, direction, length, upper_radius, result, budget);
+        std::sort(result.begin(), result.end(), [&](size_t a, size_t b) {
+            budget.consume();
+            return a < b;
+        });
+    }
+};
+
 bool point_less(const Point &a, const Point &b)
 {
     return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y());
@@ -243,9 +397,13 @@ bool slab(Scalar value, Scalar slope, Scalar lo, Scalar hi, Scalar &begin, Scala
     return begin < end;
 }
 
-void add_line_contact(const Point &upper_a, const Point &upper_b, const LowerSection &lower,
-                      Scalar upper_radius, Scalar reserve, bool require_rounding_reserve,
-                      SegmentContact &result, Budget &budget)
+// Keep the finite witness calculation independent of output storage so an
+// optional whole-path probe can inspect exactly these intervals without
+// allocating speculative certificates or contact masks.
+template<class Emit>
+void visit_line_contacts(const Point &upper_a, const Point &upper_b, const LowerSection &lower,
+                         Scalar upper_radius, Scalar reserve, bool require_rounding_reserve,
+                         Emit &&emit)
 {
     const V u = V(upper_b) - V(upper_a), v = V(lower.b) - V(lower.a);
     const V relative = V(lower.a) - V(upper_a);
@@ -262,8 +420,7 @@ void add_line_contact(const Point &upper_a, const Point &upper_b, const LowerSec
         a = std::max(int64_t(0), a);
         b = std::min(uu, b);
         if (a < b && Scalar(b - a) / length_u > 2 * reserve) {
-            budget.allocate(1);
-            result.line_contacts.push_back({a, uu, b, uu});
+            emit(ExactInterval{a, uu, b, uu});
         }
         return;
     }
@@ -297,9 +454,8 @@ void add_line_contact(const Point &upper_a, const Point &upper_b, const LowerSec
         const Scalar s = Scalar(lower_numerator) / denominator;
         if (std::min(t, 1 - t) * length_u <= margin || std::min(s, 1 - s) * length_v <= margin)
             return;
-        budget.allocate(1);
-        result.line_contacts.push_back({numerator, denominator, numerator, denominator,
-                                        double(2 * reserve / sine_lower * SCALING_FACTOR)});
+        emit(ExactInterval{numerator, denominator, numerator, denominator,
+                           double(2 * reserve / sine_lower * SCALING_FACTOR)});
     };
     Scalar begin = 0, end = 1;
     if (!slab(Scalar(cross_r) / length_u, Scalar(cross_v) / length_u,
@@ -327,10 +483,9 @@ void add_line_contact(const Point &upper_a, const Point &upper_b, const LowerSec
             Scalar(ur) > longitudinal_margin && Scalar(uu - ur) > longitudinal_margin :
             ur >= 0 && ur <= uu;
         if (within && (end - begin) * length_v > 2 * reserve) {
-            budget.allocate(1);
             const double uncertainty = require_rounding_reserve ?
                 double((2 * reserve + 4 * reserve * upper_radius / length_u) * SCALING_FACTOR) : 0.;
-            result.line_contacts.push_back({ur, uu, ur, uu, uncertainty});
+            emit(ExactInterval{ur, uu, ur, uu, uncertainty});
         }
         return;
     }
@@ -366,10 +521,20 @@ void add_line_contact(const Point &upper_a, const Point &upper_b, const LowerSec
     const int64_t first = std::max(int64_t(0), int64_t(std::ceil(a * interval_denominator)));
     const int64_t last = std::min(interval_denominator, int64_t(std::floor(b * interval_denominator)));
     if (first < last) {
-        budget.allocate(1);
-        result.line_contacts.push_back({first, interval_denominator, last, interval_denominator});
+        emit(ExactInterval{first, interval_denominator, last, interval_denominator});
     } else
         add_transverse_anchor();
+}
+
+void add_line_contact(const Point &upper_a, const Point &upper_b, const LowerSection &lower,
+                      Scalar upper_radius, Scalar reserve, bool require_rounding_reserve,
+                      SegmentContact &result, Budget &budget)
+{
+    visit_line_contacts(upper_a, upper_b, lower, upper_radius, reserve, require_rounding_reserve,
+        [&](const ExactInterval &interval) {
+            budget.allocate(1);
+            result.line_contacts.push_back(interval);
+        });
 }
 } // namespace
 
@@ -393,9 +558,155 @@ struct PreparedLower {
     bool sections_prepared = false;
     PathContact status;
     std::vector<LowerSection> sections;
+    SectionIndex index;
 };
 
+struct QueryCacheData {
+    using Key = std::tuple<size_t, Scalar, Scalar, double>;
+    struct Entry { ExPolygons polygons; size_t units; };
+    struct Less {
+        Budget **active;
+        bool operator()(const Key &a, const Key &b) const
+        {
+            (*active)->consume();
+            return a < b;
+        }
+    };
+    PreparedLowerPtr prepared;
+    size_t capacity = 0;
+    QueryCacheStatistics stats;
+    Budget *active_budget = nullptr;
+    std::map<Key, Entry, Less> entries;
+    QueryCacheData(PreparedLowerPtr source, size_t limit)
+        : prepared(std::move(source)), entries(Less{&active_budget})
+    {
+        if (!prepared) throw std::invalid_argument("A contact query cache requires a prepared lower snapshot.");
+        capacity = std::min(limit, max_vertices - prepared->admission_vertices);
+    }
+};
+
+QueryCache::QueryCache(PreparedLowerPtr prepared, size_t capacity_units)
+    : m_data(std::make_unique<QueryCacheData>(std::move(prepared), capacity_units)) {}
+QueryCache::~QueryCache() = default;
+QueryCacheStatistics QueryCache::statistics() const { return m_data->stats; }
+
 namespace {
+class CacheScope {
+    Budget &m_budget;
+    QueryCacheData *m_cache;
+    Budget *m_previous = nullptr;
+public:
+    CacheScope(Budget &budget, QueryCacheData *cache) : m_budget(budget), m_cache(cache)
+    {
+        if (cache != nullptr) {
+            m_previous = cache->active_budget;
+            cache->active_budget = &budget;
+            budget.cache = cache;
+        }
+    }
+    ~CacheScope()
+    {
+        if (m_cache != nullptr) {
+            m_cache->active_budget = m_previous;
+            m_budget.cache = nullptr;
+        }
+    }
+};
+
+void evict_first(QueryCacheData &cache, Budget &budget)
+{
+    budget.consume();
+    const auto first = cache.entries.begin();
+    cache.stats.resident_units -= first->second.units;
+    cache.entries.erase(first);
+    ++cache.stats.evictions;
+}
+
+void ensure_query_capacity(QueryCacheData *cache, size_t requested, Budget &budget)
+{
+    // Cache occupancy is optional. Never reject an otherwise admissible query
+    // merely because masks retained by earlier queries occupy the allowance.
+    while (!cache->entries.empty() &&
+           (requested > max_vertices - budget.vertices ||
+            cache->stats.resident_units > max_vertices - budget.vertices - requested))
+        evict_first(*cache, budget);
+}
+
+bool cache_matches(PathContact &result, const PreparedLower &prepared, QueryCacheData *cache)
+{
+    if (cache == nullptr || cache->prepared.get() == &prepared) return true;
+    result.input_valid = false;
+    result.failure_reason = "Contact query cache belongs to a different prepared lower snapshot.";
+    return false;
+}
+
+size_t mask_vertices(const ExPolygons &mask)
+{
+    size_t count = 0;
+    for (const auto &polygon : mask) {
+        count += polygon.contour.points.size();
+        for (const auto &hole : polygon.holes) count += hole.points.size();
+    }
+    return count;
+}
+
+ExPolygons contact_mask(size_t lower_index, const LowerSection &lower, V transverse,
+                        double mask_reserve, Budget &budget)
+{
+    if (!std::isfinite(transverse.x) || !std::isfinite(transverse.y) || !std::isfinite(mask_reserve))
+        throw Limit{LimitKind::Coordinates};
+    QueryCacheData *cache = budget.cache;
+    const QueryCacheData::Key key{lower_index, transverse.x, transverse.y, mask_reserve};
+    if (cache != nullptr) {
+        budget.consume();
+        const auto found = cache->entries.find(key);
+        if (found != cache->entries.end()) {
+            ++cache->stats.hits;
+            const size_t count = found->second.units - 1;
+            if (count <= max_vertices - budget.vertices - cache->stats.resident_units) {
+                // This preflight proves the allocation hook cannot evict the
+                // borrowed entry. Charge exactly one output copy before it.
+                budget.allocate(count);
+                return found->second.polygons;
+            }
+            // Preserve ownership before an allocation hook can erase entries.
+            budget.consume();
+            ExPolygons mask = std::move(found->second.polygons);
+            cache->stats.resident_units -= found->second.units;
+            cache->entries.erase(found);
+            ++cache->stats.evictions;
+            budget.allocate(count);
+            return mask;
+        }
+        ++cache->stats.misses;
+    }
+    std::vector<V> corners;
+    corners.reserve(8);
+    if (lower.radius == 0) {
+        corners = {V(lower.a) + transverse, V(lower.a) - transverse,
+                   V(lower.b) + transverse, V(lower.b) - transverse};
+    } else for (V corner : lower.corners) {
+        corners.push_back(corner + transverse);
+        corners.push_back(corner - transverse);
+    }
+    ExPolygons mask = inner_hull(corners, mask_reserve, budget);
+    if (cache != nullptr) {
+        const size_t units = mask_vertices(mask) + 1;
+        if (units <= cache->capacity && units <= max_vertices - budget.vertices) {
+            while (!cache->entries.empty() &&
+                   (cache->stats.resident_units > cache->capacity - units ||
+                    cache->stats.resident_units > max_vertices - budget.vertices - units))
+                evict_first(*cache, budget);
+            // Admission covers the temporary copy and its eventual map entry.
+            // A throwing copy/comparison publishes no partial cached mask.
+            budget.consume(units);
+            QueryCacheData::Entry entry{mask, units};
+            const auto inserted = cache->entries.emplace(key, std::move(entry));
+            if (inserted.second) cache->stats.resident_units += units;
+        }
+    }
+    return mask;
+}
 void describe_limit(PathContact &result, const Limit &limit, const Budget &budget,
                     const PreparedLower &prepared)
 {
@@ -515,7 +826,93 @@ void prepare_impl(PreparedLower &prepared, const std::vector<Bead> &deposited, B
             budget.allocate(4);
             section.corners = rectangle_corners(section.a, section.b, section.radius);
         }
+    prepared.index.prepare(prepared.sections, budget);
     prepared.admission_vertices = budget.vertices - initial_vertices;
+}
+
+void physical_impl(PathContact &result, const PreparedLower &prepared, Budget &budget)
+{
+    budget.category = BridgeAwareCubicValidation::WorkCategory::ContactSections;
+    for (const LowerSection &section : prepared.sections) {
+        if (section.radius > 0) {
+            ExPolygons material = inner_hull(section.corners, 0., budget);
+            for (ExPolygon &polygon : material) {
+                // Both original axis endpoints belong to the real butt
+                // rectangle. Their hull with an inner convex section is
+                // still inside that rectangle, and preserves the actual
+                // common vertex at near-collinear path joins. This only
+                // repairs physical wall topology; contact masks below
+                // retain their complete anchoring/rounding reserve.
+                Points points = polygon.contour.points;
+                points.push_back(section.a);
+                points.push_back(section.b);
+                budget.allocate(2);
+                polygon.contour = Geometry::convex_hull(std::move(points));
+            }
+            result.physical_footprint.insert(result.physical_footprint.end(),
+                std::make_move_iterator(material.begin()), std::make_move_iterator(material.end()));
+        } else {
+            // Its axis is still genuine material. Keeping an axis loses
+            // tiny area conservatively instead of inflating it.
+            budget.allocate(2);
+            result.physical_lines.emplace_back(Points{section.a, section.b});
+        }
+    }
+}
+
+bool prove_entire_path(PathContact &result, const PreparedLower &prepared, const ExtrusionPath &upper,
+                       double upper_print_z, double xy_tolerance_mm, Budget &budget)
+{
+    if (xy_tolerance_mm != 0. || prepared.sections.empty()) return false;
+    const Scalar upper_radius = .5L * snapped_section(upper, upper_print_z, prepared.status.contact_z) / SCALING_FACTOR;
+    const auto axis_key = [](const LowerSection &section) {
+        const auto key = section.line_key();
+        return std::make_tuple(std::get<0>(key), std::get<1>(key), std::get<2>(key));
+    };
+    const Points &points = upper.polyline.points;
+    size_t positive_segments = 0;
+    budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+    for (size_t i = 1; i < points.size(); ++i) {
+        budget.consume();
+        if (points[i - 1] == points[i]) continue;
+        ++positive_segments;
+        LowerSection axis{points[i - 1], points[i], 0., {}};
+        if (point_less(axis.b, axis.a)) std::swap(axis.a, axis.b);
+        const auto key = axis_key(axis);
+        auto candidate = std::lower_bound(prepared.sections.begin(), prepared.sections.end(), key,
+            [&](const LowerSection &section, const auto &wanted) {
+                budget.consume();
+                return axis_key(section) < wanted;
+            });
+        bool complete = false;
+        // This optional search has bounded overhead even with many radii or
+        // disjoint intervals on one axis. A miss preserves exhaustive checking.
+        for (size_t examined = 0; candidate != prepared.sections.end() && examined < 16; ++candidate, ++examined) {
+            budget.consume();
+            if (axis_key(*candidate) != key) break;
+            if (point_less(axis.a, candidate->a) || point_less(candidate->b, axis.b)) continue;
+            visit_line_contacts(points[i - 1], points[i], *candidate, upper_radius, 3., false,
+                [&](const ExactInterval &interval) {
+                    budget.consume();
+                    complete |= interval.begin_numerator == 0 &&
+                        interval.end_numerator == interval.end_denominator &&
+                        interval.position_uncertainty_mm == 0.;
+                });
+            if (complete) break;
+        }
+        if (!complete) return false;
+    }
+    if (positive_segments == 0) return false;
+    // Nothing was allocated by the probe. Publish certificates only after all
+    // original positive segments passed; failed output admission stays fatal.
+    result.contact_z = prepared.status.contact_z;
+    result.coordinate_uncertainty_mm = 0.;
+    for (size_t i = 1; i < points.size(); ++i)
+        if (points[i - 1] != points[i]) {
+            budget.allocate(2); // One segment record and one exact interval.
+            result.segments.push_back({i - 1, {}, {{0, 1, 1, 1, 0.}}});
+        }
+    return true;
 }
 
 void query_impl(PathContact &result, const PreparedLower &prepared, const ExtrusionPath &upper,
@@ -542,40 +939,20 @@ void query_impl(PathContact &result, const PreparedLower &prepared, const Extrus
         return;
     const Scalar upper_radius = .5L * snapped_section(upper, upper_print_z, result.contact_z) / SCALING_FACTOR;
     const Scalar reserve = xy_tolerance_mm / SCALING_FACTOR + 3.;
-    budget.category = BridgeAwareCubicValidation::WorkCategory::ContactSections;
-    for (const LowerSection &section : prepared.sections) {
-        if (section.radius > 0) {
-            if (mode == FootprintMode::ContactsOnly)
-                continue;
-            ExPolygons material = inner_hull(section.corners, 0., budget);
-            for (ExPolygon &polygon : material) {
-                // Both original axis endpoints belong to the real butt
-                // rectangle. Their hull with an inner convex section is
-                // still inside that rectangle, and preserves the actual
-                // common vertex at near-collinear path joins. This only
-                // repairs physical wall topology; contact masks below
-                // retain their complete anchoring/rounding reserve.
-                Points points = polygon.contour.points;
-                points.push_back(section.a);
-                points.push_back(section.b);
-                budget.allocate(2);
-                polygon.contour = Geometry::convex_hull(std::move(points));
-            }
-            result.physical_footprint.insert(result.physical_footprint.end(),
-                std::make_move_iterator(material.begin()), std::make_move_iterator(material.end()));
-        } else if (mode == FootprintMode::Full) {
-            // Its axis is still genuine material. Keeping an axis loses
-            // tiny area conservatively instead of inflating it.
-            budget.allocate(2);
-            result.physical_lines.emplace_back(Points{section.a, section.b});
-        }
-    }
+    if (mode == FootprintMode::Full) physical_impl(result, prepared, budget);
+    const bool indexed = !prepared.index.empty();
+    std::vector<size_t> candidates;
     for (SegmentContact &segment : result.segments) {
         const Point &a = upper_points[segment.segment_index], &b = upper_points[segment.segment_index + 1];
         const V u = V(b) - V(a);
         const Scalar length = std::sqrt(dot(u, u));
         const V transverse(-u.y / length * upper_radius, u.x / length * upper_radius);
-        for (const LowerSection &lower : prepared.sections) {
+        budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
+        if (indexed)
+            prepared.index.candidates(a, b, u, length, upper_radius, candidates, budget);
+        const size_t lower_count = indexed ? candidates.size() : prepared.sections.size();
+        for (size_t i = 0; i < lower_count; ++i) {
+            const LowerSection &lower = prepared.sections[indexed ? candidates[i] : i];
             budget.category = BridgeAwareCubicValidation::WorkCategory::ContactCandidates;
             budget.consume();
             // Exact broad phase; a conservative maximum XY reach is enough.
@@ -591,23 +968,12 @@ void query_impl(PathContact &result, const PreparedLower &prepared, const Extrus
                 separated_normal(lower.a, lower_delta, lower_length, a, b, reach, budget))
                 continue;
             budget.category = BridgeAwareCubicValidation::WorkCategory::ContactMasks;
-            std::vector<V> corners;
-            corners.reserve(8);
-            if (lower.radius == 0) {
-                corners = {V(lower.a) + transverse, V(lower.a) - transverse,
-                           V(lower.b) + transverse, V(lower.b) - transverse};
-            } else {
-                for (V corner : lower.corners) {
-                    corners.push_back(corner + transverse);
-                    corners.push_back(corner - transverse);
-                }
-            }
             // Both centreline endpoints can move, and both section
             // directions can rotate. Erode the convex contact region by
             // the corresponding support-function displacement bound.
             const double mask_reserve = xy_tolerance_mm *
                 double(2 + 4 * upper_radius / length + 4 * lower.radius / lower_length);
-            ExPolygons mask = inner_hull(corners, mask_reserve, budget);
+            ExPolygons mask = contact_mask(indexed ? candidates[i] : i, lower, transverse, mask_reserve, budget);
             segment.centerline_support.insert(segment.centerline_support.end(),
                 std::make_move_iterator(mask.begin()), std::make_move_iterator(mask.end()));
             // An axis remains genuine material when a very thin positive
@@ -637,33 +1003,92 @@ PreparedLowerPtr prepare_lower(const std::vector<Bead> &deposited, double upper_
     }
     if (!prepared->status.input_valid || !prepared->status.completed) {
         std::vector<LowerSection>().swap(prepared->sections);
+        prepared->index = SectionIndex{};
         prepared->admission_vertices = 0;
     }
     return prepared;
 }
 
-PathContact footprint(const PreparedLower &prepared, const ExtrusionPath &upper,
-                      double upper_print_z, double xy_tolerance_mm, FootprintMode mode,
-                      BridgeAwareCubicValidation::WorkBudget *shared)
+namespace {
+SupportQuery query_prepared(const PreparedLower &prepared, const ExtrusionPath &upper,
+                            double upper_print_z, double xy_tolerance_mm, FootprintMode mode,
+                            BridgeAwareCubicValidation::WorkBudget *shared, QueryCacheData *cache_data,
+                            bool try_entire_path)
 {
-    PathContact result;
+    SupportQuery query;
+    PathContact &result = query.contact;
     Budget budget(shared);
     budget.vertices = prepared.admission_vertices;
+    CacheScope cache_scope(budget, cache_data);
     try {
         if (!query_arguments(result, xy_tolerance_mm, mode))
-            return result;
+            return query;
+        if (!cache_matches(result, prepared, cache_data)) return query;
         // A failed snapshot supplies no usable evidence. Preserve its precise
         // cause even when preparation exhausted the shared work allowance.
-        if (!prepared.status.input_valid || !prepared.status.completed)
-            return prepared.status;
+        if (!prepared.status.input_valid || !prepared.status.completed) {
+            result = prepared.status;
+            return query;
+        }
         if (!upper_valid(result, upper, upper_print_z, budget))
-            return result;
+            return query;
+        // A mismatched key must reach the ordinary error below, before any
+        // witness can use this snapshot's common physical plane.
+        if (try_entire_path && upper_print_z == prepared.upper_print_z && upper.height == prepared.upper_height &&
+            prove_entire_path(result, prepared, upper, upper_print_z, xy_tolerance_mm, budget)) {
+            query.entire_path_supported = true;
+            return query;
+        }
+        budget.category = BridgeAwareCubicValidation::WorkCategory::ContactInput;
         query_impl(result, prepared, upper, upper_print_z, xy_tolerance_mm, mode, budget);
     } catch (const Limit &limit) {
         describe_limit(result, limit, budget, prepared);
     } catch (const std::exception &error) {
         result.completed = false;
         result.failure_reason = std::string("Bead contact geometry failed: ") + error.what();
+    }
+    return query;
+}
+} // namespace
+
+PathContact footprint(const PreparedLower &prepared, const ExtrusionPath &upper,
+                      double upper_print_z, double xy_tolerance_mm, FootprintMode mode,
+                      BridgeAwareCubicValidation::WorkBudget *shared, QueryCache *cache)
+{
+    return query_prepared(prepared, upper, upper_print_z, xy_tolerance_mm, mode, shared,
+                          cache == nullptr ? nullptr : cache->m_data.get(), false).contact;
+}
+
+SupportQuery footprint_for_support(const PreparedLower &prepared, const ExtrusionPath &upper,
+                                   double upper_print_z, double xy_tolerance_mm,
+                                   BridgeAwareCubicValidation::WorkBudget *shared, QueryCache *cache)
+{
+    return query_prepared(prepared, upper, upper_print_z, xy_tolerance_mm, FootprintMode::ContactsOnly,
+                          shared, cache == nullptr ? nullptr : cache->m_data.get(), true);
+}
+
+PathContact physical_sections(const PreparedLower &prepared,
+                              BridgeAwareCubicValidation::WorkBudget *shared, QueryCache *cache)
+{
+    PathContact result;
+    Budget budget(shared);
+    budget.vertices = prepared.admission_vertices;
+    QueryCacheData *cache_data = cache == nullptr ? nullptr : cache->m_data.get();
+    CacheScope cache_scope(budget, cache_data);
+    try {
+        if (!cache_matches(result, prepared, cache_data)) return result;
+        if (!prepared.status.input_valid || !prepared.status.completed) return prepared.status;
+        result.contact_z = prepared.status.contact_z;
+        physical_impl(result, prepared, budget);
+    } catch (const Limit &limit) {
+        describe_limit(result, limit, budget, prepared);
+    } catch (const std::exception &error) {
+        result.completed = false;
+        result.failure_reason = std::string("Bead contact geometry failed: ") + error.what();
+    }
+    if (!result.input_valid || !result.completed) {
+        result.physical_footprint.clear();
+        result.physical_lines.clear();
     }
     return result;
 }

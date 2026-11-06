@@ -37,6 +37,9 @@ struct Cell {
     size_t reason_demand = std::numeric_limits<size_t>::max();
     double reason_diameter = 0.;
     std::vector<size_t> reason_demands;
+    // Exact successful footprint predicates, including demands whose gap did
+    // not split this node. Retained only on split nodes, for their children.
+    std::vector<size_t> intersecting_demands;
 
     CellId id() const { return { address, depth }; }
 };
@@ -180,6 +183,67 @@ struct Plan::Impl {
                         cancel();
                         append_and_refine(Cell { { u, v, w } }, active_demands, work);
                     }
+            active_owners.clear();
+            refinements.clear();
+            for (const Cell &cell : cells) {
+                if (!cell.split && !cell.solid) continue;
+                active_owners.insert(cell.id());
+                const double low_z = lower(cell).sum() / sqrt_three;
+                const double size = edge(cell);
+                refinements.push_back({ cell.id(), cell.solid,
+                    low_z + (cell.solid ? 0. : .5 * size / sqrt_three),
+                    low_z + (cell.solid ? 3. : 2.5) * size / sqrt_three, cell.reason_demands });
+            }
+            bool activated = false;
+            for (size_t i = 0; i < enabled.size(); ++i)
+                if (!enabled[i] && has_owner(demands[i].owners, &work)) {
+                    enabled[i] = true;
+                    activated = true;
+                }
+            if (!activated) break;
+        }
+        statistics.nodes = cells.size();
+        statistics.leaves = statistics.nodes - statistics.splits;
+    }
+
+    Impl(const Impl &source, const CellId &forced_leaf)
+        : parameters(source.parameters), demands(source.demands), bulk_edge(source.bulk_edge),
+          to_world(source.to_world), origin(source.origin), demand_bounds(source.demand_bounds),
+          demand_masks(source.demand_masks), closures(source.closures), layer_attachments(source.layer_attachments),
+          forced_leaves(source.forced_leaves)
+    {
+        // All immutable inputs were already validated. Adding a forced leaf
+        // can only remove nodes and reachable demands; it cannot introduce a
+        // new geometric predicate or exceed the source's allocation bounds.
+        cancel();
+        forced_leaves.insert(forced_leaf);
+        cells.reserve(source.cells.size());
+        std::vector<size_t> subtree_end(source.cells.size(), source.cells.size());
+        std::vector<size_t> ancestors;
+        ancestors.reserve(parameters.max_depth + 1);
+        for (size_t i = 0; i < source.cells.size(); ++i) {
+            if ((i & 255) == 0) cancel();
+            while (!ancestors.empty() && source.cells[ancestors.back()].depth >= source.cells[i].depth) {
+                subtree_end[ancestors.back()] = i;
+                ancestors.pop_back();
+            }
+            ancestors.push_back(i);
+        }
+        std::vector<bool> enabled(demands.size(), false);
+        for (size_t i = 0; i < demands.size(); ++i)
+            enabled[i] = !demands[i].dependency;
+        size_t work = 0;
+        for (;;) {
+            cells.clear();
+            statistics = {};
+            statistics.root_cells = source.statistics.root_cells;
+            active_demands.clear();
+            for (size_t i = 0; i < enabled.size(); ++i)
+                if (enabled[i] && !demands[i].footprint.empty()) active_demands.push_back(i);
+            for (size_t index = 0; index < source.cells.size();) {
+                cancel();
+                append_cached(source.cells, subtree_end, index, active_demands, work);
+            }
             active_owners.clear();
             refinements.clear();
             for (const Cell &cell : cells) {
@@ -427,6 +491,7 @@ struct Plan::Impl {
                     << " limit";
             throw std::runtime_error(message.str());
         }
+        cell.intersecting_demands = std::move(local);
         cells[id] = cell;
         ++statistics.splits;
         // Selection is repeated against the original finite-width fragments in
@@ -437,8 +502,57 @@ struct Plan::Impl {
             child.depth = cell.depth + 1;
             for (unsigned axis = 0; axis < 3; ++axis)
                 child.address[axis] = cell.address[axis] * 2 + ((octant >> axis) & 1);
-            append_and_refine(child, local, work);
+            append_and_refine(child, cell.intersecting_demands, work);
         }
+    }
+
+    void append_cached(const std::vector<Cell> &source, const std::vector<size_t> &subtree_end,
+                       size_t &index, const std::vector<size_t> &candidates, size_t &work)
+    {
+        const size_t source_id = index++;
+        const Cell &previous = source[source_id];
+        Cell cell { previous.address, previous.depth };
+        if (cells.size() >= parameters.max_nodes)
+            throw std::runtime_error("Bridge aware cubic exceeds the cell work limit during local support refinement");
+        const size_t id = cells.size();
+        cells.push_back(cell);
+        statistics.max_depth = std::max(statistics.max_depth, cell.depth);
+        if (forced_leaves.find(cell.id()) != forced_leaves.end()) {
+            index = subtree_end[source_id];
+            return;
+        }
+        // Preserve the cold constructor's work charges, including candidates
+        // that do not intersect or whose gap is already satisfied. The cached
+        // lists are sorted by original demand index. Looking up only currently
+        // inherited candidates avoids repeatedly scanning disabled demands.
+        for (size_t demand : candidates) {
+            if (++work > parameters.max_nodes * 64)
+                throw std::runtime_error("Bridge aware cubic exceeds the footprint-intersection work limit");
+            if ((work & 255) == 0) cancel();
+            if (std::binary_search(previous.reason_demands.begin(), previous.reason_demands.end(), demand))
+                cell.reason_demands.push_back(demand);
+            if (previous.split && std::binary_search(previous.intersecting_demands.begin(),
+                                                     previous.intersecting_demands.end(), demand))
+                cell.intersecting_demands.push_back(demand);
+        }
+        if (cell.reason_demands.empty()) {
+            index = subtree_end[source_id];
+            return;
+        }
+        cell.reason_demand = cell.reason_demands.front();
+        cell.reason_diameter = cell.reason_demand == previous.reason_demand ? previous.reason_diameter :
+            section_diameter(section(cell, demands[cell.reason_demand].z));
+        cell.split = previous.split;
+        cell.solid = previous.solid;
+        cells[id] = cell;
+        if (cell.solid) {
+            ++statistics.solid_cells;
+            index = subtree_end[source_id];
+            return;
+        }
+        ++statistics.splits;
+        for (unsigned octant = 0; octant < 8; ++octant)
+            append_cached(source, subtree_end, index, cell.intersecting_demands, work);
     }
 
     bool has_elevation(double z) const
@@ -698,9 +812,9 @@ struct Plan::Impl {
 
 Plan::Plan(Parameters parameters, std::vector<Demand> demands,
            std::vector<LayerClosure> closures, std::vector<LayerAttachment> attachments)
-    : m_impl(std::make_unique<Impl>(std::move(parameters), std::move(demands),
+    : m_impl(std::make_shared<Impl>(std::move(parameters), std::move(demands),
                                    std::move(closures), std::move(attachments))) {}
-Plan::Plan(std::unique_ptr<const Impl> implementation) : m_impl(std::move(implementation)) {}
+Plan::Plan(std::shared_ptr<const Impl> implementation) : m_impl(std::move(implementation)) {}
 Plan::~Plan() = default;
 Plan::Plan(Plan&&) noexcept = default;
 Plan& Plan::operator=(Plan&&) noexcept = default;
@@ -855,20 +969,22 @@ const std::vector<size_t>& Plan::active_demands() const { return m_impl->active_
 Plan Plan::clone() const
 {
     m_impl->cancel();
-    return Plan(std::make_unique<Impl>(*m_impl));
+    return Plan(m_impl);
 }
+
+std::shared_ptr<const void> Plan::immutable_identity() const noexcept { return m_impl; }
 
 Plan Plan::with_demands(std::vector<Demand> demands) const
 {
     m_impl->cancel();
-    return Plan(std::make_unique<Impl>(m_impl->parameters, std::move(demands),
+    return Plan(std::make_shared<Impl>(m_impl->parameters, std::move(demands),
                                        m_impl->closures, m_impl->layer_attachments, m_impl->forced_leaves));
 }
 
 Plan Plan::with_payloads(std::vector<LayerClosure> closures, std::vector<LayerAttachment> attachments) const
 {
     m_impl->cancel();
-    return Plan(std::make_unique<Impl>(m_impl->parameters, m_impl->demands,
+    return Plan(std::make_shared<Impl>(m_impl->parameters, m_impl->demands,
                                        std::move(closures), std::move(attachments), m_impl->forced_leaves));
 }
 
@@ -877,17 +993,14 @@ Plan Plan::collapsed(const CellId &id) const
     m_impl->cancel();
     if (m_impl->active_owners.find(id) == m_impl->active_owners.end())
         throw std::invalid_argument("Bridge aware cubic can only collapse an active split or solid cell");
-    std::set<CellId> forced = m_impl->forced_leaves;
-    forced.insert(id);
-    return Plan(std::make_unique<Impl>(m_impl->parameters, m_impl->demands,
-                                       m_impl->closures, m_impl->layer_attachments, std::move(forced)));
+    return Plan(std::make_shared<Impl>(*m_impl, id));
 }
 
 Plan Plan::coarsened(const std::function<bool(const Plan&)> &validate, size_t max_trials) const
 {
     m_impl->cancel();
     if (!validate) throw std::invalid_argument("Bridge aware cubic coarsening requires a final-deposition validator");
-    Plan current(std::make_unique<Impl>(*m_impl));
+    Plan current(m_impl);
     if (!validate(current))
         throw std::runtime_error("Bridge aware cubic cannot coarsen an uncertified starting plan");
     size_t attempts = 0;

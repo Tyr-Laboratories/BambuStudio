@@ -116,6 +116,10 @@ set(lisbslic3r_sources
     Fill/BridgeAwareCubicAttachment.hpp
     Fill/BridgeAwareCubicContact.cpp
     Fill/BridgeAwareCubicContact.hpp
+    Fill/BridgeAwareCubicCertificate.cpp
+    Fill/BridgeAwareCubicCertificate.hpp
+    Fill/BridgeAwareCubicModelProofCache.hpp
+    Fill/BridgeAwareCubicOwnerBounds.hpp
     Fill/BridgeAwareCubicDependencies.cpp
     Fill/BridgeAwareCubicDependencies.hpp
     Fill/BridgeAwareCubicSupport.hpp

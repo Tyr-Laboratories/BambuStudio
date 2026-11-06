@@ -790,3 +790,468 @@ TEST_CASE("Bridge aware polygon box index preserves overlapping-mask order", "[B
     REQUIRE(actual.unsupported_runs.size() == expected.unsupported_runs.size());
     CHECK(actual.max_unsupported_mm == Approx(expected.max_unsupported_mm));
 }
+
+TEST_CASE("Bridge aware prepared cell index preserves complete ordered cells and exact selection", "[BridgeAwareCubic][Validation]")
+{
+    ExPolygons domain{rectangle(0., 0., 10., 10.)};
+    ExPolygons support = frame(10.);
+    support.push_back(rectangle(4., 4., 6., 6.)); // A physical island creates a hole in the first void.
+    for (size_t i = 0; i < 100; ++i) {
+        const double x = 20. + 4. * double(i % 10), y = 20. + 4. * double(i / 10);
+        // Scale locally and translate domain and walls identically. Scaling
+        // x+side separately can differ by a coordinate unit from their sum,
+        // creating real unintended boundary voids in this closed-cell fixture.
+        const Point origin = Point::new_scale(x, y);
+        auto box = rectangle(0., 0., 2., 2.);
+        box.translate(origin);
+        domain.push_back(std::move(box));
+        auto walls = frame(2.);
+        for (auto &wall : walls) wall.translate(origin);
+        append(support, std::move(walls));
+    }
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    REQUIRE(prepared);
+    auto surrounding = rectangle(-1., -1., 60., 60.);
+    Polygon excluded = rectangle(-.25, -.25, 10.25, 10.25).contour;
+    excluded.make_clockwise();
+    surrounding.holes.push_back(std::move(excluded));
+    const std::vector<ExPolygons> demands{
+        {rectangle(1., 1., 1.1, 1.1)},                         // Demand wholly inside a larger cell.
+        {rectangle(-1., -1., 11., 11.)},                       // Demand contains that entire cell.
+        {rectangle(4.5, 4.5, 5.5, 5.5)},                       // Wholly inside the cell's physical island.
+        {rectangle(4.5, 4., 5.5, 4.25)},                       // Touches the island boundary only.
+        {rectangle(-1., 2., .5, 3.)},                          // Outer cell edge contact only.
+        {rectangle(-1., -1., .5, .5)},                         // Outer cell vertex contact only.
+        {rectangle(10., 10., 11., 11.)},                       // Disjoint despite nearby model bounds.
+        {rectangle(1., 1., 1.1, 1.1), rectangle(20.75, 20.75, 21., 21.),
+         rectangle(56.75, 56.75, 57., 57.)},                  // Separate, spatially distant candidates.
+        {rectangle(-1., -1., 60., 60.)},                       // Every cell, in original output order.
+        {surrounding}                                        // Demand hole excludes the first cell.
+    };
+    const size_t expected_counts[] = {1, 1, 0, 1, 1, 1, 0, 3, 101, 100};
+    const auto check_points = [](const Points &actual, const Points &expected) {
+        REQUIRE(actual.size() == expected.size());
+        for (size_t i = 0; i < expected.size(); ++i) {
+            CHECK(actual[i].x() == expected[i].x());
+            CHECK(actual[i].y() == expected[i].y());
+        }
+    };
+    for (size_t i = 0; i < demands.size(); ++i) {
+        INFO("demand case " << i);
+        const auto expected = Validation::validate_contacts(domain, support, {}, demands[i], 15., 0., {});
+        const auto actual = Validation::validate_prepared_contacts(*prepared, {}, demands[i], 15., 0., {});
+        REQUIRE(expected.input_valid);
+        REQUIRE(expected.completed);
+        REQUIRE(actual.input_valid);
+        REQUIRE(actual.completed);
+        REQUIRE(expected.void_cells.size() == expected_counts[i]);
+        REQUIRE(actual.void_cells.size() == expected.void_cells.size());
+        CHECK(actual.passed() == expected.passed());
+        CHECK(actual.max_void_diameter_mm == expected.max_void_diameter_mm);
+        for (size_t j = 0; j < expected.void_cells.size(); ++j) {
+            const auto &actual_cell = actual.void_cells[j];
+            const auto &expected_cell = expected.void_cells[j];
+            CHECK(actual_cell.closed == expected_cell.closed);
+            CHECK(actual_cell.exceeds_gap == expected_cell.exceeds_gap);
+            CHECK(actual_cell.diameter_mm == expected_cell.diameter_mm);
+            check_points(actual_cell.geometry.contour.points, expected_cell.geometry.contour.points);
+            REQUIRE(actual_cell.geometry.holes.size() == expected_cell.geometry.holes.size());
+            for (size_t k = 0; k < expected_cell.geometry.holes.size(); ++k)
+                check_points(actual_cell.geometry.holes[k].points, expected_cell.geometry.holes[k].points);
+        }
+        if (i == 0) {
+            CHECK(actual.void_cells.front().diameter_mm == Approx(std::sqrt(162.)));
+            REQUIRE(actual.void_cells.front().geometry.holes.size() == 1);
+        }
+    }
+}
+
+TEST_CASE("Bridge aware prepared cell index bounds repeated sparse queries and fails closed", "[BridgeAwareCubic][Validation]")
+{
+    ExPolygons domain, support;
+    for (size_t i = 0; i < 1024; ++i) {
+        const double x = 4. * double(i);
+        const Point origin = Point::new_scale(x, 0.);
+        auto box = rectangle(0., 0., 2., 2.);
+        box.translate(origin);
+        domain.push_back(std::move(box));
+        auto walls = frame(2.);
+        for (auto &wall : walls) wall.translate(origin);
+        append(support, std::move(walls));
+    }
+    Validation::WorkBudget measured_preparation;
+    const size_t initial_preparation_work = measured_preparation.remaining_work;
+    const auto prepared = Validation::prepare_geometry(domain, support, &measured_preparation);
+    REQUIRE(prepared);
+    // One immutable index serves all queries. A full 1,024-cell scan per
+    // target cannot fit this allowance; exact visits to nearby cells can.
+    Validation::WorkBudget budget{20000};
+    for (size_t i = 0; i < 64; ++i) {
+        const double x = 4. * double((i * 97) % 1024);
+        const auto result = Validation::validate_prepared_contacts(*prepared, {},
+            {rectangle(x + .75, .75, x + 1.25, 1.25)}, 2., 0., {}, &budget);
+        INFO("query " << i);
+        REQUIRE(result.input_valid);
+        REQUIRE(result.completed);
+        CHECK_FALSE(result.resource_limited);
+        REQUIRE(result.void_cells.size() == 1);
+        CHECK(result.void_cells.front().closed);
+        CHECK(result.void_cells.front().diameter_mm == Approx(std::sqrt(2.)));
+        CHECK(result.passed());
+    }
+    CHECK(budget.remaining_work > 0);
+    CHECK(budget.remaining_work < 20000);
+
+    const ExPolygons demand{rectangle(.75, .75, 1.25, 1.25)};
+    const size_t preparation_work = initial_preparation_work - measured_preparation.remaining_work;
+    REQUIRE(preparation_work > 1);
+    // Index construction is the final preparation step. One less work unit
+    // exercises failure after geometry and most of the immutable index exist.
+    Validation::WorkBudget late_preparation_budget{preparation_work - 1};
+    const auto late_prepared = Validation::prepare_geometry(domain, support, &late_preparation_budget);
+    REQUIRE(late_prepared);
+    const auto late_cached = Validation::validate_prepared_contacts(*late_prepared, {}, demand, 2., 0., {});
+    CHECK(late_cached.input_valid);
+    CHECK_FALSE(late_cached.completed);
+    CHECK(late_cached.resource_limited);
+    CHECK_FALSE(late_cached.passed());
+    CHECK(late_cached.void_cells.empty());
+    CHECK_FALSE(late_cached.failure_reason.empty());
+    CHECK(late_preparation_budget.remaining_work == 0);
+
+    Validation::WorkBudget exhausted{0};
+    const auto incomplete = Validation::validate_prepared_contacts(*prepared, {}, demand, 2., 0., {}, &exhausted);
+    CHECK(incomplete.input_valid);
+    CHECK_FALSE(incomplete.completed);
+    CHECK(incomplete.resource_limited);
+    CHECK_FALSE(incomplete.passed());
+    CHECK_FALSE(incomplete.failure_reason.empty());
+
+    ExPolygons invalid_demand = demand;
+    invalid_demand.emplace_back(Polygon({Point(500000000, 0), Point(500000001, 0)}));
+    const auto invalid = Validation::validate_prepared_contacts(*prepared, {}, invalid_demand, 2., 0., {});
+    CHECK_FALSE(invalid.input_valid);
+    CHECK_FALSE(invalid.passed());
+
+    ExPolygons invalid_domain = domain;
+    invalid_domain.emplace_back(Polygon({Point(500000000, 0), Point(500000001, 0)}));
+    const auto invalid_prepared = Validation::prepare_geometry(invalid_domain, support);
+    REQUIRE(invalid_prepared);
+    const auto invalid_cached = Validation::validate_prepared_contacts(*invalid_prepared, {}, demand, 2., 0., {});
+    CHECK_FALSE(invalid_cached.input_valid);
+    CHECK_FALSE(invalid_cached.passed());
+
+    Validation::WorkBudget preparation_budget{0};
+    const auto limited_prepared = Validation::prepare_geometry(domain, support, &preparation_budget);
+    REQUIRE(limited_prepared);
+    const auto limited_cached = Validation::validate_prepared_contacts(*limited_prepared, {}, demand, 2., 0., {});
+    CHECK(limited_cached.input_valid);
+    CHECK_FALSE(limited_cached.completed);
+    CHECK(limited_cached.resource_limited);
+    CHECK_FALSE(limited_cached.passed());
+}
+
+namespace {
+void same_trial_decision(const Validation::Result &trial, const Validation::Result &full,
+                         bool preserve_maximum = false)
+{
+    CHECK(trial.input_valid == full.input_valid);
+    CHECK(trial.completed == full.completed);
+    CHECK(trial.resource_limited == full.resource_limited);
+    CHECK(trial.failure_reason == full.failure_reason);
+    CHECK(trial.passed() == full.passed());
+    CHECK(trial.max_unsupported_mm == full.max_unsupported_mm);
+    REQUIRE(trial.unsupported_runs.size() == full.unsupported_runs.size());
+    for (size_t i = 0; i < full.unsupported_runs.size(); ++i) {
+        const auto &actual = trial.unsupported_runs[i], &expected = full.unsupported_runs[i];
+        CHECK(actual.path_index == expected.path_index);
+        CHECK(actual.begin_mm == expected.begin_mm);
+        CHECK(actual.end_mm == expected.end_mm);
+        CHECK(actual.length_mm == expected.length_mm);
+        CHECK(actual.uncertainty_mm == expected.uncertainty_mm);
+        CHECK(actual.kind == expected.kind);
+        CHECK(actual.exceeds_gap == expected.exceeds_gap);
+    }
+    size_t failing = 0;
+    double maximum = 0.;
+    for (const auto &expected : full.void_cells) {
+        if (expected.closed && !expected.exceeds_gap) continue;
+        REQUIRE(failing < trial.void_cells.size());
+        const auto &actual = trial.void_cells[failing++];
+        CHECK(actual.closed == expected.closed);
+        CHECK(actual.exceeds_gap == expected.exceeds_gap);
+        CHECK(actual.diameter_mm == expected.diameter_mm);
+        CHECK(actual.geometry.contour.points == expected.geometry.contour.points);
+        REQUIRE(actual.geometry.holes.size() == expected.geometry.holes.size());
+        for (size_t j = 0; j < expected.geometry.holes.size(); ++j)
+            CHECK(actual.geometry.holes[j].points == expected.geometry.holes[j].points);
+        maximum = std::max(maximum, expected.diameter_mm);
+    }
+    CHECK(trial.void_cells.size() == failing);
+    CHECK(trial.max_void_diameter_mm == (preserve_maximum ? full.max_void_diameter_mm : maximum));
+}
+}
+
+TEST_CASE("Bridge aware trial validation preserves every selected failing whole cell", "[BridgeAwareCubic][Validation]")
+{
+    const size_t small_count = GENERATE(size_t(1), size_t(70));
+    const double gap = GENERATE(2., 15.);
+    ExPolygons domain{rectangle(0., 0., 10., 10.), rectangle(14., 0., 18., 4.)};
+    ExPolygons support = frame(10.);
+    support.push_back(rectangle(4., 4., 6., 6.)); // Hole in the closed large cell.
+    for (size_t i = 0; i < small_count; ++i) {
+        const Point origin = Point::new_scale(24. + 4. * double(i), 0.);
+        auto box = rectangle(0., 0., 2., 2.);
+        box.translate(origin);
+        domain.push_back(std::move(box));
+        auto walls = frame(2.);
+        for (auto &wall : walls) wall.translate(origin);
+        append(support, std::move(walls));
+    }
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    auto surrounding = rectangle(-1., -1., 310., 11.);
+    Polygon hole = rectangle(-.25, -.25, 20.25, 10.25).contour;
+    hole.make_clockwise();
+    surrounding.holes.push_back(std::move(hole));
+    const std::vector<ExPolygons> demands{
+        {rectangle(1., 1., 1.1, 1.1)},                // Inside the large cell.
+        {rectangle(-1., -1., 11., 11.)},              // Contains the whole cell.
+        {rectangle(4.5, 4.5, 5.5, 5.5)},              // Inside its physical island.
+        {rectangle(4.5, 4., 5.5, 4.25)},              // Touches the island boundary.
+        {rectangle(-1., 2., .5, 3.)},                 // Outer edge touch.
+        {rectangle(-1., -1., .5, .5)},                // Outer vertex touch.
+        {rectangle(15., 1., 16., 2.)},                // Whole unclosed void selected.
+        {rectangle(24.75, .75, 25.25, 1.25)},         // Safe cell only.
+        {rectangle(-1., -1., 310., 11.)},             // Mixed cells in original order.
+        {surrounding},                               // Demand hole excludes bad cells.
+        {rectangle(-5., -5., -4., -4.)},              // Disjoint selection.
+        {}
+    };
+    for (size_t i = 0; i < demands.size(); ++i) {
+        INFO("selection " << i << ", small cells " << small_count << ", gap " << gap);
+        const auto full = Validation::validate_prepared_contacts(*prepared, {}, demands[i], gap, 0., {});
+        const auto trial = Validation::validate_prepared_contacts_for_trial(*prepared, {}, demands[i], gap, 0., {});
+        REQUIRE(full.input_valid);
+        REQUIRE(full.completed);
+        same_trial_decision(trial, full);
+        same_trial_decision(Validation::validate_prepared_contact_failures(*prepared, {}, demands[i], gap, 0., {}), full, true);
+        if (i == 6) {
+            REQUIRE(trial.void_cells.size() == 1);
+            CHECK_FALSE(trial.void_cells.front().closed);
+            CHECK_FALSE(trial.passed());
+        }
+        if (i == 7) {
+            REQUIRE(full.void_cells.size() == 1);
+            CHECK(full.passed());
+            CHECK(trial.void_cells.empty());
+        }
+    }
+}
+
+TEST_CASE("Bridge aware trial validation keeps contacts and exact gap boundaries", "[BridgeAwareCubic][Validation]")
+{
+    const auto prepared = Validation::prepare_geometry({rectangle(0., 0., 2., 2.)}, frame(2.));
+    const ExPolygons demand{rectangle(-1., -1., 12., 3.)};
+    const Polylines paths{path({{0., 0.}, {10., 0.}})};
+    for (int contact_kind = 0; contact_kind < 4; ++contact_kind) {
+        Contact::PathContact contact;
+        ExPolygons masks;
+        if (contact_kind <= 2) masks.push_back(rectangle(-1., -1., 1., 1.));
+        if (contact_kind <= 1) masks.push_back(rectangle(9., -1., 11., 1.));
+        contact.segments.push_back({0, masks, {}});
+        if (contact_kind == 0) contact.segments.front().line_contacts.push_back({1, 2, 1, 2, .0002});
+        contact.coordinate_uncertainty_mm = .0001;
+        for (double gap : {4., 9.}) {
+            const auto full = Validation::validate_prepared_contacts(*prepared, paths, demand, gap, .001, {contact});
+            REQUIRE(full.input_valid);
+            REQUIRE(full.completed);
+            REQUIRE_FALSE(full.unsupported_runs.empty());
+            same_trial_decision(Validation::validate_prepared_contacts_for_trial(*prepared, paths, demand, gap, .001, {contact}), full);
+            same_trial_decision(Validation::validate_prepared_contact_failures(*prepared, paths, demand, gap, .001, {contact}), full, true);
+            if (contact_kind <= 1 && gap == 9.) CHECK(full.passed());
+        }
+    }
+    const auto baseline = Validation::validate_prepared_contacts(*prepared, {}, demand, 2., 0., {});
+    REQUIRE(baseline.void_cells.size() == 1);
+    const double tolerance = .001;
+    const double boundary = baseline.void_cells.front().diameter_mm + tolerance;
+    for (double gap : {std::nextafter(boundary, 0.), boundary,
+                       std::nextafter(boundary, std::numeric_limits<double>::infinity())}) {
+        const auto full = Validation::validate_prepared_contacts(*prepared, {}, demand, gap, tolerance, {});
+        same_trial_decision(Validation::validate_prepared_contacts_for_trial(*prepared, {}, demand, gap, tolerance, {}), full);
+        same_trial_decision(Validation::validate_prepared_contact_failures(*prepared, {}, demand, gap, tolerance, {}), full, true);
+    }
+}
+
+TEST_CASE("Bridge aware trial validation retains invalid inputs and preparation failures", "[BridgeAwareCubic][Validation]")
+{
+    const ExPolygons domain{rectangle(0., 0., 2., 2.)}, support = frame(2.);
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    const ExPolygons demand{rectangle(.75, .75, 1.25, 1.25)};
+    for (double gap : {0., std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()})
+        same_trial_decision(Validation::validate_prepared_contacts_for_trial(*prepared, {}, demand, gap, 0., {}),
+                            Validation::validate_prepared_contacts(*prepared, {}, demand, gap, 0., {}));
+    ExPolygons invalid = demand;
+    invalid.front().contour.points.resize(2);
+    same_trial_decision(Validation::validate_prepared_contacts_for_trial(*prepared, {}, invalid, 2., 0., {}),
+                        Validation::validate_prepared_contacts(*prepared, {}, invalid, 2., 0., {}));
+    const Polylines paths{path({{.75, 1.}, {1.25, 1.}})};
+    Contact::PathContact bad_contact;
+    bad_contact.segments.push_back({1, {}, {}}); // Wrong original segment index.
+    same_trial_decision(Validation::validate_prepared_contacts_for_trial(*prepared, paths, demand, 2., 0., {bad_contact}),
+                        Validation::validate_prepared_contacts(*prepared, paths, demand, 2., 0., {bad_contact}));
+    const auto invalid_prepared = Validation::prepare_geometry(invalid, support);
+    same_trial_decision(Validation::validate_prepared_contacts_for_trial(*invalid_prepared, {}, demand, 2., 0., {}),
+                        Validation::validate_prepared_contacts(*invalid_prepared, {}, demand, 2., 0., {}));
+    Validation::WorkBudget empty{0};
+    const auto failed = Validation::prepare_geometry(domain, support, &empty);
+    const auto trial = Validation::validate_prepared_contacts_for_trial(*failed, {}, demand, 2., 0., {});
+    CHECK_FALSE(trial.completed);
+    CHECK(trial.resource_limited);
+    same_trial_decision(trial, Validation::validate_prepared_contacts(*failed, {}, demand, 2., 0., {}));
+}
+
+TEST_CASE("Bridge aware trial validation charges remaining work without passing cell copies", "[BridgeAwareCubic][Validation]")
+{
+    ExPolygons domain, support;
+    for (size_t i = 0; i < 100; ++i) {
+        const Point origin = Point::new_scale(4. * double(i), 0.);
+        auto box = rectangle(0., 0., 2., 2.);
+        box.translate(origin);
+        domain.push_back(std::move(box));
+        auto walls = frame(2.);
+        for (auto &wall : walls) wall.translate(origin);
+        append(support, std::move(walls));
+    }
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    const ExPolygons demand{rectangle(-1., -1., 400., 3.)};
+    Validation::WorkBudget full_budget, trial_budget;
+    const auto full = Validation::validate_prepared_contacts(*prepared, {}, demand, 2., 0., {}, &full_budget);
+    const auto trial = Validation::validate_prepared_contacts_for_trial(*prepared, {}, demand, 2., 0., {}, &trial_budget);
+    REQUIRE(full.passed());
+    REQUIRE(full.void_cells.size() == 100);
+    same_trial_decision(trial, full);
+    CHECK(trial_budget.remaining_work > full_budget.remaining_work);
+    CHECK(trial_budget.remaining_work < 50000000);
+    const size_t trial_work = 50000000 - trial_budget.remaining_work;
+    Validation::WorkBudget exact{trial_work};
+    CHECK(Validation::validate_prepared_contacts_for_trial(*prepared, {}, demand, 2., 0., {}, &exact).passed());
+    CHECK(exact.remaining_work == 0);
+    Validation::WorkBudget short_budget{trial_work - 1};
+    const auto incomplete = Validation::validate_prepared_contacts_for_trial(*prepared, {}, demand, 2., 0., {}, &short_budget);
+    CHECK_FALSE(incomplete.completed);
+    CHECK(incomplete.resource_limited);
+    CHECK_FALSE(incomplete.passed());
+    CHECK(short_budget.remaining_work == 0);
+    Validation::WorkBudget exhausted{0};
+    CHECK_FALSE(Validation::validate_prepared_contacts_for_trial(*prepared, {}, demand, 2., 0., {}, &exhausted).completed);
+}
+
+TEST_CASE("Bridge aware failure reports preserve maxima from larger safe selected cells", "[BridgeAwareCubic][Validation]")
+{
+    const bool descending = GENERATE(false, true);
+    ExPolygons domain, support;
+    for (size_t i = 0; i < 4; ++i) {
+        const double side = descending ? 5. - double(i) : 2. + double(i);
+        const Point origin = Point::new_scale(10. * double(i), 0.);
+        auto box = rectangle(0., 0., side, side);
+        box.translate(origin);
+        domain.push_back(std::move(box));
+        auto walls = frame(side);
+        for (auto &wall : walls) wall.translate(origin);
+        append(support, std::move(walls));
+    }
+    domain.push_back(rectangle(40., 0., 42., 2.)); // Smaller unclosed failing cell.
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    auto with_hole = rectangle(-1., -1., 43., 6.);
+    const double largest_x = descending ? 0. : 30.;
+    Polygon hole = rectangle(largest_x - .25, -.25, largest_x + 5.25, 5.25).contour;
+    hole.make_clockwise();
+    with_hole.holes.push_back(std::move(hole));
+    for (const ExPolygons &demand : std::vector<ExPolygons>{{rectangle(-1., -1., 43., 6.)}, {with_hole}}) {
+        const auto full = Validation::validate_prepared_contacts(*prepared, {}, demand, 10., 0., {});
+        const auto failures = Validation::validate_prepared_contact_failures(*prepared, {}, demand, 10., 0., {});
+        REQUIRE(full.input_valid);
+        REQUIRE(full.completed);
+        same_trial_decision(failures, full, true);
+        REQUIRE(failures.void_cells.size() == 1);
+        CHECK_FALSE(failures.void_cells.front().closed);
+        CHECK(failures.max_void_diameter_mm > failures.void_cells.front().diameter_mm);
+    }
+    // A grouped target's failing path need not observe its largest opening.
+    // Preserve the maximum from passing paths too, before caller aggregation.
+    const ExPolygons failing_demand{rectangle(40.5, .5, 41.5, 1.5)};
+    const ExPolygons passing_demand{rectangle(largest_x + .75, .75, largest_x + 1.25, 1.25)};
+    const auto full_failure = Validation::validate_prepared_contacts(*prepared, {}, failing_demand, 10., 0., {});
+    const auto full_passing = Validation::validate_prepared_contacts(*prepared, {}, passing_demand, 10., 0., {});
+    const auto failures = Validation::validate_prepared_contact_failures(*prepared, {}, failing_demand, 10., 0., {});
+    const auto passing = Validation::validate_prepared_contact_failures(*prepared, {}, passing_demand, 10., 0., {});
+    REQUIRE_FALSE(full_failure.passed());
+    REQUIRE(full_passing.passed());
+    CHECK(std::max(failures.max_void_diameter_mm, passing.max_void_diameter_mm) ==
+          std::max(full_failure.max_void_diameter_mm, full_passing.max_void_diameter_mm));
+    CHECK(passing.max_void_diameter_mm > failures.max_void_diameter_mm);
+    CHECK(passing.void_cells.empty());
+}
+
+TEST_CASE("Bridge aware failure reports preserve invalid and incomplete states", "[BridgeAwareCubic][Validation]")
+{
+    const ExPolygons domain{rectangle(0., 0., 2., 2.)}, support = frame(2.);
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    const ExPolygons demand{rectangle(.75, .75, 1.25, 1.25)};
+    for (double gap : {0., std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()})
+        same_trial_decision(Validation::validate_prepared_contact_failures(*prepared, {}, demand, gap, 0., {}),
+                            Validation::validate_prepared_contacts(*prepared, {}, demand, gap, 0., {}), true);
+    ExPolygons invalid = demand;
+    invalid.front().contour.points.resize(2);
+    same_trial_decision(Validation::validate_prepared_contact_failures(*prepared, {}, invalid, 2., 0., {}),
+                        Validation::validate_prepared_contacts(*prepared, {}, invalid, 2., 0., {}), true);
+    const Polylines paths{path({{.75, 1.}, {1.25, 1.}})};
+    Contact::PathContact contact;
+    contact.segments.push_back({1, {}, {}});
+    same_trial_decision(Validation::validate_prepared_contact_failures(*prepared, paths, demand, 2., 0., {contact}),
+                        Validation::validate_prepared_contacts(*prepared, paths, demand, 2., 0., {contact}), true);
+    const auto bad_prepared = Validation::prepare_geometry(invalid, support);
+    same_trial_decision(Validation::validate_prepared_contact_failures(*bad_prepared, {}, demand, 2., 0., {}),
+                        Validation::validate_prepared_contacts(*bad_prepared, {}, demand, 2., 0., {}), true);
+    Validation::WorkBudget empty{0};
+    const auto failed = Validation::prepare_geometry(domain, support, &empty);
+    const auto result = Validation::validate_prepared_contact_failures(*failed, {}, demand, 2., 0., {});
+    REQUIRE_FALSE(result.completed);
+    CHECK(result.resource_limited);
+    same_trial_decision(result, Validation::validate_prepared_contacts(*failed, {}, demand, 2., 0., {}), true);
+}
+
+TEST_CASE("Bridge aware failure metrics skip dominated safe cell work within shared limits", "[BridgeAwareCubic][Validation]")
+{
+    ExPolygons domain, support;
+    for (size_t i = 0; i < 100; ++i) {
+        const Point origin = Point::new_scale(4. * double(i), 0.);
+        auto box = rectangle(0., 0., 2., 2.);
+        box.translate(origin);
+        domain.push_back(std::move(box));
+        auto walls = frame(2.);
+        for (auto &wall : walls) wall.translate(origin);
+        append(support, std::move(walls));
+    }
+    const auto prepared = Validation::prepare_geometry(domain, support);
+    const ExPolygons demand{rectangle(-1., -1., 400., 3.)};
+    Validation::WorkBudget full_budget, failure_budget, trial_budget;
+    const auto full = Validation::validate_prepared_contacts(*prepared, {}, demand, 2., 0., {}, &full_budget);
+    const auto failures = Validation::validate_prepared_contact_failures(*prepared, {}, demand, 2., 0., {}, &failure_budget);
+    REQUIRE(full.passed());
+    same_trial_decision(failures, full, true);
+    REQUIRE(Validation::validate_prepared_contacts_for_trial(*prepared, {}, demand, 2., 0., {}, &trial_budget).passed());
+    CHECK(failure_budget.remaining_work > full_budget.remaining_work);
+    CHECK(failure_budget.remaining_work < trial_budget.remaining_work);
+    const size_t work = 50000000 - failure_budget.remaining_work;
+    Validation::WorkBudget exact{work};
+    same_trial_decision(Validation::validate_prepared_contact_failures(*prepared, {}, demand, 2., 0., {}, &exact), full, true);
+    CHECK(exact.remaining_work == 0);
+    Validation::WorkBudget short_budget{work - 1};
+    const auto incomplete = Validation::validate_prepared_contact_failures(*prepared, {}, demand, 2., 0., {}, &short_budget);
+    CHECK_FALSE(incomplete.completed);
+    CHECK(incomplete.resource_limited);
+    CHECK_FALSE(incomplete.passed());
+    CHECK(short_budget.remaining_work == 0);
+}

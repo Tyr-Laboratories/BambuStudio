@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 using namespace Slic3r;
 namespace Contact = Slic3r::BridgeAwareCubicContact;
@@ -807,4 +808,557 @@ TEST_CASE("Bridge aware cached queries preserve combined excluded-input admissio
     CHECK(uncached.resource_limited);
     CHECK(cached.failure_reason.find("vertex allocation limit") != std::string::npos);
     CHECK(uncached.failure_reason.find("vertex allocation limit") != std::string::npos);
+}
+
+TEST_CASE("Bridge aware indexed sections preserve independent contact geometry and ordering", "[BridgeAwareCubic][Contact]")
+{
+    const auto mode = GENERATE(Contact::FootprintMode::Full, Contact::FootprintMode::ContactsOnly);
+    const int direction = GENERATE(-1, 0, 1);
+    const int query = GENERATE(0, 1, 2);
+    std::vector<ExtrusionPath> lower;
+    lower.reserve(97);
+    for (int i = -48; i <= 48; ++i) {
+        const double y = .3 * i;
+        lower.push_back(bead({{-10., y - 10. * direction}, {10., y + 10. * direction}},
+                             i % 3 == 0 ? .2f : .45f, .2f));
+        lower.back().polyline.points = {Point(-1000000, 30000 * i - 1000000 * direction),
+                                         Point(1000000, 30000 * i + 1000000 * direction)};
+        if (i % 2 == 0) std::reverse(lower.back().polyline.points.begin(), lower.back().polyline.points.end());
+    }
+    const auto upper = query == 0 ? bead({{-8., -8. * direction}, {8., 8. * direction}}) :
+                       query == 1 ? bead({{10., -15.}, {10., 15.}}) :
+                                    bead({{10.125, -15.}, {10.125, 15.}});
+    std::vector<Contact::Bead> deposited;
+    for (const auto &path : lower) deposited.push_back({&path, .2});
+    const auto prepared = Contact::prepare_lower(deposited, .4, upper.height);
+    const auto actual = Contact::footprint(*prepared, upper, .4, 0., mode);
+    REQUIRE(actual.input_valid);
+    REQUIRE(actual.completed);
+    // Each single-section call uses the original direct scan. Input is in
+    // canonical section-key order; the independent output concatenation must
+    // equal the indexed result, including irrelevant masks and finite lines.
+    Contact::PathContact expected;
+    for (size_t i = 0; i < lower.size(); ++i) {
+        auto single = Contact::footprint({{&lower[i], .2}}, upper, .4, 0., mode);
+        REQUIRE(single.input_valid);
+        REQUIRE(single.completed);
+        if (i == 0) {
+            expected = std::move(single);
+            continue;
+        }
+        expected.physical_footprint.insert(expected.physical_footprint.end(),
+            single.physical_footprint.begin(), single.physical_footprint.end());
+        expected.physical_lines.insert(expected.physical_lines.end(), single.physical_lines.begin(), single.physical_lines.end());
+        REQUIRE(expected.segments.size() == single.segments.size());
+        for (size_t j = 0; j < expected.segments.size(); ++j) {
+            auto &target = expected.segments[j];
+            const auto &source = single.segments[j];
+            target.centerline_support.insert(target.centerline_support.end(), source.centerline_support.begin(), source.centerline_support.end());
+            target.line_contacts.insert(target.line_contacts.end(), source.line_contacts.begin(), source.line_contacts.end());
+        }
+    }
+    same_contact(actual, expected);
+}
+
+TEST_CASE("Bridge aware diagonal section index bounds work without changing contacts", "[BridgeAwareCubic][Contact]")
+{
+    const bool reversed = GENERATE(false, true);
+    std::vector<ExtrusionPath> lower;
+    lower.reserve(4096);
+    for (int i = -2048; i < 2048; ++i) {
+        lower.push_back(bead({{-40., -40. + .5 * i}, {40., 40. + .5 * i}}));
+        lower.back().polyline.points = {Point(-4000000, -4000000 + 50000 * i),
+                                         Point(4000000, 4000000 + 50000 * i)};
+    }
+    std::vector<Contact::Bead> deposited;
+    for (const auto &path : lower) deposited.push_back({&path, .2});
+    auto upper = bead({{-30., -30.}, {30., 30.}});
+    upper.polyline.points.clear();
+    for (size_t i = 0; i <= 1000; ++i)
+        upper.polyline.points.emplace_back((i % 2 == 0) != reversed ? -3000000 : 3000000,
+                                          (i % 2 == 0) != reversed ? -3000000 : 3000000);
+    // Every diagonal XY box overlaps the query for hundreds of lower strands.
+    // The previous scan visits 4,096,000 pairs before any narrow predicates.
+    // The node diagonal bound is exactly an existing upper-normal rejection.
+    Validation::WorkBudget budget{1000000};
+    const auto prepared = Contact::prepare_lower(deposited, .4, upper.height, &budget);
+    const auto result = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, &budget);
+    REQUIRE(result.input_valid);
+    REQUIRE(result.completed);
+    CHECK_FALSE(result.resource_limited);
+    REQUIRE(result.segments.size() == 1000);
+    for (const auto &segment : result.segments) {
+        REQUIRE(segment.centerline_support.size() == 1);
+        CHECK(segment.line_contacts.size() <= 1);
+    }
+    CHECK(budget.remaining_work > 0);
+}
+
+TEST_CASE("Bridge aware section indexes retain invalid input and aggregate limits", "[BridgeAwareCubic][Contact]")
+{
+    std::vector<ExtrusionPath> lower;
+    lower.reserve(100);
+    for (size_t i = 0; i < 100; ++i)
+        lower.push_back(bead({{0., double(i)}, {10., double(i)}}));
+    std::vector<Contact::Bead> deposited;
+    for (const auto &path : lower) deposited.push_back({&path, .2});
+    const auto upper = bead({{1., 0.}, {9., 0.}});
+    Validation::WorkBudget measured;
+    const auto prepared = Contact::prepare_lower(deposited, .4, upper.height, &measured);
+    REQUIRE(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly).completed);
+    const size_t preparation_work = 50000000 - measured.remaining_work;
+    REQUIRE(preparation_work > 1);
+    Validation::WorkBudget exhausted{preparation_work - 1};
+    const auto incomplete = Contact::prepare_lower(deposited, .4, upper.height, &exhausted);
+    const auto rejected = Contact::footprint(*incomplete, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    CHECK_FALSE(rejected.completed);
+    CHECK(rejected.resource_limited);
+    CHECK(rejected.segments.empty());
+    CHECK(exhausted.remaining_work == 0);
+    lower.back().mm3_per_mm = 0.;
+    deposited.back().print_z = .8; // Excluded future input is still validated.
+    const auto invalid = Contact::prepare_lower(deposited, .4, upper.height);
+    CHECK_FALSE(Contact::footprint(*invalid, upper, .4, 0., Contact::FootprintMode::ContactsOnly).input_valid);
+}
+
+TEST_CASE("Bridge aware exact mask cache preserves every contact output", "[BridgeAwareCubic][Contact]")
+{
+    const auto mode = GENERATE(Contact::FootprintMode::Full, Contact::FootprintMode::ContactsOnly);
+    const double tolerance = GENERATE(0., .0001);
+    const float lower_width = GENERATE(.45f, .2f, .201f);
+    const auto lower = bead({{-2., 0.}, {12., 0.}}, lower_width, .2f);
+    const auto crossing = bead({{5., -2.}, {5., 2.}}, lower_width, .2f);
+    const auto prepared = Contact::prepare_lower({{&lower, .2}, {&crossing, .2}}, .4, .2f);
+    Contact::QueryCache cache(prepared);
+    for (int repeat = 0; repeat < 2; ++repeat)
+        for (auto upper : {bead({{0., 0.}, {10., 0.}}), bead({{10., 0.}, {0., 0.}}),
+                           bead({{0., 0.}, {5., 0.}}), bead({{0., .125}, {10., .125}}),
+                           bead({{0., 0.}, {10., 0.}}, .6f), bead({{5., -1.}, {5., 1.}})}) {
+            const auto expected = Contact::footprint(*prepared, upper, .4, tolerance, mode);
+            const auto actual = Contact::footprint(*prepared, upper, .4, tolerance, mode, nullptr, &cache);
+            REQUIRE(expected.input_valid);
+            REQUIRE(expected.completed);
+            same_contact(actual, expected);
+        }
+    CHECK(cache.statistics().hits > 0);
+    CHECK(cache.statistics().misses > 0);
+    CHECK(cache.statistics().resident_units <= 8192);
+}
+
+TEST_CASE("Bridge aware mask cache keeps exact reserve and snapshot identities", "[BridgeAwareCubic][Contact]")
+{
+    const auto lower = bead({{-2., 0.}, {12., 0.}});
+    auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    Contact::QueryCache cache(prepared);
+    const auto query = [&](const ExtrusionPath &path, double tolerance) {
+        same_contact(Contact::footprint(*prepared, path, .4, tolerance, Contact::FootprintMode::ContactsOnly, nullptr, &cache),
+                     Contact::footprint(*prepared, path, .4, tolerance, Contact::FootprintMode::ContactsOnly));
+    };
+    query(upper, .0001);
+    CHECK(cache.statistics().misses == 1);
+    query(upper, .0001);
+    CHECK(cache.statistics().hits == 1);
+    auto shorter = bead({{0., 0.}, {5., 0.}});
+    query(shorter, .0001);
+    CHECK(cache.statistics().misses == 2); // Same transverse, different final reserve.
+    query(upper, .0002);
+    CHECK(cache.statistics().misses == 3);
+    upper.width = .6f;
+    query(upper, .0001);
+    CHECK(cache.statistics().misses == 4);
+
+    const auto different = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    CHECK_FALSE(Contact::footprint(*different, upper, .4, .0001, Contact::FootprintMode::ContactsOnly, nullptr, &cache).input_valid);
+    const size_t hits = cache.statistics().hits;
+    upper.mm3_per_mm = 0.;
+    CHECK_FALSE(Contact::footprint(*prepared, upper, .4, .0001, Contact::FootprintMode::ContactsOnly, nullptr, &cache).input_valid);
+    CHECK(cache.statistics().hits == hits);
+    REQUIRE_THROWS_AS(Contact::QueryCache(Contact::PreparedLowerPtr{}), std::invalid_argument);
+}
+
+TEST_CASE("Bridge aware mask cache bounds eviction including empty masks", "[BridgeAwareCubic][Contact]")
+{
+    const bool empty_masks = GENERATE(false, true);
+    const float width = empty_masks ? .2f : .45f;
+    const auto left = bead({{2., -1.}, {2., 1.}}, width, .2f);
+    const auto right = bead({{8., -1.}, {8., 1.}}, width, .2f);
+    const auto upper = bead({{0., 0.}, {10., 0.}}, width, .2f);
+    const auto prepared = Contact::prepare_lower({{&left, .2}, {&right, .2}}, .4, upper.height);
+    const size_t capacity = empty_masks ? 1 : 5;
+    Contact::QueryCache cache(prepared, capacity);
+    for (int repeat = 0; repeat < 3; ++repeat)
+        same_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, nullptr, &cache),
+                     Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly));
+    CHECK(cache.statistics().evictions > 0);
+    CHECK(cache.statistics().resident_units <= capacity);
+    CHECK(cache.statistics().resident_units > 0);
+}
+
+TEST_CASE("Bridge aware cached masks charge copied output and preserve shared failures", "[BridgeAwareCubic][Contact]")
+{
+    const auto lower = bead({{-1., 0.}, {11., 0.}});
+    const auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    Contact::QueryCache cache(prepared);
+    const auto expected = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    Validation::WorkBudget first, second, uncached;
+    same_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, &first, &cache), expected);
+    same_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, &second, &cache), expected);
+    same_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, &uncached), expected);
+    CHECK(second.remaining_work > uncached.remaining_work);
+    CHECK(second.remaining_work < 50000000);
+    const size_t hit_work = 50000000 - second.remaining_work;
+    REQUIRE(hit_work > 1);
+    Validation::WorkBudget limited{hit_work - 1};
+    const auto incomplete = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, &limited, &cache);
+    CHECK_FALSE(incomplete.completed);
+    CHECK(incomplete.resource_limited);
+    CHECK(limited.remaining_work == 0);
+    same_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, nullptr, &cache), expected);
+    // Exhaust every stage of this hit, including map comparisons. Each next
+    // successful query must use its own live budget after exception unwinding.
+    for (size_t allowance = 0; allowance < hit_work; ++allowance) {
+        Validation::WorkBudget interrupted{allowance};
+        const auto rejected = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, &interrupted, &cache);
+        CHECK_FALSE(rejected.completed);
+        CHECK(rejected.resource_limited);
+        CHECK(interrupted.remaining_work == 0);
+        same_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, nullptr, &cache), expected);
+    }
+}
+
+TEST_CASE("Bridge aware optional mask residency cannot reject an admissible query", "[BridgeAwareCubic][Contact]")
+{
+    const auto lower = bead({{-1., 0.}, {11., 0.}});
+    auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    Contact::QueryCache cache(prepared);
+    REQUIRE(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, nullptr, &cache).completed);
+    REQUIRE(cache.statistics().resident_units == 5);
+    // Eight lower input/axis/corner units, N upper input units, one segment,
+    // four mask vertices and one line interval exactly fill the 200k bound.
+    // The cached mask must transfer ownership before its output allocation.
+    upper.polyline.points.resize(199986, upper.polyline.points.back());
+    const auto expected = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    REQUIRE(expected.input_valid);
+    REQUIRE(expected.completed);
+    const size_t hits = cache.statistics().hits;
+    same_contact(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, nullptr, &cache), expected);
+    CHECK(cache.statistics().hits == hits + 1);
+    CHECK(cache.statistics().evictions == 1);
+    CHECK(cache.statistics().resident_units == 0);
+    upper.polyline.points.push_back(upper.polyline.points.back());
+    const auto rejected = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, nullptr, &cache);
+    CHECK_FALSE(rejected.completed);
+    CHECK(rejected.resource_limited);
+}
+
+TEST_CASE("Bridge aware physical sections equal Full material without path certificates", "[BridgeAwareCubic][Contact]")
+{
+    const float width = GENERATE(.45f, .2f, .201f);
+    const double upper_z = GENERATE(.4, .35, .4001);
+    const auto lower = bead({{-1., 0.}, {11., 0.}}, width, .2f);
+    const auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, upper_z, upper.height);
+    Contact::QueryCache cache(prepared);
+    auto expected = Contact::footprint(*prepared, upper, upper_z, 0.);
+    expected.segments.clear();
+    const auto physical = Contact::physical_sections(*prepared, nullptr, &cache);
+    same_contact(physical, expected);
+    CHECK_FALSE(check_contact(upper, physical).input_valid);
+    Validation::WorkBudget empty{0};
+    const auto limited = Contact::physical_sections(*prepared, &empty, &cache);
+    if (!expected.physical_footprint.empty() || !expected.physical_lines.empty()) {
+        CHECK_FALSE(limited.completed);
+        CHECK(limited.resource_limited);
+        CHECK(limited.physical_footprint.empty());
+        CHECK(limited.physical_lines.empty());
+    }
+    auto invalid_lower = lower;
+    invalid_lower.mm3_per_mm = 0.;
+    const auto invalid = Contact::prepare_lower({{&invalid_lower, .2}}, upper_z, upper.height);
+    CHECK_FALSE(Contact::physical_sections(*invalid).input_valid);
+    Contact::QueryCache invalid_cache(invalid);
+    same_contact(Contact::physical_sections(*invalid, nullptr, &invalid_cache), Contact::physical_sections(*invalid));
+    Validation::WorkBudget no_preparation{0};
+    const auto incomplete = Contact::prepare_lower({{&lower, .2}}, upper_z, upper.height, &no_preparation);
+    Contact::QueryCache incomplete_cache(incomplete);
+    const auto failed = Contact::physical_sections(*incomplete, nullptr, &incomplete_cache);
+    CHECK_FALSE(failed.completed);
+    CHECK(failed.resource_limited);
+    CHECK(failed.physical_footprint.empty());
+    CHECK(failed.physical_lines.empty());
+    same_contact(failed, Contact::physical_sections(*incomplete));
+}
+
+TEST_CASE("Bridge aware indexed candidate scratch follows its actual lifetime", "[BridgeAwareCubic][Contact]")
+{
+    const bool cached_masks = GENERATE(false, true);
+    std::vector<ExtrusionPath> lower;
+    lower.reserve(201);
+    for (int i = -100; i <= 100; ++i) {
+        auto strand = bead({{-100., -50.}, {100., 50.}});
+        strand.polyline.points = {Point(-10000000, -5000000 + 50000 * i),
+                                  Point(10000000, 5000000 + 50000 * i)};
+        lower.push_back(std::move(strand));
+    }
+    std::vector<Contact::Bead> deposited;
+    for (const auto &strand : lower) deposited.push_back({&strand, .2});
+    auto upper = bead({{-1., -.5}, {1., .5}});
+    upper.polyline.points.clear();
+    for (size_t i = 0; i <= 1000; ++i)
+        upper.polyline.points.emplace_back(i % 2 == 0 ? -100000 : 100000,
+                                          i % 2 == 0 ? -50000 : 50000);
+    // Every long lower box meets this short slope-1/2 query. The exact normal
+    // tests retain only the central strand. Repeated candidate arrays are
+    // scratch, not 201,000 simultaneous output or resident vertices.
+    const auto expected = Contact::footprint({{&lower[100], .2}}, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    REQUIRE(expected.input_valid);
+    REQUIRE(expected.completed);
+    REQUIRE(expected.segments.size() == 1000);
+    Validation::WorkBudget budget{10000000};
+    const auto prepared = Contact::prepare_lower(deposited, .4, upper.height, &budget);
+    Contact::QueryCache cache(prepared);
+    const auto actual = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly,
+                                          &budget, cached_masks ? &cache : nullptr);
+    INFO(actual.failure_reason);
+    REQUIRE(actual.input_valid);
+    REQUIRE(actual.completed);
+    CHECK_FALSE(actual.resource_limited);
+    same_contact(actual, expected);
+    CHECK(budget.remaining_work > 0);
+}
+
+TEST_CASE("Bridge aware whole-path proof certifies every segment without contact masks",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    const bool reversed = GENERATE(false, true);
+    const bool cached = GENERATE(false, true);
+    std::vector<ExtrusionPath> lower{bead({{0., 0.}, {5., 0.}}), bead({{10., 0.}, {5., 0.}}),
+        bead({{10., 0.}, {10., 1.}, {0., 1.}, {0., 0.}})};
+    auto upper = bead({{0., 0.}, {10., 0.}, {10., 0.}, {10., 1.}, {0., 1.}, {0., 0.}});
+    if (reversed) std::reverse(upper.polyline.points.begin(), upper.polyline.points.end());
+    std::vector<Contact::Bead> deposited;
+    for (const auto &path : lower) deposited.push_back({&path, .2});
+    const auto prepared = Contact::prepare_lower(deposited, .4, upper.height);
+    Contact::QueryCache cache(prepared);
+    Validation::WorkBudget budget;
+    const auto proof = Contact::footprint_for_support(*prepared, upper, .4, 0., &budget, cached ? &cache : nullptr);
+    REQUIRE(proof.contact.input_valid);
+    REQUIRE(proof.contact.completed);
+    REQUIRE(proof.entire_path_supported);
+    REQUIRE(proof.contact.segments.size() == 4);
+    for (const auto &segment : proof.contact.segments) CHECK(segment.centerline_support.empty());
+    CHECK(proof.contact.physical_footprint.empty());
+    CHECK(proof.contact.physical_lines.empty());
+    CHECK(budget.charged_work[size_t(Validation::WorkCategory::ContactMasks)] == 0);
+    CHECK(cache.statistics().misses == 0);
+    const auto checked = check_contact(upper, proof.contact);
+    REQUIRE(checked.passed());
+    CHECK(checked.unsupported_runs.empty());
+    const auto exhaustive = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    const auto reference = check_contact(upper, exhaustive);
+    REQUIRE(reference.passed());
+    CHECK(reference.unsupported_runs.empty());
+}
+
+TEST_CASE("Bridge aware whole-path proof never mistakes a passing bridge for continuous support",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    const auto left = bead({{-1., 0.}, {2., 0.}});
+    const auto right = bead({{8., 0.}, {11., 0.}});
+    const auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&left, .2}, {&right, .2}}, .4, upper.height);
+    const auto proof = Contact::footprint_for_support(*prepared, upper, .4, 0.);
+    CHECK_FALSE(proof.entire_path_supported);
+    same_contact(proof.contact, Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly));
+    const auto checked = check_contact(upper, proof.contact);
+    REQUIRE(checked.passed());
+    REQUIRE(checked.unsupported_runs.size() == 1);
+    CHECK(checked.unsupported_runs.front().kind == Validation::UnsupportedRunKind::TwoEndedBridge);
+}
+
+TEST_CASE("Bridge aware whole-path support is not a physical cell certificate",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    // A tangent circular bead supplies a finite contact line along the whole
+    // upper strand, but no positive-area wall enclosing the model's void.
+    const auto lower = bead({{0., 0.}, {10., 0.}}, .2f, .2f);
+    const auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    const auto proof = Contact::footprint_for_support(*prepared, upper, .4, 0.);
+    REQUIRE(proof.entire_path_supported);
+    const auto physical = Contact::physical_sections(*prepared);
+    REQUIRE(physical.input_valid);
+    REQUIRE(physical.completed);
+    CHECK(physical.physical_footprint.empty());
+    REQUIRE(physical.physical_lines.size() == 1);
+
+    const ExPolygons demand{contact_demand()};
+    const auto span = Validation::validate_contacts({}, physical.physical_footprint,
+        {upper.polyline}, demand, 20., .0001, {proof.contact});
+    REQUIRE(span.passed());
+    CHECK(span.unsupported_runs.empty());
+    const auto model = Validation::validate_contacts(demand, physical.physical_footprint,
+        {upper.polyline}, demand, 20., .0001, {proof.contact});
+    REQUIRE(model.input_valid);
+    REQUIRE(model.completed);
+    CHECK(model.unsupported_runs.empty());
+    REQUIRE_FALSE(model.void_cells.empty());
+    CHECK_FALSE(model.passed());
+}
+
+TEST_CASE("Bridge aware whole-path misses preserve exhaustive contact output",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    const int condition = GENERATE(0, 1, 2, 3, 4, 5, 6, 7);
+    std::vector<ExtrusionPath> lower{bead({{0., 0.}, {10., 0.}})};
+    auto upper = bead({{0., 0.}, {10., 0.}});
+    double tolerance = 0., upper_z = .4;
+    if (condition == 0) tolerance = .0001;
+    if (condition == 1) upper.polyline.translate(Point::new_scale(0., .01));
+    if (condition == 2) lower.front().polyline.points.front().x() += 1;
+    if (condition == 3) upper.polyline.points.push_back(Point::new_scale(10., 1.));
+    if (condition == 4) lower = {bead({{0., 0.}, {5., 0.}}), bead({{5.00001, 0.}, {10., 0.}})};
+    if (condition == 5) lower.front().width = .1f; // Valid, unmodeled lower gap fill.
+    if (condition == 6) lower.front().polyline.points.back() = lower.front().polyline.points.front();
+    if (condition == 7) upper_z = .4001;
+    std::vector<Contact::Bead> deposited;
+    for (const auto &path : lower) deposited.push_back({&path, .2});
+    const auto prepared = Contact::prepare_lower(deposited, upper_z, upper.height);
+    Contact::QueryCache cache(prepared);
+    Contact::QueryCache reference_cache(prepared);
+    Validation::WorkBudget budget, reference_budget;
+    const auto proof = Contact::footprint_for_support(*prepared, upper, upper_z, tolerance, &budget, &cache);
+    REQUIRE_FALSE(proof.entire_path_supported);
+    const auto reference = Contact::footprint(*prepared, upper, upper_z, tolerance,
+        Contact::FootprintMode::ContactsOnly, &reference_budget, &reference_cache);
+    same_contact(proof.contact, reference);
+    // A failed probe never constructs masks, including when an earlier upper
+    // segment matched and a later segment did not. Only fallback does so.
+    CHECK(budget.charged_work[size_t(Validation::WorkCategory::ContactMasks)] ==
+          reference_budget.charged_work[size_t(Validation::WorkCategory::ContactMasks)]);
+}
+
+TEST_CASE("Bridge aware whole-path proof follows actual serialized axes and circular line contact",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    const float width = GENERATE(.45f, .2f);
+    const double phase = GENERATE(.00049, .00051);
+    auto lower = bead({{0., 0.}, {5., .5}, {10., 0.}}, width);
+    BridgeAwareCubic::SerializedXY serialization;
+    serialization.shift = Vec2d(80. + phase, 80. - phase);
+    serialization.plate_origin = Vec2d(80., 80.);
+    lower.polyline = serialization.emitted_polyline(lower.polyline);
+    auto upper = lower;
+    std::reverse(upper.polyline.points.begin(), upper.polyline.points.end());
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    const auto proof = Contact::footprint_for_support(*prepared, upper, .4, 0.);
+    REQUIRE(proof.entire_path_supported);
+    const auto result = check_contact(upper, proof.contact);
+    REQUIRE(result.passed());
+    CHECK(result.unsupported_runs.empty());
+    const auto exhaustive = Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly);
+    CHECK(check_contact(upper, exhaustive).unsupported_runs.empty());
+}
+
+TEST_CASE("Bridge aware whole-path proof uses the fully prepared common plane",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    const auto aligned = bead({{0., 0.}, {10., 0.}});
+    const auto higher = bead({{20., 1.}, {30., 1.}}, .45f, .05f);
+    const auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&aligned, .2}, {&higher, .3}}, .4, upper.height);
+    const auto proof = Contact::footprint_for_support(*prepared, upper, .4, 0.);
+    REQUIRE(proof.contact.input_valid);
+    REQUIRE(proof.contact.completed);
+    CHECK_FALSE(proof.entire_path_supported);
+    CHECK(proof.contact.contact_z == Approx(.275));
+    CHECK_FALSE(check_contact(upper, proof.contact).passed());
+    same_contact(proof.contact, Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly));
+}
+
+TEST_CASE("Bridge aware whole-path proof retains query and preparation guards",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    const int invalid = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8);
+    const auto lower = bead({{0., 0.}, {10., 0.}});
+    auto excluded = bead({{100., 100.}, {110., 100.}});
+    if (invalid == 4) excluded.mm3_per_mm = std::numeric_limits<double>::quiet_NaN();
+    auto upper = bead({{0., 0.}, {10., 0.}});
+    const auto prepared = Contact::prepare_lower({{&lower, .2}, {&excluded, .8}}, .4, upper.height);
+    Contact::QueryCache cache(prepared);
+    const auto other = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    Contact::QueryCache wrong_cache(other);
+    double upper_z = .4, tolerance = 0.;
+    if (invalid == 0) upper.mm3_per_mm = 0.;
+    if (invalid == 1) upper.height = 0.;
+    if (invalid == 2) upper.width = .1f;
+    if (invalid == 3) {
+        PathFittingData arc{};
+        arc.start_point_index = 0;
+        arc.end_point_index = 1;
+        arc.path_type = EMovePathType::Arc_move_ccw;
+        upper.polyline.fitting_result.push_back(arc);
+    }
+    if (invalid == 5) upper_z = std::nextafter(.4, 1.);
+    if (invalid == 6) upper.height = std::nextafter(upper.height, 1.f);
+    if (invalid == 7) tolerance = std::numeric_limits<double>::quiet_NaN();
+    Contact::QueryCache *query_cache = invalid == 8 ? &wrong_cache : &cache;
+    const auto proof = Contact::footprint_for_support(*prepared, upper, upper_z, tolerance, nullptr, query_cache);
+    CHECK_FALSE(proof.entire_path_supported);
+    CHECK_FALSE(proof.contact.input_valid);
+    same_contact(proof.contact, Contact::footprint(*prepared, upper, upper_z, tolerance,
+        Contact::FootprintMode::ContactsOnly, nullptr, query_cache));
+}
+
+TEST_CASE("Bridge aware whole-path proof preserves finite budgets before publication",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    const auto lower = bead({{0., 0.}, {10., 0.}, {10., 1.}});
+    const auto upper = lower;
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    Contact::QueryCache cache(prepared);
+    Validation::WorkBudget measured;
+    REQUIRE(Contact::footprint_for_support(*prepared, upper, .4, 0., &measured, &cache).entire_path_supported);
+    const size_t work = 50000000 - measured.remaining_work;
+    REQUIRE(work > 0);
+    for (size_t allowance = 0; allowance < work; ++allowance) {
+        Validation::WorkBudget limited{allowance};
+        const auto failed = Contact::footprint_for_support(*prepared, upper, .4, 0., &limited, &cache);
+        CHECK_FALSE(failed.entire_path_supported);
+        CHECK_FALSE(failed.contact.completed);
+        CHECK(failed.contact.resource_limited);
+        CHECK(limited.remaining_work == 0);
+    }
+    Validation::WorkBudget no_preparation{0};
+    const auto incomplete = Contact::prepare_lower({{&lower, .2}}, .4, upper.height, &no_preparation);
+    const auto failed = Contact::footprint_for_support(*incomplete, upper, .4, 0.);
+    CHECK_FALSE(failed.entire_path_supported);
+    CHECK_FALSE(failed.contact.completed);
+    CHECK(failed.contact.resource_limited);
+    CHECK(failed.contact.segments.empty());
+    REQUIRE(Contact::footprint_for_support(*prepared, upper, .4, 0., nullptr, &cache).entire_path_supported);
+}
+
+TEST_CASE("Bridge aware whole-path proof retains combined resident and output admission",
+          "[BridgeAwareCubic][Contact][WholePathSupport]")
+{
+    const auto lower = bead({{0., 0.}, {10., 0.}});
+    auto upper = lower;
+    const auto prepared = Contact::prepare_lower({{&lower, .2}}, .4, upper.height);
+    Contact::QueryCache cache(prepared);
+    REQUIRE(Contact::footprint(*prepared, upper, .4, 0., Contact::FootprintMode::ContactsOnly, nullptr, &cache).completed);
+    // Eight prepared units plus upper input and two proof-output units fill
+    // the existing allowance. Optional cached masks must yield their storage.
+    upper.polyline.points.resize(199990, upper.polyline.points.back());
+    const auto admitted = Contact::footprint_for_support(*prepared, upper, .4, 0., nullptr, &cache);
+    REQUIRE(admitted.entire_path_supported);
+    CHECK(cache.statistics().resident_units == 0);
+    upper.polyline.points.push_back(upper.polyline.points.back());
+    const auto rejected = Contact::footprint_for_support(*prepared, upper, .4, 0., nullptr, &cache);
+    CHECK_FALSE(rejected.entire_path_supported);
+    CHECK_FALSE(rejected.contact.completed);
+    CHECK(rejected.contact.resource_limited);
 }

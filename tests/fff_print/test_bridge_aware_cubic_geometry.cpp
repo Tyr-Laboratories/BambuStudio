@@ -15,6 +15,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 
 using namespace Slic3r;
 namespace BAC = Slic3r::BridgeAwareCubic;
@@ -63,6 +64,55 @@ void check_demanded_cells(const BAC::Plan &plan, const BAC::Demand &demand)
         }
     }
     REQUIRE(touched > 0);
+}
+
+void check_cold_rebuild(const BAC::Plan &plan, const std::vector<double> &elevations)
+{
+    // This deliberately uses the full constructor, with the same accepted
+    // forced leaves, rather than another incremental collapse.
+    const BAC::Plan cold = plan.with_demands(plan.demands());
+    REQUIRE(plan.immutable_identity() != cold.immutable_identity());
+    CHECK(plan.statistics().root_cells == cold.statistics().root_cells);
+    CHECK(plan.statistics().nodes == cold.statistics().nodes);
+    CHECK(plan.statistics().leaves == cold.statistics().leaves);
+    CHECK(plan.statistics().splits == cold.statistics().splits);
+    CHECK(plan.statistics().solid_cells == cold.statistics().solid_cells);
+    CHECK(plan.statistics().max_depth == cold.statistics().max_depth);
+    CHECK(plan.active_demands() == cold.active_demands());
+    REQUIRE(plan.refinements().size() == cold.refinements().size());
+    for (size_t i = 0; i < plan.refinements().size(); ++i) {
+        const auto &a = plan.refinements()[i], &b = cold.refinements()[i];
+        CHECK(a.id == b.id);
+        CHECK(a.solid == b.solid);
+        CHECK(a.bottom_z == b.bottom_z);
+        CHECK(a.top_z == b.top_z);
+        CHECK(a.demand_indices == b.demand_indices);
+    }
+    const ExPolygon domain = rectangle(-40., -40., 40., 40.);
+    for (double z : elevations) {
+        CAPTURE(z);
+        CHECK(plan.lines(z, domain) == cold.lines(z, domain));
+        CHECK(plan.refinement_lines(z, domain) == cold.refinement_lines(z, domain));
+        CHECK(plan.partition_lines(z, domain) == cold.partition_lines(z, domain));
+        CHECK(plan.refinement_area(z) == cold.refinement_area(z));
+        CHECK(plan.solid_area(z) == cold.solid_area(z));
+        CHECK(plan.closure_lines(z) == cold.closure_lines(z));
+        const auto actual = plan.leaf_sections(z), expected = cold.leaf_sections(z);
+        REQUIRE(actual.size() == expected.size());
+        CHECK(std::equal(actual.begin(), actual.end(), expected.begin(), [](const auto &a, const auto &b) {
+            return a.node_id == b.node_id && a.cell_id == b.cell_id && a.depth == b.depth && a.edge == b.edge &&
+                a.polygon.points == b.polygon.points && a.solid == b.solid;
+        }));
+        const auto attachments = plan.attachments(z), rebuilt = cold.attachments(z);
+        REQUIRE(attachments.size() == rebuilt.size());
+        for (size_t i = 0; i < attachments.size(); ++i) {
+            CHECK(attachments[i].emitting_region == rebuilt[i].emitting_region);
+            CHECK(attachments[i].original == rebuilt[i].original);
+            CHECK(attachments[i].replacement == rebuilt[i].replacement);
+            CHECK(attachments[i].owners == rebuilt[i].owners);
+            CHECK(attachments[i].demand_selection == rebuilt[i].demand_selection);
+        }
+    }
 }
 
 } // namespace
@@ -785,6 +835,110 @@ TEST_CASE("Bridge aware cubic coarsening uses deposited widths rather than ideal
     REQUIRE(initial.statistics().splits == 1);
 }
 
+TEST_CASE("Bridge aware cubic incremental collapses exactly match cold dependency rebuilds", "[bridge_aware_cubic][geometry]")
+{
+    const BAC::CellId a {{ 0, 0, 0 }, 0}, b {{ 1, 0, 0 }, 0}, c {{ -1, 0, 2 }, 0};
+    const BAC::Demand direct_a { { rectangle(-.1, -.1, .1, .1) }, 19., 20. };
+    const BAC::Demand direct_b { { rectangle(-.1, 17.9, .1, 18.1) }, 31.727922061, 20. };
+    const BAC::Demand dependent_c { { rectangle(29.9, -30.1, 30.1, -29.9) }, 20., 3.5, true, { a, b } };
+    const BAC::Demand dependent_a { direct_a.footprint, 18., 3.5, true, { c } };
+    const BAC::LayerClosure closure { 20., { Polyline(Point::new_scale(-3., 0.), Point::new_scale(3., 0.)) },
+                                      { rectangle(-3., -.3, 3., .3) }, { c } };
+    // The dependent reason comes first, at a different Z. Losing it must
+    // restore the later direct reason while retaining its exact parent node.
+    const BAC::Plan initial(parameters(), { dependent_a, direct_a, direct_b, dependent_c }, { closure });
+    REQUIRE(initial.active_demands().size() == 4);
+    for (const auto &owner : initial.refinements()) {
+        CAPTURE(owner.id.depth, owner.id.address);
+        const BAC::Plan trial = initial.collapsed(owner.id);
+        check_cold_rebuild(trial, { 18., 20., direct_b.z });
+    }
+    BAC::Plan sequence = initial.clone();
+    const auto descendant = std::find_if(sequence.refinements().rbegin(), sequence.refinements().rend(),
+        [](const auto &owner) { return owner.id.depth > 0; });
+    REQUIRE(descendant != sequence.refinements().rend());
+    sequence = sequence.collapsed(descendant->id);
+    check_cold_rebuild(sequence, { 18., 20. });
+    sequence = sequence.collapsed(a);
+    check_cold_rebuild(sequence, { 18., 20. });
+    sequence = sequence.collapsed(b);
+    check_cold_rebuild(sequence, { 18., 20. });
+    CHECK(sequence.active_demands().size() == 2);
+    CHECK(sequence.refinements().empty());
+    CHECK(initial.active_demands().size() == 4);
+}
+
+TEST_CASE("Bridge aware cubic incremental collapses preserve saturated and forced leaves", "[bridge_aware_cubic][geometry]")
+{
+    BAC::Parameters p = parameters();
+    p.bounds = BoundingBoxf3(Vec3d(-8., -8., 0.), Vec3d(8., 8., 8.));
+    p.density = .2;
+    p.angle = .37;
+    p.allow_solid_fallback = true;
+    const BAC::Plan initial(p, { { { rectangle(-1.2, -.2, 1.2, .2) }, 4.1, .3 } });
+    REQUIRE(initial.statistics().solid_cells > 0);
+    for (const auto &owner : initial.refinements()) {
+        CAPTURE(owner.id.depth, owner.id.address, owner.solid);
+        const BAC::Plan trial = initial.collapsed(owner.id);
+        check_cold_rebuild(trial, { 2.3, 4.1, 6.7 });
+    }
+    BAC::Plan sequence = initial.clone();
+    while (!sequence.refinements().empty()) {
+        const BAC::CellId id = sequence.refinements().back().id;
+        sequence = sequence.collapsed(id);
+        check_cold_rebuild(sequence, { 4.1 });
+    }
+    CHECK(initial.statistics().solid_cells > 0);
+}
+
+TEST_CASE("Bridge aware cubic cached collapse retains delayed and empty dependency activation", "[bridge_aware_cubic][geometry]")
+{
+    const BAC::CellId a {{ 0, 0, 0 }, 0}, b {{ 1, 0, 0 }, 0}, c {{ -1, 0, 2 }, 0};
+    const BAC::Demand direct_a { { rectangle(-.1, -.1, .1, .1) }, 19., 20. };
+    const BAC::Demand direct_b { { rectangle(-.1, 17.9, .1, 18.1) }, 31.727922061, 20. };
+    const BAC::Demand via_b { { rectangle(29.9, -30.1, 30.1, -29.9) }, 20., 3.5, true, { b } };
+    const BAC::Demand via_either { direct_b.footprint, direct_b.z, 3.5, true, { a, c } };
+    std::vector<BAC::Demand> demands { via_either, direct_a, direct_b, via_b };
+    const BAC::Plan preview(parameters(), demands);
+    const auto dependent_child = std::find_if(preview.refinements().begin(), preview.refinements().end(),
+        [](const auto &owner) {
+            return owner.id.depth > 0 && std::find(owner.demand_indices.begin(), owner.demand_indices.end(), 0) !=
+                owner.demand_indices.end();
+        });
+    REQUIRE(dependent_child != preview.refinements().end());
+    demands.push_back({ {}, 20., 3.5, true, { dependent_child->id } });
+    const BAC::Plan initial(parameters(), demands);
+    REQUIRE(initial.active_demands().size() == 4); // The fifth demand has no footprint.
+    // Removing a delays via_either until b has first activated c. The empty
+    // dependency still activates afterward and causes a complete extra round.
+    const BAC::Plan delayed = initial.collapsed(a);
+    check_cold_rebuild(delayed, { 19., 20., direct_b.z });
+    CHECK(delayed.active_demands().size() == 4);
+    const BAC::Plan unrooted = delayed.collapsed(b);
+    check_cold_rebuild(unrooted, { 19., 20., direct_b.z });
+    CHECK(unrooted.active_demands().size() == 2);
+}
+
+TEST_CASE("Bridge aware cubic incremental collapse cancellation leaves its source intact", "[bridge_aware_cubic][geometry]")
+{
+    bool cancel_trial = false;
+    unsigned checks = 0;
+    BAC::Parameters p = parameters();
+    p.throw_if_canceled = [&] {
+        if (cancel_trial && ++checks == 4) throw std::runtime_error("incremental canceled");
+    };
+    const BAC::Plan initial(p, { { { rectangle(-25., 4.8, 25., 5.2) }, 21., 3.5 } });
+    const auto identity = initial.immutable_identity();
+    const auto stats = initial.statistics();
+    REQUIRE_FALSE(initial.refinements().empty());
+    cancel_trial = true;
+    REQUIRE_THROWS_WITH(initial.collapsed(initial.refinements().back().id), "incremental canceled");
+    cancel_trial = false;
+    CHECK(initial.immutable_identity() == identity);
+    CHECK(initial.statistics().nodes == stats.nodes);
+    check_cold_rebuild(initial, { 21. });
+}
+
 TEST_CASE("Bridge aware cubic rejected coarsening and work limits cannot certify a trial", "[bridge_aware_cubic][geometry]")
 {
     const BAC::Plan initial(parameters(), { { { rectangle(-25., 4.8, 25., 5.2) }, 21., 3.5 } });
@@ -916,6 +1070,89 @@ TEST_CASE("Bridge aware cubic trial copies preserve collapsed cells during globa
     REQUIRE(original.refinements().size() == 1);
     REQUIRE(original.refinements().front().id == a);
     REQUIRE(filtered.closures(10.).size() == 1);
+}
+
+TEST_CASE("Bridge aware cubic immutable identities distinguish rebuilds from exact clones", "[bridge_aware_cubic][geometry]")
+{
+    static_assert(!std::is_copy_constructible<BAC::Plan>::value, "Plans remain explicitly cloned");
+    static_assert(!std::is_copy_assignable<BAC::Plan>::value, "Plans remain move-only");
+    static_assert(std::is_nothrow_move_constructible<BAC::Plan>::value, "Plan moves remain noexcept");
+    const BAC::Demand demand { { rectangle(-.1, -.1, .1, .1) }, 19., 20. };
+    const ExPolygon domain = rectangle(-30., -30., 30., 30.);
+    const BAC::Plan original(parameters(), { demand });
+    const auto identity = original.immutable_identity();
+    REQUIRE(identity);
+    REQUIRE_FALSE(original.refinements().empty());
+    const Polylines before = original.lines(demand.z, domain);
+    REQUIRE_FALSE(before.empty());
+    const auto same_output = [&](const BAC::Plan &plan) {
+        const Polylines actual = plan.lines(demand.z, domain);
+        REQUIRE(actual.size() == before.size());
+        for (size_t i = 0; i < before.size(); ++i) CHECK(actual[i].points == before[i].points);
+    };
+
+    const BAC::Plan copy = original.clone();
+    CHECK(copy.immutable_identity() == identity);
+    same_output(copy);
+    const BAC::Plan rebuilt = original.with_demands(original.demands());
+    const BAC::Plan repackaged = original.with_payloads({}, {});
+    CHECK(rebuilt.immutable_identity() != identity);
+    CHECK(repackaged.immutable_identity() != identity);
+    CHECK(repackaged.immutable_identity() != rebuilt.immutable_identity());
+    same_output(rebuilt);
+    same_output(repackaged);
+
+    const BAC::Plan collapsed = copy.collapsed(copy.refinements().front().id);
+    CHECK(collapsed.immutable_identity() != identity);
+    CHECK(collapsed.refinements().empty());
+    REQUIRE_FALSE(original.refinements().empty());
+    CHECK(original.immutable_identity() == identity);
+    same_output(original);
+    same_output(copy);
+
+    // Refusing every removal keeps the original immutable state, while the
+    // callback still receives a separate identity for each proposed change.
+    size_t trials = 0;
+    const BAC::Plan unchanged = original.coarsened([&](const BAC::Plan &trial) {
+        ++trials;
+        return trial.immutable_identity() == identity;
+    });
+    CHECK(trials > 1);
+    CHECK(unchanged.immutable_identity() == identity);
+    same_output(unchanged);
+}
+
+TEST_CASE("Bridge aware cubic identity tokens retain their exact implementation lifetime", "[bridge_aware_cubic][geometry]")
+{
+    std::shared_ptr<const void> retained;
+    std::weak_ptr<const void> lifetime;
+    {
+        const BAC::Plan original(parameters(), {});
+        retained = original.immutable_identity();
+        lifetime = retained;
+        REQUIRE_FALSE(lifetime.expired());
+    }
+    REQUIRE_FALSE(lifetime.expired());
+    // A newly constructed, geometrically identical plan cannot impersonate a
+    // destroyed wrapper while a proof still retains its implementation token.
+    const BAC::Plan replacement(parameters(), {});
+    CHECK(replacement.immutable_identity() != retained);
+    retained.reset();
+    CHECK(lifetime.expired());
+}
+
+TEST_CASE("Bridge aware cubic shared clones preserve cancellation", "[bridge_aware_cubic][geometry]")
+{
+    bool canceled = false;
+    BAC::Parameters p = parameters();
+    p.throw_if_canceled = [&] { if (canceled) throw std::runtime_error("identity canceled"); };
+    const BAC::Plan original(p, {});
+    const BAC::Plan copy = original.clone();
+    CHECK(copy.immutable_identity() == original.immutable_identity());
+    canceled = true;
+    REQUIRE_THROWS_WITH(original.clone(), "identity canceled");
+    REQUIRE_THROWS_WITH(copy.clone(), "identity canceled");
+    REQUIRE_THROWS_WITH(copy.lines(19., rectangle(-10., -10., 10., 10.)), "identity canceled");
 }
 
 TEST_CASE("Bridge aware cubic validates and bounds attachment demand selection", "[bridge_aware_cubic][geometry]")

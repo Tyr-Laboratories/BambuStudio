@@ -890,6 +890,7 @@ void PrintObject::prepare_infill()
         return;
     // Bridge reconstruction below may request sparse previews before the new
     // demand solve. Never expose a previous solve's plan to those previews.
+    clear_bridge_aware_cubic_certificate();
     m_bridge_aware_cubic_plans.clear();
     m_bridge_aware_cubic_reservations.clear();
     const bool record_prepare_infill_time = m_print->m_slice_time != nullptr;
@@ -2040,6 +2041,7 @@ bool PrintObject::invalidate_all_steps()
 {
 	// First call the "invalidate" functions, which may cancel background processing.
     bool result = Inherited::invalidate_all_steps() | m_print->invalidate_all_steps();
+	clear_bridge_aware_cubic_certificate();
 	// Then reset some of the depending values.
 	m_slicing_params.valid = false;
 	return result;

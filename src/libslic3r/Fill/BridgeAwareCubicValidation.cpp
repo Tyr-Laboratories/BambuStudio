@@ -11,6 +11,7 @@
 #include <exception>
 #include <limits>
 #include <numeric>
+#include <set>
 
 namespace Slic3r { namespace BridgeAwareCubicValidation {
 
@@ -716,6 +717,146 @@ VoidCell measure_cell(ExPolygon cell, const PolygonSet &domain, Budget &budget)
     return measured;
 }
 
+// Only candidate selection is indexed. Complete cells remain in their original
+// order, and every candidate still runs the unchanged exact selection checks.
+class PreparedCellIndex {
+public:
+    PreparedCellIndex(const std::vector<VoidCell> &cells, size_t owned_vertices, Budget &budget)
+    {
+        // Bound the index together with all retained physical/cell geometry,
+        // including reserved node storage rather than only populated nodes.
+        size_t allocated = owned_vertices;
+        const auto admit = [&](size_t count) {
+            if (count > max_vertices - allocated)
+                throw WorkLimit{};
+            allocated += count;
+        };
+        admit(cells.size()); // Bounds.
+        admit(cells.size()); // Original cell IDs.
+        admit(cells.size() / 2); // Balanced tree with leaves of at most eight.
+        admit(cells.size()); // At most one live query candidate per cell.
+        m_bounds.reserve(cells.size());
+        m_order.resize(cells.size());
+        m_nodes.reserve(cells.size() / 2);
+        budget.consume(cells.size());
+        std::iota(m_order.begin(), m_order.end(), size_t(0));
+        for (const VoidCell &cell : cells) {
+            budget.consume();
+            m_bounds.push_back(polygon_bounds(cell.geometry, budget));
+        }
+        build(0, cells.size(), budget);
+    }
+
+    template<class Visitor> void visit_candidates(const ExPolygons &selection, Budget &budget, Visitor visitor) const
+    {
+        // Ordered insertion deduplicates overlapping demand boxes without a
+        // per-query scan or zero-initialization of every cached cell. Charge
+        // actual ordering comparisons, and preserve original cell order.
+        Candidates candidates(CandidateLess{&budget});
+        for (const ExPolygon &polygon : selection) {
+            budget.consume();
+            query(0, polygon_bounds(polygon, budget), candidates, budget);
+            if (candidates.size() == m_bounds.size())
+                break;
+        }
+        for (size_t index : candidates) {
+            budget.consume();
+            visitor(index);
+        }
+    }
+
+private:
+    struct Node {
+        Bounds bounds;
+        size_t begin, end, left = 0, right = 0;
+    };
+    struct CandidateLess {
+        Budget *budget;
+        bool operator()(size_t a, size_t b) const
+        {
+            budget->consume();
+            return a < b;
+        }
+    };
+    using Candidates = std::set<size_t, CandidateLess>;
+
+    static void extend(Bounds &bounds, const Bounds &other)
+    {
+        bounds.x0 = std::min(bounds.x0, other.x0);
+        bounds.y0 = std::min(bounds.y0, other.y0);
+        bounds.x1 = std::max(bounds.x1, other.x1);
+        bounds.y1 = std::max(bounds.y1, other.y1);
+    }
+
+    static Bounds polygon_bounds(const ExPolygon &polygon, Budget &budget)
+    {
+        budget.consume(polygon.contour.points.size());
+        Bounds bounds(polygon.contour.points);
+        for (const Polygon &hole : polygon.holes) {
+            budget.consume(hole.points.size() + 1);
+            extend(bounds, Bounds(hole.points));
+        }
+        return bounds;
+    }
+
+    size_t build(size_t begin, size_t end, Budget &budget)
+    {
+        budget.consume(end - begin);
+        Bounds bounds = m_bounds[m_order[begin]];
+        for (size_t i = begin + 1; i < end; ++i)
+            extend(bounds, m_bounds[m_order[i]]);
+        if (m_nodes.size() == m_nodes.capacity())
+            throw WorkLimit{};
+        budget.consume();
+        const size_t node = m_nodes.size();
+        m_nodes.push_back({bounds, begin, end});
+        if (end - begin > 8) {
+            const bool split_x = bounds.x1 - bounds.x0 >= bounds.y1 - bounds.y0;
+            const size_t middle = begin + (end - begin) / 2;
+            std::nth_element(m_order.begin() + begin, m_order.begin() + middle, m_order.begin() + end,
+                [&](size_t a, size_t b) {
+                    budget.consume();
+                    const Scalar center_a = split_x ? m_bounds[a].x0 + m_bounds[a].x1 : m_bounds[a].y0 + m_bounds[a].y1;
+                    const Scalar center_b = split_x ? m_bounds[b].x0 + m_bounds[b].x1 : m_bounds[b].y0 + m_bounds[b].y1;
+                    return center_a < center_b || (center_a == center_b && a < b);
+                });
+            const size_t left = build(begin, middle, budget);
+            const size_t right = build(middle, end, budget);
+            m_nodes[node].left = left;
+            m_nodes[node].right = right;
+        }
+        return node;
+    }
+
+    void query(size_t index, const Bounds &bounds, Candidates &candidates, Budget &budget) const
+    {
+        budget.consume();
+        const Node &node = m_nodes[index];
+        // Inclusive overlap preserves edge/vertex touches and either direction
+        // of containment; holes are filtered only by the exact predicate.
+        if (!node.bounds.overlaps(bounds) || candidates.size() == m_bounds.size())
+            return;
+        if (node.end - node.begin > 8) {
+            query(node.left, bounds, candidates, budget);
+            query(node.right, bounds, candidates, budget);
+        } else {
+            for (size_t i = node.begin; i < node.end; ++i) {
+                budget.consume();
+                if (m_bounds[m_order[i]].overlaps(bounds)) {
+                    budget.consume();
+                    // At most one entry per admitted cell, never one per
+                    // cell/demand pair. The retained cell count is bounded.
+                    candidates.insert(m_order[i]);
+                }
+            }
+        }
+    }
+
+    std::vector<Bounds> m_bounds;
+    std::vector<size_t> m_order;
+    std::vector<Node> m_nodes;
+};
+
 } // namespace
 
 std::string WorkBudget::describe_work(WorkCategory active) const
@@ -736,6 +877,7 @@ struct PreparedGeometry {
     Result status;
     ExPolygons support, domain;
     std::vector<VoidCell> cells;
+    std::unique_ptr<const PreparedCellIndex> cell_index;
 };
 
 PreparedGeometryPtr prepare_geometry(const ExPolygons &material_domain,
@@ -761,14 +903,20 @@ PreparedGeometryPtr prepare_geometry(const ExPolygons &material_domain,
         vertices = 0;
         if (!checked_polygons(prepared->support, vertices) || !checked_polygons(prepared->domain, vertices))
             throw WorkLimit{};
+        const size_t physical_vertices = vertices;
         guard_boolean(prepared->domain, prepared->support, budget);
         ExPolygons cells = diff_ex(prepared->domain, prepared->support);
         vertices = 0;
         if (!checked_polygons(cells, vertices))
             throw WorkLimit{};
+        if (vertices > max_vertices - physical_vertices)
+            throw WorkLimit{};
+        const size_t owned_vertices = physical_vertices + vertices;
         const PolygonSet domain(prepared->domain, budget);
         for (ExPolygon &cell : cells)
             prepared->cells.push_back(measure_cell(std::move(cell), domain, budget));
+        if (prepared->cells.size() > 64)
+            prepared->cell_index = std::make_unique<PreparedCellIndex>(prepared->cells, owned_vertices, budget);
     } catch (const WorkLimit &limit) {
         record_limit(prepared->status, limit);
     } catch (const std::exception &error) {
@@ -795,7 +943,8 @@ static Result validate_impl(const ExPolygons &material_domain, const ExPolygons 
                 const Polylines &required_paths, const ExPolygons &demand,
                 double max_gap_mm, double geometry_tolerance_mm,
                 const std::vector<BridgeAwareCubicContact::PathContact> *contacts,
-                WorkBudget *shared = nullptr, const PreparedGeometry *prepared = nullptr)
+                WorkBudget *shared = nullptr, const PreparedGeometry *prepared = nullptr,
+                bool report_passing_cells = true, bool preserve_cell_maximum = false)
 {
     Result result;
     if (prepared != nullptr && (!prepared->status.input_valid || !prepared->status.completed))
@@ -1014,12 +1163,31 @@ static Result validate_impl(const ExPolygons &material_domain, const ExPolygons 
             result.void_cells.push_back(std::move(measured));
         };
         if (prepared != nullptr) {
-            for (const VoidCell &cell : prepared->cells)
+            const auto visit_cell = [&](size_t index) {
+                const VoidCell &cell = prepared->cells[index];
+                // Selection cannot change the acceptance of a safe cell. If
+                // complete metrics are needed, only a diameter larger than
+                // the selected maximum can matter, and its selection remains
+                // exact. Potential failures always retain the whole-cell test.
+                if (!report_passing_cells && cell.closed && cell.diameter_mm <= permitted) {
+                    if (preserve_cell_maximum && cell.diameter_mm > result.max_void_diameter_mm &&
+                        cell_selected(cell.geometry, demand_set, budget))
+                        result.max_void_diameter_mm = std::max(result.max_void_diameter_mm, cell.diameter_mm);
+                    return;
+                }
                 if (cell_selected(cell.geometry, demand_set, budget)) {
                     budget.consume(cell.geometry.contour.points.size());
                     for (const Polygon &hole : cell.geometry.holes)
                         budget.consume(hole.points.size());
                     record_cell(cell);
+                }
+            };
+            if (prepared->cell_index != nullptr)
+                prepared->cell_index->visit_candidates(selection, budget, visit_cell);
+            else
+                for (size_t i = 0; i < prepared->cells.size(); ++i) {
+                    budget.consume();
+                    visit_cell(i);
                 }
         } else if (!domain.empty()) {
             guard_boolean(domain, support, budget);
@@ -1066,6 +1234,26 @@ Result validate_prepared_contacts(const PreparedGeometry &prepared,
 {
     return validate_impl({}, {}, required_paths, demand,
                          max_gap_mm, geometry_tolerance_mm, &contacts, budget, &prepared);
+}
+
+Result validate_prepared_contacts_for_trial(const PreparedGeometry &prepared,
+                                            const Polylines &required_paths, const ExPolygons &demand,
+                                            double max_gap_mm, double geometry_tolerance_mm,
+                                            const std::vector<BridgeAwareCubicContact::PathContact> &contacts,
+                                            WorkBudget *budget)
+{
+    return validate_impl({}, {}, required_paths, demand,
+                         max_gap_mm, geometry_tolerance_mm, &contacts, budget, &prepared, false);
+}
+
+Result validate_prepared_contact_failures(const PreparedGeometry &prepared,
+                                          const Polylines &required_paths, const ExPolygons &demand,
+                                          double max_gap_mm, double geometry_tolerance_mm,
+                                          const std::vector<BridgeAwareCubicContact::PathContact> &contacts,
+                                          WorkBudget *budget)
+{
+    return validate_impl({}, {}, required_paths, demand,
+                         max_gap_mm, geometry_tolerance_mm, &contacts, budget, &prepared, false, true);
 }
 
 }} // namespace Slic3r::BridgeAwareCubicValidation

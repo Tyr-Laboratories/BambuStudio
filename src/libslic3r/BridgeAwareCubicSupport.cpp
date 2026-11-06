@@ -10,13 +10,23 @@
 #include "Fill/BridgeAwareCubicClipMask.hpp"
 #include "Fill/BridgeAwareCubicDependencies.hpp"
 #include "Fill/BridgeAwareCubicSerialization.hpp"
+#include "Fill/BridgeAwareCubicModelProofCache.hpp"
+#include "Fill/BridgeAwareCubicCertificate.hpp"
+#include "Fill/BridgeAwareCubicOwnerBounds.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <exception>
+#include <fstream>
 #include <iomanip>
 #include <map>
 #include <limits>
 #include <numeric>
+#include <mutex>
 #include <sstream>
 #include <set>
 #include <tuple>
@@ -24,6 +34,218 @@
 namespace Slic3r {
 namespace {
 namespace Dependency = BridgeAwareCubic::Dependencies;
+
+// Opt-in, aggregate-only profiling. Set BAC_PROFILE_FILE to a unique JSONL
+// destination; BAC_PROFILE_STAGE is an optional caller label (e.g. export).
+// BAC_PROFILE_FULL_TRIAL_CHECKS=1 is the exhaustive reference: rejected trials,
+// prepared cells and final checks run fully, without optional proof caches.
+// Timings are inclusive, so nested metrics must not be summed as wall time.
+// No clocks, containers or output are used by inner probes when disabled.
+enum class ProfilePhase {
+    PlanBuild, PlanClone, PlanCollapse, PlanPayload, Prune,
+    GenerateFull, GenerateChanged, GenerateRollback,
+    CollectModel, CollectConstruction, CheckModel, CheckConstruction, CheckMixed,
+    PrepareModelTargets, CompareFinalProof, CaptureFinalProof, FinalProof, Sweep,
+    ConstructionSections, ConstructionMatch, ConstructionOwners, ConstructionAdd, Count
+};
+
+struct ProfileMetric {
+    uint64_t calls = 0, nanoseconds = 0, work = 0, items = 0;
+    uint64_t layers = 0, unique_layers = 0, unique_planes = 0;
+    uint64_t upper_segments = 0, lower_segments = 0;
+};
+
+struct ProfileState {
+    using Clock = std::chrono::steady_clock;
+    static constexpr size_t entry_limit = 65536;
+    std::array<ProfileMetric, size_t(ProfilePhase::Count)> metrics{};
+    std::set<std::pair<ProfilePhase, size_t>> layers;
+    std::set<std::tuple<ProfilePhase, size_t, size_t, double>> planes;
+    std::set<std::tuple<size_t, unsigned, std::array<int64_t, 3>>> candidates;
+    uint64_t trials = 0, accepted = 0, rejected = 0, repeated = 0, closure_trials = 0;
+    uint64_t early_trial_rejections = 0;
+    uint64_t whole_support_queries = 0, whole_support_proofs = 0, whole_support_segments = 0;
+    uint64_t model_cache_hits = 0, model_cache_fallbacks = 0, model_cache_vertices = 0, model_cache_items = 0;
+    uint64_t model_layer_proof_hits = 0, model_layer_proof_misses = 0, model_layer_proof_publications = 0;
+    uint64_t model_layer_proof_vertices = 0, model_layer_proof_items = 0;
+    uint64_t final_proof_hits = 0, final_proof_misses = 0, final_proof_publications = 0, final_proof_bytes = 0;
+    bool full_trial_checks = false;
+    bool truncated = false;
+    std::string file, stage;
+    const char *session;
+    uint64_t sequence, object_id;
+    Clock::time_point started = Clock::now();
+    int exceptions = std::uncaught_exceptions();
+
+    void layer(ProfilePhase phase, size_t index) noexcept {
+        auto &metric = metrics[size_t(phase)];
+        ++metric.layers;
+        try {
+            if (layers.size() < entry_limit) metric.unique_layers += layers.emplace(phase, index).second;
+            else truncated = true;
+        } catch (...) { truncated = true; }
+    }
+    void plane(ProfilePhase phase, size_t layer, size_t output_phase, double z) noexcept {
+        if (!std::isfinite(z)) return;
+        try {
+            if (planes.size() < entry_limit)
+                metrics[size_t(phase)].unique_planes += planes.emplace(phase, layer, output_phase, z).second;
+            else truncated = true;
+        } catch (...) { truncated = true; }
+    }
+    void trial(size_t region, const BridgeAwareCubic::CellId *cell) noexcept {
+        ++trials;
+        if (cell == nullptr) { ++closure_trials; return; }
+        try {
+            if (candidates.size() < entry_limit)
+                repeated += !candidates.emplace(region, cell->depth, cell->address).second;
+            else truncated = true;
+        } catch (...) { truncated = true; }
+    }
+    void write(const char *record, uint64_t elapsed, uint64_t sweep = 0,
+               uint64_t attempted = 0, uint64_t passed = 0, uint64_t failed = 0,
+               uint64_t retried = 0, uint64_t closure_attempted = 0) const noexcept {
+        try {
+            static std::mutex output_mutex;
+            std::lock_guard<std::mutex> lock(output_mutex);
+            std::ofstream out(file, std::ios::app);
+            if (!out) return;
+            out << "{\"record\":\"" << record << "\",\"session\":\"" << session
+                << "\",\"stage\":\"" << stage << "\",\"sequence\":" << sequence
+                << ",\"object\":" << object_id << ",\"elapsed_ns\":" << elapsed
+                << ",\"incomplete\":" << (std::uncaught_exceptions() > exceptions ? "true" : "false");
+            if (sweep != 0) {
+                out << ",\"sweep\":" << sweep << ",\"trials\":" << attempted
+                    << ",\"accepted\":" << passed << ",\"rejected\":" << failed
+                    << ",\"repeated_cell_trials\":" << retried << ",\"closure_trials\":" << closure_attempted;
+            } else {
+                out << ",\"trials\":" << trials << ",\"accepted\":" << accepted
+                    << ",\"rejected\":" << rejected << ",\"repeated_cell_trials\":" << repeated
+                    << ",\"closure_trials\":" << closure_trials
+                    << ",\"early_trial_rejections\":" << early_trial_rejections
+                    << ",\"full_trial_checks\":" << (full_trial_checks ? "true" : "false")
+                    << ",\"model_cache_hits\":" << model_cache_hits << ",\"model_cache_fallbacks\":" << model_cache_fallbacks
+                    << ",\"model_cache_vertices\":" << model_cache_vertices << ",\"model_cache_items\":" << model_cache_items
+                    << ",\"model_layer_proof_hits\":" << model_layer_proof_hits
+                    << ",\"model_layer_proof_misses\":" << model_layer_proof_misses
+                    << ",\"model_layer_proof_publications\":" << model_layer_proof_publications
+                    << ",\"model_layer_proof_vertices\":" << model_layer_proof_vertices
+                    << ",\"model_layer_proof_items\":" << model_layer_proof_items
+                    << ",\"whole_support_queries\":" << whole_support_queries
+                    << ",\"whole_support_proofs\":" << whole_support_proofs
+                    << ",\"whole_support_segments\":" << whole_support_segments
+                    << ",\"final_proof_hits\":" << final_proof_hits << ",\"final_proof_misses\":" << final_proof_misses
+                    << ",\"final_proof_publications\":" << final_proof_publications << ",\"final_proof_bytes\":" << final_proof_bytes
+                    << ",\"identity_counts_truncated\":" << (truncated ? "true" : "false") << ",\"metrics\": [";
+                static constexpr const char *names[] = {"plan_build", "plan_clone", "plan_collapse", "plan_payload", "dependency_prune",
+                    "generate_full", "generate_changed", "generate_rollback", "collect_model", "collect_construction",
+                    "check_model", "check_construction", "check_mixed", "prepare_model_targets", "compare_final_proof",
+                    "capture_final_proof", "final_proof", "coarsening_sweep", "construction_sections",
+                    "construction_match", "construction_owners", "construction_add"};
+                bool first = true;
+                for (size_t i = 0; i < metrics.size(); ++i) {
+                    const auto &metric = metrics[i];
+                    if (metric.calls == 0) continue;
+                    if (!first) out << ',';
+                    first = false;
+                    out << "{\"name\":\"" << names[i] << "\",\"calls\":" << metric.calls
+                        << ",\"elapsed_ns\":" << metric.nanoseconds << ",\"work\":" << metric.work
+                        << ",\"items\":" << metric.items << ",\"layer_visits\":" << metric.layers
+                        << ",\"unique_layers\":" << metric.unique_layers << ",\"unique_planes\":" << metric.unique_planes
+                        << ",\"upper_segment_slots\":" << metric.upper_segments << ",\"lower_segment_slots\":" << metric.lower_segments << '}';
+                }
+                out << ']';
+            }
+            out << "}\n";
+        } catch (...) { /* Diagnostics must not change slicing or exception flow. */ }
+    }
+};
+
+thread_local ProfileState *active_profile = nullptr;
+
+class ProfileSession {
+    std::unique_ptr<ProfileState> state;
+    ProfileState *previous = active_profile;
+public:
+    ProfileSession(const char *session, uint64_t object_id) noexcept {
+        const char *file = std::getenv("BAC_PROFILE_FILE");
+        if (file == nullptr || *file == '\0') return;
+        try {
+            state = std::make_unique<ProfileState>();
+            state->file = file;
+            state->session = session;
+            state->object_id = object_id;
+            if (const char *full = std::getenv("BAC_PROFILE_FULL_TRIAL_CHECKS"))
+                state->full_trial_checks = full[0] == '1' && full[1] == '\0';
+            static std::atomic<uint64_t> sequence{0};
+            state->sequence = ++sequence;
+            if (const char *stage = std::getenv("BAC_PROFILE_STAGE"))
+                for (size_t i = 0; stage[i] != '\0' && i < 64; ++i) {
+                    const char c = stage[i];
+                    state->stage += ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') ? c : '_';
+                }
+            active_profile = state.get();
+        } catch (...) { state.reset(); }
+    }
+    ~ProfileSession() {
+        if (state) {
+            state->write("total", uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                ProfileState::Clock::now() - state->started).count()));
+            active_profile = previous;
+        }
+    }
+};
+
+class ProfileScope {
+    ProfileState *state = active_profile;
+    ProfilePhase phase;
+    ProfileState::Clock::time_point started;
+    const BridgeAwareCubicValidation::WorkBudget *budget;
+    size_t initial_work = 0;
+public:
+    explicit ProfileScope(ProfilePhase phase, const BridgeAwareCubicValidation::WorkBudget *budget = nullptr)
+        : phase(phase), budget(budget) {
+        if (state) {
+            started = ProfileState::Clock::now();
+            ++state->metrics[size_t(phase)].calls;
+            if (budget) initial_work = budget->remaining_work;
+        }
+    }
+    ~ProfileScope() {
+        if (state) {
+            auto &metric = state->metrics[size_t(phase)];
+            metric.nanoseconds += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileState::Clock::now() - started).count());
+            if (budget) metric.work += initial_work - budget->remaining_work;
+        }
+    }
+    void layer(size_t index) { if (state) state->layer(phase, index); }
+    void plane(size_t layer, size_t output_phase, double z) { if (state) state->plane(phase, layer, output_phase, z); }
+    void upper(size_t segments) { if (state) state->metrics[size_t(phase)].upper_segments += segments; }
+    void lower(size_t segments) { if (state) state->metrics[size_t(phase)].lower_segments += segments; }
+    void items(size_t count) { if (state) state->metrics[size_t(phase)].items += count; }
+};
+
+class ProfileSweep {
+    ProfileState *state = active_profile;
+    ProfileScope timing{ProfilePhase::Sweep};
+    ProfileState::Clock::time_point started;
+    uint64_t number, trials = 0, accepted = 0, rejected = 0, repeated = 0, closures = 0;
+public:
+    explicit ProfileSweep(uint64_t number) : number(number) {
+        if (state) {
+            started = ProfileState::Clock::now();
+            trials = state->trials; accepted = state->accepted; rejected = state->rejected;
+            repeated = state->repeated; closures = state->closure_trials;
+        }
+    }
+    ~ProfileSweep() {
+        if (state) state->write("sweep", uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            ProfileState::Clock::now() - started).count()), number, state->trials - trials,
+            state->accepted - accepted, state->rejected - rejected, state->repeated - repeated,
+            state->closure_trials - closures);
+    }
+};
 
 // No path simplification is allowed after contact-qualified verification.
 // This allowance covers polygon operations plus paired XYZ export rounding:
@@ -263,6 +485,18 @@ const ExPolygons &path_demand(const Target &target, size_t index)
     return target.footprint;
 }
 
+std::unique_ptr<BridgeAwareCubicContact::QueryCache> make_contact_query_cache(
+    const BridgeAwareCubicContact::PreparedLowerPtr &prepared)
+{
+    try {
+        return std::make_unique<BridgeAwareCubicContact::QueryCache>(prepared);
+    } catch (const std::bad_alloc &) {
+        // This allocation is optional acceleration. Keep the exact prepared
+        // geometry and query without reuse until the next prepared-key change.
+        return {};
+    }
+}
+
 // Group equal contact planes, but retain complete emitted paths and endpoints.
 // Only the demand mask is clipped to the supplying region; it never closes a
 // cell or supplies an artificial endpoint to the validator.
@@ -271,6 +505,7 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
 {
     std::vector<Target> targets;
     BridgeAwareCubicValidation::WorkBudget contact_budget;
+    ProfileScope profile(dependencies ? ProfilePhase::CollectConstruction : ProfilePhase::CollectModel, &contact_budget);
     const auto &layers = object.layers();
     const BoundingBox bounds = object.bounding_box();
     const ExPolygon broad_domain(Polygon{Points{
@@ -278,12 +513,14 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
         Point(bounds.min.x(), bounds.max.y())}});
     for (size_t index = 1; index < layers.size(); ++index) {
         if (selected_layers != nullptr && selected_layers->count(index) == 0) continue;
+        profile.layer(index);
         if (object.print()->canceled()) throw CanceledException();
         const Layer &upper = *layers[index];
         const Layer &lower = *layers[index - 1];
         const ActiveAttachments active = active_attachments(upper);
         std::vector<BridgeAwareCubicContact::Bead> prior_beads;
         visit_layer(lower, [&](const ExtrusionPath &path) {
+            profile.lower(path.polyline.size() - 1);
             prior_beads.push_back({&path, deposition_z(lower)});
         });
         // Collection visits many upper strands above the same immutable lower
@@ -291,6 +528,7 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
         // key; replacing it first preserves the helper's combined resident and
         // query allocation allowance. Rebuilds charge this collection's budget.
         BridgeAwareCubicContact::PreparedLowerPtr prepared_lower;
+        std::unique_ptr<BridgeAwareCubicContact::QueryCache> contact_queries;
         std::optional<std::pair<double, float>> prepared_key;
         const double upper_z = deposition_z(upper);
         std::vector<ExPolygons> eligible(lower.regions().size());
@@ -387,6 +625,9 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
         auto add = [&](const ExtrusionPath &path, bool dependency, size_t emitting_region, bool free_ended,
                        const std::vector<BridgeAwareCubic::CellId> &producers,
                        const ExPolygons *selection = nullptr, bool solid_cut = false) {
+            std::optional<ProfileScope> detail_profile;
+            if (dependency && active_profile) detail_profile.emplace(ProfilePhase::ConstructionAdd);
+            profile.upper(path.polyline.size() - 1);
             // A swept bead edge alone is not an unsupported extrusion. Select
             // actual air runs first and then use the real target bead width.
             // The original path below retains all endpoints and identities.
@@ -395,13 +636,18 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                 const bool finite_key = std::isfinite(upper_z) && std::isfinite(path.height);
                 const auto key = std::make_pair(upper_z, path.height);
                 if (!prepared_lower || !finite_key || !prepared_key || *prepared_key != key) {
+                    contact_queries.reset();
                     prepared_lower.reset();
                     prepared_key.reset();
                     prepared_lower = BridgeAwareCubicContact::prepare_lower(prior_beads, upper_z, path.height, &contact_budget);
-                    if (finite_key) prepared_key = key;
+                    if (finite_key) {
+                        prepared_key = key;
+                        contact_queries = make_contact_query_cache(prepared_lower);
+                    }
                 }
                 const auto contact = BridgeAwareCubicContact::footprint(*prepared_lower, path, upper_z, geometry_tolerance,
-                    BridgeAwareCubicContact::FootprintMode::ContactsOnly, &contact_budget);
+                    BridgeAwareCubicContact::FootprintMode::ContactsOnly, &contact_budget, contact_queries.get());
+                profile.plane(index, 0, contact.contact_z);
                 if (contact.resource_limited)
                     throw SlicingError("Bridge aware cubic target collection is incomplete at layer " + std::to_string(upper.id() + 1) +
                         ": " + contact.failure_reason, object.model_object()->id().id);
@@ -487,6 +733,8 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
             for (size_t region_id = 0; region_id < upper.regions().size(); ++region_id) {
                 const auto *plan = object.bridge_aware_cubic_plan(region_id);
                 if (plan == nullptr) continue;
+                std::optional<ProfileScope> sections_profile;
+                if (active_profile) sections_profile.emplace(ProfilePhase::ConstructionSections);
                 const Polylines added = plan->refinement_lines(upper.print_z, broad_domain);
                 if (added.empty() && plan->solid_area(upper.print_z).empty() && plan->attachments(upper.print_z).empty()) continue;
                 const ExPolygons solid_area = plan->solid_area(upper.print_z);
@@ -496,8 +744,36 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                 const auto &saved_attachments = active.entries;
                 const auto solid_sections = plan->solid_sections(upper.print_z);
                 const auto owner_sections = plan->partition_lines(upper.print_z, broad_domain);
+                std::vector<BridgeAwareCubic::PartitionOwnerBounds> owner_bounds;
+                // Optional broad-phase metadata is admitted as one bounded
+                // layer-local batch. Allocation/size/work fallback retains the
+                // original exact owner scan; no owner is lost to cache limits.
+                constexpr size_t max_owner_bounds = 20000, max_owner_vertices = 200000;
+                size_t owner_vertices = 0;
+                bool bounded = owner_sections.size() <= max_owner_bounds;
+                for (const auto &owner : owner_sections) {
+                    if (!bounded) break;
+                    for (const Polyline &line : owner.second) {
+                        if (line.size() > max_owner_vertices - owner_vertices) { bounded = false; break; }
+                        owner_vertices += line.size();
+                    }
+                }
+                if (bounded && owner_vertices <= contact_budget.remaining_work) {
+                    try {
+                        owner_bounds.reserve(owner_sections.size());
+                        for (const auto &owner : owner_sections) {
+                            if (object.print()->canceled()) throw CanceledException();
+                            owner_bounds.emplace_back(owner.second);
+                        }
+                        contact_budget.remaining_work -= owner_vertices;
+                        contact_budget.charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)] += owner_vertices;
+                    } catch (const std::bad_alloc &) { owner_bounds.clear(); }
+                }
+                sections_profile.reset();
                 visit_paths(upper.get_region(int(region_id))->fills, [&](const ExtrusionPath &path) {
                     if (path.role() != erInternalInfill) return;
+                    std::optional<ProfileScope> match_profile;
+                    if (active_profile) match_profile.emplace(ProfilePhase::ConstructionMatch);
                     const Polylines matched = intersection_pl(Polylines{path.polyline}, added_clip_mask.candidates(path.polyline));
                     // Full emitted strand identity, not a clipped fragment.
                     bool attachment_match = false;
@@ -511,9 +787,23 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                             }
                         }
                     const bool ordinary_full_path = BridgeAwareCubic::complete_construction_match(path.polyline, matched, geometry_tolerance);
+                    match_profile.reset();
                     if (attachment_match || ordinary_full_path) {
+                        std::optional<ProfileScope> owners_profile;
+                        if (active_profile) owners_profile.emplace(ProfilePhase::ConstructionOwners);
                         std::vector<BridgeAwareCubic::CellId> producers;
-                        for (const auto &[owner_id, owner_lines] : owner_sections) {
+                        const bool use_bounds = owner_bounds.size() == owner_sections.size() &&
+                            path.polyline.size() <= contact_budget.remaining_work;
+                        const auto path_bounds = use_bounds ?
+                            BridgeAwareCubic::PartitionCandidateBounds(path.polyline) :
+                            BridgeAwareCubic::PartitionCandidateBounds(Polyline{});
+                        if (use_bounds) {
+                            contact_budget.remaining_work -= path.polyline.size();
+                            contact_budget.charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)] += path.polyline.size();
+                        }
+                        for (size_t owner_index = 0; owner_index < owner_sections.size(); ++owner_index) {
+                            if (use_bounds && !owner_bounds[owner_index].may_match(path_bounds)) continue;
+                            const auto &[owner_id, owner_lines] = owner_sections[owner_index];
                             const auto pieces = remove_collinear_duplicates({path.polyline}, owner_lines, true);
                             if (BridgeAwareCubic::complete_construction_match(path.polyline, pieces, 2. * SCALING_FACTOR))
                                 producers.push_back(owner_id);
@@ -526,6 +816,7 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
                                 append(producers, saved_attachments[id].owners);
                         const auto attachment_selection = BridgeAwareCubic::merged_attachment_selection(
                             ordinary_full_path, saved_attachments, attachment_lineage);
+                        owners_profile.reset();
                         add(path, true, region_id, true, producers,
                             attachment_selection ? &*attachment_selection : nullptr, attachment_selection.has_value());
                     } else if (!solid_area.empty()) {
@@ -577,6 +868,7 @@ std::vector<Target> collect_targets(const PrintObject &object, bool dependencies
         for (const auto &group : groups)
             targets[group.second].footprint = union_ex(targets[group.second].footprint);
     }
+    profile.items(targets.size());
     return targets;
 }
 
@@ -586,8 +878,13 @@ struct Failure {
     Polylines verified_paths;
 };
 
+enum class TargetCheck { CollectFailures, RejectTrial };
+struct PreparedModelView;
+
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
-                                   const PrintObject *phase_object = nullptr);
+                                   const PrintObject *phase_object = nullptr,
+                                   TargetCheck mode = TargetCheck::CollectFailures,
+                                   const PreparedModelView *prepared_model = nullptr);
 
 [[noreturn]] void fail(const PrintObject &object, const Failure &failure);
 
@@ -1239,6 +1536,49 @@ std::vector<BridgeAwareCubic::SerializedXY> serialization_phases(const PrintObje
     return phases;
 }
 
+void final_proof_preamble(const PrintObject &geometry, const PrintObject &caller,
+                         const std::vector<BridgeAwareCubic::SerializedXY> &phases)
+{
+    // Untargeted emitted paths can precede a required model path. Retain the
+    // complete representation/range scan before publishing a successful proof.
+    for (const auto &phase : phases)
+        for (const Layer *layer : geometry.layers()) {
+            if (caller.print()->canceled()) throw CanceledException();
+            visit_layer(*layer, [&](const ExtrusionPath &path) {
+                try {
+                    phase.validate_path(path.polyline);
+                } catch (const std::logic_error &error) {
+                    throw SlicingError("Bridge aware cubic cannot certify serialized extrusion geometry for object \"" +
+                        caller.model_object()->name + "\", layer " + std::to_string(layer->id() + 1) + ": " + error.what(),
+                        caller.model_object()->id().id);
+                }
+            });
+        }
+    for (size_t region_id = 0; region_id < caller.num_printing_regions(); ++region_id) {
+        if (!participates(caller.printing_region(region_id).config()) || caller.bridge_aware_cubic_plan(region_id) != nullptr)
+            continue;
+        for (const Layer *layer : geometry.layers())
+            if (!sparse_domain(*layer->get_region(int(region_id))).empty())
+                throw SlicingError("Bridge aware cubic support plan is missing for object \"" + caller.model_object()->name +
+                    "\". Reslice the object to rebuild and verify its support geometry.", caller.model_object()->id().id);
+    }
+}
+
+std::shared_ptr<const BridgeAwareCubic::DepositionStateSnapshot> capture_final_proof(
+    const PrintObject &geometry, const PrintObject &caller, const std::vector<BridgeAwareCubic::SerializedXY> &phases)
+{
+    if (active_profile && active_profile->full_trial_checks) return {};
+    ProfileScope profile(ProfilePhase::CaptureFinalProof);
+    auto snapshot = BridgeAwareCubic::DepositionStateSnapshot::capture(geometry, caller, phases, [&] {
+        if (caller.print()->canceled()) throw CanceledException();
+    });
+    if (active_profile && snapshot) {
+        ++active_profile->final_proof_publications;
+        active_profile->final_proof_bytes = snapshot->retained_bytes();
+    }
+    return snapshot;
+}
+
 void remove_stationary_construction(Layer &layer, const ActiveAttachments &active)
 {
     const PrintObject &object = *layer.object();
@@ -1350,67 +1690,296 @@ void remove_stationary_construction(Layer &layer, const ActiveAttachments &activ
     }
 }
 
+ExtrusionPath serialized_extrusion(const PrintObject &object, const ExtrusionPath &source,
+                                  const BridgeAwareCubic::SerializedXY &phase, const Point &origin)
+{
+    ExtrusionPath emitted = source;
+    try {
+        emitted.polyline = phase.emitted_polyline(source.polyline);
+    } catch (const std::logic_error &error) {
+        throw SlicingError("Bridge aware cubic cannot certify serialized extrusion geometry for object \"" +
+            object.model_object()->name + "\": " + error.what(), object.model_object()->id().id);
+    }
+    emitted.polyline.translate(-origin);
+    return emitted;
+}
+
+// This is a coarsening-local optimization of immutable model inputs, not a
+// support certificate. Each use follows exact actual/frozen target equality;
+// lower deposition, contact and complete-cell geometry are always checked anew.
+struct PreparedModelTargets {
+    struct Phase {
+        BridgeAwareCubic::SerializedXY transform;
+        std::vector<std::vector<ExPolygons>> path_demands;
+        std::vector<ExtrusionPaths> extrusions;
+        std::map<size_t, ExPolygons> layer_demands;
+    };
+    std::vector<Phase> phases;
+    size_t vertices = 0, items = 0;
+};
+
+struct PreparedModelView {
+    const PreparedModelTargets *snapshot;
+    // Each actual target maps to the equal frozen target in this snapshot.
+    const std::vector<size_t> &frozen_indices;
+    BridgeAwareCubic::ModelLayerProofCache *proofs = nullptr;
+};
+
+std::unique_ptr<BridgeAwareCubic::ModelLayerProofCache> prepare_model_proofs(
+    const PrintObject &object, const PreparedModelTargets *snapshot, const std::vector<Target> &targets)
+{
+    if (snapshot == nullptr || snapshot->phases.size() > BridgeAwareCubic::ModelLayerProofCache::max_phases) return {};
+    // Count fixed keys before copying them. The optional cache and every
+    // in-flight owned source snapshot share these aggregate admission bounds.
+    constexpr size_t max_items = 20000, max_vertices = 200000;
+    size_t items = snapshot->phases.size();
+    if (items > max_items || targets.size() > max_items - items) return {};
+    items += targets.size();
+    size_t layers = 0, previous_layer = size_t(-1);
+    for (const Target &target : targets) {
+        if (object.print()->canceled()) throw CanceledException();
+        if (target.dependency || (previous_layer != size_t(-1) && target.upper_layer < previous_layer)) return {};
+        if (target.upper_layer != previous_layer) { ++layers; previous_layer = target.upper_layer; }
+    }
+    if (layers > max_items - items) return {};
+    try {
+        std::vector<BridgeAwareCubic::ModelLayerProofCache::Coverage> coverage;
+        std::vector<BridgeAwareCubic::SerializedXY> phases;
+        coverage.reserve(layers);
+        phases.reserve(snapshot->phases.size());
+        for (const auto &phase : snapshot->phases) phases.push_back(phase.transform);
+        for (size_t index = 0; index < targets.size(); ++index) {
+            if (object.print()->canceled()) throw CanceledException();
+            if (coverage.empty() || coverage.back().layer != targets[index].upper_layer)
+                coverage.push_back({targets[index].upper_layer, {}});
+            coverage.back().targets.push_back(index);
+        }
+        return std::make_unique<BridgeAwareCubic::ModelLayerProofCache>(snapshot,
+            std::move(coverage), std::move(phases), max_vertices, max_items);
+    } catch (const std::bad_alloc &) { return {}; }
+}
+
+std::unique_ptr<const PreparedModelTargets> prepare_model_targets(const PrintObject &object,
+                                                                 const std::vector<Target> &targets)
+{
+    ProfileScope profile(ProfilePhase::PrepareModelTargets);
+    // Aggregate admission covers every retained instance phase, vector/header,
+    // path metadata object, polygon/ring and geometry vertex. A cache miss uses
+    // the original one-phase-at-a-time preparation; it never omits verification.
+    constexpr size_t max_vertices = 200000, max_items = 20000;
+    struct CacheFull {};
+    std::unique_ptr<PreparedModelTargets> result;
+    const auto charge = [](size_t &used, size_t amount, size_t maximum) {
+        if (amount > maximum - used) throw CacheFull{};
+        used += amount;
+    };
+    const auto polygons = [&](const ExPolygons &geometry) {
+        charge(result->items, geometry.size(), max_items);
+        for (const ExPolygon &polygon : geometry) {
+            charge(result->items, 1, max_items);
+            charge(result->items, polygon.holes.size(), max_items);
+            charge(result->vertices, polygon.contour.size(), max_vertices);
+            for (const Polygon &hole : polygon.holes) charge(result->vertices, hole.size(), max_vertices);
+        }
+    };
+    try {
+        result = std::make_unique<PreparedModelTargets>();
+        for (const auto &transform : serialization_phases(object, nullptr)) {
+            if (object.print()->canceled()) throw CanceledException();
+            charge(result->items, 1, max_items);
+            charge(result->items, targets.size(), max_items);
+            charge(result->items, targets.size(), max_items);
+            result->phases.emplace_back();
+            auto &phase = result->phases.back();
+            phase.transform = transform;
+            phase.path_demands.resize(targets.size());
+            phase.extrusions.resize(targets.size());
+            const Point origin = transform(Point(0, 0));
+            for (size_t index = 0; index < targets.size(); ++index) {
+                if (object.print()->canceled()) throw CanceledException();
+                const Target &target = targets[index];
+                if (target.dependency) throw std::logic_error("Construction targets cannot use frozen model preparation.");
+                try {
+                    ExPolygons demand = BridgeAwareCubic::serialized_demand(target.footprint, target.paths, transform);
+                    if (!target.bridge_followup) {
+                        polygons(demand);
+                        if (phase.layer_demands.count(target.upper_layer) == 0) charge(result->items, 1, max_items);
+                        append(phase.layer_demands[target.upper_layer], std::move(demand));
+                    }
+                    charge(result->items, target.paths.size(), max_items);
+                    phase.path_demands[index].reserve(target.paths.size());
+                    for (size_t path = 0; path < target.paths.size(); ++path) {
+                        ExPolygons selection = BridgeAwareCubic::serialized_demand(path_demand(target, path), {target.paths[path]}, transform);
+                        polygons(selection);
+                        phase.path_demands[index].push_back(std::move(selection));
+                    }
+                } catch (const std::logic_error &error) {
+                    throw SlicingError("Bridge aware cubic cannot preserve output demand for object \"" +
+                        object.model_object()->name + "\": " + error.what(), object.model_object()->id().id);
+                }
+                charge(result->items, target.extrusions.size(), max_items);
+                phase.extrusions[index].reserve(target.extrusions.size());
+                for (const ExtrusionPath &source : target.extrusions) {
+                    charge(result->vertices, source.polyline.size(), max_vertices);
+                    phase.extrusions[index].push_back(serialized_extrusion(object, source, transform, origin));
+                }
+            }
+        }
+    } catch (const CacheFull &) {
+        if (active_profile) ++active_profile->model_cache_fallbacks;
+        return {};
+    } catch (const std::bad_alloc &) {
+        if (active_profile) ++active_profile->model_cache_fallbacks;
+        return {};
+    }
+    if (active_profile) {
+        active_profile->model_cache_vertices = result->vertices;
+        active_profile->model_cache_items = result->items;
+    }
+    return result;
+}
+
 std::vector<Failure> check_targets(const PrintObject &object, const std::vector<Target> &targets,
-                                   const PrintObject *phase_object)
+                                   const PrintObject *phase_object, TargetCheck mode,
+                                   const PreparedModelView *prepared_model)
 {
     std::vector<Failure> failures;
     BridgeAwareCubicValidation::WorkBudget budget;
+    ProfilePhase kind = !targets.empty() && targets.front().dependency ? ProfilePhase::CheckConstruction : ProfilePhase::CheckModel;
+    if (active_profile && std::any_of(targets.begin(), targets.end(), [&](const auto &target) {
+        return target.dependency != (kind == ProfilePhase::CheckConstruction);
+    })) kind = ProfilePhase::CheckMixed;
+    ProfileScope profile(kind, &budget);
+    profile.items(targets.size());
+    const auto phases = serialization_phases(object, phase_object);
+    bool use_model_cache = prepared_model != nullptr && prepared_model->snapshot != nullptr && mode == TargetCheck::RejectTrial &&
+        prepared_model->frozen_indices.size() == targets.size() && prepared_model->snapshot->phases.size() == phases.size() &&
+        std::none_of(targets.begin(), targets.end(), [](const Target &target) { return target.dependency; });
+    if (use_model_cache) {
+        const auto equal_offset = [](const Vec2d &a, const Vec2d &b) { return a.x() == b.x() && a.y() == b.y(); };
+        for (size_t i = 0; i < phases.size(); ++i) {
+            const auto &saved = prepared_model->snapshot->phases[i].transform;
+            if (!equal_offset(saved.shift, phases[i].shift) || !equal_offset(saved.nozzle_offset, phases[i].nozzle_offset) ||
+                !equal_offset(saved.plate_origin, phases[i].plate_origin)) { use_model_cache = false; break; }
+        }
+    }
+    if (active_profile && prepared_model) {
+        if (use_model_cache) ++active_profile->model_cache_hits;
+        else ++active_profile->model_cache_fallbacks;
+    }
+    size_t output_phase = 0;
     // Quantize whole original paths in the exact writer operation order. An
     // integer translation back near the object origin keeps all shared joints
     // exact while allowing failed cells to select their original local demand.
     // Source-coordinate tolerance is only used by repair discovery; emitted
     // geometry itself is checked without a hypothetical XY displacement.
-    for (const auto &phase : serialization_phases(object, phase_object)) {
+    for (const auto &phase : phases) {
+        ++output_phase;
         const Point origin = phase(Point(0, 0));
+        const auto *cached_phase = use_model_cache ? &prepared_model->snapshot->phases[output_phase - 1] : nullptr;
         const auto emitted_path = [&](const ExtrusionPath &source) {
-            ExtrusionPath emitted = source;
-            try {
-                emitted.polyline = phase.emitted_polyline(source.polyline);
-            } catch (const std::logic_error &error) {
-                throw SlicingError("Bridge aware cubic cannot certify serialized extrusion geometry for object \"" +
-                    object.model_object()->name + "\": " + error.what(), object.model_object()->id().id);
-            }
-            emitted.polyline.translate(-origin);
-            return emitted;
+            return serialized_extrusion(object, source, phase, origin);
         };
         std::vector<ExPolygons> preserved_demands;
         std::vector<std::vector<ExPolygons>> preserved_path_demands;
         std::map<size_t, ExPolygons> layer_demands;
-        preserved_demands.reserve(targets.size());
-        preserved_path_demands.reserve(targets.size());
-        for (const Target &target : targets) {
-            try {
-                preserved_demands.push_back(BridgeAwareCubic::serialized_demand(target.footprint, target.paths, phase));
-                std::vector<ExPolygons> paths;
-                paths.reserve(target.paths.size());
-                for (size_t index = 0; index < target.paths.size(); ++index)
-                    paths.push_back(BridgeAwareCubic::serialized_demand(path_demand(target, index), {target.paths[index]}, phase));
-                preserved_path_demands.push_back(std::move(paths));
-            } catch (const std::logic_error &error) {
-                throw SlicingError("Bridge aware cubic cannot preserve output demand for object \"" +
-                    object.model_object()->name + "\": " + error.what(), object.model_object()->id().id);
+        if (cached_phase == nullptr) {
+            preserved_demands.reserve(targets.size());
+            preserved_path_demands.reserve(targets.size());
+            for (const Target &target : targets) {
+                try {
+                    preserved_demands.push_back(BridgeAwareCubic::serialized_demand(target.footprint, target.paths, phase));
+                    std::vector<ExPolygons> paths;
+                    paths.reserve(target.paths.size());
+                    for (size_t index = 0; index < target.paths.size(); ++index)
+                        paths.push_back(BridgeAwareCubic::serialized_demand(path_demand(target, index), {target.paths[index]}, phase));
+                    preserved_path_demands.push_back(std::move(paths));
+                } catch (const std::logic_error &error) {
+                    throw SlicingError("Bridge aware cubic cannot preserve output demand for object \"" +
+                        object.model_object()->name + "\": " + error.what(), object.model_object()->id().id);
+                }
+                if (!target.dependency && !target.bridge_followup)
+                    append(layer_demands[target.upper_layer], preserved_demands.back());
             }
-            if (!target.dependency && !target.bridge_followup)
-                append(layer_demands[target.upper_layer], preserved_demands.back());
         }
+        const auto &physical_demands = cached_phase ? cached_phase->layer_demands : layer_demands;
         size_t cached_lower = size_t(-1);
         ExtrusionPaths prior_paths;
         std::vector<BridgeAwareCubicContact::Bead> prior_beads;
         std::map<double, BridgeAwareCubicValidation::PreparedGeometryPtr> prepared;
         std::map<std::pair<double, float>, BridgeAwareCubicContact::PreparedLowerPtr> prepared_lower;
+        std::unique_ptr<BridgeAwareCubicContact::QueryCache> contact_queries;
+        // The source pointers and budget outlive the transaction. Publication
+        // is possible only after every ordered frozen group on this layer has
+        // passed; a partial view or rejected path cannot produce a cache hit.
+        BridgeAwareCubic::ModelLayerProofCache::Sources proof_sources;
+        std::vector<size_t> proof_targets;
+        BridgeAwareCubic::ModelLayerProofCache::Proof layer_proof;
+        size_t proof_layer_end = 0;
+        const auto cancel = [&] { if (object.print()->canceled()) throw CanceledException(); };
         for (size_t target_index = 0; target_index < targets.size(); ++target_index) {
             const Target &target = targets[target_index];
+            const size_t frozen_index = cached_phase ? prepared_model->frozen_indices.at(target_index) : 0;
             if (object.print()->canceled()) throw CanceledException();
             const Layer &lower = *object.layers()[target.upper_layer - 1];
+            if (cached_phase && prepared_model->proofs && target_index >= proof_layer_end) {
+                layer_proof = {};
+                proof_sources.clear();
+                proof_targets.clear();
+                proof_layer_end = target_index + 1;
+                while (proof_layer_end < targets.size() && targets[proof_layer_end].upper_layer == target.upper_layer)
+                    ++proof_layer_end;
+                constexpr size_t max_source_items = 20000;
+                try {
+                    bool admitted = proof_layer_end - target_index <= max_source_items;
+                    if (admitted) {
+                        proof_targets.reserve(proof_layer_end - target_index);
+                        for (size_t index = target_index; index < proof_layer_end; ++index)
+                            proof_targets.push_back(prepared_model->frozen_indices.at(index));
+                        visit_layer(lower, [&](const ExtrusionPath &path) {
+                            cancel();
+                            if (!admitted) return;
+                            if (proof_sources.size() == max_source_items || budget.remaining_work == 0) {
+                                admitted = false;
+                                return;
+                            }
+                            --budget.remaining_work;
+                            ++budget.charged_work[size_t(BridgeAwareCubicValidation::WorkCategory::Validation)];
+                            if (proof_sources.size() == proof_sources.capacity())
+                                proof_sources.reserve(std::min(max_source_items,
+                                    std::max(size_t(64), 2 * proof_sources.capacity())));
+                            proof_sources.push_back(&path);
+                        });
+                    }
+                    if (admitted) {
+                        const double lower_z = deposition_z(lower);
+                        const double upper_z = deposition_z(*object.layers()[target.upper_layer]);
+                        if (prepared_model->proofs->matches(prepared_model->snapshot, target.upper_layer,
+                                proof_targets, phase, lower_z, upper_z, proof_sources, &budget, cancel)) {
+                            target_index = proof_layer_end - 1;
+                            continue;
+                        }
+                        layer_proof = prepared_model->proofs->begin(prepared_model->snapshot, target.upper_layer,
+                            proof_targets, phase, lower_z, upper_z, proof_sources, &budget, cancel);
+                    }
+                } catch (const std::bad_alloc &) {
+                    // Allocation is optional acceleration only. Keep all
+                    // already charged work and perform the original proof.
+                    layer_proof = {};
+                }
+            }
             if (cached_lower != target.upper_layer - 1) {
+                profile.layer(target.upper_layer);
                 // The prepared sections own their snapshot, but clearing all
                 // lower-geometry caches before replacing it makes the lifetime
                 // and output-phase boundary explicit.
+                contact_queries.reset();
                 prepared_lower.clear();
                 prepared.clear();
                 prior_paths.clear();
                 visit_layer(lower, [&](const ExtrusionPath &path) {
                     auto emitted = emitted_path(path);
+                    if (emitted.polyline.size() >= 2) profile.lower(emitted.polyline.size() - 1);
                     if (emitted.polyline.size() >= 2) prior_paths.push_back(std::move(emitted));
                 });
                 prior_beads.clear();
@@ -1420,11 +1989,14 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
             BridgeAwareCubicValidation::Result result;
             Polylines verified_paths(target.paths.size());
             for (size_t index = 0; index < target.paths.size(); ++index) {
-                const ExtrusionPath upper = emitted_path(target.extrusions.at(index));
+                ExtrusionPath uncached_upper;
+                const ExtrusionPath &upper = cached_phase ? cached_phase->extrusions.at(frozen_index).at(index) :
+                    (uncached_upper = emitted_path(target.extrusions.at(index)));
                 verified_paths[index] = upper.polyline;
                 // A source path made entirely of repeated points emits no
                 // segment and supplies neither a demand nor support.
                 if (upper.polyline.size() < 2) continue;
+                profile.upper(upper.polyline.size() - 1);
                 const double upper_z = deposition_z(*object.layers()[target.upper_layer]);
                 BridgeAwareCubicContact::PreparedLowerPtr lower_contact;
                 if (std::isfinite(upper_z) && std::isfinite(upper.height)) {
@@ -1437,71 +2009,113 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                         // Keep one resident snapshot so the helper's combined
                         // prepared-plus-query allocation admission remains the
                         // complete allowance, rather than one per cached key.
+                        contact_queries.reset();
                         prepared_lower.clear();
                         found = prepared_lower.emplace(key, BridgeAwareCubicContact::prepare_lower(
                             prior_beads, upper_z, upper.height, &budget)).first;
+                        contact_queries = make_contact_query_cache(found->second);
                     }
                     lower_contact = found->second;
                 } else {
                     // Invalid floating values must not enter an ordered key.
                     // Retain the contact helper's normal invalid-input result.
+                    contact_queries.reset();
                     prepared_lower.clear();
                     lower_contact = BridgeAwareCubicContact::prepare_lower(prior_beads, upper_z, upper.height, &budget);
                 }
-                const auto contact = BridgeAwareCubicContact::footprint(*lower_contact, upper, upper_z, 0.,
-                    BridgeAwareCubicContact::FootprintMode::ContactsOnly, &budget);
+                // A continuous contact line proves the path span, but it is
+                // not a physical wall bounding the independent model-cell
+                // obligation. Only span-only construction/follow-up targets
+                // may omit the normal physical-demand and cell checks.
+                const bool allow_whole_support = (target.dependency || target.bridge_followup) &&
+                    !(active_profile && active_profile->full_trial_checks);
+                const auto support_query = !allow_whole_support ?
+                    BridgeAwareCubicContact::SupportQuery{BridgeAwareCubicContact::footprint(*lower_contact, upper, upper_z, 0.,
+                        BridgeAwareCubicContact::FootprintMode::ContactsOnly, &budget, contact_queries.get()), false} :
+                    BridgeAwareCubicContact::footprint_for_support(*lower_contact, upper, upper_z, 0.,
+                        &budget, contact_queries.get());
+                const auto &contact = support_query.contact;
+                if (active_profile && allow_whole_support) {
+                    ++active_profile->whole_support_queries;
+                    if (support_query.entire_path_supported) {
+                        ++active_profile->whole_support_proofs;
+                        active_profile->whole_support_segments += contact.segments.size();
+                    }
+                }
+                profile.plane(target.upper_layer, output_phase, contact.contact_z);
                 if (contact.resource_limited) {
                     result.completed = false;
                     result.resource_limited = true;
                     result.failure_reason = contact.failure_reason;
                     break;
                 }
-                Polylines unsupported;
-                for (const auto &segment : contact.segments) {
-                    const size_t i = segment.segment_index;
-                    append(unsupported, diff_pl(Polylines{Polyline(Points{upper.polyline.points[i], upper.polyline.points[i + 1]})},
-                                                segment.centerline_support));
-                }
-                if (!contact.input_valid || !contact.completed || contact.segments.empty()) unsupported = {upper.polyline};
-                const ExPolygons selected = intersection_ex(preserved_path_demands[target_index][index],
-                    union_ex(offset(unsupported, scale_(.5 * target.path_widths[index]))));
                 BridgeAwareCubicValidation::Result checked;
-                if (target.bridge_followup || target.dependency || selected.empty() || !contact.input_valid || !contact.completed) {
-                    // Construction and follow-up paths require actual prior
-                    // anchors and bounded complete air runs. They do not turn
-                    // long slots between bridge strands into cubic cells.
-                    checked = BridgeAwareCubicValidation::validate_contacts({}, contact.physical_footprint,
-                        {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                if (support_query.entire_path_supported) {
+                    // Contact proved every original segment continuously
+                    // supported at the common plane. Keep the validator's
+                    // input, gap and certificate guards without constructing
+                    // an empty air selection or unrelated physical cells.
+                    checked = BridgeAwareCubicValidation::validate_contacts({}, {},
+                        {upper.polyline}, {}, target.gap, 0., {contact}, &budget);
                 } else {
-                    // Raw occupied material is independent of upper direction
-                    // at the same selected contact plane. Reuse only immutable
-                    // geometry from this exact lower layer and output phase.
-                    auto found = prepared.find(contact.contact_z);
-                    if (found == prepared.end()) {
-                        // Physical sections are identical for every target at
-                        // this plane. Construct them only on a cache miss;
-                        // segment contact predicates above remain per-path.
-                        const auto physical = BridgeAwareCubicContact::footprint(*lower_contact, upper, upper_z, 0.,
-                            BridgeAwareCubicContact::FootprintMode::Full, &budget);
-                        if (!physical.input_valid || !physical.completed || physical.contact_z != contact.contact_z) {
-                            result.input_valid = physical.input_valid && physical.contact_z == contact.contact_z;
-                            result.completed = physical.completed;
-                            result.resource_limited = physical.resource_limited;
-                            result.failure_reason = physical.failure_reason.empty() ?
-                                "Physical support section changed during immutable contact verification." : physical.failure_reason;
-                            break;
-                        }
-                        // Compute the actual support complement in a padded
-                        // window containing every demand for this layer. No
-                        // rounded model seam may erase a cell or act as a wall.
-                        const ExPolygons domain = BridgeAwareCubic::support_topology_domain(
-                            physical.physical_footprint, layer_demands.at(target.upper_layer));
-                        found = prepared.emplace(contact.contact_z,
-                            BridgeAwareCubicValidation::prepare_geometry(domain, physical.physical_footprint, &budget)).first;
+                    Polylines unsupported;
+                    for (const auto &segment : contact.segments) {
+                        const size_t i = segment.segment_index;
+                        append(unsupported, diff_pl(Polylines{Polyline(Points{upper.polyline.points[i], upper.polyline.points[i + 1]})},
+                                                    segment.centerline_support));
                     }
-                    checked = BridgeAwareCubicValidation::validate_prepared_contacts(*found->second,
-                        {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                    if (!contact.input_valid || !contact.completed || contact.segments.empty()) unsupported = {upper.polyline};
+                    const ExPolygons &path_selection = cached_phase ? cached_phase->path_demands.at(frozen_index).at(index) :
+                        preserved_path_demands[target_index][index];
+                    const ExPolygons selected = intersection_ex(path_selection,
+                        union_ex(offset(unsupported, scale_(.5 * target.path_widths[index]))));
+                    if (target.bridge_followup || target.dependency || selected.empty() || !contact.input_valid || !contact.completed) {
+                        // Construction and follow-up paths require actual prior
+                        // anchors and bounded complete air runs. They do not turn
+                        // long slots between bridge strands into cubic cells.
+                        checked = BridgeAwareCubicValidation::validate_contacts({}, contact.physical_footprint,
+                            {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                    } else {
+                        // Raw occupied material is independent of upper direction
+                        // at the same selected contact plane. Reuse only immutable
+                        // geometry from this exact lower layer and output phase.
+                        auto found = prepared.find(contact.contact_z);
+                        if (found == prepared.end()) {
+                            // Physical sections are identical for every target at
+                            // this plane. Construct them only on a cache miss;
+                            // segment contact predicates above remain per-path.
+                            const auto physical = BridgeAwareCubicContact::physical_sections(*lower_contact, &budget, contact_queries.get());
+                            if (!physical.input_valid || !physical.completed || physical.contact_z != contact.contact_z) {
+                                result.input_valid = physical.input_valid && physical.contact_z == contact.contact_z;
+                                result.completed = physical.completed;
+                                result.resource_limited = physical.resource_limited;
+                                result.failure_reason = physical.failure_reason.empty() ?
+                                    "Physical support section changed during immutable contact verification." : physical.failure_reason;
+                                break;
+                            }
+                            // Compute the actual support complement in a padded
+                            // window containing every demand for this layer. No
+                            // rounded model seam may erase a cell or act as a wall.
+                            const ExPolygons domain = BridgeAwareCubic::support_topology_domain(
+                                physical.physical_footprint, physical_demands.at(target.upper_layer));
+                            found = prepared.emplace(contact.contact_z,
+                                BridgeAwareCubicValidation::prepare_geometry(domain, physical.physical_footprint, &budget)).first;
+                        }
+                        if (active_profile && active_profile->full_trial_checks)
+                            checked = BridgeAwareCubicValidation::validate_prepared_contacts(*found->second,
+                                {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                        else if (mode == TargetCheck::RejectTrial)
+                            checked = BridgeAwareCubicValidation::validate_prepared_contacts_for_trial(*found->second,
+                                {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                        else
+                            checked = BridgeAwareCubicValidation::validate_prepared_contact_failures(*found->second,
+                                {upper.polyline}, selected, target.gap, 0., {contact}, &budget);
+                    }
                 }
+                // Inspect only this path before moving its vectors. Rescanning
+                // the growing aggregate after every successful path would make
+                // accepted trials quadratic in their target-group size.
+                const bool path_rejects_trial = mode == TargetCheck::RejectTrial && !checked.passed();
                 result.input_valid &= checked.input_valid;
                 result.completed &= checked.completed;
                 result.resource_limited |= checked.resource_limited;
@@ -1512,11 +2126,25 @@ std::vector<Failure> check_targets(const PrintObject &object, const std::vector<
                 append(result.unsupported_runs, std::move(checked.unsupported_runs));
                 append(result.void_cells, std::move(checked.void_cells));
                 if (!result.input_valid || !result.completed) break;
+                // A discarded coarsening candidate needs only one complete
+                // counterexample. Successful candidates, repair discovery and
+                // final/export verification still check their entire scope.
+                // Incomplete results above retain their normal fatal handling.
+                if (path_rejects_trial) {
+                    if (active_profile) ++active_profile->early_trial_rejections;
+                    failures.push_back({target, std::move(result), std::move(verified_paths)});
+                    return failures;
+                }
             }
+            layer_proof.record(frozen_index, result);
             if (!result.passed()) {
                 const bool incomplete = !result.input_valid || !result.completed;
                 failures.push_back({target, std::move(result), std::move(verified_paths)});
                 if (incomplete) return failures;
+            }
+            if (target_index + 1 == proof_layer_end) {
+                layer_proof.commit();
+                layer_proof = {};
             }
         }
         // Repair one output phase at a time, preserving original path identity.
@@ -2244,10 +2872,12 @@ const ExPolygons &PrintObject::bridge_aware_cubic_reservations(size_t layer_id, 
 
 void PrintObject::prepare_bridge_aware_cubic()
 {
+    clear_bridge_aware_cubic_certificate();
     m_bridge_aware_cubic_plans.clear();
     m_bridge_aware_cubic_plans.resize(num_printing_regions());
     m_bridge_aware_cubic_reservations.clear();
     if (!has_bridge_aware_cubic() || m_layers.empty()) return;
+    ProfileSession profile_session("prepare", model_object()->id().id);
     common_nozzle_offset(*this);
 
     if (print()->config().spiral_mode.value)
@@ -2272,8 +2902,10 @@ void PrintObject::prepare_bridge_aware_cubic()
                     throw SlicingError("Bridge aware cubic currently requires Apply scarf seam on circles disabled for compensated circular walls.", model_object()->id().id);
 
     const auto generate = [this] {
+        ProfileScope profile(ProfilePhase::GenerateFull);
         for (Layer *layer : m_layers) {
             throw_if_canceled();
+            profile.layer(layer->id());
             layer->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
         }
     };
@@ -2351,6 +2983,7 @@ void PrintObject::prepare_bridge_aware_cubic()
     // dependencies globally before rebuilding any local Plan, so a coincident
     // address in another modifier cannot impersonate the true producer.
     const auto prune_dependencies = [&] {
+        ProfileScope profile(ProfilePhase::Prune);
         Dependency::Limits limits;
         limits.throw_if_canceled = [this] { throw_if_canceled(); };
         for (size_t iteration = 0;; ++iteration) {
@@ -2401,6 +3034,7 @@ void PrintObject::prepare_bridge_aware_cubic()
                         active.push_back(demands[region][index]);
                     }
                 if (selected != demand_indices[region]) {
+                    ProfileScope build(ProfilePhase::PlanBuild);
                     plan = std::make_unique<BridgeAwareCubic::Plan>(plan->with_demands(std::move(active)));
                     demand_indices[region] = std::move(selected);
                     changed = true;
@@ -2439,6 +3073,8 @@ void PrintObject::prepare_bridge_aware_cubic()
                     " mm: " + error.what(), model_object()->id().id);
             };
             try {
+                ProfileScope build(ProfilePhase::PlanBuild);
+                build.items(demands[region_id].size());
                 m_bridge_aware_cubic_plans[region_id] = std::make_unique<BridgeAwareCubic::Plan>(parameters[region_id], demands[region_id],
                     closures[region_id], attachments[region_id]);
                 demand_indices[region_id].resize(demands[region_id].size());
@@ -2492,6 +3128,9 @@ void PrintObject::prepare_bridge_aware_cubic()
             // cell sizing is only a construction proposal; bead width may make
             // a coarser parent sufficient. A changed cell affects its own layer
             // paths and the next layer's contacts, not every layer in the part.
+            const auto prepared_roofs = active_profile && active_profile->full_trial_checks ? nullptr :
+                prepare_model_targets(*this, roofs);
+            const auto model_proofs = prepare_model_proofs(*this, prepared_roofs.get(), roofs);
             size_t trials = 0;
             const auto changed_plan_layers = [&](const auto &previous, const auto &previous_indices) {
                 std::set<size_t> changed;
@@ -2578,9 +3217,16 @@ void PrintObject::prepare_bridge_aware_cubic()
                         left.emitting_regions != right.emitting_regions || left.free_ended != right.free_ended ||
                         left.producers != right.producers || left.solid_cuts != right.solid_cuts ||
                         left.path_footprints != right.path_footprints || left.extrusions.size() != right.extrusions.size()) return false;
+                    // Polyline equality compares points only. Frozen emitted
+                    // preparation may be reused only while both actual and
+                    // frozen paths retain the straight-segment representation
+                    // that serialization validated before caching them.
+                    for (const Polyline &path : left.paths) if (!path.fitting_result.empty()) return false;
+                    for (const Polyline &path : right.paths) if (!path.fitting_result.empty()) return false;
                     for (size_t index = 0; index < left.extrusions.size(); ++index) {
                         const ExtrusionPath &before = left.extrusions[index], &after = right.extrusions[index];
-                        if (before.polyline != after.polyline || before.role() != after.role() ||
+                        if (!before.polyline.fitting_result.empty() || !after.polyline.fitting_result.empty() ||
+                            before.polyline != after.polyline || before.role() != after.role() ||
                             before.width != after.width || before.height != after.height || before.mm3_per_mm != after.mm3_per_mm ||
                             before.is_force_no_extrusion() != after.is_force_no_extrusion()) return false;
                     }
@@ -2589,25 +3235,47 @@ void PrintObject::prepare_bridge_aware_cubic()
             };
             const auto check_changed_layers = [&](const std::set<size_t> &changed) {
                 std::set<size_t> checked_layers;
-                for (size_t index : changed) {
-                    m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
-                    if (index > 0) checked_layers.insert(index);
-                    if (index + 1 < m_layers.size()) checked_layers.insert(index + 1);
+                {
+                    ProfileScope profile(ProfilePhase::GenerateChanged);
+                    for (size_t index : changed) {
+                        profile.layer(index);
+                        m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                        if (index > 0) checked_layers.insert(index);
+                        if (index + 1 < m_layers.size()) checked_layers.insert(index + 1);
+                    }
                 }
                 std::vector<Target> selected;
-                for (const Target &target : roofs) if (checked_layers.count(target.upper_layer)) selected.push_back(target);
+                std::vector<size_t> frozen_indices;
+                for (size_t index = 0; index < roofs.size(); ++index)
+                    if (checked_layers.count(roofs[index].upper_layer)) {
+                        selected.push_back(roofs[index]);
+                        frozen_indices.push_back(index);
+                    }
                 const auto actual = collect_targets(*this, false, false, &checked_layers);
                 // Coarsening may remove support, never adopt a different
                 // required model path to avoid its frozen support obligation.
                 if (!same_model_targets(selected, actual)) return false;
-                auto rejected = check_targets(*this, actual);
-                if (rejected.empty()) rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers));
+                const TargetCheck mode = active_profile && active_profile->full_trial_checks ?
+                    TargetCheck::CollectFailures : TargetCheck::RejectTrial;
+                const PreparedModelView prepared_view{prepared_roofs.get(), frozen_indices, model_proofs.get()};
+                auto rejected = check_targets(*this, actual, nullptr, mode, prepared_roofs ? &prepared_view : nullptr);
+                if (active_profile && model_proofs) {
+                    const auto stats = model_proofs->statistics();
+                    active_profile->model_layer_proof_hits = stats.hits;
+                    active_profile->model_layer_proof_misses = stats.misses;
+                    active_profile->model_layer_proof_publications = stats.publications;
+                    active_profile->model_layer_proof_vertices = stats.vertices;
+                    active_profile->model_layer_proof_items = stats.items;
+                }
+                if (rejected.empty()) rejected = check_targets(*this, collect_targets(*this, true, false, &checked_layers), nullptr, mode);
                 for (const Failure &failure : rejected)
                     if (!failure.result.input_valid || !failure.result.completed) fail(*this, failure);
                 return rejected.empty();
             };
             bool accepted;
+            uint64_t sweep_number = 0;
             do {
+                ProfileSweep profile_sweep(++sweep_number);
                 accepted = false;
                 struct Candidate { size_t region; BridgeAwareCubic::Refinement refinement; };
                 std::vector<Candidate> candidates;
@@ -2627,21 +3295,34 @@ void PrintObject::prepare_bridge_aware_cubic()
                     })) continue;
                     if (++trials > 10000)
                         throw SlicingError("Bridge aware cubic exceeded the final coarsening work limit; no minimal support certificate was produced.", model_object()->id().id);
+                    if (active_profile) active_profile->trial(candidate.region, &candidate.refinement.id);
                     std::vector<std::unique_ptr<BridgeAwareCubic::Plan>> previous(m_bridge_aware_cubic_plans.size());
-                    for (size_t region = 0; region < previous.size(); ++region)
-                        if (m_bridge_aware_cubic_plans[region])
-                            previous[region] = std::make_unique<BridgeAwareCubic::Plan>(m_bridge_aware_cubic_plans[region]->clone());
+                    {
+                        ProfileScope profile(ProfilePhase::PlanClone);
+                        for (size_t region = 0; region < previous.size(); ++region)
+                            if (m_bridge_aware_cubic_plans[region]) {
+                                profile.items(1);
+                                previous[region] = std::make_unique<BridgeAwareCubic::Plan>(m_bridge_aware_cubic_plans[region]->clone());
+                            }
+                    }
                     const auto previous_indices = demand_indices;
-                    current = std::make_unique<BridgeAwareCubic::Plan>(current->collapsed(candidate.refinement.id));
+                    {
+                        ProfileScope profile(ProfilePhase::PlanCollapse);
+                        current = std::make_unique<BridgeAwareCubic::Plan>(current->collapsed(candidate.refinement.id));
+                    }
                     prune_dependencies();
                     const auto changed = changed_plan_layers(previous, previous_indices);
                     const bool verified = check_changed_layers(changed);
+                    if (active_profile) verified ? ++active_profile->accepted : ++active_profile->rejected;
                     if (verified) accepted = true;
                     else {
                         m_bridge_aware_cubic_plans = std::move(previous);
                         demand_indices = previous_indices;
-                        for (size_t index : changed)
+                        ProfileScope profile(ProfilePhase::GenerateRollback);
+                        for (size_t index : changed) {
+                            profile.layer(index);
                             m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                        }
                     }
                 }
                 // A shared interface partition is a complete construction
@@ -2662,38 +3343,56 @@ void PrintObject::prepare_bridge_aware_cubic()
                     for (const auto &stack : stacks) {
                         if (++trials > 10000)
                             throw SlicingError("Bridge aware cubic exceeded the final closure coarsening work limit.", model_object()->id().id);
+                        if (active_profile) active_profile->trial(owner, nullptr);
                         std::vector<std::unique_ptr<BridgeAwareCubic::Plan>> previous(m_bridge_aware_cubic_plans.size());
-                        for (size_t region = 0; region < previous.size(); ++region)
-                            if (m_bridge_aware_cubic_plans[region])
-                                previous[region] = std::make_unique<BridgeAwareCubic::Plan>(m_bridge_aware_cubic_plans[region]->clone());
+                        {
+                            ProfileScope profile(ProfilePhase::PlanClone);
+                            for (size_t region = 0; region < previous.size(); ++region)
+                                if (m_bridge_aware_cubic_plans[region]) {
+                                    profile.items(1);
+                                    previous[region] = std::make_unique<BridgeAwareCubic::Plan>(m_bridge_aware_cubic_plans[region]->clone());
+                                }
+                        }
                         const auto previous_indices = demand_indices;
                         const auto previous_closures = closures[owner];
                         auto &remaining = closures[owner];
                         remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [&](const auto &closure) {
                             return same_paths(stack, closure.paths);
                         }), remaining.end());
-                        m_bridge_aware_cubic_plans[owner] = std::make_unique<BridgeAwareCubic::Plan>(
-                            m_bridge_aware_cubic_plans[owner]->with_payloads(remaining, attachments[owner]));
+                        {
+                            ProfileScope profile(ProfilePhase::PlanPayload);
+                            m_bridge_aware_cubic_plans[owner] = std::make_unique<BridgeAwareCubic::Plan>(
+                                m_bridge_aware_cubic_plans[owner]->with_payloads(remaining, attachments[owner]));
+                        }
                         prune_dependencies();
                         const auto changed = changed_plan_layers(previous, previous_indices);
                         const bool verified = check_changed_layers(changed);
+                        if (active_profile) verified ? ++active_profile->accepted : ++active_profile->rejected;
                         if (verified) accepted = true;
                         else {
                             m_bridge_aware_cubic_plans = std::move(previous);
                             demand_indices = previous_indices;
                             closures[owner] = previous_closures;
-                            for (size_t index : changed)
+                            ProfileScope profile(ProfilePhase::GenerateRollback);
+                            for (size_t index : changed) {
+                                profile.layer(index);
                                 m_layers[index]->make_fills(m_adaptive_fill_octrees.first.get(), m_adaptive_fill_octrees.second.get(), m_lightning_generator.get());
+                            }
                         }
                     }
                 }
             } while (accepted);
-            const auto final_model_targets = collect_targets(*this, false, false);
-            if (!same_model_targets(roofs, final_model_targets))
-                throw SlicingError("Bridge aware cubic could not preserve the required model paths during final support reduction.", model_object()->id().id);
-            failures = check_targets(*this, final_model_targets);
-            if (failures.empty()) failures = check_targets(*this, collect_targets(*this, true, false));
-            if (!failures.empty()) fail(*this, failures.front());
+            const auto final_phases = serialization_phases(*this, nullptr);
+            {
+                ProfileScope profile(ProfilePhase::FinalProof);
+                final_proof_preamble(*this, *this, final_phases);
+                const auto final_model_targets = collect_targets(*this, false, false);
+                if (!same_model_targets(roofs, final_model_targets))
+                    throw SlicingError("Bridge aware cubic could not preserve the required model paths during final support reduction.", model_object()->id().id);
+                failures = check_targets(*this, final_model_targets);
+                if (failures.empty()) failures = check_targets(*this, collect_targets(*this, true, false));
+                if (!failures.empty()) fail(*this, failures.front());
+            }
             // Reservation is separate from refinement demand. An added strand
             // already supported by a retained parent face must not split that
             // parent's otherwise coarse cells, but combination must retain the
@@ -2720,6 +3419,10 @@ void PrintObject::prepare_bridge_aware_cubic()
                         reserved.emplace_back(cell.polygon);
                 reserved = union_ex(reserved);
             }
+            // Reservations are part of the owned state too. They do not alter
+            // the just-proven emitted paths, and must be captured after their
+            // final values are installed. Capture alone never asserts a proof.
+            std::atomic_store(&m_bridge_aware_cubic_certificate, capture_final_proof(*this, *this, final_phases));
             return;
         }
 
@@ -2971,37 +3674,47 @@ void PrintObject::prepare_bridge_aware_cubic()
     if (!failures.empty()) fail(*this, failures.front());
 }
 
+void PrintObject::clear_bridge_aware_cubic_certificate() const
+{
+    std::atomic_store(&m_bridge_aware_cubic_certificate,
+        std::shared_ptr<const BridgeAwareCubic::DepositionStateSnapshot>{});
+}
+
 void PrintObject::validate_bridge_aware_cubic() const
 {
     if (!has_bridge_aware_cubic()) return;
+    ProfileSession profile_session("validate", model_object()->id().id);
     const PrintObject &geometry = m_shared_object == nullptr ? *this : *m_shared_object;
-    // Untargeted paths can precede a model target in the exporter. Check their
-    // straight-path representation and output-coordinate range too. BAC
-    // export retains every nonzero source edge, including tiny destinations.
-    for (const auto &phase : serialization_phases(geometry, this))
-        for (const Layer *layer : geometry.layers()) {
-            print()->throw_if_canceled();
-            visit_layer(*layer, [&](const ExtrusionPath &path) {
-                try {
-                    phase.validate_path(path.polyline);
-                } catch (const std::logic_error &error) {
-                    throw SlicingError("Bridge aware cubic cannot certify serialized extrusion geometry for object \"" +
-                        model_object()->name + "\", layer " + std::to_string(layer->id() + 1) + ": " + error.what(), model_object()->id().id);
-                }
-            });
-        }
-    for (size_t region_id = 0; region_id < num_printing_regions(); ++region_id) {
-        if (!participates(printing_region(region_id).config()) || bridge_aware_cubic_plan(region_id) != nullptr)
-            continue;
-        for (const Layer *layer : geometry.layers())
-            if (!sparse_domain(*layer->get_region(int(region_id))).empty())
-                throw SlicingError("Bridge aware cubic support plan is missing for object \"" + model_object()->name +
-                    "\". Reslice the object to rebuild and verify its support geometry.", model_object()->id().id);
+    // Cancellation and the complete physical-nozzle guard are always fresh.
+    // Separate phase components preserve writer operation order; new instance
+    // phases cannot inherit a proof established only at an older placement.
+    print()->throw_if_canceled();
+    const auto phases = serialization_phases(geometry, this);
+    auto certificate = std::atomic_load(&geometry.m_bridge_aware_cubic_certificate);
+    bool hit = false;
+    if (certificate && !(active_profile && active_profile->full_trial_checks)) {
+        ProfileScope profile(ProfilePhase::CompareFinalProof);
+        hit = certificate->matches(geometry, *this, phases, [&] { print()->throw_if_canceled(); });
     }
+    if (hit) {
+        if (active_profile) {
+            ++active_profile->final_proof_hits;
+            active_profile->final_proof_bytes = certificate->retained_bytes();
+        }
+        return;
+    }
+    if (active_profile) ++active_profile->final_proof_misses;
+    // Release retired Plan tokens before proving/capturing replacement state.
+    // The exact comparison, rather than invalidation notifications, is the
+    // authority: all public mutable path/config/surface trees may change.
+    geometry.clear_bridge_aware_cubic_certificate();
+    certificate.reset();
+    final_proof_preamble(geometry, *this, phases);
     auto failures = check_targets(geometry, collect_targets(geometry, false, false), this);
     if (!failures.empty()) fail(geometry, failures.front());
     failures = check_targets(geometry, collect_targets(geometry, true, false), this);
     if (!failures.empty()) fail(geometry, failures.front());
+    std::atomic_store(&geometry.m_bridge_aware_cubic_certificate, capture_final_proof(geometry, *this, phases));
 }
 
 } // namespace Slic3r
