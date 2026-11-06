@@ -71,6 +71,17 @@ The [official slicing benchmark procedure](bridge-aware-cubic-benchmark.md) docu
 
 ## Correctness checkpoint and outstanding performance gate
 
+The current application passes the full geometry suite (442 executions, 389,095 assertions). **All four fixtures fail the 2× slicing-time limit.** These are matched development runs against official 2.9.1.70, one pair per fixture without a warm-up. All eight CLI runs completed and passed the input, emitted-configuration and G-code checks.
+
+| Fixture | Official regular Cubic | Bridge aware cubic | Ratio |
+| --- | ---: | ---: | ---: |
+| Small cube, 32 × 28 × 18 mm | 0.273 s | 9.590 s | 35.13× |
+| Large cube, 64 × 56 × 18 mm | 0.259 s | 148.325 s | 572.68× |
+| Rib | 0.256 s | 30.892 s | 120.67× |
+| Modifier | 0.270 s | 122.595 s | 454.06× |
+
+Infill preparation alone takes 146.253 seconds on the large cube and 121.557 seconds on the modifier. The benchmark application is byte-identical to the full-suite build at `11f4aba1f`. The fixture writer passes 260 assertions after restoring the cube's empty machine scripts to the rib and modifier. All eight 3MF mesh members are byte-identical to their predecessors; part settings differ only by regenerated UUIDs. The cube project settings are unchanged; only the two machine scripts changed for the rib and modifier. No parser or configuration exception was added.
+
 The 6 November 2026 model-target reuse checkpoint passes the complete arm64 RelWithDebInfo application build, all 17 existing CTest targets, 44 packaging tests and 70 benchmark-tool tests. Bridge aware cubic passes 431 default cases across 433 executions, plus the small and large geometry qualifications and the exhaustive-versus-optimized comparison: 436 executions and 379,742 assertions in total. The three modifier-reslice sections run independently. Exact-name manifests, source inventory and XML results are tied to unchanged test executable SHA-256 `ae6f666052ac3e51e3c9b376334c8f991b7d680ca69f4eff7333544a2b4f5b7a`. The separate native fixture writer passes another 244 assertions and is excluded from those geometry totals.
 
 Final emitted sparse paths now retain their actual clipped source attribution, independent finite cell owners and ordered endpoint transitions. Collection checks the complete live path values and current Plan identities before reusing those records. Exact broad-reference clipping preserves the existing rounded owner endpoints. Integer longitudinal bounds retain true line endpoints without accepting points beyond their caps. Solid/closure layers, unresolved attachment classification and unsupported representations retain complete-emitter reference collection. The cube, rib and modifier audits compare all ordered target fields; stale Plan bindings and cancellation are checked separately. Opaque Plan identity tokens no longer retain abandoned geometry or callbacks.

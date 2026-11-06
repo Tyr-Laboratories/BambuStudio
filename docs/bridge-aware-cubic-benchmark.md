@@ -34,6 +34,8 @@ The configuration exceptions are specific to the recorded baseline and guarded f
 
 The existing hidden C++ test `BACBenchmarkFixtures` in [test_bridge_aware_cubic_export.cpp](../tests/fff_print/test_bridge_aware_cubic_export.cpp) is the input authority. It writes eight native 3MF projects, JSON and INI snapshots of their completed configuration, and a manifest. It does not slice. Each pair has identical model geometry, placement, and common global/local settings; Cubic omits the unsupported BAC gap setting. It also completes the CLI inheritance and filament metadata vectors.
 
+All four families use empty machine start and end scripts. The generator sets them after loading the family defaults and checks both values after configuration resolution on each side. This prevents a default startup Z move from preceding the slicer's absolute-coordinate and millimeter declarations. Keep the G-code mode and moving-extrusion checks enabled.
+
 Generate into a new absolute directory using the test binary built from the source under evaluation. For example, from the repository root, with the test executable path adjusted to the actual build:
 
 ```sh

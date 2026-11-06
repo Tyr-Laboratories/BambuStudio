@@ -844,6 +844,10 @@ TEST_CASE("Bridge aware cubic writes native CLI benchmark fixtures", "[.][BACBen
             });
             if (rib) fixture_defaults.set_deserialize_strict({{"ensure_vertical_shell_thickness", "disabled"}});
         }
+        // Keep every fixture on the cubes' existing empty machine scripts.
+        // Native defaults can move Z before the slicer declares G90/G21.
+        fixture_defaults.set_deserialize_strict({{"machine_start_gcode", ""},
+                                                 {"machine_end_gcode", ""}});
         Model model;
         ModelObject *object = model.add_object();
         object->name = "BAC benchmark " + size;
@@ -904,6 +908,10 @@ TEST_CASE("Bridge aware cubic writes native CLI benchmark fixtures", "[.][BACBen
             REQUIRE(configured.get_object(size_t(0))->layers().empty());
             REQUIRE_FALSE(configured.is_step_done(posSlice));
             config = configured.full_print_config();
+            for (const char *key : {"machine_start_gcode", "machine_end_gcode"}) {
+                CAPTURE(stem, key);
+                REQUIRE(config.opt_string(key).empty());
+            }
             // The native CLI indexes process, filament and printer inheritance
             // slots directly. Empty entries preserve no-inheritance semantics;
             // an empty vector is not a valid CLI project shape.
