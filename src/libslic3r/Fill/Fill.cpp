@@ -733,7 +733,8 @@ BridgeFlowMask bridge_flow_mask(const Layer &layer)
 {
     BridgeFlowMask mask;
     const auto &regions = layer.regions();
-    if (!layer.lower_layer || std::all_of(regions.begin(), regions.end(), [](const LayerRegion *r) {
+    // group_fills() emits bridge extrusion only above layer zero.
+    if (!layer.lower_layer || layer.lower_layer->id() == 0 || std::all_of(regions.begin(), regions.end(), [](const LayerRegion *r) {
             return r->region().config().flow_above_internal_bridges.value == 100.;
         }))
         return mask;
@@ -744,7 +745,7 @@ BridgeFlowMask bridge_flow_mask(const Layer &layer)
         if (replaces_solid_fill_with_locked_zag(*lower))
             continue;
         for (const Surface &surface : lower->fill_surfaces.surfaces)
-            if (surface.surface_type == stInternalBridge)
+            if (surface.is_bridge())
                 append(bridges, lower->bridge_fill_boundary(surface.expolygon));
     }
     if (bridges.empty())

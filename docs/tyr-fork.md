@@ -90,14 +90,16 @@ Existing system profiles and early Tyr projects may store a single Bridge value 
 
 ## Bridge settings
 
-In **Quality > Advanced**, the following settings appear immediately after **Thick bridges**. Enable Advanced settings to see them. The two controls for bridge lines apply to both external and internal bridges. The layer count and flow above bridges apply to internal bridges.
+In **Quality > Advanced**, the following settings appear immediately after **Thick bridges**. Enable Advanced settings to see them. Bridge density, overlap, and flow above bridges apply to both regular bridges across openings and internal bridges over sparse infill. **Internal bridge layers** controls the number of layers in an internal bridge.
 
 | Setting | Range | Default | Effect |
 | --- | --- | --- | --- |
 | **Bridge Layer Density** (`bridge_layer_density`) | 1–100% | 100% | Changes the spacing between bridge strands while retaining each strand's width, height, and extrusion per millimeter. |
 | **Bridge line travel extend** (`bridge_line_travel_extend`) | 1–100% | 15% | Sets the Infill/Wall overlap for bridge infill independently of other infill. |
 | **Internal bridge layers** (`internal_bridge_layers`) | 1, 2, or 3 | 1 | Adds internal bridge planes beneath the existing shell before normal internal solid infill. |
-| **Flow above internal bridges** (`flow_above_internal_bridges`) | 1–200% | 100% | Scales extrusion for solid fill directly over an internal bridge. For example, 120% deposits 20% more material along the portion of a line above the bridge footprint. With stacked bridges, this applies to the first solid fill above the stack. |
+| **Flow above bridges** (`flow_above_internal_bridges`) | 1–200% | 100% | Scales extrusion for the first solid fill directly over a regular or internal bridge. At 120%, only the portion of a solid fill line over the bridge footprint receives 20% more material. For stacked bridges this applies above the top of the stack. |
+
+Tyr.18 projects and presets retain their saved **Flow above internal bridges** percentage. When you reslice, Studio uses that same percentage above both kinds of bridge.
 
 At **100% density**, bridge line spacing follows the original full-density calculation. At **50%**, the pitch between strands doubles; the individual strands retain their extrusion settings. Very low density can leave only a few strands across a small bridge. Density does not change normal infill or support density.
 
