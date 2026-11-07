@@ -2095,6 +2095,16 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(1));
 
+    def = this->add("flow_above_internal_bridges", coPercent);
+    def->label = L("Flow above internal bridges");
+    def->category = L("Quality");
+    def->tooltip = L("Extrusion multiplier for solid fill directly above an internal bridge. Increase it to fill gaps between the bridge strands. 100% uses normal flow.");
+    def->sidetext = "%";
+    def->min = 1;
+    def->max = 200;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(100));
+
     def = this->add("max_bridge_length", coFloat);
     def->label = L("Max bridge length");
     def->category = L("Support");

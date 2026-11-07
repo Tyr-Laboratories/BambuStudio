@@ -4245,6 +4245,8 @@ std::string PrintStatistics::finalize_output_path(const std::string &path_in) co
 #define JSON_EXTRUSION_HEIGHT                  "height"
 #define JSON_EXTRUSION_ROLE                    "role"
 #define JSON_EXTRUSION_NO_EXTRUSION            "no_extrusion"
+#define JSON_EXTRUSION_CAN_REVERSE             "can_reverse"
+#define JSON_EXTRUSION_CUSTOMIZE_FLAG          "customize_flag"
 #define JSON_EXTRUSION_LOOP_ROLE               "loop_role"
 
 
@@ -4341,6 +4343,10 @@ static void to_json(json& j, const ExtrusionPath& extrusion_path) {
     j[JSON_EXTRUSION_HEIGHT] = extrusion_path.height;
     j[JSON_EXTRUSION_ROLE] = extrusion_path.role();
     j[JSON_EXTRUSION_NO_EXTRUSION] = extrusion_path.is_force_no_extrusion();
+    if (!extrusion_path.can_reverse())
+        j[JSON_EXTRUSION_CAN_REVERSE] = false;
+    if (extrusion_path.get_customize_flag() != cfNone)
+        j[JSON_EXTRUSION_CUSTOMIZE_FLAG] = extrusion_path.get_customize_flag();
 }
 
 static bool convert_extrusion_to_json(json& entity_json, json& entity_paths_json, const ExtrusionEntity* extrusion_entity) {
@@ -4372,6 +4378,8 @@ static bool convert_extrusion_to_json(json& entity_json, json& entity_paths_json
         entity_paths_json.push_back(std::move(entity_path_json));
     }
     else if (multipath) {
+        if (!multipath->can_reverse())
+            entity_json[JSON_EXTRUSION_CAN_REVERSE] = false;
         for (const ExtrusionPath& extrusion_path : multipath->paths)
         {
             json entity_path_json = extrusion_path;
@@ -4623,6 +4631,9 @@ static void from_json(const json& j, ExtrusionPath& extrusion_path) {
     extrusion_path.height                 =    j[JSON_EXTRUSION_HEIGHT];
     extrusion_path.set_extrusion_role(j[JSON_EXTRUSION_ROLE]);
     extrusion_path.set_force_no_extrusion(j[JSON_EXTRUSION_NO_EXTRUSION]);
+    if (!j.value(JSON_EXTRUSION_CAN_REVERSE, true))
+        extrusion_path.set_reverse();
+    extrusion_path.set_customize_flag(j.value(JSON_EXTRUSION_CUSTOMIZE_FLAG, cfNone));
 }
 
 static bool convert_extrusion_from_json(const json& entity_json, ExtrusionEntityCollection& entity_collection) {
@@ -4651,6 +4662,8 @@ static bool convert_extrusion_from_json(const json& entity_json, ExtrusionEntity
             path = entity_json[JSON_EXTRUSION_PATHS][path_index];
             multipath->paths.push_back(std::move(path));
         }
+        if (!entity_json.value(JSON_EXTRUSION_CAN_REVERSE, true))
+            multipath->set_reverse();
         entity_collection.entities.push_back(multipath);
     }
     else if (path_type == JSON_EXTRUSION_TYPE_LOOP) {

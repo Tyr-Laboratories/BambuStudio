@@ -1098,6 +1098,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionPercent, bridge_layer_density))
     ((ConfigOptionPercent, bridge_line_travel_extend))
     ((ConfigOptionInt, internal_bridge_layers))
+    ((ConfigOptionPercent, flow_above_internal_bridges))
     ((ConfigOptionEnum<CounterboreHoleBridgingOption>, counterbore_hole_bridging))
     ((ConfigOptionFloatsNullable, overhang_totally_speed))
     ((ConfigOptionFloatsNullable, bridge_speed))

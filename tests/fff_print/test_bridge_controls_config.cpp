@@ -51,6 +51,14 @@ void check_bridge_controls(const ConfigBase &config, double density, double exte
     CHECK(config.option<ConfigOptionInt>("internal_bridge_layers")->value == layers);
 }
 
+void check_flow_above_internal_bridges(const ConfigBase &config, double percent)
+{
+    const ConfigOption *option = config.option("flow_above_internal_bridges");
+    REQUIRE(option != nullptr);
+    REQUIRE(option->type() == coPercent);
+    CHECK(option->getFloat() == percent);
+}
+
 void set_bridge_controls(ModelConfig &config, double density, double extension, int layers)
 {
     config.set_key_value("bridge_layer_density", new ConfigOptionPercent(density));
@@ -65,6 +73,8 @@ TEST_CASE("Bridge controls have scalar region defaults and closed value ranges",
     DynamicPrintConfig config;
     config.apply(static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
     check_bridge_controls(config, 100., 15., 1);
+    check_flow_above_internal_bridges(config, 100.);
+    CHECK(std::count(Preset::print_options().begin(), Preset::print_options().end(), "flow_above_internal_bridges") == 1);
     for (const auto *key : bridge_control_keys) {
         CAPTURE(key);
         CHECK(std::count(Preset::print_options().begin(), Preset::print_options().end(), key) == 1);
@@ -107,7 +117,8 @@ TEST_CASE("Bridge controls survive process JSON and Bambu project overrides", "[
     DynamicPrintConfig config;
     config.apply(static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
     config.set_deserialize_strict({
-        {"bridge_layer_density", "72.5%"}, {"bridge_line_travel_extend", "25%"}, {"internal_bridge_layers", "2"}
+        {"bridge_layer_density", "72.5%"}, {"bridge_line_travel_extend", "25%"}, {"internal_bridge_layers", "2"},
+        {"flow_above_internal_bridges", "137.5%"}
     });
 
     Preset preset(Preset::TYPE_PRINT, "Bridge controls test");
@@ -118,6 +129,7 @@ TEST_CASE("Bridge controls survive process JSON and Bambu project overrides", "[
     reopened_preset.file = preset.file;
     reopened_preset.reload(Preset(Preset::TYPE_PRINT, "Default"));
     check_bridge_controls(reopened_preset.config, 72.5, 25., 2);
+    check_flow_above_internal_bridges(reopened_preset.config, 137.5);
 
     Model model;
     auto *object = model.add_object();
@@ -125,6 +137,7 @@ TEST_CASE("Bridge controls survive process JSON and Bambu project overrides", "[
     object->add_instance();
     set_bridge_controls(object->config, 50., 40., 3);
     set_bridge_controls(part->config, 33.5, 60.5, 1);
+    part->config.set_key_value("flow_above_internal_bridges", new ConfigOptionPercent(95.5));
 
     const auto filename = (workspace.path / "bridge-controls.3mf").string();
     StoreParams params;
@@ -145,6 +158,7 @@ TEST_CASE("Bridge controls survive process JSON and Bambu project overrides", "[
     for (auto *saved_preset : presets) delete saved_preset;
     REQUIRE(loaded);
     check_bridge_controls(reopened_config, 72.5, 25., 2);
+    check_flow_above_internal_bridges(reopened_config, 137.5);
     REQUIRE(reopened.objects.size() == 1);
     const auto *reopened_object = reopened.objects.front();
     REQUIRE(reopened_object->volumes.size() == 1);
@@ -156,6 +170,7 @@ TEST_CASE("Bridge controls survive process JSON and Bambu project overrides", "[
     effective.apply(reopened_object->config.get());
     effective.apply(reopened_object->volumes.front()->config.get());
     check_bridge_controls(effective, 33.5, 60.5, 1);
+    check_flow_above_internal_bridges(effective, 95.5);
 }
 
 TEST_CASE("Bridge controls restore with the H2S multi-variant process", "[BridgeControls][Config][ProfileRestore]")
@@ -175,7 +190,7 @@ TEST_CASE("Bridge controls restore with the H2S multi-variant process", "[Bridge
 
     auto saved = base->config;
     saved.set_deserialize_strict({{"inherits", name}, {"bridge_layer_density", "67.5%"},
-        {"bridge_line_travel_extend", "42.5%"}, {"internal_bridge_layers", "3"}});
+        {"bridge_line_travel_extend", "42.5%"}, {"internal_bridge_layers", "3"}, {"flow_above_internal_bridges", "127.5%"}});
     bool legacy = false;
     SECTION("Ordinary project restore retains one scalar per setting") {}
     SECTION("Reordering nozzle variants does not reinterpret bridge controls as vectors") {
@@ -187,15 +202,17 @@ TEST_CASE("Bridge controls restore with the H2S multi-variant process", "[Bridge
         legacy = true;
         for (const auto *key : bridge_control_keys)
             saved.erase(key);
+        saved.erase("flow_above_internal_bridges");
     }
 
     const auto restored = bundle.prints.load_external_preset("bridge-controls-test.3mf", "Bridge controls project",
         "Custom H2S bridge process", saved,
-        {"bridge_layer_density", "bridge_line_travel_extend", "internal_bridge_layers"},
+        {"bridge_layer_density", "bridge_line_travel_extend", "internal_bridge_layers", "flow_above_internal_bridges"},
         PresetCollection::LoadAndSelect::Always, Semver());
     REQUIRE(restored.first != nullptr);
     const auto &restored_config = bundle.prints.get_edited_preset().config;
     check_bridge_controls(restored_config, legacy ? 100. : 67.5, legacy ? 15. : 42.5, legacy ? 1 : 3);
+    check_flow_above_internal_bridges(restored_config, legacy ? 100. : 127.5);
     REQUIRE(restored_config.option<ConfigOptionStrings>("print_extruder_variant")->size() == 3);
     check_bridge_controls(bundle.prints.find_preset(name, false)->config, 100., 15., 1);
 }
