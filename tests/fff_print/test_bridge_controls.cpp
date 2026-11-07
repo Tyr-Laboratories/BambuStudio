@@ -34,14 +34,14 @@ DynamicPrintConfig bridge_controls_config(double density=100., double extend=15.
     config.set_key_value("internal_bridge_layers", new ConfigOptionInt(layers));
     return config;
 }
-Model bridge_controls_model(bool internal=true)
+Model bridge_controls_model(bool internal=true, double roof_height=1.2)
 {
     Model model;
     auto *object=model.add_object();
     TriangleMesh mesh(its_make_cube(internal ? 30. : 6.,20.,8.));
     if (!internal) {
         TriangleMesh right(its_make_cube(6.,20.,8.)); right.translate(24.,0.,0.); mesh.merge(right);
-        TriangleMesh roof(its_make_cube(30.,20.,1.2)); roof.translate(0.,0.,8.); mesh.merge(roof);
+        TriangleMesh roof(its_make_cube(30.,20.,roof_height)); roof.translate(0.,0.,8.); mesh.merge(roof);
     }
     object->add_volume(mesh); object->add_instance()->set_offset(Vec3d(80.,80.,0.));
     return model;
@@ -119,6 +119,33 @@ void same_surfaces(const std::map<size_t,ExPolygons> &a,const std::map<size_t,Ex
         REQUIRE(b.count(layer)==1);
         CHECK(diff_ex(polys,b.at(layer)).empty()); CHECK(diff_ex(b.at(layer),polys).empty());
     }
+}
+std::map<std::pair<int, std::string>, double> extruded_filament(Print &print, const DynamicPrintConfig &config)
+{
+    const auto directory = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("bridge-flow-%%%%-%%%%");
+    boost::filesystem::create_directories(directory);
+    ScopeGuard cleanup([&] {
+        boost::system::error_code ec;
+        boost::filesystem::remove_all(directory, ec);
+    });
+    const std::string path = (directory / "flow.gcode").string();
+    GCodeProcessorResult preview;
+    print.export_gcode(path, &preview);
+    std::map<std::pair<int, std::string>, double> result;
+    int layer = -1;
+    std::string role;
+    GCodeReader reader;
+    reader.apply_config(config);
+    REQUIRE(reader.parse_file(path, [&](GCodeReader &state, const GCodeReader::GCodeLine &line) {
+        const auto comment = line.comment();
+        if (comment == " CHANGE_LAYER")
+            ++layer;
+        else if (comment.substr(0, 10) == " FEATURE: ")
+            role = comment.substr(10);
+        if (layer >= 0 && line.extruding(state) && line.dist_XY(state) > 0.)
+            result[{layer, role}] += line.dist_E(state);
+    }));
+    return result;
 }
 }
 
@@ -222,16 +249,20 @@ TEST_CASE("Changing internal bridge count on a sliced job rebuilds its classific
     }
 }
 
-TEST_CASE("Flow above internal bridges changes only the covered length of a solid fill path",
+TEST_CASE("Flow above bridges changes only the covered length of a solid fill path",
           "[BridgeControls][FlowAbove]")
 {
-    ExPolygon internal = rectangle(-8., -5., 8., 5.);
-    ExPolygon external = rectangle(-3., -2., 3., 2.);
-    internal.holes.push_back(external.contour);
-    internal.holes.back().make_clockwise();
+    // A first-layer bridge classification prints as ordinary bed-facing fill.
+    const bool lower_on_bed = GENERATE(false, true);
+    const ExPolygon internal = rectangle(-8., -5., -2., 5.);
+    ExPolygon external = rectangle(0., -5., 8., 5.);
+    const ExPolygon opening = rectangle(2., -2., 6., 2.);
+    external.holes.push_back(opening.contour);
+    external.holes.back().make_clockwise();
+    const ExPolygons bridges{internal, external};
 
-    // The solid fill crosses an internal bridge, ordinary material, and
-    // the external bridge in its central opening, all at the same height.
+    // The upper solid spans both kinds of bridge, the gap between them and
+    // a supported patch inside the outline of the external bridge.
     auto paths_at_flow = [&](double percent) {
         auto config = bridge_controls_config();
         config.set_deserialize_strict({{"flow_above_internal_bridges", std::to_string(percent) + "%"},
@@ -239,9 +270,9 @@ TEST_CASE("Flow above internal bridges changes only the covered length of a soli
         Model model = bridge_controls_model();
         Print print;
         start_print(print, model, config);
-        Layer *layer = print.get_object(size_t(0))->get_layer(5);
+        Layer *layer = print.get_object(size_t(0))->get_layer(lower_on_bed ? 1 : 5);
         layer->lower_layer->get_region(0)->fill_surfaces.surfaces = {
-            Surface(stInternalBridge, internal), Surface(stBottomBridge, external)};
+            Surface(stInternalBridge, internal), Surface(stBottomBridge, external), Surface(stInternalSolid, opening)};
         LayerRegion *region = layer->get_region(0);
         const ExPolygon solid = rectangle(-12., -8., 12., 8.);
         region->fill_surfaces.surfaces = {Surface(stInternalSolid, solid)};
@@ -263,20 +294,22 @@ TEST_CASE("Flow above internal bridges changes only the covered length of a soli
     }
 
     const double percent = GENERATE(80., 137.5);
-    double inside_length = 0., outside_length = 0., external_length = 0.;
+    double inside_length = 0., outside_length = 0., external_length = 0., opening_length = 0.;
     for (const ExtrusionPath &path : paths_at_flow(percent)) {
         REQUIRE(path.role() == erSolidInfill);
         const double length = unscale<double>(path.polyline.length());
-        const double inside = unscale<double>(total_length(intersection_pl(path.polyline, internal)));
+        const double inside = unscale<double>(total_length(intersection_pl(path.polyline, bridges)));
         if (inside > 0.001)
-            CHECK(path.mm3_per_mm == Approx(nominal * percent / 100.));
+            CHECK(path.mm3_per_mm == Approx(lower_on_bed ? nominal : nominal * percent / 100.));
         if (length - inside > 0.001)
             CHECK(path.mm3_per_mm == Approx(nominal));
         inside_length += inside;
         outside_length += length - inside;
         external_length += unscale<double>(total_length(intersection_pl(path.polyline, external)));
+        opening_length += unscale<double>(total_length(intersection_pl(path.polyline, opening)));
     }
-    CHECK(inside_length > 10.);
+    CHECK(inside_length - external_length > 10.);
+    CHECK(opening_length > 10.);
     CHECK(outside_length > 10.);
     CHECK(external_length > 10.);
     CHECK(inside_length + outside_length == Approx(baseline_length).margin(0.001));
@@ -297,34 +330,7 @@ TEST_CASE("Reslicing changes flow directly above the top of an internal bridge s
 
     // Compare every layer and extrusion role. In particular, a follow-up
     // bridge above a bridge must keep its own bridge flow.
-    const auto directory = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("bridge-flow-%%%%-%%%%");
-    boost::filesystem::create_directories(directory);
-    ScopeGuard cleanup([&] {
-        boost::system::error_code ec;
-        boost::filesystem::remove_all(directory, ec);
-    });
-    auto extruded_filament = [&] {
-        const std::string path = (directory / "flow.gcode").string();
-        GCodeProcessorResult preview;
-        print.export_gcode(path, &preview);
-        std::map<std::pair<int, std::string>, double> result;
-        int layer = -1;
-        std::string role;
-        GCodeReader reader;
-        reader.apply_config(config);
-        REQUIRE(reader.parse_file(path, [&](GCodeReader &state, const GCodeReader::GCodeLine &line) {
-            const auto comment = line.comment();
-            if (comment == " CHANGE_LAYER")
-                ++layer;
-            else if (comment.substr(0, 10) == " FEATURE: ")
-                role = comment.substr(10);
-            if (layer >= 0 && line.extruding(state) && line.dist_XY(state) > 0.)
-                result[{layer, role}] += line.dist_E(state);
-        }));
-        return result;
-    };
-
-    const auto baseline = extruded_filament();
+    const auto baseline = extruded_filament(print, config);
     const auto above = std::make_pair(int(above_stack), std::string("Internal solid infill"));
     REQUIRE(baseline.count(above) == 1);
     REQUIRE(baseline.at(above) > 0.);
@@ -333,12 +339,56 @@ TEST_CASE("Reslicing changes flow directly above the top of an internal bridge s
         print.apply(model, config);
         REQUIRE_FALSE(print.get_object(size_t(0))->is_step_done(posInfill));
         print.process();
-        const auto actual = extruded_filament();
+        const auto actual = extruded_filament(print, config);
         REQUIRE(actual.size() == baseline.size());
         for (const auto &[key, filament] : baseline) {
             REQUIRE(actual.count(key) == 1);
             const double factor = key == above ? percent / 100. : 1.;
             CHECK(actual.at(key) == Approx(filament * factor).margin(0.0005));
+        }
+    }
+}
+
+TEST_CASE("Solid and top fill directly above an external span use the bridge flow multiplier",
+          "[BridgeControls][FlowAbove][Reslice]")
+{
+    const int roof_layers = GENERATE(2, 4);
+    auto config = bridge_controls_config();
+    config.set_deserialize_strict({{"use_relative_e_distances", "1"}, {"sparse_infill_density", "100%"}});
+    Model model = bridge_controls_model(false, 0.2 * roof_layers);
+    Print print;
+    start_print(print, model, config);
+    REQUIRE(surface_layers(print, stInternalBridge).empty());
+    const auto bridges = surface_layers(print, stBottomBridge);
+    REQUIRE(bridges.size() == 1);
+    const int bridge_layer = int(bridges.begin()->first);
+    const std::string role = roof_layers == 2 ? "Top surface" : "Internal solid infill";
+    const auto receiving = std::make_pair(bridge_layer + 1, role);
+    const auto baseline = extruded_filament(print, config);
+    REQUIRE(baseline.at({bridge_layer, "Bridge"}) > 0.);
+    REQUIRE(baseline.at(receiving) > 0.);
+    if (roof_layers > 2) {
+        const auto next = baseline.lower_bound({bridge_layer + 2, ""});
+        REQUIRE(next != baseline.end());
+        REQUIRE(next->first.first == bridge_layer + 2);
+    }
+
+    for (int percent : {150, 100}) {
+        config.set_deserialize_strict({{"flow_above_internal_bridges", std::to_string(percent) + "%"}});
+        print.apply(model, config);
+        REQUIRE_FALSE(print.get_object(size_t(0))->is_step_done(posInfill));
+        print.process();
+        const auto actual = extruded_filament(print, config);
+        REQUIRE(actual.size() == baseline.size());
+        for (const auto &[key, filament] : baseline) {
+            REQUIRE(actual.count(key) == 1);
+            if (percent == 150 && key == receiving) {
+                // This roof also covers the solid pillars on both sides of the
+                // span. Only part of its solid fill receives the extra material.
+                CHECK(actual.at(key) > filament * 1.1);
+                CHECK(actual.at(key) < filament * 1.5);
+            } else
+                CHECK(actual.at(key) == Approx(filament).margin(0.001));
         }
     }
 }

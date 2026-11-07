@@ -2095,10 +2095,11 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(1));
 
+    // Keep the Tyr.18 key so saved projects and presets retain their percentage.
     def = this->add("flow_above_internal_bridges", coPercent);
-    def->label = L("Flow above internal bridges");
+    def->label = L("Flow above bridges");
     def->category = L("Quality");
-    def->tooltip = L("Extrusion multiplier for solid fill directly above an internal bridge. Increase it to fill gaps between the bridge strands. 100% uses normal flow.");
+    def->tooltip = L("Extrusion multiplier for the first solid fill directly above a regular or internal bridge. Increase it to fill gaps between the bridge strands. 100% uses normal flow.");
     def->sidetext = "%";
     def->min = 1;
     def->max = 200;
