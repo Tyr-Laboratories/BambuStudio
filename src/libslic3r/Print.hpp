@@ -546,6 +546,9 @@ public:
 
     // Helpers to project custom facets on slices
     void project_and_append_custom_facets(bool seam, EnforcerBlockerType type, std::vector<Polygons>& expolys, std::vector<std::pair<Vec3f,Vec3f>>* vertical_points=nullptr) const;
+    bool has_support_base_painting() const;
+    // Upward-facing base permissions in object-layer coordinates, without raft layers.
+    std::vector<Polygons> project_support_base_facets() const;
 
     // Painted-support (enforcer/blocker) meshes are projected in raw object coordinates, while the
     // object contours are scaled by filament_shrink during slice_volumes(). Returns the matching

@@ -94,3 +94,8 @@ target_link_libraries(bridge_controls_tests test_common libslic3r slicer_test_su
 target_include_directories(bridge_controls_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/libslic3r)
 set_property(TARGET bridge_controls_tests PROPERTY FOLDER "tests")
 add_test(bridge_controls_tests bridge_controls_tests ${CATCH_EXTRA_ARGS})
+
+add_executable(support_base_tests fff_print_tests.cpp test_support_base_painting.cpp test_support_base_slicing.cpp test_support_base_routes.cpp)
+target_link_libraries(support_base_tests test_common libslic3r slicer_test_support)
+set_property(TARGET support_base_tests PROPERTY FOLDER "tests")
+add_test(support_base_tests support_base_tests ${CATCH_EXTRA_ARGS})

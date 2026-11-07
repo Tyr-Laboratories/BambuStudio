@@ -91,7 +91,9 @@ using PaintReprojectCancelCallback   = std::function<bool()>;
                                              FacetsAnnotation       &dst_walls,
                                              const PaintReprojectProgressCallback &progress = nullptr,
                                              const PaintReprojectCancelCallback   &cancel   = nullptr,
-                                             const Transform3d      *dst_world_matrix = nullptr);
+                                             const Transform3d      *dst_world_matrix = nullptr,
+                                             const FacetsAnnotation *src_support_bases = nullptr,
+                                             FacetsAnnotation       *dst_support_bases = nullptr);
 
 } // namespace Slic3r
 

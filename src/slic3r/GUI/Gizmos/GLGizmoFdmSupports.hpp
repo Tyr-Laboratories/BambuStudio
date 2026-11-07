@@ -39,6 +39,12 @@ protected:
     void on_set_state() override;
     void show_tooltip_information(float caption_max, float x, float y);
     wxString handle_snapshot_action_name(bool shift_down, Button button_down) const override;
+    EnforcerBlockerType get_right_button_state_type() const override
+        { return m_paint_support_bases ? EnforcerBlockerType::NONE : EnforcerBlockerType::BLOCKER; }
+    std::array<float, 4> get_cursor_sphere_left_button_color() const override
+        { return m_paint_support_bases ? std::array<float, 4>{0.05f, 0.8f, 0.35f, 0.4f} : GLGizmoPainterBase::get_cursor_sphere_left_button_color(); }
+    std::array<float, 4> get_cursor_sphere_right_button_color() const override
+        { return m_paint_support_bases ? std::array<float, 4>{1.f, 1.f, 1.f, 0.4f} : GLGizmoPainterBase::get_cursor_sphere_right_button_color(); }
 
     std::string get_gizmo_entering_text() const override { return "Entering Paint-on supports"; }
     std::string get_gizmo_leaving_text() const override { return "Leaving Paint-on supports"; }
@@ -55,6 +61,12 @@ private:
     //BBS: add logic to distinguish the first_time_update and later_update
     void update_from_model_object(bool first_update) override;
     void tool_changed(wchar_t old_tool, wchar_t new_tool);
+    void set_base_painting(bool enabled);
+    void refresh_mode_descriptions();
+    void on_load(cereal::BinaryInputArchive &ar) override;
+    void on_save(cereal::BinaryOutputArchive &ar) const override;
+    bool m_paint_support_bases = false;
+    bool m_requirements_overhangs_only = false;
 
     void on_opening() override;
     void on_shutdown() override;
@@ -86,7 +98,7 @@ private:
     bool m_is_tree_support = false;
     bool m_cancel = false;
     size_t m_object_id;
-    std::vector<ObjectBase::Timestamp> m_volume_timestamps;
+    std::vector<std::array<ObjectBase::Timestamp, 2>> m_volume_timestamps;
     PrintInstance m_print_instance;
     mutable EditState m_edit_state;
     //thread

@@ -77,6 +77,8 @@ static inline void model_volume_list_copy_configs(ModelObject &model_object_dst,
 		mv_dst.config.assign_config(mv_src.config);
         assert(mv_dst.supported_facets.id() == mv_src.supported_facets.id());
         mv_dst.supported_facets.assign(mv_src.supported_facets);
+        assert(mv_dst.support_base_facets.id() == mv_src.support_base_facets.id());
+        mv_dst.support_base_facets.assign(mv_src.support_base_facets);
         assert(mv_dst.fuzzy_skin_facets.id() == mv_src.fuzzy_skin_facets.id());
         mv_dst.fuzzy_skin_facets.assign(mv_src.fuzzy_skin_facets);
         assert(mv_dst.wall_painting_facets.id() == mv_src.wall_painting_facets.id());

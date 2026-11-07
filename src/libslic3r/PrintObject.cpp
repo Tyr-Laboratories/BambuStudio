@@ -5304,6 +5304,53 @@ void PrintObject::project_and_append_custom_facets(
         }
 }
 
+bool PrintObject::has_support_base_painting() const
+{
+    return std::any_of(this->model_object()->volumes.begin(), this->model_object()->volumes.end(),
+        [](const ModelVolume *volume) {
+            return volume->is_model_part() && !volume->support_base_facets.empty();
+        });
+}
+
+std::vector<Polygons> PrintObject::project_support_base_facets() const
+{
+    std::vector<Polygons> result(this->layer_count());
+    if (result.empty())
+        return result;
+    const auto zs = zs_from_layers(this->layers());
+    const double shrink_scale = this->support_shrinkage_scale();
+    const auto cancel = [this]() { this->print()->throw_if_canceled(); };
+    for (const ModelVolume *volume : this->model_object()->volumes) {
+        if (!volume->is_model_part() || volume->support_base_facets.empty())
+            continue;
+        const auto facets = volume->support_base_facets.get_facets_strict(*volume, EnforcerBlockerType::ENFORCER);
+        if (facets.indices.empty())
+            continue;
+        std::vector<Polygons> projected;
+        // A base is an upward-facing printed surface. Use the same transformed
+        // slab projection as support requirements, with the opposite orientation.
+        // It preserves partial triangle paint and follows instance mirroring.
+        slice_mesh_slabs(facets, zs, this->trafo_centered() * volume->get_matrix(),
+            &projected, nullptr, nullptr, cancel);
+        assert(projected.size() == result.size());
+        for (size_t layer = 0; layer < result.size(); ++layer) {
+            if (shrink_scale != 1.)
+                for (Polygon &polygon : projected[layer])
+                    polygon.scale(shrink_scale);
+            append(result[layer], std::move(projected[layer]));
+        }
+        cancel();
+    }
+    for (size_t layer = 0; layer < result.size(); ++layer) {
+        // Negative parts and model slicing can remove material from a painted
+        // triangle. Only the portion that survives in the printed part is a base.
+        if (!result[layer].empty())
+            result[layer] = intersection(result[layer], to_polygons(this->get_layer(layer)->lslices));
+        cancel();
+    }
+    return result;
+}
+
 const Layer* PrintObject::get_layer_at_printz(coordf_t print_z) const {
     auto it = Slic3r::lower_bound_by_predicate(m_layers.begin(), m_layers.end(), [print_z](const Layer *layer) { return layer->print_z < print_z; });
     return (it == m_layers.end() || (*it)->print_z != print_z) ? nullptr : *it;

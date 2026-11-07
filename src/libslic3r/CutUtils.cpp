@@ -620,12 +620,13 @@ static void merge_solid_parts_inside_object(ModelObjectPtrs &objects, const Mode
 
         for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
             TriangleMesh             mesh;
-            std::vector<std::string> merged_supported, merged_seam, merged_mmu, merged_fuzzy;
+            std::vector<std::string> merged_supported, merged_seam, merged_mmu, merged_fuzzy, merged_support_bases;
             // Merge all SolidPart of this group but not Connectors
             for (const ModelVolume *mv : groups[group_idx]) {
                 const size_t face_count = mv->mesh().its.indices.size();
                 for (size_t face_idx = 0; face_idx < face_count; ++face_idx) {
                     merged_supported.emplace_back(mv->supported_facets.get_triangle_as_string(int(face_idx)));
+                    merged_support_bases.emplace_back(mv->support_base_facets.get_triangle_as_string(int(face_idx)));
                     merged_seam.emplace_back(mv->seam_facets.get_triangle_as_string(int(face_idx)));
                     merged_mmu.emplace_back(mv->mmu_segmentation_facets.get_triangle_as_string(int(face_idx)));
                     merged_fuzzy.emplace_back(mv->fuzzy_skin_facets.get_triangle_as_string(int(face_idx)));
@@ -659,6 +660,8 @@ static void merge_solid_parts_inside_object(ModelObjectPtrs &objects, const Mode
             for (size_t face_idx = 0; face_idx < annotation_face_count; ++face_idx) {
                 if (!merged_supported[face_idx].empty())
                     new_volume->supported_facets.set_triangle_from_string(int(face_idx), merged_supported[face_idx]);
+                if (!merged_support_bases[face_idx].empty())
+                    new_volume->support_base_facets.set_triangle_from_string(int(face_idx), merged_support_bases[face_idx]);
                 if (!merged_seam[face_idx].empty())
                     new_volume->seam_facets.set_triangle_from_string(int(face_idx), merged_seam[face_idx]);
                 if (!merged_mmu[face_idx].empty())

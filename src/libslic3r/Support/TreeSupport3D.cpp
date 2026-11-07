@@ -15,6 +15,7 @@
 #include "BuildVolume.hpp"
 #include "ClipperUtils.hpp"
 #include "EdgeGrid.hpp"
+#include "Exception.hpp"
 #include "Fill/Fill.hpp"
 #include "Fill/Lightning/Generator.hpp"
 #include "Layer.hpp"
@@ -373,6 +374,15 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 
     LineStatus type = LineStatus::INVALID;
 
+    // Prefer a nearby painted base only when the collision-aware model route
+    // actually reaches one. Other tips keep the ordinary build-plate route.
+    if (config.painted_bases_only) {
+        if (!contains(volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::FastSafe, true, min_xy_dist), p))
+            return LineStatus::TO_MODEL_GRACIOUS_SAFE;
+        if (!contains(volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::Fast, true, min_xy_dist), p))
+            return LineStatus::TO_MODEL_GRACIOUS;
+    }
+
     if (!contains(volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::FastSafe, false, min_xy_dist), p))
         type = LineStatus::TO_BP_SAFE;
     else if (!contains(volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::Fast, false, min_xy_dist), p))
@@ -381,10 +391,23 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
         type = LineStatus::TO_MODEL_GRACIOUS_SAFE;
     else if (config.support_rests_on_model && !contains(volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::Fast, true, min_xy_dist), p))
         type = LineStatus::TO_MODEL_GRACIOUS;
-    else if (config.support_rests_on_model && !contains(volumes.getCollision(radius, layer_idx, min_xy_dist), p))
+    else if (config.support_rests_on_model && !config.painted_bases_only && !contains(volumes.getCollision(radius, layer_idx, min_xy_dist), p))
         type = LineStatus::TO_MODEL;
 
     return type;
+}
+
+// A roof may be supported by either a normal bed route or a painted base.
+// Collision alone would also admit unpainted model contacts in painted mode.
+static Polygons support_tip_forbidden(const TreeModelVolumes &volumes, const TreeSupportSettings &config,
+                                     coord_t radius, LayerIndex layer_idx, bool min_xy_dist)
+{
+    if (config.painted_bases_only)
+        return intersection(volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::Fast, false, min_xy_dist),
+                            volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::Fast, true, min_xy_dist));
+    return config.support_rests_on_model ?
+        volumes.getCollision(radius, layer_idx, min_xy_dist) :
+        volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::Fast, false, min_xy_dist);
 }
 
 /*!
@@ -399,23 +422,14 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
     const TreeModelVolumes &volumes, const TreeSupportSettings &config,
     const Polylines &polylines, LayerIndex layer_idx)
 {
-    const bool min_xy_dist = config.xy_distance > config.xy_min_distance;
-
     LineInformations result;
     // Also checks if the position is valid, if it is NOT, it deletes that point
     for (const Polyline &line : polylines) {
         LineInformation res_line;
         for (Point p : line) {
-            if (! contains(volumes.getAvoidance(config.getRadius(0), layer_idx, TreeModelVolumes::AvoidanceType::FastSafe, false, min_xy_dist), p))
-                res_line.emplace_back(p, LineStatus::TO_BP_SAFE);
-            else if (! contains(volumes.getAvoidance(config.getRadius(0), layer_idx, TreeModelVolumes::AvoidanceType::Fast, false, min_xy_dist), p))
-                res_line.emplace_back(p, LineStatus::TO_BP);
-            else if (config.support_rests_on_model && ! contains(volumes.getAvoidance(config.getRadius(0), layer_idx, TreeModelVolumes::AvoidanceType::FastSafe, true, min_xy_dist), p))
-                res_line.emplace_back(p, LineStatus::TO_MODEL_GRACIOUS_SAFE);
-            else if (config.support_rests_on_model && ! contains(volumes.getAvoidance(config.getRadius(0), layer_idx, TreeModelVolumes::AvoidanceType::Fast, true, min_xy_dist), p))
-                res_line.emplace_back(p, LineStatus::TO_MODEL_GRACIOUS);
-            else if (config.support_rests_on_model && ! contains(volumes.getCollision(config.getRadius(0), layer_idx, min_xy_dist), p))
-                res_line.emplace_back(p, LineStatus::TO_MODEL);
+            const LineStatus status = get_avoidance_status(p, config.getRadius(0), layer_idx, volumes, config);
+            if (status != LineStatus::INVALID)
+                res_line.emplace_back(p, status);
             else if (!res_line.empty()) {
                 result.emplace_back(res_line);
                 res_line.clear();
@@ -464,6 +478,9 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 {
     using AvoidanceType = TreeModelVolumes::AvoidanceType;
     const bool min_xy_dist = config.xy_distance > config.xy_min_distance;
+    if (config.painted_bases_only && (p.second == LineStatus::TO_MODEL_GRACIOUS || p.second == LineStatus::TO_MODEL_GRACIOUS_SAFE))
+        return !contains(volumes.getAvoidance(config.getRadius(0), current_layer - 1,
+            p.second == LineStatus::TO_MODEL_GRACIOUS_SAFE ? AvoidanceType::FastSafe : AvoidanceType::Fast, true, min_xy_dist), p.first);
     if (! contains(volumes.getAvoidance(config.getRadius(0), current_layer - 1, p.second == LineStatus::TO_BP_SAFE ? AvoidanceType::FastSafe : AvoidanceType::Fast, false, min_xy_dist), p.first))
         return true;
     if (config.support_rests_on_model && (p.second != LineStatus::TO_BP && p.second != LineStatus::TO_BP_SAFE))
@@ -1036,9 +1053,8 @@ void sample_overhang_area(
             Polygons forbidden_next;
             {
                 const bool min_xy_dist = interface_placer.config.xy_distance > interface_placer.config.xy_min_distance;
-                const Polygons& forbidden_next_raw = interface_placer.config.support_rests_on_model ?
-                    interface_placer.volumes.getCollision(interface_placer.config.getRadius(0), layer_idx - (dtt_roof + 1), min_xy_dist) :
-                    interface_placer.volumes.getAvoidance(interface_placer.config.getRadius(0), layer_idx - (dtt_roof + 1), TreeModelVolumes::AvoidanceType::Fast, false, min_xy_dist);
+                const Polygons forbidden_next_raw = support_tip_forbidden(interface_placer.volumes, interface_placer.config,
+                    interface_placer.config.getRadius(0), layer_idx - (dtt_roof + 1), min_xy_dist);
                 // prevent rounding errors down the line
                 //FIXME maybe use SafetyOffset::Yes at the following diff() instead?
                 forbidden_next = offset(union_ex(forbidden_next_raw), scaled<float>(0.005), jtMiter, 1.2);
@@ -1228,9 +1244,8 @@ void generate_initial_areas(
             // take the least restrictive avoidance possible
             Polygons relevant_forbidden;
             {
-                const Polygons &relevant_forbidden_raw = config.support_rests_on_model ?
-                    volumes.getCollision(config.getRadius(0), layer_idx, min_xy_dist) :
-                    volumes.getAvoidance(config.getRadius(0), layer_idx, AvoidanceType::Fast, false, min_xy_dist);
+                const Polygons relevant_forbidden_raw = support_tip_forbidden(volumes, config,
+                    config.getRadius(0), layer_idx, min_xy_dist);
                 // prevent rounding errors down the line, points placed directly on the line of the forbidden area may not be added otherwise.
                 relevant_forbidden = offset(union_ex(relevant_forbidden_raw), scaled<float>(0.005), jtMiter, 1.2);
             }
@@ -1519,7 +1534,7 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
 
     if (mergelayer || current_elem.to_buildplate) {
         to_bp_data = safe_union(diff_clipped(increased, volumes.getAvoidance(radius, layer_idx - 1, settings.type, false, settings.use_min_distance)));
-        if (! current_elem.to_buildplate && area(to_bp_data) > tiny_area_threshold) {
+        if (!config.painted_bases_only && !current_elem.to_buildplate && area(to_bp_data) > tiny_area_threshold) {
             // mostly happening in the tip, but with merges one should check every time, just to be sure.
             current_elem.to_buildplate = true; // sometimes nodes that can reach the buildplate are marked as cant reach, tainting subtrees. This corrects it.
             BOOST_LOG_TRIVIAL(debug) << "Corrected taint leading to a wrong to model value on layer " << layer_idx - 1 << " targeting " <<
@@ -1535,8 +1550,10 @@ static Point move_inside_if_outside(const Polygons &polygons, Point from, int di
                 current_elem.to_model_gracious = true;
                 BOOST_LOG_TRIVIAL(debug) << "Corrected taint leading to a wrong non gracious value on layer " << layer_idx - 1 << " targeting " <<
                     current_elem.target_height << " with radius " << radius;
-            } else
+            } else if (!config.painted_bases_only)
                 to_model_data = safe_union(diff_clipped(increased, volumes.getCollision(radius, layer_idx - 1, settings.use_min_distance)));
+            else
+                to_model_data.clear();
         }
     }
 
@@ -1889,9 +1906,10 @@ static void increase_areas_one_layer(
             if (add) {
                 // Union seems useless, but some rounding errors somewhere can cause to_bp_data to be slightly bigger than it should be.
                 assert(! inc_wo_collision.empty() || ! to_bp_data.empty() || ! to_model_data.empty());
-                Polygons max_influence_area = safe_union(
-                    diff_clipped(inc_wo_collision, volumes.getCollision(radius, layer_idx - 1, elem.use_min_xy_dist)),
-                    safe_union(to_bp_data, to_model_data));
+                Polygons max_influence_area = config.painted_bases_only && !elem.to_buildplate ?
+                    to_model_data : safe_union(
+                        diff_clipped(inc_wo_collision, volumes.getCollision(radius, layer_idx - 1, elem.use_min_xy_dist)),
+                        safe_union(to_bp_data, to_model_data));
                 merging_area.state = elem;
                 assert(!max_influence_area.empty());
                 merging_area.set_bbox(get_extents(max_influence_area));
@@ -1907,7 +1925,8 @@ static void increase_areas_one_layer(
                 // But as branches connecting with the model that are to small have to be culled, the bottom most point has to be not set.
                 // A point can be set on the top most tip layer (maybe more if it should not move for a few layers).
                 parent.state.result_on_layer_reset();
-                parent.state.to_model_gracious = false;
+                if (!config.painted_bases_only)
+                    parent.state.to_model_gracious = false;
             }
             throw_on_cancel();
         }
@@ -2104,14 +2123,21 @@ static bool merge_influence_areas_two_elements(
         intersect_small_with_bigger(smaller_rad.areas.influence_areas, bigger_rad.areas.influence_areas),
         intersect);
 
+    if (config.painted_bases_only && !merging_to_bp)
+        influence_areas = intersect;
+
     Polygons to_model_areas;
-    if (merging_to_bp && config.support_rests_on_model)
-        to_model_areas = new_state.to_model_gracious ?
-            // Rather unioning with "intersect" due to some rounding errors.
-            safe_union(
-                intersect_small_with_bigger(smaller_rad.areas.to_model_areas, bigger_rad.areas.to_model_areas),
-                intersect) :
-            influence_areas;
+    if (merging_to_bp && config.support_rests_on_model) {
+        if (config.painted_bases_only)
+            to_model_areas = intersect_small_with_bigger(smaller_rad.areas.to_model_areas, bigger_rad.areas.to_model_areas);
+        else
+            to_model_areas = new_state.to_model_gracious ?
+                // Rather unioning with "intersect" due to some rounding errors.
+                safe_union(
+                    intersect_small_with_bigger(smaller_rad.areas.to_model_areas, bigger_rad.areas.to_model_areas),
+                    intersect) :
+                influence_areas;
+    }
 
     dst.parents.insert(dst.parents.end(), src.parents.begin(), src.parents.end());
     dst.state = new_state;
@@ -2476,6 +2502,11 @@ static void set_to_model_contact_simple(SupportElement &elem)
  * \param first_elem[in,out] SupportElement that did not have its result_on_layer set meaning that it does not have a child element.
  * \param layer_idx[in] The current layer.
  */
+[[noreturn]] static void fail_painted_support_base()
+{
+    throw SlicingError(_L("A tree support could not reach a valid painted base. Paint a larger or lower support base, reduce the tree branch diameter, or erase the support base painting and slice again."));
+}
+
 static void set_to_model_contact_to_model_gracious(
     const TreeModelVolumes          &volumes,
     const TreeSupportSettings       &config,
@@ -2489,7 +2520,8 @@ static void set_to_model_contact_to_model_gracious(
     {
         SupportElement *elem = &first_elem;
         for (LayerIndex layer_check = elem->state.layer_idx;
-            ! intersection(elem->influence_area, volumes.getPlaceableAreas(support_element_collision_radius(config, elem->state), layer_check, throw_on_cancel)).empty();
+            ! intersection(elem->influence_area, volumes.getPlaceableAreas(config.painted_bases_only ?
+                support_element_radius(config, elem->state) : support_element_collision_radius(config, elem->state), layer_check, throw_on_cancel)).empty();
             elem = &move_bounds[++ layer_check][elem->parents.front()]) {
             assert(elem->state.layer_idx == layer_check);
             assert(! elem->state.deleted);
@@ -2503,6 +2535,10 @@ static void set_to_model_contact_to_model_gracious(
 
     // Could not find valid placement, even though it should exist => error handling
     if (last_successfull_layer == nullptr) {
+        if (config.painted_bases_only) {
+            // An invalid branch must never invent an unpainted model anchor.
+            fail_painted_support_base();
+        }
         BOOST_LOG_TRIVIAL(warning) << "No valid placement found for to model gracious element on layer " << first_elem.state.layer_idx;
         tree_supports_show_error("Could not fine valid placement on model! Just placing it down anyway. Could cause floating branches."sv, true);
         first_elem.state.to_model_gracious = false;
@@ -2517,7 +2553,11 @@ static void set_to_model_contact_to_model_gracious(
             }
         }
         // Guess a point inside the influence area, in which the branch will be placed in.
-        const Point best = move_inside_if_outside(last_successfull_layer->influence_area, last_successfull_layer->state.next_position);
+        const Polygons contact_area = config.painted_bases_only ?
+            intersection(last_successfull_layer->influence_area,
+                volumes.getPlaceableAreas(support_element_radius(config, last_successfull_layer->state),
+                    last_successfull_layer->state.layer_idx, throw_on_cancel)) : last_successfull_layer->influence_area;
+        const Point best = move_inside_if_outside(contact_area, last_successfull_layer->state.next_position);
         last_successfull_layer->state.result_on_layer = best;
         BOOST_LOG_TRIVIAL(debug) << "Added gracious Support On Model Point (" << best.x() << "," << best.y() << "). The current layer is " << last_successfull_layer;
     }
@@ -2606,6 +2646,8 @@ void create_nodes_from_area(
             // check if the resulting center point is not yet set
             if (! elem.state.result_on_layer_is_set()) {
                 if (elem.state.to_buildplate || (elem.state.distance_to_top < config.min_dtt_to_model && ! elem.state.supports_roof)) {
+                    if (config.painted_bases_only && !elem.state.to_buildplate)
+                        fail_painted_support_base();
                     if (elem.state.to_buildplate) {
                         BOOST_LOG_TRIVIAL(warning) << "Uninitialized Influence area targeting " << elem.state.target_position.x() << "," << elem.state.target_position.y()
                                                    << ") "
@@ -2618,13 +2660,19 @@ void create_nodes_from_area(
                     // set the point where the branch will be placed on the model
                     if (elem.state.to_model_gracious)
                         set_to_model_contact_to_model_gracious(volumes, config, move_bounds, elem, throw_on_cancel);
+                    else if (config.painted_bases_only)
+                        fail_painted_support_base();
                     else
                         set_to_model_contact_simple(elem);
                 }
             }
-            if (! elem.state.deleted && ! elem.state.marked && elem.state.target_height == layer_idx)
-                // Just a tip surface with no supporting element.
+            if (! elem.state.deleted && ! elem.state.marked && elem.state.target_height == layer_idx) {
+                // Just a tip surface with no supporting element. Painted
+                // routing must not leave its already generated roof floating.
+                if (config.painted_bases_only && !elem.state.to_buildplate)
+                    fail_painted_support_base();
                 elem.state.deleted = true;
+            }
             if (elem.state.deleted) {
                 for (int32_t parent_idx : elem.parents)
                     // When the roof was not able to generate downwards enough, the top elements may have not moved, and have result_on_layer already set.
@@ -4898,6 +4946,8 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
             m_progress_multiplier, m_progress_offset,
 #endif // SLIC3R_TREESUPPORTS_PROGRESS
             /* additional_excluded_areas */{} };
+        config.painted_bases_only = volumes.painted_bases_only();
+        config.support_rests_on_model |= config.painted_bases_only;
 
         //FIXME generating overhangs just for the first mesh of the group.
         assert(processing.second.size() == 1);

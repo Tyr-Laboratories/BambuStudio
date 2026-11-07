@@ -71,8 +71,8 @@ void GLGizmoFdmSupports::on_opening()
 {
     m_angle_threshold_deg = 40;
     m_parent.set_slope_normal_angle(90.f - m_angle_threshold_deg);
-    if (! m_parent.is_using_slope()) {
-        m_parent.use_slope(true);
+    if (m_parent.is_using_slope() == m_paint_support_bases) {
+        m_parent.use_slope(!m_paint_support_bases);
         m_parent.set_as_dirty();
     }
     m_print_instance.print_object = NULL;
@@ -109,7 +109,7 @@ bool GLGizmoFdmSupports::on_init()
     m_desc["block"]                 = _L("Block supports");
     m_desc["remove_caption"]        = _L("Shift + Left mouse button");
     m_desc["remove"]                = _L("Erase");
-    m_desc["remove_all"]            = _L("Erase all painting");
+    m_desc["remove_all"]            = _L("Erase all support requirements");
     m_desc["highlight_by_angle"]    = _L("Highlight overhang areas");
     m_desc["gap_fill"]              = _L("Gap fill");
     m_desc["perform"]               = _L("Perform");
@@ -123,6 +123,48 @@ bool GLGizmoFdmSupports::on_init()
 
     memset(&m_print_instance, 0, sizeof(m_print_instance));
     return true;
+}
+
+void GLGizmoFdmSupports::refresh_mode_descriptions()
+{
+    m_desc["enforce"] = m_paint_support_bases ? _L("Paint support bases") : _L("Enforce supports");
+    m_desc["block"] = m_paint_support_bases ? _L("Erase support bases") : _L("Block supports");
+    m_desc["remove_all"] = m_paint_support_bases ? _L("Erase all support bases") : _L("Erase all support requirements");
+}
+
+void GLGizmoFdmSupports::set_base_painting(bool enabled)
+{
+    if (m_paint_support_bases == enabled)
+        return;
+    // Each channel is committed independently. Switching tools must never copy
+    // the current channel's selector into the other channel's annotation.
+    update_model_object();
+    if (enabled) {
+        m_requirements_overhangs_only = m_paint_on_overhangs_only;
+        m_paint_on_overhangs_only = false;
+    } else {
+        m_paint_on_overhangs_only = m_requirements_overhangs_only;
+    }
+    m_paint_support_bases = enabled;
+    refresh_mode_descriptions();
+    update_from_model_object(false);
+    m_parent.use_slope(!enabled);
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoFdmSupports::on_load(cereal::BinaryInputArchive &ar)
+{
+    GLGizmoPainterBase::on_load(ar);
+    ar(m_paint_support_bases, m_requirements_overhangs_only, m_paint_on_overhangs_only);
+    if (m_paint_support_bases)
+        m_paint_on_overhangs_only = false;
+    refresh_mode_descriptions();
+}
+
+void GLGizmoFdmSupports::on_save(cereal::BinaryOutputArchive &ar) const
+{
+    GLGizmoPainterBase::on_save(ar);
+    ar(m_paint_support_bases, m_requirements_overhangs_only, m_paint_on_overhangs_only);
 }
 
 void GLGizmoFdmSupports::render_painter_gizmo() const
@@ -215,7 +257,7 @@ void GLGizmoFdmSupports::render_triangles(const Selection& selection) const
 
         shader->set_uniform("volume_world_matrix", trafo_matrix);
         shader->set_uniform("volume_mirrored", is_left_handed);
-        shader->set_uniform("slope.actived", m_parent.is_using_slope());
+        shader->set_uniform("slope.actived", !m_paint_support_bases && m_parent.is_using_slope());
         shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
         shader->set_uniform("slope.normal_z", normal_z);
         m_triangle_selectors[mesh_id]->render(m_imgui, trafo_matrix);
@@ -309,6 +351,17 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     float       window_width    = minimal_slider_width + sliders_left_width + slider_icon_width;
     float drag_pos_times     = 0.7;
 
+    m_imgui->disabled_begin(m_round_hole_fill_pending);
+    if (ImGui::RadioButton(_u8L("Support requirements").c_str(), !m_paint_support_bases))
+        set_base_painting(false);
+    ImGui::SameLine();
+    if (ImGui::RadioButton(_u8L("Support bases").c_str(), m_paint_support_bases))
+        set_base_painting(true);
+    m_imgui->disabled_end();
+    if (m_paint_support_bases)
+        m_imgui->text_wrapped(_L("Use Organic tree supports. Paint upward-facing areas where supports may start on the part, even with On build plate only enabled. Left-click paints green; right-click or Shift erases."), ImGui::GetFontSize() * 24.f);
+    ImGui::Separator();
+
     ImGui::AlignTextToFramePadding();
     m_imgui->text(m_desc.at("tool_type"));
     std::array<wchar_t, 4> tool_ids = { ImGui::CircleButtonIcon, ImGui::SphereButtonIcon, ImGui::FillButtonIcon, ImGui::GapFillIcon };
@@ -355,9 +408,11 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
         }
     }
 
-    m_imgui->bbl_checkbox(m_desc["on_overhangs_only"], m_paint_on_overhangs_only);
-    if (ImGui::IsItemHovered())
-        m_imgui->tooltip(format_wxstr(_L("Allows painting only on facets selected by: \"%1%\""), m_desc["highlight_by_angle"]), max_tooltip_width);
+    if (!m_paint_support_bases) {
+        m_imgui->bbl_checkbox(m_desc["on_overhangs_only"], m_paint_on_overhangs_only);
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(format_wxstr(_L("Allows painting only on facets selected by: \"%1%\""), m_desc["highlight_by_angle"]), max_tooltip_width);
+    }
     ImGui::Separator();
 
     if (m_current_tool != old_tool)
@@ -421,64 +476,67 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
         ImGui::BBLDragFloat("##gap_area_input", &TriangleSelectorPatch::gap_area, 0.05f, 0.0f, 0.0f, "%.2f");
     }
 
-    float position_before_text_y = ImGui::GetCursorPos().y;
-    ImGui::AlignTextToFramePadding();
-    m_imgui->text(m_desc["highlight_by_angle"]);
-    ImGui::AlignTextToFramePadding();
-    float position_after_text_y = ImGui::GetCursorPos().y;
-    ImGui::SameLine(sliders_left_width);
+    if (!m_paint_support_bases) {
+        float position_before_text_y = ImGui::GetCursorPos().y;
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc["highlight_by_angle"]);
+        ImGui::AlignTextToFramePadding();
+        float position_after_text_y = ImGui::GetCursorPos().y;
+        ImGui::SameLine(sliders_left_width);
 
-    float slider_height = m_imgui->get_slider_float_height();
-    // Makes slider to be aligned to bottom of the multi-line text.
-    float slider_start_position_y = std::max(position_before_text_y, position_after_text_y - slider_height);
-    ImGui::SetCursorPosY(slider_start_position_y);
+        float slider_height = m_imgui->get_slider_float_height();
+        // Makes slider to be aligned to bottom of the multi-line text.
+        float slider_start_position_y = std::max(position_before_text_y, position_after_text_y - slider_height);
+        ImGui::SetCursorPosY(slider_start_position_y);
 
-    std::string format_str = std::string("%.f");
-    ImGui::PushItemWidth(sliders_width);
-    wxString tooltip = _L("Highlight faces according to overhang angle.");
-    if (m_imgui->bbl_slider_float_style("##angle_threshold_deg", &m_highlight_by_angle_threshold_deg, 0.f, 90.f, format_str.data(), 1.0f, true, tooltip)) {
-        m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
-        if (!m_parent.is_using_slope()) {
-            m_parent.use_slope(true);
-            m_parent.set_as_dirty();
+        std::string format_str = std::string("%.f");
+        ImGui::PushItemWidth(sliders_width);
+        wxString tooltip = _L("Highlight faces according to overhang angle.");
+        if (m_imgui->bbl_slider_float_style("##angle_threshold_deg", &m_highlight_by_angle_threshold_deg, 0.f, 90.f, format_str.data(), 1.0f, true, tooltip)) {
+            m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
+            if (!m_parent.is_using_slope()) {
+                m_parent.use_slope(true);
+                m_parent.set_as_dirty();
+            }
         }
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::BeginTooltip();
-        if (m_support_threshold_angle != 0) {
-            wxString str_tooltip = (_L("Auto support threshold angle: ") + std::to_string(m_support_threshold_angle));
-            m_imgui->text_colored(ImGuiWrapper::COL_WINDOW_BG, str_tooltip);
-        } else {
-            wxString s_tooltip = (_L("No auto support"));
-            m_imgui->text_colored(ImGuiWrapper::COL_WINDOW_BG, s_tooltip);
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            if (m_support_threshold_angle != 0) {
+                wxString str_tooltip = (_L("Auto support threshold angle: ") + std::to_string(m_support_threshold_angle));
+                m_imgui->text_colored(ImGuiWrapper::COL_WINDOW_BG, str_tooltip);
+            } else {
+                wxString s_tooltip = (_L("No auto support"));
+                m_imgui->text_colored(ImGuiWrapper::COL_WINDOW_BG, s_tooltip);
+            }
+            ImGui::EndTooltip();
         }
-        ImGui::EndTooltip();
-    }
-    ImGui::SameLine(drag_left_width);
-    ImGui::PushItemWidth(1.5 * slider_icon_width);
-    ImGui::BBLDragFloat("##angle_threshold_deg_input", &m_highlight_by_angle_threshold_deg, 0.05f, 0.0f, 0.0f, "%.2f");
+        ImGui::SameLine(drag_left_width);
+        ImGui::PushItemWidth(1.5 * slider_icon_width);
+        ImGui::BBLDragFloat("##angle_threshold_deg_input", &m_highlight_by_angle_threshold_deg, 0.05f, 0.0f, 0.0f, "%.2f");
 
-    m_imgui->disabled_begin(m_round_hole_fill_pending);
-    if (m_imgui->button(m_desc.at("block_round_holes"))) {
-        m_round_hole_fill_pending = true;
-        const ObjectID object_id = p_model_object->id();
-        const int instance_idx = m_parent.get_selection().get_instance_idx();
-        // The modal progress dialog yields UI events; open it outside this
-        // ImGui frame so nested rendering cannot corrupt the painter window.
-        wxGetApp().CallAfter([this, object_id, instance_idx]() {
-            ScopeGuard reset_pending([this]() { m_round_hole_fill_pending = false; });
-            if (get_state() == On && m_c && m_c->selection_info() && m_c->selection_info()->model_object() &&
-                m_c->selection_info()->model_object()->id() == object_id &&
-                m_parent.get_selection().get_instance_idx() == instance_idx)
-                block_round_internal_hole_overhangs();
-            m_parent.set_as_dirty();
-        });
+        m_imgui->disabled_begin(m_round_hole_fill_pending);
+        if (m_imgui->button(m_desc.at("block_round_holes"))) {
+            m_round_hole_fill_pending = true;
+            const ObjectID object_id = p_model_object->id();
+            const int instance_idx = m_parent.get_selection().get_instance_idx();
+            // The modal progress dialog yields UI events; open it outside this
+            // ImGui frame so nested rendering cannot corrupt the painter window.
+            wxGetApp().CallAfter([this, object_id, instance_idx]() {
+                ScopeGuard reset_pending([this]() { m_round_hole_fill_pending = false; });
+                if (get_state() == On && m_c && m_c->selection_info() && m_c->selection_info()->model_object() &&
+                    m_c->selection_info()->model_object()->id() == object_id &&
+                    m_parent.get_selection().get_instance_idx() == instance_idx)
+                    block_round_internal_hole_overhangs();
+                m_parent.set_as_dirty();
+            });
+        }
+        m_imgui->disabled_end();
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(_L("Paint support blockers on circular bore walls and enclosed flat ends selected by Highlight overhang areas, including hidden surfaces. Other painting is preserved. Undo reverses the fill."), max_tooltip_width);
+        if (!m_round_hole_fill_status.empty())
+            m_imgui->text_wrapped(m_round_hole_fill_status, ImGui::GetFontSize() * 22.f);
+
     }
-    m_imgui->disabled_end();
-    if (ImGui::IsItemHovered())
-        m_imgui->tooltip(_L("Paint support blockers on circular bore walls and enclosed flat ends selected by Highlight overhang areas, including hidden surfaces. Other painting is preserved. Undo reverses the fill."), max_tooltip_width);
-    if (!m_round_hole_fill_status.empty())
-        m_imgui->text_wrapped(m_round_hole_fill_status, ImGui::GetFontSize() * 22.f);
 
     if (m_current_tool != ImGui::GapFillIcon) {
         ImGui::Separator();
@@ -539,7 +597,7 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     ImGui::SameLine();
 
     if (m_imgui->button(m_desc.at("remove_all"))) {
-        Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Reset selection", UndoRedo::SnapshotType::GizmoAction);
+        Plater::TakeSnapshot snapshot(wxGetApp().plater(), m_paint_support_bases ? "Erase all support bases" : "Erase all support requirements", UndoRedo::SnapshotType::GizmoAction);
         ModelObject *        mo  = m_c->selection_info()->model_object();
         int                  idx = -1;
         for (ModelVolume *mv : mo->volumes)
@@ -563,6 +621,8 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
 
 void GLGizmoFdmSupports::block_round_internal_hole_overhangs()
 {
+    if (m_paint_support_bases)
+        return;
     ModelObject *object = m_c->selection_info()->model_object();
     const int instance_idx = m_parent.get_selection().get_instance_idx();
     if (!object || instance_idx < 0 || size_t(instance_idx) >= object->instances.size())
@@ -772,6 +832,8 @@ int GLGizmoFdmSupports::get_selection_support_threshold_angle()
 
 void GLGizmoFdmSupports::select_facets_by_angle(float threshold_deg, bool block)
 {
+    if (m_paint_support_bases)
+        return;
     float threshold = (float(M_PI)/180.f)*threshold_deg;
     const Selection& selection = m_parent.get_selection();
     const ModelObject* mo = m_c->selection_info()->model_object();
@@ -818,7 +880,8 @@ void GLGizmoFdmSupports::update_model_object()
         if (! mv->is_model_part())
             continue;
         ++idx;
-        updated |= mv->supported_facets.set(*m_triangle_selectors[idx].get());
+        FacetsAnnotation &annotation = m_paint_support_bases ? mv->support_base_facets : mv->supported_facets;
+        updated |= annotation.set(*m_triangle_selectors[idx]);
     }
 
     if (updated) {
@@ -839,13 +902,14 @@ void GLGizmoFdmSupports::update_from_model_object(bool first_update)
 
     const ModelObject* mo = m_c->selection_info()->model_object();
     m_triangle_selectors.clear();
-    //BBS: add timestamp logic
-    m_volume_timestamps.clear();
+    // Build the replacement off-lock: the support-preview worker may still be
+    // recording timestamps while the user switches the active paint channel.
+    std::vector<std::array<ObjectBase::Timestamp, 2>> volume_timestamps;
 
     int volume_id = -1;
     std::vector<std::array<float, 4>> ebt_colors;
     ebt_colors.push_back(GLVolume::NEUTRAL_COLOR);
-    ebt_colors.push_back(TriangleSelectorGUI::enforcers_color);
+    ebt_colors.push_back(m_paint_support_bases ? std::array<float, 4>{0.05f, 0.8f, 0.35f, 1.f} : TriangleSelectorGUI::enforcers_color);
     ebt_colors.push_back(TriangleSelectorGUI::blockers_color);
     for (const ModelVolume* mv : mo->volumes) {
         if (! mv->is_model_part())
@@ -857,11 +921,18 @@ void GLGizmoFdmSupports::update_from_model_object(bool first_update)
         const TriangleMesh* mesh = &mv->mesh();
         m_triangle_selectors.emplace_back(std::make_unique<TriangleSelectorPatch>(*mesh, ebt_colors));
         // Reset of TriangleSelector is done inside TriangleSelectorGUI's constructor, so we don't need it to perform it again in deserialize().
-        m_triangle_selectors.back()->deserialize(mv->supported_facets.get_data(), false);
+        const FacetsAnnotation &annotation = m_paint_support_bases ? mv->support_base_facets : mv->supported_facets;
+        m_triangle_selectors.back()->deserialize(annotation.get_data(), false,
+            m_paint_support_bases ? EnforcerBlockerType::ENFORCER : EnforcerBlockerType::BLOCKER);
+        static_cast<TriangleSelectorPatch *>(m_triangle_selectors.back().get())->set_filter_state(m_current_tool == ImGui::GapFillIcon);
         m_triangle_selectors.back()->request_update_render_data();
         m_triangle_selectors.back()->set_wireframe_needed(true);
         //BBS: add timestamp logic
-        m_volume_timestamps.emplace_back(mv->supported_facets.timestamp());
+        volume_timestamps.push_back({mv->supported_facets.timestamp(), mv->support_base_facets.timestamp()});
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_volume_timestamps.swap(volume_timestamps);
     }
 
     //BBS: invalid volume_support status
@@ -876,6 +947,8 @@ PainterGizmoType GLGizmoFdmSupports::get_painter_type() const
 wxString GLGizmoFdmSupports::handle_snapshot_action_name(bool shift_down, GLGizmoPainterBase::Button button_down) const
 {
     // BBS remove _L()
+    if (m_paint_support_bases)
+        return shift_down || button_down == Button::Right ? "Erase support bases" : "Paint support bases";
     wxString action_name;
     if (shift_down)
         action_name = ("Unselect all");
@@ -975,6 +1048,7 @@ void GLGizmoFdmSupports::invalid_support_volumes(bool invalid_step)
 
 bool GLGizmoFdmSupports::need_regenerate_support_volumes()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_support_volume)
         return true;
 
@@ -992,15 +1066,18 @@ bool GLGizmoFdmSupports::need_regenerate_support_volumes()
             continue;
 
         ++volume_id;
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ",volume_id "<<volume_id<<", record_timestamp "<< m_volume_timestamps[volume_id]
+        if (size_t(volume_id) >= m_volume_timestamps.size())
+            return true;
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ",volume_id "<<volume_id<<", record_timestamp "<< m_volume_timestamps[volume_id][0]
                 <<", current_timestamp "<<mv->supported_facets.timestamp();
-        if (m_volume_timestamps[volume_id] != mv->supported_facets.timestamp())
+        if (m_volume_timestamps[volume_id][0] != mv->supported_facets.timestamp() ||
+            m_volume_timestamps[volume_id][1] != mv->support_base_facets.timestamp())
         {
             return true;
         }
     }
 
-    return false;
+    return size_t(volume_id + 1) != m_volume_timestamps.size();
 }
 
 void GLGizmoFdmSupports::update_support_volumes()
@@ -1074,6 +1151,7 @@ void GLGizmoFdmSupports::run_thread()
         auto record_timestamp = [this]()
         {
             const ModelObject* mo = m_c->selection_info()->model_object();
+            std::lock_guard<std::mutex> lock(m_mutex);
 
             int volume_id = -1;
             for (const ModelVolume* mv : mo->volumes) {
@@ -1081,7 +1159,9 @@ void GLGizmoFdmSupports::run_thread()
                     continue;
 
                 ++volume_id;
-                m_volume_timestamps[volume_id] = mv->supported_facets.timestamp();
+                if (size_t(volume_id) >= m_volume_timestamps.size())
+                    break;
+                m_volume_timestamps[volume_id] = {mv->supported_facets.timestamp(), mv->support_base_facets.timestamp()};
             }
         };
 

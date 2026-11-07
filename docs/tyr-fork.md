@@ -1,6 +1,6 @@
 # Tyr Laboratories Bambu Studio fork
 
-This public fork adds wall painting, automatic round-hole painting and support blockers, slope-based inner walls, and dedicated bridge controls to Bambu Studio. It retains the native Classic and Arachne wall generators and the standard project workflow.
+This public fork adds wall painting, automatic round-hole painting and support blockers, support base painting, slope-based inner walls, and dedicated bridge controls to Bambu Studio. It retains the native Classic and Arachne wall generators and the standard project workflow.
 
 The source is based on upstream `master` commit `79df7ae309be398ed30c9f397c13c9911c2edc57`. The wall-painting implementation is commit `eeae2b3e3`; the upstream version in [version.inc](../version.inc) is `02.08.04.57`. This is a Tyr Laboratories fork, not an official Bambu Lab release.
 
@@ -75,6 +75,23 @@ Detection searches all model parts of the selected object, including hidden surf
 Existing painting outside those targets is preserved. The entire operation is one **Undo** action, and Cancel leaves painting unchanged. These are ordinary support-painting annotations: they trigger reslicing, can be edited with the existing brushes, and are retained when the project is saved and reopened as **3MF**. Wall-painting annotations remain independent.
 
 The same conservative bore limits apply as for automatic wall painting. Open channels, noncircular openings, tapered or chamfered recesses, interrupted or damaged meshes, and incomplete or nonplanar end caps may need manual painting. Review the red surfaces and sliced support Preview before printing.
+
+## Paint bases for Organic tree supports
+
+With **Tree Organic** selected and **On build plate only** enabled, select an object in Prepare, open **Supports Painting**, and choose **Support bases**. Paint an upward-facing surface below an overhang to allow trees to start there. This can replace a tall tower from the bed with a short tree on a raised part of the model.
+
+- **Left-click or drag:** paint an allowed base in green.
+- **Right-click or Shift + left-click:** erase base paint.
+- **Erase all support bases:** clear the base channel on the selected object.
+- **Support requirements:** return to ordinary support enforcement and red blockers. Those annotations remain independent.
+
+Base paint grants permission to anchor a tree; it does not itself create an overhang or force support generation. Organic routing prefers reachable painted bases while distant overhangs keep their build-plate routes. Unpainted surfaces remain prohibited as bases when **On build plate only** is enabled. Existing branch angle, branch size, model clearance, bottom contact gap, and bottom interface settings still apply. A patch must have enough room for the branch footprint, and a branch must be able to reach it without passing through the model. Downward-facing or vertical paint does not provide a base.
+
+Use the ordinary brushes, Fill, Gap Fill, and Section view to select the intended surfaces. The overhang-only brush filter and automatic round-hole blocker command belong to **Support requirements**, so they are hidden in base mode. Painting participates in Undo and is retained in this fork's **3MF** projects. Inspect both the markings and the generated support layers after changing the model's orientation or geometry.
+
+This feature applies to **Organic tree supports** only; it does not change the selected support style. With **On build plate only** disabled, ordinary unrestricted model-base behavior remains in effect. Projects without effective base paint retain their existing routing. Older slicers ignore the separate base-paint extension and will not honor these local exceptions; saving through an older slicer may discard them.
+
+If branches merge or grow until their final trunk no longer fits an allowed painted base, slicing reports an error instead of leaving a support roof without its tree. Enlarge the painted base, reduce the branch diameter, or erase the base paint to use ordinary build-plate routing.
 
 ## Bridge acceleration
 
@@ -166,6 +183,7 @@ established; this change is not a claim to fix that memory usage.
 
 The following results cover the Tyr extensions and their macOS application build:
 
+- **Support base painting:** 17 cases and 222 assertions passed, plus 50 consecutive runs of the routing tests. Actual Organic support paths show shorter trees above painted platforms, retained support beneath their overhangs, unchanged distant bed routes, and restoration after erasing paint. Tests cover separate enforcer/blocker masks, partial-paint serialization, 3MF round trips, copy/split/merge/cut/reprojection, support invalidation, transformed projections, undersized bases, barriers, raft offsets, contact gaps, and explicit errors for invalid final branches. See [painting and persistence](../tests/fff_print/test_support_base_painting.cpp), [generated support paths](../tests/fff_print/test_support_base_slicing.cpp), and [routing](../tests/fff_print/test_support_base_routes.cpp). These checks do not establish manual painting interaction or physical print quality.
 - **Focused automated tests:** 45 cases and 20,443 assertions passed. Coverage includes both generators, partial and curved painted surfaces, holes, zero/high counts, narrow regions, transitions, infill clearance, transforms, variable layer heights, numeric modifiers, per-part settings, annotation lifecycle, and 3MF persistence. Automatic-hole cases cover circular bores, arbitrary orientation and mirroring, circular and elliptical scaling, dense tessellation, chamfers, oblique rims, incomplete channels, spherical cavities, cancellation, and preservation of manual painting through 3MF serialization. Support-hole cases additionally check angle selection, inverse-transpose normals under nonuniform scaling, downward-facing blind caps, exterior-flange and incomplete-cap exclusion, preservation of unrelated subdivided support painting, wall-mask independence, and support-blocker persistence through a real 3MF save/reload. These automated checks do not establish manual button or Undo interaction. See [wall-painting tests](../tests/fff_print/test_wall_painting.cpp) and [round-hole tests](../tests/fff_print/test_round_hole_detection.cpp).
 - **Slope and overhang tests:** 18 cases and 5,585 assertions passed. Coverage includes both slope directions and wall generators, transformed surfaces, variable layer heights, painted counts, modifier angles, top/first-layer rules, preserved overhang slowdown, and reslicing through 30° → 0° → 90° → 30°. Process-preset and 3MF round trips retain the angle, including H2S multi-variant profile restoration. Separate regressions reproduce and correct width interpolation, short open-wall measurement, and triple extrusion during open-line modifier clipping. A private 645-layer project slice also generated the added inner walls and exported G-code; sampled cross-sections confirmed the inner wall occupies its own space inside the outer wall. These checks do not establish physical print quality or eliminate every remaining short bridge path. See [slope/overhang tests](../tests/fff_print/test_overhang_walls.cpp) and [setting persistence tests](../tests/fff_print/test_slope_wall_config.cpp).
 - **Automatic-hole project checks:** all 54 independently identified complete reference bores were detected across 18 aircraft parts containing 8.84 million triangles. The pass found 262 cylindrical sections, including surfaces missed by partial manual selections; independent radius and inward-normal checks found no false positives in those results. The largest 1.93-million-triangle part took about 4.5 seconds to scan, with about 265 MiB peak memory for the standalone validation process including the mesh. These samples do not establish exhaustive recognition of every possible hole.

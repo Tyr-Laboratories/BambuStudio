@@ -166,6 +166,10 @@ public:
             this->ceilRadius(radius + m_current_min_xy_dist_delta) - m_current_min_xy_dist_delta;
     }
 
+    // True only when build-plate-only supports have usable upward-facing base paint.
+    // In this mode to_model avoidances describe routes to paint, not to the bed.
+    bool painted_bases_only() const { return m_painted_bases_only; }
+
     Polygon m_bed_area;
 
 private:
@@ -479,6 +483,12 @@ private:
      * \brief Storage for areas that should be avoided, like support blocker or previous generated trees.
      */
     std::vector<Polygons> m_anti_overhang;
+
+    bool m_painted_bases_only { false };
+    // Actual painted surface footprints, indexed with the organic raft offset.
+    std::vector<Polygons> m_painted_base_areas;
+    // Filled work domain used to seed model-only reachability below any paint.
+    Polygons m_painted_route_domain;
     /*!
      * \brief Radii that can be ignored by ceilRadius as they will never be requested, sorted.
      */

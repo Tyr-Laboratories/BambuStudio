@@ -645,6 +645,7 @@ bool apply_painted_mesh_to_volume(
     // import paths that carry support / seam / fuzzy_skin painting cannot
     // leak indices from the old mesh into the new one.
     volume.supported_facets.reset();
+    volume.support_base_facets.reset();
     volume.fuzzy_skin_facets.reset();
     volume.seam_facets.reset();
 
