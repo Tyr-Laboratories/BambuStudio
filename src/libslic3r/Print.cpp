@@ -2033,6 +2033,8 @@ void Print::process(std::unordered_map<std::string, long long>* slice_time, bool
                 return false;
             if (!model_volume1.supported_facets.equals(model_volume2.supported_facets))
                 return false;
+            if (!model_volume1.support_base_facets.equals(model_volume2.support_base_facets))
+                return false;
             if (!model_volume1.fuzzy_skin_facets.equals(model_volume2.fuzzy_skin_facets))
                 return false;
             if (!model_volume1.wall_painting_facets.equals(model_volume2.wall_painting_facets))

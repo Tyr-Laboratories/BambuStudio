@@ -10,6 +10,7 @@ Tyr additions include:
 
 - **Wall Painting:** choose a total wall count for painted surfaces using Classic or Arachne, with automatic painting of circular internal holes.
 - **Support blockers in round holes:** mark overhanging hole surfaces to prevent support generation in screw holes.
+- **Support base painting:** let Organic trees start on selected painted surfaces of the part while retaining build-plate-only routing elsewhere.
 - **Extra wall slope angle:** add an inner wall to single-wall surfaces beyond a chosen angle from vertical, in either slope direction.
 - **Bridge controls:** dedicated bridge acceleration, bridge-layer density, separate bridge/wall overlap, and one to three internal bridge layers.
 - Corrections to overhang-wall width interpolation, short open-wall filtering, and duplicate extrusion during modifier clipping, plus macOS stability and cloud-send integration fixes.

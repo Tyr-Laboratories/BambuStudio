@@ -1607,7 +1607,8 @@ bool reproject_paint(const ModelVolume &src_volume,
         const char             *name;    // internal log tag
         const char             *display; // user-facing progress label (English)
     };
-    const std::array<Layer, 5> layers {{
+    const std::array<Layer, 6> layers {{
+        {src_volume.support_base_facets, dst_volume.support_base_facets, "support bases", L("Restoring support base painting")},
         {src_volume.supported_facets,        dst_volume.supported_facets,        "support",    L("Restoring support painting")},
         {src_volume.seam_facets,             dst_volume.seam_facets,             "seam",       L("Restoring seam painting")},
         {src_volume.mmu_segmentation_facets, dst_volume.mmu_segmentation_facets, "mmu",        L("Restoring paint color")},
@@ -1739,7 +1740,9 @@ bool reproject_paint_geometric(const TriangleMesh     &src_mesh,
                                FacetsAnnotation       &dst_walls,
                                const PaintReprojectProgressCallback &progress,
                                const PaintReprojectCancelCallback   &cancel,
-                               const Transform3d      *dst_world_matrix)
+                               const Transform3d      *dst_world_matrix,
+                               const FacetsAnnotation *src_support_bases,
+                               FacetsAnnotation       *dst_support_bases)
 {
     // Bail out before the whole-mesh prologue below, and before resetting anything, so a
     // cancellation that arrived in the meantime leaves the destination exactly as it was.
@@ -1755,6 +1758,7 @@ bool reproject_paint_geometric(const TriangleMesh     &src_mesh,
     dst_mmu.reset();
     dst_fuzzy.reset();
     dst_walls.reset();
+    if (dst_support_bases) dst_support_bases->reset();
     if (dst_mesh.its.indices.empty() || src_mesh.its.indices.empty())
         return true;
 
@@ -1766,13 +1770,15 @@ bool reproject_paint_geometric(const TriangleMesh     &src_mesh,
         const char             *name;    // internal log tag
         const char             *display; // user-facing progress label (English)
     };
-    const std::array<Layer, 5> layers {{
+    std::vector<Layer> layers {
         {src_supported, dst_supported, "support",    L("Restoring support painting")},
         {src_seam,      dst_seam,      "seam",       L("Restoring seam painting")},
         {src_mmu,       dst_mmu,       "mmu",        L("Restoring paint color")},
         {src_fuzzy,     dst_fuzzy,     "fuzzy skin", L("Restoring fuzzy skin")},
         {src_walls,     dst_walls,     "wall painting", L("Restoring wall painting")},
-    }};
+    };
+    if (src_support_bases && dst_support_bases)
+        layers.push_back({*src_support_bases, *dst_support_bases, "support bases", L("Restoring support base painting")});
     int active_layers = 0;
     for (const Layer &layer : layers)
         if (!layer.src.empty())
@@ -1885,6 +1891,7 @@ bool reproject_paint_between_volumes(const ModelVolume &src, ModelVolume &dst)
         src.mesh().its.indices == dst.mesh().its.indices) {
         // An unchanged reload must retain the subdivision bit for bit.
         dst.supported_facets.assign(src.supported_facets);
+        dst.support_base_facets.assign(src.support_base_facets);
         dst.seam_facets.assign(src.seam_facets);
         dst.mmu_segmentation_facets.assign(src.mmu_segmentation_facets);
         dst.fuzzy_skin_facets.assign(src.fuzzy_skin_facets);
@@ -1898,7 +1905,7 @@ bool reproject_paint_between_volumes(const ModelVolume &src, ModelVolume &dst)
         src.mmu_segmentation_facets, src.fuzzy_skin_facets, src.wall_painting_facets,
         dst.mesh(), dst_to_src, dst.supported_facets, dst.seam_facets,
         dst.mmu_segmentation_facets, dst.fuzzy_skin_facets, dst.wall_painting_facets,
-        nullptr, nullptr, &world);
+        nullptr, nullptr, &world, &src.support_base_facets, &dst.support_base_facets);
 }
 
 } // namespace Slic3r

@@ -137,7 +137,23 @@ TreeModelVolumes::TreeModelVolumes(
     }
 #endif
 
-    m_support_rests_on_model = false;
+    if (print_object.config().support_on_build_plate_only.value && print_object.has_support_base_painting()) {
+        std::vector<Polygons> painted = print_object.project_support_base_facets();
+        m_painted_bases_only = std::any_of(painted.begin(), painted.end(), [](const Polygons &p) { return !p.empty(); });
+        if (m_painted_bases_only) {
+            m_painted_base_areas.resize(m_raft_layers.size());
+            for (Polygons &layer : painted)
+                m_painted_base_areas.emplace_back(union_(layer));
+            // Include the exterior collision ring as well as the bed. Starting
+            // with just the bed would invent reachable strips at its edges as
+            // the first avoidance polygon is inset during propagation.
+            m_painted_route_domain = offset(m_bed_area, scaled<float>(1000.), jtMiter, 1.2);
+            if (m_painted_route_domain.empty())
+                m_painted_bases_only = false;
+        }
+    }
+
+    m_support_rests_on_model = m_painted_bases_only;
     m_min_resolution  = std::numeric_limits<coord_t>::max();
     for (auto data_pair : m_layer_outlines) {
         m_support_rests_on_model |= ! data_pair.first.support_material_buildplate_only;
@@ -348,8 +364,11 @@ const Polygons& TreeModelVolumes::getCollisionHolefree(coord_t radius, LayerInde
 
 const Polygons& TreeModelVolumes::getAvoidance(const coord_t orig_radius, LayerIndex layer_idx, AvoidanceType type, bool to_model, bool min_xy_dist) const
 {
-    if (layer_idx == 0) // What on the layer directly above buildplate do i have to avoid to reach the buildplate ...
+    if (layer_idx == 0) {
+        if (to_model && m_painted_bases_only)
+            return m_painted_route_domain;
         return getCollision(orig_radius, layer_idx, min_xy_dist);
+    }
 
     const coord_t radius = this->ceilRadius(orig_radius, min_xy_dist);
     if (type == AvoidanceType::FastSafe && radius >= m_increase_until_radius + m_current_min_xy_dist_delta)
@@ -385,9 +404,15 @@ const Polygons& TreeModelVolumes::getPlaceableAreas(const coord_t orig_radius, L
         BOOST_LOG_TRIVIAL(error_level_not_in_cache) << "Had to calculate Placeable Areas at radius " << radius << " and layer " << layer_idx << ", but precalculate was called. Performance may suffer!";
         tree_supports_show_error("Not precalculated Placeable areas requested."sv, false);
     }	
-    if (orig_radius == 0)
-        // Placable areas for radius 0 are calculated in the general collision code.
-        return this->getCollision(0, layer_idx, true);
+    if (orig_radius == 0) {
+        // Collision generation also populates radius-zero placeables. Return
+        // that result, never the collision polygons used to compute it.
+        this->getCollision(0, layer_idx, true);
+        if (auto result = m_placeable_areas_cache.getArea({0, layer_idx}); result)
+            return result->get();
+        static const Polygons no_model_contacts;
+        return no_model_contacts;
+    }
     const_cast<TreeModelVolumes*>(this)->calculatePlaceables(radius, layer_idx, throw_on_cancel);
     return getPlaceableAreas(orig_radius, layer_idx, throw_on_cancel);
 }
@@ -443,7 +468,11 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
         [this](size_t i, size_t j) { return m_layer_outlines[i].second.size() < m_layer_outlines[j].second.size(); });
 
     LayerPolygonCache           data;
-    data.allocate(m_collision_cache.getMaxCalculatedLayer(radius) + 1, max_layer_idx + 1);
+    // Another lazy requester may have populated this radius since the miss.
+    const LayerIndex first_missing_layer = m_collision_cache.getMaxCalculatedLayer(radius) + 1;
+    if (first_missing_layer > max_layer_idx)
+        return;
+    data.allocate(first_missing_layer, max_layer_idx + 1);
 
     const bool                  calculate_placable = m_support_rests_on_model && radius == 0;
     LayerPolygonCache           data_placeable;
@@ -555,7 +584,8 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                 // Calculating both the collision areas and placable areas.
                 tbb::parallel_for(tbb::blocked_range<LayerIndex>(std::max(z_distance_bottom_layers + 1, data.begin()), data.end()),
                     [&collision_areas_offsetted, &outlines, &anti_overhang = m_anti_overhang, processing_last_mesh,
-                     min_resolution = m_min_resolution, z_distance_bottom_layers, xy_distance, &data_placeable, &throw_on_cancel]
+                     min_resolution = m_min_resolution, z_distance_bottom_layers, xy_distance, &data_placeable, &throw_on_cancel,
+                     painted_only = m_painted_bases_only, &painted_bases = m_painted_base_areas]
                 (const tbb::blocked_range<LayerIndex>& range) {
                     for (LayerIndex layer_idx = range.begin(); layer_idx != range.end(); ++ layer_idx) {
                         LayerIndex layer_idx_below = layer_idx - z_distance_bottom_layers - 1;
@@ -566,6 +596,13 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                             // Inflate the surface to sit on by the separation distance to increase chance of a support being placed on a sloped surface.
                             offset(below, xy_distance), 
                             layer_idx_below < int(anti_overhang.size()) ? union_(current, anti_overhang[layer_idx_below]) : current);
+                        if (painted_only) {
+                            // Keep the actual painted surface. Unlike native
+                            // placeables this is not enlarged by XY separation;
+                            // nonzero radii are inset by the branch footprint.
+                            placable = layer_idx_below < LayerIndex(painted_bases.size()) ?
+                                intersection(placable, painted_bases[layer_idx_below]) : Polygons{};
+                        }
                         auto &dst     = data_placeable[layer_idx];
                         if (processing_last_mesh) {
                             if (! dst.empty())
@@ -592,9 +629,11 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
 #endif
     if (throw_on_cancel)
         throw_on_cancel();
-    m_collision_cache.insert(std::move(data), radius);
+    // Publish derived radius-zero contacts first: a concurrent lazy reader
+    // that observes collision data must also be able to read its placeables.
     if (calculate_placable)
         m_placeable_areas_cache.insert(std::move(data_placeable), radius);
+    m_collision_cache.insert(std::move(data), radius);
 }
 
 void TreeModelVolumes::calculateCollisionHolefree(const std::vector<RadiusLayerPair> &keys, std::function<void()> throw_on_cancel)
@@ -734,6 +773,12 @@ void TreeModelVolumes::calculateAvoidance(const std::vector<RadiusLayerPair> &ke
 
 void TreeModelVolumes::calculatePlaceables(const std::vector<RadiusLayerPair> &keys, std::function<void()> throw_on_cancel)
 {
+    if (!keys.empty()) {
+        LayerIndex max_layer = 0;
+        for (const RadiusLayerPair &key : keys)
+            max_layer = std::max(max_layer, key.second);
+        getPlaceableAreas(0, max_layer, throw_on_cancel);
+    }
     tbb::parallel_for(tbb::blocked_range<size_t>(0, keys.size()),
         [&, keys](const tbb::blocked_range<size_t>& range) {
             for (size_t key_idx = range.begin(); key_idx < range.end(); ++ key_idx)
@@ -743,6 +788,9 @@ void TreeModelVolumes::calculatePlaceables(const std::vector<RadiusLayerPair> &k
 
 void TreeModelVolumes::calculatePlaceables(const coord_t radius, const LayerIndex max_required_layer, std::function<void()> throw_on_cancel)
 {
+    // Populate the shared zero-radius source once before parallel offsetting.
+    // Otherwise lazy requests for different layers race to extend that cache.
+    getPlaceableAreas(0, max_required_layer, throw_on_cancel);
     LayerIndex start_layer = 1 + m_placeable_areas_cache.getMaxCalculatedLayer(radius);
     if (start_layer > max_required_layer) {
         BOOST_LOG_TRIVIAL(debug) << "Requested calculation for value already calculated ?";
@@ -762,7 +810,11 @@ void TreeModelVolumes::calculatePlaceables(const coord_t radius, const LayerInde
                     // As a placeable area is calculated by (collision of the layer below) - (collision of the current layer) and the collision is offset by xy_distance, 
                     // it can happen that a small line is considered a flat area to place something onto, even though it is mostly 
                     // xy_distance that cant support it. Making the area smaller by xy_distance fixes this.
-                    - (radius + m_current_min_xy_dist + m_current_min_xy_dist_delta),
+                    - (m_painted_bases_only ?
+                        // Organic may draw a branch up to this minimum radius
+                        // even while its collision radius is still smaller.
+                        std::max(radius, m_increase_until_radius) :
+                        radius + m_current_min_xy_dist + m_current_min_xy_dist_delta),
                     jtMiter, 1.2);
                 if(throw_on_cancel)
                     throw_on_cancel();

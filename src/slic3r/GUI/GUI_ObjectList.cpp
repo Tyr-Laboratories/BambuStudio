@@ -2915,8 +2915,10 @@ void ObjectList::del_info_item(const int obj_idx, InfoItemType type)
     case InfoItemType::CustomSupports:
         cnv->get_gizmos_manager().reset_all_states();
         Plater::TakeSnapshot(plater, "Remove support painting");
-        for (ModelVolume* mv : (*m_objects)[obj_idx]->volumes)
+        for (ModelVolume* mv : (*m_objects)[obj_idx]->volumes) {
             mv->supported_facets.reset();
+            mv->support_base_facets.reset();
+        }
         break;
     case InfoItemType::FuzzySkin:
         cnv->get_gizmos_manager().reset_all_states();
@@ -3365,6 +3367,7 @@ void ObjectList::merge(bool to_multipart_object)
                 // BBS: also carry support/seam/fuzzy-skin painting across the merge
                 // (each part keeps its own mesh, so the per-triangle data maps 1:1).
                 new_volume->supported_facets.assign(std::move(volume->supported_facets));
+                new_volume->support_base_facets.assign(std::move(volume->support_base_facets));
                 new_volume->seam_facets.assign(std::move(volume->seam_facets));
                 new_volume->fuzzy_skin_facets.assign(std::move(volume->fuzzy_skin_facets));
                 new_volume->wall_painting_facets.assign(std::move(volume->wall_painting_facets));
@@ -4313,7 +4316,7 @@ void ObjectList::update_info_items(size_t obj_idx, wxDataViewItemArray *selectio
         bool should_show = printer_technology() == ptFFF
             && std::any_of(model_object->volumes.begin(), model_object->volumes.end(),
                 [](const ModelVolume* mv) {
-                    return mv->is_model_part() && !mv->supported_facets.empty();
+                    return mv->is_model_part() && mv->is_fdm_support_painted();
                 });
         if (shows && !should_show) {
             m_objects_model->SetSupportPaintState(false, item_obj);
@@ -4376,7 +4379,7 @@ void ObjectList::update_info_items(size_t obj_idx, wxDataViewItemArray *selectio
         bool should_show = false;
         for (ModelObject* mo : *m_objects) {
             for (ModelVolume* mv : mo->volumes) {
-                if (!mv->supported_facets.empty()) {
+                if (mv->is_fdm_support_painted()) {
                     should_show = true;
                     break;
                 }

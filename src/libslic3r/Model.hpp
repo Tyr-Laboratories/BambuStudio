@@ -841,6 +841,7 @@ private:
 struct PaintKeepPrepared {
     TriangleMesh     mesh;
     FacetsAnnotation supported;
+    FacetsAnnotation support_bases;
     FacetsAnnotation seam;
     FacetsAnnotation mmu;
     FacetsAnnotation fuzzy;
@@ -978,6 +979,9 @@ public:
 
     // List of mesh facets to be supported/unsupported.
     FacetsAnnotation    supported_facets;
+
+    // Independent permission for tree supports to originate on painted model surfaces.
+    FacetsAnnotation    support_base_facets;
 
     // List of seam enforcers/blockers.
     FacetsAnnotation    seam_facets;
@@ -1146,13 +1150,14 @@ public:
         ObjectBase::set_new_unique_id();
         this->config.set_new_unique_id();
         this->supported_facets.set_new_unique_id();
+        this->support_base_facets.set_new_unique_id();
         this->fuzzy_skin_facets.set_new_unique_id();
         this->wall_painting_facets.set_new_unique_id();
         this->seam_facets.set_new_unique_id();
         this->mmu_segmentation_facets.set_new_unique_id();
     }
 
-    bool is_fdm_support_painted() const { return !this->supported_facets.empty(); }
+    bool is_fdm_support_painted() const { return !this->supported_facets.empty() || !this->support_base_facets.empty(); }
     bool is_fuzzy_skin_facets_painted() const { return !this->fuzzy_skin_facets.empty(); }
     bool is_wall_painting_facets_painted() const { return !this->wall_painting_facets.empty(); }
     bool is_seam_painted() const { return !this->seam_facets.empty(); }
@@ -1239,12 +1244,14 @@ private:
 		assert(this->id().valid());
         assert(this->config.id().valid());
         assert(this->supported_facets.id().valid());
+        assert(this->support_base_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->wall_painting_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
+        assert(this->id() != this->support_base_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
         assert(this->id() != this->wall_painting_facets.id());
         assert(this->id() != this->seam_facets.id());
@@ -1257,12 +1264,14 @@ private:
 		assert(this->id().valid());
         assert(this->config.id().valid());
         assert(this->supported_facets.id().valid());
+        assert(this->support_base_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->wall_painting_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
+        assert(this->id() != this->support_base_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
         assert(this->id() != this->wall_painting_facets.id());
         assert(this->id() != this->seam_facets.id());
@@ -1273,12 +1282,14 @@ private:
 		assert(this->id().valid());
         assert(this->config.id().valid());
         assert(this->supported_facets.id().valid());
+        assert(this->support_base_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->wall_painting_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
+        assert(this->id() != this->support_base_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
         assert(this->id() != this->wall_painting_facets.id());
         assert(this->id() != this->seam_facets.id());
@@ -1293,6 +1304,7 @@ private:
         , m_assemble_transformation(other.m_assemble_transformation)
         , m_assemble_initialized(other.m_assemble_initialized)
         , supported_facets(other.supported_facets)
+        , support_base_facets(other.support_base_facets)
         , fuzzy_skin_facets(other.fuzzy_skin_facets)
         , wall_painting_facets(other.wall_painting_facets)
         , seam_facets(other.seam_facets)
@@ -1304,12 +1316,14 @@ private:
 		assert(this->id().valid());
         assert(this->config.id().valid());
         assert(this->supported_facets.id().valid());
+        assert(this->support_base_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->wall_painting_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
+        assert(this->id() != this->support_base_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
         assert(this->id() != this->wall_painting_facets.id());
         assert(this->id() != this->seam_facets.id());
@@ -1317,6 +1331,7 @@ private:
 		assert(this->id() == other.id());
         assert(this->config.id() == other.config.id());
         assert(this->supported_facets.id() == other.supported_facets.id());
+        assert(this->support_base_facets.id() == other.support_base_facets.id());
         assert(this->fuzzy_skin_facets.id() == other.fuzzy_skin_facets.id());
         assert(this->wall_painting_facets.id() == other.wall_painting_facets.id());
         assert(this->seam_facets.id() == other.seam_facets.id());
@@ -1334,12 +1349,14 @@ private:
 		assert(this->id().valid());
         assert(this->config.id().valid());
         assert(this->supported_facets.id().valid());
+        assert(this->support_base_facets.id().valid());
         assert(this->fuzzy_skin_facets.id().valid());
         assert(this->wall_painting_facets.id().valid());
         assert(this->seam_facets.id().valid());
         assert(this->mmu_segmentation_facets.id().valid());
         assert(this->id() != this->config.id());
         assert(this->id() != this->supported_facets.id());
+        assert(this->id() != this->support_base_facets.id());
         assert(this->id() != this->fuzzy_skin_facets.id());
         assert(this->id() != this->wall_painting_facets.id());
         assert(this->id() != this->seam_facets.id());
@@ -1353,12 +1370,14 @@ private:
 		assert(this->config.id().valid());
         assert(this->config.id() != other.config.id());
         assert(this->supported_facets.id() != other.supported_facets.id());
+        assert(this->support_base_facets.id() != other.support_base_facets.id());
         assert(this->fuzzy_skin_facets.id() != other.fuzzy_skin_facets.id());
         assert(this->wall_painting_facets.id() != other.wall_painting_facets.id());
         assert(this->seam_facets.id() != other.seam_facets.id());
         assert(this->mmu_segmentation_facets.id() != other.mmu_segmentation_facets.id());
         assert(this->id() != this->config.id());
         assert(this->supported_facets.empty());
+        assert(this->support_base_facets.empty());
         assert(this->fuzzy_skin_facets.empty());
         assert(this->wall_painting_facets.empty());
         assert(this->seam_facets.empty());
@@ -1370,11 +1389,12 @@ private:
 	friend class cereal::access;
 	friend class UndoRedo::StackImpl;
 	// Used for deserialization, therefore no IDs are allocated.
-    ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), fuzzy_skin_facets(-1), wall_painting_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), object(nullptr)
+    ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), support_base_facets(-1), fuzzy_skin_facets(-1), wall_painting_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), object(nullptr)
     {
 		assert(this->id().invalid());
         assert(this->config.id().invalid());
         assert(this->supported_facets.id().invalid());
+        assert(this->support_base_facets.id().invalid());
         assert(this->fuzzy_skin_facets.id().invalid());
         assert(this->wall_painting_facets.id().invalid());
         assert(this->seam_facets.id().invalid());
@@ -1390,6 +1410,9 @@ private:
         auto t = supported_facets.timestamp();
         cereal::load_by_value(ar, supported_facets);
         mesh_changed |= t != supported_facets.timestamp();
+        t = support_base_facets.timestamp();
+        cereal::load_by_value(ar, support_base_facets);
+        mesh_changed |= t != support_base_facets.timestamp();
         t = fuzzy_skin_facets.timestamp();
         cereal::load_by_value(ar, fuzzy_skin_facets);
         mesh_changed |= t != fuzzy_skin_facets.timestamp();
@@ -1419,6 +1442,7 @@ private:
 		bool has_convex_hull = m_convex_hull.get() != nullptr;
         ar(name, source, m_mesh, m_type, m_material_id, m_transformation, m_is_splittable, has_convex_hull, m_text_info, cut_info, m_assemble_transformation, m_assemble_initialized, m_part_guid, m_assembly_src_guid, m_printable);
         cereal::save_by_value(ar, supported_facets);
+        cereal::save_by_value(ar, support_base_facets);
         cereal::save_by_value(ar, fuzzy_skin_facets);
         cereal::save_by_value(ar, wall_painting_facets);
         cereal::save_by_value(ar, seam_facets);
