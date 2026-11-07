@@ -328,7 +328,7 @@ size_t remove_bridge_metadata(nlohmann::json &value)
 {
     size_t removed = 0;
     if (value.is_object()) {
-        for (const auto *key : {"bridge_fill_expolygons", "bridge_fill_overlap_delta", "bridge_followup"})
+        for (const auto *key : {"bridge_fill_expolygons", "bridge_fill_overlap_delta", "bridge_followup", "customize_flag", "can_reverse"})
             removed += value.erase(key);
         for (auto &child : value.items()) removed += remove_bridge_metadata(child.value());
     } else if (value.is_array())
@@ -559,5 +559,51 @@ TEST_CASE("Cached density edits rebuild Lightning and cubic infill dependencies"
             INFO(cache_flow_diagnostics(full_density_bridges.at(index).flows, previous.flows));
             CHECK(bool(full_density_bridges.at(index).flows == previous.flows));
         }
+    }
+}
+
+TEST_CASE("Cached split fill retains flow, path order and floating shell flags",
+          "[BridgeControls][FlowAbove][Cache]")
+{
+    BridgeCacheWorkspace workspace;
+    auto config = cache_config("classic", false);
+    auto model = cache_model(true);
+    Print source;
+    prepare_print(source, model, config);
+    source.process();
+
+    // A fill crossing the internal-bridge boundary is stored as one
+    // continuous multipath with different volumes along its segments.
+    auto &fills = source.get_object(size_t(0))->get_layer(5)->get_region(0)->fills;
+    fills.clear();
+    auto *split = new ExtrusionMultiPath;
+    fills.entities.push_back(split);
+    split->set_reverse();
+    const Point a = Point::new_scale(1., 2.), b = Point::new_scale(2., 2.), c = Point::new_scale(3., 2.);
+    for (const double flow : {0.08, 0.108}) {
+        auto &path = split->paths.emplace_back(erSolidInfill, flow, 0.45f, 0.2f);
+        path.polyline.points = split->paths.size() == 1 ? Points{a, b} : Points{b, c};
+        path.set_reverse();
+        path.set_customize_flag(cfFloatingVerticalShell);
+    }
+    int exported = 0;
+    REQUIRE(source.export_cached_data(workspace.path.string(), exported) == 0);
+    REQUIRE(exported == 1);
+
+    Print restored;
+    prepare_print(restored, model, config);
+    REQUIRE(restored.load_cached_data(workspace.path.string()) == 0);
+    REQUIRE(restored.get_object(size_t(0))->layer_count() == source.get_object(size_t(0))->layer_count());
+    const auto &loaded = restored.get_object(size_t(0))->get_layer(5)->get_region(0)->fills;
+    REQUIRE(loaded.entities.size() == 1);
+    const auto *copy = dynamic_cast<const ExtrusionMultiPath *>(loaded.entities.front());
+    REQUIRE(copy != nullptr);
+    CHECK_FALSE(copy->can_reverse());
+    REQUIRE(copy->paths.size() == split->paths.size());
+    for (size_t i = 0; i < copy->paths.size(); ++i) {
+        CHECK_FALSE(copy->paths[i].can_reverse());
+        CHECK(copy->paths[i].get_customize_flag() == cfFloatingVerticalShell);
+        CHECK(copy->paths[i].mm3_per_mm == split->paths[i].mm3_per_mm);
+        CHECK(bool(copy->paths[i].polyline.points == split->paths[i].polyline.points));
     }
 }

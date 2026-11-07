@@ -88,15 +88,16 @@ The focused `bridge_acceleration_tests` target passed 4 cases and 68 assertions.
 
 Existing system profiles and early Tyr projects may store a single Bridge value even when the process lists several nozzle variants. The loader now expands that shared value before restoring the process profile, avoiding the `invalid restore_index size` project-loading error. Explicit per-variant values retain their nozzle association, and projects without this setting retain the normal-acceleration default. Existing project files do not need manual conversion.
 
-## Bridge density, anchoring, and layer count
+## Bridge settings
 
-In **Quality > Advanced**, the following settings appear immediately after **Thick bridges**. Enable Advanced settings to see them. They apply to regular bridge infill across open gaps and internal bridge infill over sparse infill; overhanging walls retain their own wall behavior.
+In **Quality > Advanced**, the following settings appear immediately after **Thick bridges**. Enable Advanced settings to see them. The two controls for bridge lines apply to both external and internal bridges. The layer count and flow above bridges apply to internal bridges.
 
 | Setting | Range | Default | Effect |
 | --- | --- | --- | --- |
 | **Bridge Layer Density** (`bridge_layer_density`) | 1–100% | 100% | Changes the spacing between bridge strands while retaining each strand's width, height, and extrusion per millimeter. |
 | **Bridge line travel extend** (`bridge_line_travel_extend`) | 1–100% | 15% | Sets the Infill/Wall overlap for bridge infill independently of other infill. |
 | **Internal bridge layers** (`internal_bridge_layers`) | 1, 2, or 3 | 1 | Adds internal bridge planes beneath the existing shell before normal internal solid infill. |
+| **Flow above internal bridges** (`flow_above_internal_bridges`) | 1–200% | 100% | Scales extrusion for solid fill directly over an internal bridge. For example, 120% deposits 20% more material along the portion of a line above the bridge footprint. With stacked bridges, this applies to the first solid fill above the stack. |
 
 At **100% density**, bridge line spacing follows the original full-density calculation. At **50%**, the pitch between strands doubles; the individual strands retain their extrusion settings. Very low density can leave only a few strands across a small bridge. Density does not change normal infill or support density.
 
@@ -104,7 +105,7 @@ At **100% density**, bridge line spacing follows the original full-density calcu
 
 **Internal bridge layers** leaves the existing solid-shell geometry intact and replaces eligible sparse infill underneath it with the additional bridge layers. It does not subtract those additional layers from **Top shell layers** or **Bottom shell layers**, and it does not add external bridge layers beneath open gaps. Where there is insufficient eligible depth, fewer layers can fit. The bottom bridge retains the ordinary thick-bridge treatment; subsequent bridge planes use layer-height bridge flow to avoid overlapping thick strands vertically. Adjacent bridge planes alternate their line direction.
 
-The density and internal-layer defaults retain the original density and one-layer behavior. All three settings support standard process, object, part, and modifier inheritance and are saved in presets and 3MF projects. They are shared scalar values across a process's nozzle variants. Changing them invalidates the affected slicing stages; slice again to update Preview and exported G-code.
+The density and internal-layer defaults retain the original density and one-layer behavior. All four settings support standard process, object, part, and modifier inheritance and are saved in presets and 3MF projects. They are shared scalar values across a process's nozzle variants. Changing them invalidates the affected slicing stages; slice again to update Preview and exported G-code.
 
 ## Projects, profiles, and accounts
 

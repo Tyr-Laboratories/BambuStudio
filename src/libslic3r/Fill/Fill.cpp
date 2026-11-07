@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <memory>
 
+#include "../Algorithm/LineSegmentation/LineSegmentation.hpp"
 #include "../ClipperUtils.hpp"
 #include "../Geometry.hpp"
 #include "../Layer.hpp"
@@ -646,11 +647,136 @@ void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> 
     svg.Close();
 }
 #endif
+namespace {
+
+bool replaces_solid_fill_with_locked_zag(const LayerRegion &region)
+{
+    const auto &config = region.region().config();
+    return config.infill_instead_top_bottom_surfaces && config.sparse_infill_pattern == ipLockedZag;
+}
+
+// Lines may cross both a bridge edge and a modifier boundary. Keep the original
+// fill pattern continuous and vary only the extrusion volume along those lines.
+struct BridgeFlowMask {
+    std::vector<ExPolygons> areas;
+    std::vector<double> multipliers{1.}; // LineSegmentation uses zero for the uncovered portion.
+    BoundingBox bounds;
+
+    void add(ExPolygons area, double percent)
+    {
+        if (!area.empty()) {
+            bounds.merge(get_extents(area));
+            areas.emplace_back(std::move(area));
+            multipliers.push_back(percent * 0.01);
+        }
+    }
+
+    // A uniform path can retain its original entity, including its direction rules.
+    ExtrusionPaths split(ExtrusionPath &path) const
+    {
+        if (path.is_force_no_extrusion() || !path.polyline.is_valid() || !bounds.overlap(get_extents(path.polyline)))
+            return {};
+        auto segments = Algorithm::LineSegmentation::polyline_segmentation(path.polyline, areas);
+        if (segments.size() == 1) {
+            path.mm3_per_mm *= multipliers[segments.front().clip_idx];
+            return {};
+        }
+        ExtrusionPaths parts;
+        for (auto &segment : segments) {
+            segment.polyline.remove_duplicate_points();
+            if (segment.polyline.is_valid()) {
+                parts.emplace_back(std::move(segment.polyline), path);
+                parts.back().mm3_per_mm *= multipliers[segment.clip_idx];
+            }
+        }
+        return parts;
+    }
+
+    void apply(ExtrusionPaths &paths) const
+    {
+        ExtrusionPaths result;
+        result.reserve(paths.size());
+        for (ExtrusionPath &path : paths) {
+            ExtrusionPaths parts = split(path);
+            if (parts.empty())
+                result.emplace_back(std::move(path));
+            else
+                result.insert(result.end(), std::make_move_iterator(parts.begin()), std::make_move_iterator(parts.end()));
+        }
+        paths = std::move(result);
+    }
+
+    void apply(ExtrusionEntity *&entity) const
+    {
+        if (auto *collection = dynamic_cast<ExtrusionEntityCollection *>(entity)) {
+            for (auto *&child : collection->entities)
+                apply(child);
+        } else if (auto *path = dynamic_cast<ExtrusionPath *>(entity)) {
+            ExtrusionPaths parts = split(*path);
+            if (!parts.empty()) {
+                auto replacement = std::make_unique<ExtrusionMultiPath>();
+                replacement->paths = std::move(parts);
+                if (!path->can_reverse())
+                    replacement->set_reverse();
+                delete entity;
+                entity = replacement.release();
+            }
+        } else if (auto *multi = dynamic_cast<ExtrusionMultiPath *>(entity)) {
+            apply(multi->paths);
+        } else if (auto *loop = dynamic_cast<ExtrusionLoop *>(entity)) {
+            apply(loop->paths);
+        }
+    }
+};
+
+BridgeFlowMask bridge_flow_mask(const Layer &layer)
+{
+    BridgeFlowMask mask;
+    const auto &regions = layer.regions();
+    if (!layer.lower_layer || std::all_of(regions.begin(), regions.end(), [](const LayerRegion *r) {
+            return r->region().config().flow_above_internal_bridges.value == 100.;
+        }))
+        return mask;
+
+    ExPolygons bridges;
+    for (const LayerRegion *lower : layer.lower_layer->regions()) {
+        // Those regions replace their surfaces with sparse fill during parallel make_fills().
+        if (replaces_solid_fill_with_locked_zag(*lower))
+            continue;
+        for (const Surface &surface : lower->fill_surfaces.surfaces)
+            if (surface.surface_type == stInternalBridge)
+                append(bridges, lower->bridge_fill_boundary(surface.expolygon));
+    }
+    if (bridges.empty())
+        return mask;
+    bridges = union_ex(bridges);
+    const double percent = regions.front()->region().config().flow_above_internal_bridges.value;
+    if (std::all_of(regions.begin(), regions.end(), [percent](const LayerRegion *r) {
+            return r->region().config().flow_above_internal_bridges.value == percent;
+        })) {
+        mask.add(std::move(bridges), percent);
+    } else {
+        // Fill generation may join adjacent regions with different flow settings.
+        // Use the receiving regions' slices to retain the original line layout.
+        std::map<double, ExPolygons> slices_by_percent;
+        for (const LayerRegion *region : regions) {
+            const double flow = region->region().config().flow_above_internal_bridges.value;
+            if (flow != 100.)
+                append(slices_by_percent[flow], to_expolygons(region->slices.surfaces));
+        }
+        for (const auto &[flow, slices] : slices_by_percent)
+            mask.add(intersection_ex(bridges, slices), flow);
+    }
+    return mask;
+}
+
+} // namespace
+
 void Layer::set_outlook_range(LockRegionParam &lock_param){
     for (size_t region_id = 0; region_id < this->regions().size(); ++region_id) {
         LayerRegion &layerm = *this->regions()[region_id];
 
-        if (layerm.region().config().infill_instead_top_bottom_surfaces && layerm.region().config().sparse_infill_pattern == ipLockedZag) {
+        if (replaces_solid_fill_with_locked_zag(layerm)) {
             for (const Surface &surface : layerm.fill_surfaces.surfaces) {
                 if (surface.surface_type != stInternal)
 					lock_param.outlook.push_back(surface.expolygon);
@@ -673,6 +799,7 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 #endif /* SLIC3R_DEBUG_SLICE_PROCESSING */
     LockRegionParam lock_param;
     set_outlook_range(lock_param);
+    const BridgeFlowMask flow_mask = bridge_flow_mask(*this);
     std::vector<SurfaceFill>     surface_fills = group_fills(*this, lock_param);
 
     const Slic3r::BoundingBox bbox 			= this->object()->bounding_box();
@@ -822,6 +949,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 		if (surface_fill.params.pattern == ipGrid || surface_fill.params.pattern == ipFloatingConcentric)
 			params.can_reverse = false;
 		LayerRegion* layerm = this->m_regions[surface_fill.region_id];
+        auto &entities = layerm->fills.entities;
+        const size_t first_entity = entities.size();
 		for (ExPolygon& expoly : surface_fill.expolygons) {
 
       f->no_overlap_expolygons = intersection_ex(surface_fill.no_overlap_expolygons, ExPolygons() = {expoly}, ApplySafetyOffset::Yes);
@@ -834,8 +963,11 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 			f->spacing = surface_fill.params.spacing;
 			surface_fill.surface.expolygon = std::move(expoly);
 			// BBS: make fill
-			f->fill_surface_extrusion(&surface_fill.surface, params, m_regions[surface_fill.region_id]->fills.entities);
+			f->fill_surface_extrusion(&surface_fill.surface, params, entities);
 		}
+        if (!flow_mask.areas.empty() && surface_fill.surface.is_solid() && !surface_fill.surface.is_bridge())
+            for (size_t i = first_entity; i < entities.size(); ++i)
+                flow_mask.apply(entities[i]);
     }
 
     // add thin fill regions

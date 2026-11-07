@@ -1,5 +1,8 @@
 #include <catch2/catch.hpp>
 #include "libslic3r/Print.hpp"
+#include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/Utils.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Preset.hpp"
@@ -217,4 +220,174 @@ TEST_CASE("Changing internal bridge count on a sliced job rebuilds its classific
         CHECK(surface_layers(print,stInternalBridge).size()==size_t(count));
         if(count==1) same_surfaces(original,surface_layers(print,stInternalBridge));
     }
+}
+
+TEST_CASE("Flow above internal bridges changes only the covered length of a solid fill path",
+          "[BridgeControls][FlowAbove]")
+{
+    ExPolygon internal = rectangle(-8., -5., 8., 5.);
+    ExPolygon external = rectangle(-3., -2., 3., 2.);
+    internal.holes.push_back(external.contour);
+    internal.holes.back().make_clockwise();
+
+    // The solid fill crosses an internal bridge, ordinary material, and
+    // the external bridge in its central opening, all at the same height.
+    auto paths_at_flow = [&](double percent) {
+        auto config = bridge_controls_config();
+        config.set_deserialize_strict({{"flow_above_internal_bridges", std::to_string(percent) + "%"},
+                                       {"internal_solid_infill_pattern", "monotonic"}});
+        Model model = bridge_controls_model();
+        Print print;
+        start_print(print, model, config);
+        Layer *layer = print.get_object(size_t(0))->get_layer(5);
+        layer->lower_layer->get_region(0)->fill_surfaces.surfaces = {
+            Surface(stInternalBridge, internal), Surface(stBottomBridge, external)};
+        LayerRegion *region = layer->get_region(0);
+        const ExPolygon solid = rectangle(-12., -8., 12., 8.);
+        region->fill_surfaces.surfaces = {Surface(stInternalSolid, solid)};
+        region->fill_expolygons = region->fill_no_overlap_expolygons = {solid};
+        layer->make_fills();
+        std::vector<ExtrusionPath> paths;
+        collect_paths(region->fills, paths);
+        return paths;
+    };
+
+    const auto baseline = paths_at_flow(100.);
+    REQUIRE_FALSE(baseline.empty());
+    const double nominal = baseline.front().mm3_per_mm;
+    REQUIRE(nominal > 0.);
+    double baseline_length = 0.;
+    for (const ExtrusionPath &path : baseline) {
+        REQUIRE(path.mm3_per_mm == Approx(nominal));
+        baseline_length += unscale<double>(path.polyline.length());
+    }
+
+    const double percent = GENERATE(80., 137.5);
+    double inside_length = 0., outside_length = 0., external_length = 0.;
+    for (const ExtrusionPath &path : paths_at_flow(percent)) {
+        REQUIRE(path.role() == erSolidInfill);
+        const double length = unscale<double>(path.polyline.length());
+        const double inside = unscale<double>(total_length(intersection_pl(path.polyline, internal)));
+        if (inside > 0.001)
+            CHECK(path.mm3_per_mm == Approx(nominal * percent / 100.));
+        if (length - inside > 0.001)
+            CHECK(path.mm3_per_mm == Approx(nominal));
+        inside_length += inside;
+        outside_length += length - inside;
+        external_length += unscale<double>(total_length(intersection_pl(path.polyline, external)));
+    }
+    CHECK(inside_length > 10.);
+    CHECK(outside_length > 10.);
+    CHECK(external_length > 10.);
+    CHECK(inside_length + outside_length == Approx(baseline_length).margin(0.001));
+}
+
+TEST_CASE("Reslicing changes flow directly above the top of an internal bridge stack",
+          "[BridgeControls][FlowAbove][Reslice]")
+{
+    const int count = GENERATE(1, 3);
+    auto config = bridge_controls_config(100., 15., count);
+    config.set_deserialize_strict({{"use_relative_e_distances", "1"}});
+    Model model = bridge_controls_model();
+    Print print;
+    start_print(print, model, config);
+    const auto bridges = surface_layers(print, stInternalBridge);
+    REQUIRE(bridges.size() == size_t(count));
+    const size_t above_stack = bridges.rbegin()->first + 1;
+
+    // Compare every layer and extrusion role. In particular, a follow-up
+    // bridge above a bridge must keep its own bridge flow.
+    const auto directory = boost::filesystem::temp_directory_path() / boost::filesystem::unique_path("bridge-flow-%%%%-%%%%");
+    boost::filesystem::create_directories(directory);
+    ScopeGuard cleanup([&] {
+        boost::system::error_code ec;
+        boost::filesystem::remove_all(directory, ec);
+    });
+    auto extruded_filament = [&] {
+        const std::string path = (directory / "flow.gcode").string();
+        GCodeProcessorResult preview;
+        print.export_gcode(path, &preview);
+        std::map<std::pair<int, std::string>, double> result;
+        int layer = -1;
+        std::string role;
+        GCodeReader reader;
+        reader.apply_config(config);
+        REQUIRE(reader.parse_file(path, [&](GCodeReader &state, const GCodeReader::GCodeLine &line) {
+            const auto comment = line.comment();
+            if (comment == " CHANGE_LAYER")
+                ++layer;
+            else if (comment.substr(0, 10) == " FEATURE: ")
+                role = comment.substr(10);
+            if (layer >= 0 && line.extruding(state) && line.dist_XY(state) > 0.)
+                result[{layer, role}] += line.dist_E(state);
+        }));
+        return result;
+    };
+
+    const auto baseline = extruded_filament();
+    const auto above = std::make_pair(int(above_stack), std::string("Internal solid infill"));
+    REQUIRE(baseline.count(above) == 1);
+    REQUIRE(baseline.at(above) > 0.);
+    for (int percent : {150, 100}) {
+        config.set_deserialize_strict({{"flow_above_internal_bridges", std::to_string(percent) + "%"}});
+        print.apply(model, config);
+        REQUIRE_FALSE(print.get_object(size_t(0))->is_step_done(posInfill));
+        print.process();
+        const auto actual = extruded_filament();
+        REQUIRE(actual.size() == baseline.size());
+        for (const auto &[key, filament] : baseline) {
+            REQUIRE(actual.count(key) == 1);
+            const double factor = key == above ? percent / 100. : 1.;
+            CHECK(actual.at(key) == Approx(filament * factor).margin(0.0005));
+        }
+    }
+}
+
+TEST_CASE("Flow above an internal bridge follows each receiving region's override",
+          "[BridgeControls][FlowAbove][Modifiers]")
+{
+    auto config = bridge_controls_config();
+    config.set_deserialize_strict({{"internal_solid_infill_pattern", "monotonic"}});
+    Model model = bridge_controls_model();
+    ModelObject *object = model.objects.front();
+    TriangleMesh mesh(its_make_cube(20., 30., 10.));
+    mesh.translate(-5., -5., -1.);
+    ModelVolume *modifier = object->add_volume(mesh);
+    modifier->set_type(ModelVolumeType::PARAMETER_MODIFIER);
+    modifier->config.set_key_value("flow_above_internal_bridges", new ConfigOptionPercent(135.));
+    Print print;
+    start_print(print, model, config);
+    Layer *layer = print.get_object(size_t(0))->get_layer(5);
+    REQUIRE(layer->regions().size() == 2);
+
+    // A single lower-region bridge spans both upper regions, as at the
+    // beginning of a height-range modifier. Both use the same infill pattern.
+    const ExPolygon whole = rectangle(-12., -8., 12., 8.);
+    for (LayerRegion *region : layer->lower_layer->regions())
+        region->fill_surfaces.clear();
+    layer->lower_layer->get_region(0)->fill_surfaces.surfaces = {Surface(stInternalBridge, whole)};
+    for (LayerRegion *region : layer->regions()) {
+        const auto *percent = region->region().config().option<ConfigOptionPercent>("flow_above_internal_bridges");
+        REQUIRE(percent != nullptr);
+        const ExPolygon side = percent->value == 100. ? rectangle(-12., -8., 0., 8.) : rectangle(0., -8., 12., 8.);
+        region->slices.surfaces = {Surface(stInternal, side)};
+        region->fill_surfaces.surfaces = {Surface(stInternalSolid, side)};
+        region->fill_expolygons = region->fill_no_overlap_expolygons = {side};
+    }
+    layer->make_fills();
+    std::vector<ExtrusionPath> paths;
+    for (const LayerRegion *region : layer->regions())
+        collect_paths(region->fills, paths);
+    std::set<double> left, right;
+    for (const ExtrusionPath &path : paths) {
+        for (const Line &line : path.polyline.lines()) {
+            if (line.midpoint().x() < -scale_(1.))
+                left.insert(path.mm3_per_mm);
+            if (line.midpoint().x() > scale_(1.))
+                right.insert(path.mm3_per_mm);
+        }
+    }
+    REQUIRE(left.size() == 1);
+    REQUIRE(right.size() == 1);
+    CHECK(*right.begin() == Approx(*left.begin() * 1.35));
 }

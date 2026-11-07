@@ -1712,6 +1712,7 @@ bool PrintObject::invalidate_state_by_config_options(
         } else if (
                opt_key == "top_surface_pattern"
             || opt_key == "bridge_layer_density"
+            || opt_key == "flow_above_internal_bridges"
             || opt_key == "top_surface_density"
             || opt_key == "monotonic_travel_into_wall"
             || opt_key == "bottom_surface_pattern"

@@ -6424,8 +6424,8 @@ std::string GCode::extrude_multi_path(ExtrusionMultiPath multipath, std::string 
 {
     // extrude along the path
     std::string gcode;
-    for (ExtrusionPath path : multipath.paths)
-        gcode += this->_extrude(path, description, speed);
+    for (const ExtrusionPath &path : multipath.paths)
+        gcode += this->_extrude(path, description, speed, path.get_customize_flag() == CustomizeFlag::cfFloatingVerticalShell);
 
     // BBS
     if (m_wipe.enable && FILAMENT_CONFIG(wipe)) {
