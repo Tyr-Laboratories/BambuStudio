@@ -16,6 +16,34 @@ spec.loader.exec_module(benchmark)
 
 
 class CommandComparisonTests(unittest.TestCase):
+    def test_failed_slice_can_retry_its_existing_output_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "slice-output"
+            fixture = {"plate": 1, "path": "fixture.3mf"}
+
+            def fail_slice(args, stdout, stderr):
+                (output / "incomplete.gcode").write_text("G1 X99 E99\n")
+                return mock.Mock(returncode=1)
+
+            with mock.patch.object(benchmark.subprocess, "run", side_effect=fail_slice):
+                with self.assertRaises(RuntimeError):
+                    benchmark.run_slice(root / "slicer", fixture, output, root / "data")
+
+            def retry_slice(args, stdout, stderr):
+                # The actual CLI replaces output left by an interrupted attempt.
+                shutil.rmtree(output)
+                output.mkdir()
+                (output / "result.json").write_text(json.dumps({"sliced_plates": [{"times": {}}]}))
+                (output / "plate_1.gcode").write_text("G1 X1 E1\n")
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(benchmark.subprocess, "run", side_effect=retry_slice):
+                result, gcode = benchmark.run_slice(root / "slicer", fixture, output, root / "data")
+            self.assertEqual(gcode.name, "plate_1.gcode")
+            self.assertEqual(result["commands"], benchmark.command_fingerprint(gcode))
+            self.assertFalse((output / "incomplete.gcode").exists())
+
     def test_slice_log_survives_cli_output_directory_reset(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

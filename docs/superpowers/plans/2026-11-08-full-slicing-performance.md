@@ -106,5 +106,31 @@ compact result data; release packaging/version files per existing workflow.
   metadata; report median/range instructions, observed times and memory.
 - [x] Run affected wall, overhang, bridge, support, parallel-plate and packaging
   checks; obtain one fresh whole-branch review and resolve material findings.
-- [ ] Build release artifacts, preserve user state, install/verify, merge/push,
+- [x] Build release artifacts, preserve user state, install/verify, merge/push,
   publish and verify downloads, then remove this pass's temporary artifacts.
+
+Delivery completed on 2026-11-08. Tyr.23 was built from `b394356334d2dff7830d0af5cd72fbbe418bd326`,
+installed at `/Applications/BambuStudio.app`, and passed an installed-binary
+foundation-fixture slice matching the qualified baseline commands, preview
+controls and metadata. All 2,561 profile files and the account-session file
+remained byte-identical. The app's last-backup path was the only changed
+configuration key.
+
+[PR #11](https://github.com/Tyr-Laboratories/BambuStudio/pull/11) merged as
+`aa89e1e8d2cd030ce2122b45d8d59ab0bd6d3272`; its tree matched the packaged source.
+[Tyr.23](https://github.com/Tyr-Laboratories/BambuStudio/releases/tag/v2.8.4.57-tyr.23)
+publishes five assets with verified uploaded sizes and SHA-256 digests. All five
+anonymous download URLs were checked, and the app ZIP was fully downloaded and
+hashed again. The release tag points to the exact packaged source revision.
+
+Final review raised minor benchmark retry and report-clarity findings, with no
+app-code findings. A failed-run retry regression reproduced `FileExistsError`;
+allowing the CLI to reset the existing output directory passed all seven
+benchmark-harness tests. These post-qualification harness/documentation changes
+do not alter the installed app or the recorded measurements. The report now
+explicitly describes the independently observed baseline output variants.
+
+Removed this pass's build tree, profiling outputs, temporary settings backup,
+rollback app and Python bytecode caches after verification. Source and compact
+verification receipts were retained; original projects, shared dependencies and
+other worktrees were preserved.

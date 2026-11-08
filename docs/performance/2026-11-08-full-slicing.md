@@ -148,7 +148,7 @@ claim that the full upstream suite or physical printing was qualified.
 
 Five alternating measured pairs per fixture; all outputs matched an exact baseline reference.
 
-| Fixture | Baseline median G instructions | Candidate median G instructions | Work reduction |
+| Fixture | Baseline median billions of instructions | Candidate median billions of instructions | Work reduction |
 | --- | ---: | ---: | ---: |
 | large-walled-assembly | 2851.175 | 2635.329 | 7.57% |
 | foundation-assembly | 1948.148 | 1871.136 | 3.95% |
@@ -161,6 +161,15 @@ The full instruction ranges and paired ratios are in the [comparison record](202
 | large-walled-assembly | 84.12 / 81.65 | 4866.1 / 4844.5 | 1 | 0 |
 | foundation-assembly | 101.18 / 103.16 | 3219.5 / 3239.9 | 1 | 0 |
 | multi-object-plate-11 | 91.97 / 84.46 | 4564.4 / 4626.0 | 2 | 0 |
+
+The multi-object baseline independently produced two complete output variants.
+Candidate round 2 matched the second variant, also produced by baseline round 4.
+The cause of this baseline variation was not established. Acceptance requires
+each candidate's entire ordered command stream, interleaved preview controls,
+and selected output metadata to match one independently observed baseline run.
+It does not require all baseline runs to be deterministic, combine fragments
+from different references, or allow any geometric tolerance. No candidate-only
+variant remained in the final qualification.
 
 The elapsed-time and memory observations include variable background activity.
 They are not constant-frequency throughput or memory guarantees. The added radius

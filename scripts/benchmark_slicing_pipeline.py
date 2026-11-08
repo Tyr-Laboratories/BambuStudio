@@ -91,7 +91,9 @@ def classify_outputs(calibration, runs):
 
 
 def run_slice(binary, fixture, directory, data_directory, metrics_runner=None):
-    directory.mkdir(parents=True)
+    # An unsaved failed attempt may leave this directory behind on --resume.
+    # The CLI resets its own output directory before exporting the retry.
+    directory.mkdir(parents=True, exist_ok=True)
     args = [str(binary), "--datadir", str(data_directory), "--debug", "2",
             "--slice", str(fixture["plate"]), "--outputdir", str(directory), fixture["path"]]
     if metrics_runner is not None:
