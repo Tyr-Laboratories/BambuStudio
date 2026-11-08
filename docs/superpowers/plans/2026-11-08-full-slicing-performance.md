@@ -17,7 +17,7 @@ where floating-point accumulation depends on it.
 
 - Low power mode remains enabled. Primary metrics: deterministic work counts and
   per-process retired instructions; wall time and CPU cycles are observational.
-- Baseline: Tyr.22 (`f7c37853`) plus the same floating-shell correctness fixes
+- Baseline: Tyr.22 (`f7c37853`) plus the same floating-shell and support-enforcer correctness fixes
   as the candidate; same source toolchain for paired runs.
 - Preserve mesh, paint, settings, normalized G-code commands and preview roles.
 - No global mutable caches, new dependencies or reduced resolution.
@@ -99,10 +99,10 @@ Files: `scripts/benchmark_slicing_pipeline.py`, `scripts/measure_macos_process.c
 compact result data; release packaging/version files per existing workflow.
 
 - [x] Complete stage survey of all available plates, recording baseline errors.
-- [ ] Warm each executable, then run five alternating paired rounds across
+- [x] Warm each executable, then run five alternating paired rounds across
   representative fixtures using retired instruction counters and recording variation independently of
   background load or clock frequency.
-- [ ] Compare every normalized G-code command and key preview/filament/time
+- [x] Compare every normalized G-code command and key preview/filament/time
   metadata; report median/range instructions, observed times and memory.
 - [x] Run affected wall, overhang, bridge, support, parallel-plate and packaging
   checks; obtain one fresh whole-branch review and resolve material findings.

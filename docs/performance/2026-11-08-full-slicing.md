@@ -138,10 +138,52 @@ were left unchanged rather than receiving speculative optimizations.
 
 Eight affected native suites passed after the shared fixes: spatial queries, wall painting, overhang
 walls, bridge controls, parallel plates, organic foundations, support bases,
-and GUI job ownership. The 53 Python packaging/measurement tests passed. The standalone sanitizer
+and GUI job ownership. The 54 Python packaging/measurement tests passed. The standalone sanitizer
 probe checks segment flags, interpolation boundaries and closed-loop flag rotation. A fresh
 whole-change review found a preview-equivalence gap in the harness; the fix now
 checks semantic comments in their exact position among commands. This is not a
 claim that the full upstream suite or physical printing was qualified.
 
-Whole-model results and delivery details are added after qualification completes.
+## Full-model results
+
+Five alternating measured pairs per fixture; all outputs matched an exact baseline reference.
+
+| Fixture | Baseline median G instructions | Candidate median G instructions | Work reduction |
+| --- | ---: | ---: | ---: |
+| large-walled-assembly | 2851.175 | 2635.329 | 7.57% |
+| foundation-assembly | 1948.148 | 1871.136 | 3.95% |
+| multi-object-plate-11 | 2793.626 | 2636.711 | 5.62% |
+
+The full instruction ranges and paired ratios are in the [comparison record](2026-11-08-full-slicing.json).
+
+| Fixture | Observed baseline / candidate median seconds | Maximum baseline / candidate physical MiB | Baseline output variants | Extra baseline controls |
+| --- | ---: | ---: | ---: | ---: |
+| large-walled-assembly | 84.12 / 81.65 | 4866.1 / 4844.5 | 1 | 0 |
+| foundation-assembly | 101.18 / 103.16 | 3219.5 / 3239.9 | 1 | 0 |
+| multi-object-plate-11 | 91.97 / 84.46 | 4564.4 / 4626.0 | 2 | 0 |
+
+The elapsed-time and memory observations include variable background activity.
+They are not constant-frequency throughput or memory guarantees. The added radius
+bounds themselves use only 0.75 MiB for the visibility index; no per-layer bounds
+are retained.
+
+## Reproduction
+
+Build baseline `f7c37853` with the `FillFloatingConcentric.cpp` and `Support/TreeSupport.cpp` corrections from
+`b967a9eb9`, and build candidate production revision `b967a9eb9`, using the
+same RelWithDebInfo/arm64/macOS 14/public-release configuration and dependencies.
+Explicitly select the system framework with
+`-DOPENGL_gl_LIBRARY=/System/Library/Frameworks/OpenGL.framework` and
+`-DOPENGL_glu_LIBRARY=/System/Library/Frameworks/OpenGL.framework`. The source audit
+caught and rejected a local XQuartz dependency; those earlier binaries and their
+incomplete full-model measurements were discarded.
+
+Compile `scripts/measure_macos_process.c` with `cc -O2 -Wall -Wextra`, then run
+`scripts/benchmark_slicing_pipeline.py --baseline BASELINE --candidate CANDIDATE
+--fixtures FIXTURES.json --output NEW_DIRECTORY --metrics-runner RUNNER --rounds 5`.
+The fixture manifest supplies name/path/plate for each private input. Input and
+executable SHA-256 hashes are recorded and rechecked. Direct baseline calibration
+and all wrapped baseline control runs establish the allowed exact references.
+Every candidate must match a complete baseline record before qualification.
+Repeated G-code files are removed after verification to limit disk
+usage; warmup files remain available during qualification.
