@@ -191,8 +191,36 @@ TreeModelVolumes::TreeModelVolumes(
 #endif
 }
 
+TreeModelVolumes::TreeModelVolumes(const TreeModelVolumes &source, LayerIndex seam_layer, const Polygons &seam_centers,
+                                 std::function<void()> throw_on_cancel) :
+    m_bed_area(source.m_bed_area),
+    m_max_move(source.m_max_move),
+    m_max_move_slow(source.m_max_move_slow),
+    m_min_resolution(source.m_min_resolution),
+    m_current_outline_idx(0),
+    m_current_min_xy_dist(source.m_current_min_xy_dist),
+    m_current_min_xy_dist_delta(source.m_current_min_xy_dist_delta),
+    m_support_rests_on_model(false),
+#ifdef SLIC3R_TREESUPPORTS_PROGRESS
+    m_progress_multiplier(0.), m_progress_offset(0.),
+#endif
+    m_increase_until_radius(source.m_increase_until_radius),
+    m_ignorable_radii(source.m_ignorable_radii),
+    m_radius_0(source.m_radius_0),
+    m_reversed_source(&source),
+    m_reversed_throw_on_cancel(std::move(throw_on_cancel)),
+    m_seam_layer(seam_layer)
+{
+    assert(seam_layer >= 0);
+    assert(source.m_reversed_source == nullptr);
+    // Include the exterior ring so shrinking avoidance cannot invent a route
+    // at the bed boundary, as in the existing painted-base route domain.
+    m_seam_excluded_centers = diff(offset(m_bed_area, scaled<float>(1000.), jtMiter, 1.2), seam_centers);
+}
+
 void TreeModelVolumes::precalculate(const PrintObject& print_object, const coord_t max_layer, std::function<void()> throw_on_cancel)
 {
+    assert(m_reversed_source == nullptr);
     auto t_start = std::chrono::high_resolution_clock::now();
     m_precalculated = true;
 
@@ -328,6 +356,36 @@ void TreeModelVolumes::precalculate(const PrintObject& print_object, const coord
 
 const Polygons& TreeModelVolumes::getCollision(const coord_t orig_radius, LayerIndex layer_idx, bool min_xy_dist) const
 {
+    if (m_reversed_source) {
+        assert(layer_idx >= 0 && layer_idx <= m_seam_layer);
+        const LayerIndex physical_layer = m_seam_layer - layer_idx;
+        if (m_reversed_throw_on_cancel) {
+            const coord_t source_radius = m_reversed_source->ceilRadius(orig_radius, min_xy_dist);
+            if (!m_reversed_source->m_collision_cache.getArea({source_radius, physical_layer})) {
+                const_cast<TreeModelVolumes*>(m_reversed_source)->calculateCollision(
+                    source_radius, physical_layer, m_reversed_throw_on_cancel);
+                m_reversed_throw_on_cancel();
+            }
+        }
+        const Polygons &physical = m_reversed_source->getCollision(orig_radius, physical_layer, min_xy_dist);
+        // Support blocker slices are object layers, while collision layers also
+        // include raft layers. Keep their exact physical layer when reversing.
+        const LayerIndex blocker_layer = physical_layer - LayerIndex(m_reversed_source->m_raft_layers.size());
+        if (blocker_layer < 0 || blocker_layer >= LayerIndex(m_reversed_source->m_anti_overhang.size()) ||
+            m_reversed_source->m_anti_overhang[blocker_layer].empty())
+            return physical;
+        const coord_t radius = ceilRadius(orig_radius, min_xy_dist);
+        if (auto cached = m_collision_cache.getArea({radius, layer_idx}); cached)
+            return cached->get();
+        // The forward generator's existing last-mesh condition may omit
+        // blockers. Correct this only in the new view to preserve bed trees.
+        if (m_reversed_throw_on_cancel)
+            m_reversed_throw_on_cancel();
+        const Polygons blocked = offset(union_ex(m_reversed_source->m_anti_overhang[blocker_layer]), radius, jtMiter, 1.2);
+        const_cast<TreeModelVolumes*>(this)->m_collision_cache.insert(
+            std::vector<std::pair<RadiusLayerPair, Polygons>>{{{radius, layer_idx}, union_(physical, blocked)}});
+        return m_collision_cache.getArea({radius, layer_idx})->get();
+    }
     const coord_t radius = this->ceilRadius(orig_radius, min_xy_dist);
     if (std::optional<std::reference_wrapper<const Polygons>> result = m_collision_cache.getArea({ radius, layer_idx }); result)
         return (*result).get();
@@ -344,6 +402,15 @@ const Polygons& TreeModelVolumes::getCollision(const coord_t orig_radius, LayerI
 // Used for pushing tree supports away from object during the final Organic optimization step.
 std::optional<std::pair<coord_t, std::reference_wrapper<const Polygons>>> TreeModelVolumes::get_collision_lower_bound_area(LayerIndex layer_id, coord_t max_radius) const
 {
+    if (m_reversed_source) {
+        assert(layer_id >= 0 && layer_id <= m_seam_layer);
+        // Populate the zero-radius view as well so a smoothing query never
+        // omits a blocker merely because no routing radius was requested yet.
+        getCollision(0, layer_id, true);
+        if (auto local = m_collision_cache.get_lower_bound_area({max_radius, layer_id}); local)
+            return local;
+        return m_reversed_source->get_collision_lower_bound_area(m_seam_layer - layer_id, max_radius);
+    }
     return m_collision_cache.get_lower_bound_area({ max_radius, layer_id });
 }
 
@@ -358,12 +425,35 @@ const Polygons& TreeModelVolumes::getCollisionHolefree(coord_t radius, LayerInde
         BOOST_LOG_TRIVIAL(error_level_not_in_cache) << "Had to calculate collision holefree at radius " << radius << " and layer " << layer_idx << ", but precalculate was called. Performance may suffer!";
         tree_supports_show_error("Not precalculated Holefree Collision requested."sv, false);
     }
-    const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree({ radius, layer_idx });
+    if (m_reversed_source) {
+        const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree(
+            std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
+        // A nested TBB loop may return without filling its cache when a sibling
+        // throws. Observe cancellation before recursively requesting that entry.
+        if (m_reversed_throw_on_cancel)
+            m_reversed_throw_on_cancel();
+    } else
+        const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree({ radius, layer_idx });
     return getCollisionHolefree(radius, layer_idx);
 }
 
 const Polygons& TreeModelVolumes::getAvoidance(const coord_t orig_radius, LayerIndex layer_idx, AvoidanceType type, bool to_model, bool min_xy_dist) const
 {
+    if (m_reversed_source) {
+        assert(layer_idx >= 0 && layer_idx <= m_seam_layer);
+        // Both route types reach the seam. Intermediate physical surfaces must
+        // never become alternate endpoints in the reversed traversal.
+        to_model = false;
+        if (layer_idx == 0) {
+            const coord_t radius = ceilRadius(orig_radius, min_xy_dist);
+            if (auto cached = m_seam_avoidance_cache.getArea({radius, 0}); cached)
+                return cached->get();
+            const_cast<TreeModelVolumes*>(this)->m_seam_avoidance_cache.insert(
+                std::vector<std::pair<RadiusLayerPair, Polygons>>{{{radius, 0},
+                    union_(getCollision(orig_radius, 0, min_xy_dist), m_seam_excluded_centers)}});
+            return m_seam_avoidance_cache.getArea({radius, 0})->get();
+        }
+    }
     if (layer_idx == 0) {
         if (to_model && m_painted_bases_only)
             return m_painted_route_domain;
@@ -389,14 +479,23 @@ const Polygons& TreeModelVolumes::getAvoidance(const coord_t orig_radius, LayerI
             tree_supports_show_error("Not precalculated Avoidance(to buildplate) requested."sv, false);
         }
     }
-    const_cast<TreeModelVolumes*>(this)->calculateAvoidance({ radius, layer_idx }, ! to_model, to_model);
+    if (m_reversed_source) {
+        const_cast<TreeModelVolumes*>(this)->calculateAvoidance(
+            std::vector<RadiusLayerPair>{{radius, layer_idx}}, !to_model, to_model, m_reversed_throw_on_cancel);
+        if (m_reversed_throw_on_cancel)
+            m_reversed_throw_on_cancel();
+    } else
+        const_cast<TreeModelVolumes*>(this)->calculateAvoidance({ radius, layer_idx }, ! to_model, to_model);
     // Retrive failed and correct result was calculated. Now it has to be retrived.
     return getAvoidance(orig_radius, layer_idx, type, to_model, min_xy_dist);
 }
 
 const Polygons& TreeModelVolumes::getPlaceableAreas(const coord_t orig_radius, LayerIndex layer_idx, std::function<void()> throw_on_cancel) const
 {
-
+    if (m_reversed_source) {
+        static const Polygons no_intermediate_contacts;
+        return no_intermediate_contacts;
+    }
     const coord_t radius = ceilRadius(orig_radius);
     if (std::optional<std::reference_wrapper<const Polygons>> result = m_placeable_areas_cache.getArea({ radius, layer_idx }); result)
         return (*result).get();
@@ -440,7 +539,13 @@ const Polygons& TreeModelVolumes::getWallRestriction(const coord_t orig_radius, 
                 "Not precalculated Wall restriction requested )."sv
             , false);
     }
-    const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions({ radius, layer_idx });
+    if (m_reversed_source) {
+        const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions(
+            std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
+        if (m_reversed_throw_on_cancel)
+            m_reversed_throw_on_cancel();
+    } else
+        const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions({ radius, layer_idx });
     return getWallRestriction(orig_radius, layer_idx, min_xy_dist); // Retrieve failed and correct result was calculated. Now it has to be retrieved.
 }
 
@@ -895,6 +1000,10 @@ void TreeModelVolumes::calculateWallRestrictions(const std::vector<RadiusLayerPa
                         throw_on_cancel();
                 }
             });
+            // An inherited cancellation may skip part of the nested loop.
+            // Do not publish its unfilled slots as valid wall restrictions.
+            if (m_reversed_source && throw_on_cancel)
+                throw_on_cancel();
             m_wall_restrictions_cache.insert(std::move(data), min_layer_bottom, radius);
             if (! data_min.empty())
                 m_wall_restrictions_cache_min.insert(std::move(data_min), min_layer_bottom, radius);

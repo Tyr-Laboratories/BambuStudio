@@ -92,6 +92,12 @@ Use the ordinary brushes, Fill, Gap Fill, and Section view to select the intende
 
 This feature applies to **Organic tree supports** only; it does not change the selected support style. With **On build plate only** disabled, ordinary unrestricted model-base behavior remains in effect. Projects without effective base paint retain their existing routing. Older slicers ignore the separate base-paint extension and will not honor these local exceptions; saving through an older slicer may discard them.
 
+Organic trees that start on the model now use multiple foundation feet where the permitted surface has enough room. The lower branches converge toward the tree's midpoint, and the existing upper branches continue to support the overhang. This applies both to painted bases and to model landings with **On build plate only** disabled. Trees that reach the build plate retain their existing branches and plate feet.
+
+Foundation branches reuse the existing Organic tip sampler, branch merging, path selection, smoothing, and tube generation in reversed Z. The same branch angle, branch distance, tip diameter, branch diameter, and diameter growth settings control both halves. Model clearance, support blockers, base-paint permissions, bottom contact gap, and bottom interface settings remain in effect. Neighboring stems divide the available foundation points so their feet do not duplicate one another. A short transition below the midpoint matches the upper stem's printed walls within the normal branch movement and growth limits.
+
+The original tree is retained when a cavity or permitted landing is too small for separated feet, when the selected branch limits cannot make a continuous printable join, or when a midpoint cut would remove a lower supported overhang. No new process setting is required; reslice existing projects to generate the foundations. Software geometry checks do not establish physical print stability.
+
 If branches merge or grow until their final trunk no longer fits an allowed painted base, slicing reports an error instead of leaving a support roof without its tree. Enlarge the painted base, reduce the branch diameter, or erase the base paint to use ordinary build-plate routing.
 
 ## Bridge acceleration

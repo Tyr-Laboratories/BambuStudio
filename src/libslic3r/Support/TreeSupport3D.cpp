@@ -1156,6 +1156,12 @@ void sample_overhang_area(
  * \param move_bounds[out] Storage for the influence areas.
  * \param storage[in] Background storage, required for adding roofs.
  */
+static coord_t organic_tip_connect_length(const TreeSupportSettings &config)
+{
+    return (config.support_line_width * 100. / config.settings.support_tree_top_rate) +
+        std::max(2. * config.min_radius - config.support_line_width, 0.0);
+}
+
 void generate_initial_areas(
     const PrintObject               &print_object,
     const TreeModelVolumes          &volumes,
@@ -1177,7 +1183,7 @@ void generate_initial_areas(
         return;
 #endif
 
-    const coord_t connect_length = (config.support_line_width * 100. / mesh_group_settings.support_tree_top_rate) + std::max(2. * config.min_radius - 1.0 * config.support_line_width, 0.0);
+    const coord_t connect_length = organic_tip_connect_length(config);
     // As r*r=x*x+y*y (circle equation): If a circle with center at (0,0) the top most point is at (0,r) as in y=r.
     // This calculates how far one has to move on the x-axis so that y=r-support_line_width/2.
     // In other words how far does one need to move on the x-axis to be support_line_width/2 away from the circle line.
@@ -3681,7 +3687,8 @@ static std::pair<float, float> extrude_branch(
     const SlicingParameters                 &slicing_params,
     const std::vector<SupportElements>      &move_bounds,
     indexed_triangle_set                    &result,
-    std::vector<ExtrudeSplitCap>            *split_caps = nullptr)
+    std::vector<ExtrudeSplitCap>            *split_caps = nullptr,
+    bool                                    force_mesh_caps = false)
 {
     const size_t n = path.size();
     if (n < 3)
@@ -3727,7 +3734,7 @@ static std::pair<float, float> extrude_branch(
     indexed_triangle_set               piece_mesh;
     // Original path ends keep a 3D hemisphere. Split joints: FlatDisk + later 2D
     // inject (default), or HemisphereMesh when TREE_SUPPORT_SPLIT_CAP_MODE=mesh.
-    const bool                         mesh_caps = split_cap_use_mesh_hemispheres();
+    const bool                         mesh_caps = force_mesh_caps || split_cap_use_mesh_hemispheres();
     auto emit_piece = [&](size_t begin, size_t end) {
         piece_path.assign(path.begin() + begin, path.begin() + end + 1);
         piece_mesh.clear();
@@ -3785,7 +3792,8 @@ void organic_smooth_branches_avoid_collisions(
     const TreeSupportSettings                           &config,
     const std::vector<std::pair<SupportElement*, int>>  &elements_with_link_down,
     const std::vector<size_t>                           &linear_data_layers,
-    std::function<void()>                                throw_on_cancel)
+    std::function<void()>                                throw_on_cancel,
+    bool                                                lock_roots)
 {
     struct LayerCollisionCache {
         coord_t          min_element_radius{ std::numeric_limits<coord_t>::max() };
@@ -3859,7 +3867,7 @@ void organic_smooth_branches_avoid_collisions(
             element,
             link_down,
             // locked
-            element.parents.empty() || (link_down == -1 && element.state.layer_idx > 0),
+            element.parents.empty() || (link_down == -1 && (element.state.layer_idx > 0 || lock_roots)),
             unscaled<float>(support_element_radius(config, element)),
             // 3D position
             to_3d(unscaled<float>(element.state.result_on_layer), float(layer_z(slicing_params, config, element.state.layer_idx)))
@@ -5501,23 +5509,12 @@ static PreparedSplitCap prepare_split_cap(
     return out;
 }
 
-void organic_draw_branches(
-    PrintObject& print_object,
-    TreeModelVolumes& volumes,
-    const TreeSupportSettings& config,
-    std::vector<SupportElements>& move_bounds,
-
-    // I/O:
-    SupportGeneratorLayersPtr& bottom_contacts,
-    SupportGeneratorLayersPtr& top_contacts,
-    InterfacePlacer& interface_placer,
-
-    // Output:
-    SupportGeneratorLayersPtr& intermediate_layers,
-    SupportGeneratorLayerStorage& layer_storage,
-    std::vector<ExPolygons>& cooldown_areas,
-
-    std::function<void()>            throw_on_cancel)
+// Both directions use the same graph layout and smoothing pass. Their graphs remain
+// separate because an inverted junction has several physical children below it.
+static void smooth_organic_forest(
+    const PrintObject &print_object, const TreeModelVolumes &volumes,
+    const TreeSupportSettings &config, std::vector<SupportElements> &move_bounds,
+    std::function<void()> throw_on_cancel, bool lock_roots = false)
 {
     // All SupportElements are put into a layer independent storage to improve parallelization.
     std::vector<std::pair<SupportElement*, int>> elements_with_link_down;
@@ -5563,7 +5560,29 @@ void organic_draw_branches(
 
     throw_on_cancel();
 
-    organic_smooth_branches_avoid_collisions(print_object, volumes, config, elements_with_link_down, linear_data_layers, throw_on_cancel);
+    organic_smooth_branches_avoid_collisions(print_object, volumes, config, elements_with_link_down, linear_data_layers, throw_on_cancel, lock_roots);
+
+}
+
+void organic_draw_branches(
+    PrintObject& print_object,
+    TreeModelVolumes& volumes,
+    const TreeSupportSettings& config,
+    std::vector<SupportElements>& move_bounds,
+
+    // I/O:
+    SupportGeneratorLayersPtr& bottom_contacts,
+    SupportGeneratorLayersPtr& top_contacts,
+    InterfacePlacer& interface_placer,
+
+    // Output:
+    SupportGeneratorLayersPtr& intermediate_layers,
+    SupportGeneratorLayerStorage& layer_storage,
+    std::vector<ExPolygons>& cooldown_areas,
+
+    std::function<void()>            throw_on_cancel)
+{
+    smooth_organic_forest(print_object, volumes, config, move_bounds, throw_on_cancel);
 
     //save the cooling area
     for (LayerIndex layer_idx = 0; layer_idx + 1 < LayerIndex(move_bounds.size()); ++layer_idx) {
@@ -5589,8 +5608,8 @@ void organic_draw_branches(
     }
         
 
-    // Reduce memory footprint. After this point only finalize_interface_and_support_areas() will use volumes and from that only collisions with zero radius will be used.
-    volumes.clear_all_but_object_collision();
+    // Retain directional/contact caches until foundation generation has inspected
+    // the actual model landings produced by the normal tree slicing pass.
 
     // Unmark all nodes.
     for (SupportElements& elements : move_bounds)
@@ -5938,6 +5957,360 @@ void organic_draw_branches(
                 }
             }
         }, tbb::simple_partitioner());
+
+    struct FoundationRequest {
+        Tree *tree;
+        LayerIndex base;
+        LayerIndex seam;
+        std::vector<const SupportElement*> nodes;
+    };
+    std::vector<FoundationRequest> foundation_requests;
+    for (Tree &tree : trees) {
+        throw_on_cancel();
+        if (tree.first_layer_id < 0 || tree.slices.empty())
+            continue;
+        LayerIndex base = tree.first_layer_id;
+        while (base < tree.first_layer_id + LayerIndex(tree.slices.size()) &&
+               tree.slices[base - tree.first_layer_id].polygons.empty())
+            ++base;
+        // A non-gracious root may have been extended down to the plate during
+        // slicing. Classify its actual landing rather than a routing hint bit.
+        if (base <= LayerIndex(config.raft_layers.size()) ||
+            base >= tree.first_layer_id + LayerIndex(tree.slices.size()) ||
+            intersection(tree.slices[base - tree.first_layer_id].polygons,
+                         volumes.getPlaceableAreas(0, base, throw_on_cancel)).empty())
+            continue;
+        LayerIndex highest_tip = base;
+        LayerIndex lowest_tip = std::numeric_limits<LayerIndex>::max();
+        for (const Branch &branch : tree.branches)
+            if (branch.has_tip) {
+                highest_tip = std::max(highest_tip, branch.path.back()->state.layer_idx);
+                lowest_tip = std::min(lowest_tip, branch.path.back()->state.layer_idx);
+            }
+        const LayerIndex seam = base + (highest_tip - base) / 2;
+        if (seam - base < 2 || lowest_tip <= seam)
+            continue;
+        std::vector<const SupportElement*> seam_nodes;
+        for (const Branch &branch : tree.branches)
+            for (const SupportElement *node : branch.path)
+                if (node->state.layer_idx == seam)
+                    seam_nodes.push_back(node);
+        std::sort(seam_nodes.begin(), seam_nodes.end());
+        seam_nodes.erase(std::unique(seam_nodes.begin(), seam_nodes.end()), seam_nodes.end());
+        if (seam_nodes.empty())
+            continue;
+        foundation_requests.push_back({&tree, base, seam, std::move(seam_nodes)});
+    }
+
+    // A reflected forest is still an ordinary organic tree in its own coordinates.
+    // Keep it separate from move_bounds: physically it has several children below
+    // each junction, which the forward graph deliberately cannot represent.
+    // Cache only the requested contact-plane result, not a whole second set of
+    // per-radius routing caches for every competing seam.
+    std::map<std::pair<const SupportElement*, LayerIndex>, Polygons> contact_avoidance;
+    auto can_reach_seam = [&](const SupportElement &node, LayerIndex physical, const Point &point) {
+        if (physical >= node.state.layer_idx - 1)
+            return false;
+        const auto key = std::make_pair(&node, physical);
+        auto found = contact_avoidance.find(key);
+        if (found == contact_avoidance.end()) {
+            Polygon disk = make_circle(std::max<coord_t>(scaled<coord_t>(0.05), config.resolution * 2), scaled<coord_t>(0.005));
+            disk.translate(node.state.result_on_layer);
+            TreeModelVolumes view(volumes, node.state.layer_idx, Polygons{disk}, throw_on_cancel);
+            found = contact_avoidance.emplace(key, view.getAvoidance(config.min_radius,
+                node.state.layer_idx - physical, TreeModelVolumes::AvoidanceType::Fast, false, true)).first;
+        }
+        return !contains(found->second, point);
+    };
+    auto foundation_for_seam = [&](const SupportElement &seam_node, LayerIndex base,
+                                   std::vector<Polygons> &out, std::vector<Polygons> &contacts,
+                                   std::vector<ExPolygons> &cooldown) {
+        const LayerIndex seam = seam_node.state.layer_idx;
+        const LayerIndex height = seam - base;
+        if (height < 2)
+            return false;
+
+        TreeSupportSettings reverse_config = config;
+        reverse_config.support_rests_on_model = false;
+        reverse_config.painted_bases_only = false;
+        reverse_config.raft_layers.clear();
+        // The virtual bed is the midpoint weld, not a physical plate foot.
+        reverse_config.layer_start_bp_radius = 0;
+        reverse_config.bp_radius = reverse_config.branch_radius;
+
+        const Point seam_point = seam_node.state.result_on_layer;
+        Polygon seam_disk = make_circle(std::max<coord_t>(scaled<coord_t>(0.05), config.resolution * 2),
+                                        scaled<coord_t>(0.005));
+        seam_disk.translate(seam_point);
+        const Polygons seam_centers{seam_disk};
+        TreeModelVolumes reverse_volumes(volumes, seam, seam_centers, throw_on_cancel);
+        std::vector<SupportElements> reverse_bounds(size_t(height + 1));
+        SupportGeneratorLayerStorage temporary_storage;
+        SupportGeneratorLayersPtr temporary_contacts(height + 1, nullptr);
+        SupportGeneratorLayersPtr temporary_interfaces(height + 1, nullptr);
+        SupportGeneratorLayersPtr temporary_base_interfaces(height + 1, nullptr);
+        InterfacePlacer temporary_placer(slicing_params, interface_placer.support_parameters, reverse_config,
+            temporary_storage, temporary_contacts, temporary_interfaces, temporary_base_interfaces);
+        RichInterfacePlacer sampler(temporary_placer, reverse_volumes, false, reverse_bounds.size(), reverse_bounds);
+
+        // Existing placeables enforce full model-footprint permissions (including
+        // painted bases). Reversed avoidance restricts sampling to surfaces that
+        // can reach this seam using the same branch angles and collision rules.
+        for (LayerIndex physical = base; physical < seam - 1; ++physical) {
+            throw_on_cancel();
+            const LayerIndex reversed = seam - physical;
+            Polygons allowed = diff(volumes.getPlaceableAreas(config.min_radius, physical, throw_on_cancel),
+                reverse_volumes.getAvoidance(config.min_radius, reversed,
+                    TreeModelVolumes::AvoidanceType::Fast, false, true));
+            allowed = intersection(allowed, volumes.m_bed_area);
+            for (ExPolygon &part : union_ex(allowed))
+                sample_overhang_area(to_polygons(std::move(part)), false, reversed,
+                    config.settings.support_roof_layers, organic_tip_connect_length(config), config.settings, sampler);
+        }
+
+        // A landing surface may serve several stems. Give each sampled foot to
+        // its nearest seam so independent generators do not plant overlapping
+        // copies of the entire platform and turn the foundation into a wall.
+        for (SupportElements &layer : reverse_bounds)
+            layer.erase(std::remove_if(layer.begin(), layer.end(), [&](const SupportElement &tip) {
+                const Point point = tip.state.target_position;
+                const double distance = (point - seam_point).cast<double>().squaredNorm();
+                for (const FoundationRequest &request : foundation_requests) {
+                    if (request.base != base)
+                        continue;
+                    for (const SupportElement *other : request.nodes) {
+                        if (other == &seam_node)
+                            continue;
+                        const Point other_point = other->state.result_on_layer;
+                        const double other_distance = (point - other_point).cast<double>().squaredNorm();
+                        if ((other_distance < distance || (other_distance == distance &&
+                            (other_point.x() < seam_point.x() ||
+                             (other_point.x() == seam_point.x() && other_point.y() < seam_point.y())))) &&
+                            can_reach_seam(*other, seam - tip.state.layer_idx, point))
+                            return true;
+                    }
+                }
+                return false;
+            }), layer.end());
+
+        create_layer_pathing(reverse_volumes, reverse_config, reverse_bounds, throw_on_cancel);
+        if (reverse_bounds.front().empty())
+            return false;
+        for (SupportElement &root : reverse_bounds.front()) {
+            root.influence_area = intersection(root.influence_area, seam_centers);
+            if (root.influence_area.empty())
+                return false;
+            // Avoidance guarantees a feasible center in the seam disk, not its
+            // exact center. A merged forest may retain several narrow slivers;
+            // let ordinary point placement choose the nearest feasible center.
+            root.state.next_position = move_inside_if_outside(root.influence_area, seam_point);
+        }
+        create_nodes_from_area(reverse_volumes, reverse_config, reverse_bounds, throw_on_cancel);
+        if (reverse_bounds.front().empty())
+            return false;
+        smooth_organic_forest(print_object, reverse_volumes, reverse_config, reverse_bounds, throw_on_cancel, true);
+
+        for (SupportElements &layer : reverse_bounds)
+            for (SupportElement &element : layer)
+                element.state.marked = false;
+        std::vector<Tree> reverse_trees;
+        for (SupportElement &root : reverse_bounds.front()) {
+            if (root.parents.empty())
+                return false;
+            reverse_trees.emplace_back();
+            TreeVisitor::visit_recursive(reverse_bounds, root, reverse_trees.back());
+        }
+
+        // All eligible physical layers are above the raft. They use the ordinary
+        // object layer height, so removing the virtual raft gives an exact Z
+        // reflection even when the physical first/raft layers have other heights.
+        const double reflection_z = layer_z(slicing_params, config, seam) +
+                                    layer_z(slicing_params, reverse_config, 0);
+        std::vector<float> planes;
+        for (LayerIndex layer = base; layer <= seam; ++layer)
+            planes.emplace_back(float(layer_mid_z(slicing_params, config, layer)));
+        std::vector<Polygons> candidate(height + 1);
+        std::vector<Polygons> tip_contacts(height + 1);
+        for (const Tree &reverse_tree : reverse_trees) {
+            for (const Branch &branch : reverse_tree.branches) {
+                indexed_triangle_set mesh;
+                // Mesh hemispheres let the same safe-joint extrusion be reflected
+                // without a second implementation of analytic cap transforms.
+                extrude_branch(branch.path, reverse_config, slicing_params, reverse_bounds, mesh, nullptr, true);
+                for (Vec3f &vertex : mesh.vertices)
+                    vertex.z() = float(reflection_z - vertex.z());
+                for (Vec3i &face : mesh.indices)
+                    std::swap(face[0], face[1]);
+                std::vector<Polygons> branch_slices = slice_mesh(mesh, planes, mesh_slicing_params, throw_on_cancel);
+                const LayerIndex physical_tip = seam - branch.path.back()->state.layer_idx;
+                for (LayerIndex physical = base; physical <= seam; ++physical) {
+                    // End hemispheres must not protrude into the model gap below
+                    // a reflected tip, just as forward tips stop at their contact.
+                    if (branch.has_tip && physical < physical_tip)
+                        continue;
+                    append(candidate[physical - base], branch_slices[physical - base]);
+                }
+                if (branch.has_tip && physical_tip >= base && physical_tip <= seam)
+                    append(tip_contacts[physical_tip - base], branch_slices[physical_tip - base]);
+            }
+        }
+
+        // Validate the actual clipped material, not just graph connectivity.
+        // Every component must grow from a permitted foot or overlap material in
+        // the preceding physical layer. A failed candidate leaves the old tree.
+        Polygons grounded_below;
+        for (LayerIndex physical = base; physical <= seam; ++physical) {
+            const size_t i = size_t(physical - base);
+            candidate[i] = intersection(diff_clipped(candidate[i], reverse_volumes.getCollision(0, seam - physical, true)), volumes.m_bed_area);
+            tip_contacts[i] = intersection(candidate[i], tip_contacts[i]);
+            // A tilted tip's sliced footprint must fit its permitted landing,
+            // not merely intersect it at the sampled center.
+            if (area(diff(tip_contacts[i], volumes.getPlaceableAreas(0, physical, throw_on_cancel))) > tiny_area_threshold)
+                return false;
+            for (const ExPolygon &part : union_ex(candidate[i])) {
+                const Polygons polygon = to_polygons(part);
+                if (intersection(polygon, grounded_below).empty() && intersection(polygon, tip_contacts[i]).empty())
+                    return false;
+            }
+            grounded_below = candidate[i];
+            throw_on_cancel();
+        }
+        // A foot that terminates in a clipped dead end cannot brace the seam.
+        // Walk back from the seam and retain/count only its connected material.
+        Polygons connected_above = seam_centers;
+        Polygons all_contacts;
+        for (LayerIndex physical = seam; physical >= base; --physical) {
+            const size_t i = size_t(physical - base);
+            Polygons connected;
+            for (const ExPolygon &part : union_ex(candidate[i]))
+                if (!intersection(to_polygons(part), connected_above).empty())
+                    append(connected, to_polygons(part));
+            candidate[i] = std::move(connected);
+            tip_contacts[i] = intersection(tip_contacts[i], candidate[i]);
+            append(all_contacts, tip_contacts[i]);
+            connected_above = candidate[i];
+            throw_on_cancel();
+        }
+        // Several sampled points that coalesce into one contact do not provide
+        // the separated feet this feature is meant to create.
+        if (union_ex(all_contacts).size() < 2 || candidate.back().empty() ||
+            !contains(candidate.back(), seam_point))
+            return false;
+        // Apply the same slope-dependent support cooling to the physical upper
+        // endpoint of each reversed edge. Commit it only with a valid forest.
+        for (size_t layer = 0; layer + 1 < reverse_bounds.size(); ++layer)
+            for (const SupportElement &element : reverse_bounds[layer])
+                for (int32_t parent : element.parents) {
+                    const auto &below = reverse_bounds[layer + 1][parent];
+                    const double degree = (below.state.result_on_layer - element.state.result_on_layer).cast<double>().norm() /
+                                          config.support_line_width * 10.;
+                    if (degree >= 2.) {
+                        const coord_t radius = support_element_radius(reverse_config, element);
+                        Polygon circle = make_circle(radius, radius / 100);
+                        circle.translate(element.state.result_on_layer);
+                        cooldown[size_t(seam - base) - layer].emplace_back(std::move(circle));
+                    }
+                }
+        for (size_t i = 0; i < candidate.size(); ++i) {
+            append(out[i], std::move(candidate[i]));
+            append(contacts[i], std::move(tip_contacts[i]));
+        }
+        return true;
+    };
+
+    for (const FoundationRequest &request : foundation_requests) {
+        Tree &tree = *request.tree;
+        const LayerIndex base = request.base;
+        const LayerIndex seam = request.seam;
+        const auto &seam_nodes = request.nodes;
+        std::vector<Polygons> foundation(seam - base + 1), foundation_contacts(seam - base + 1);
+        std::vector<ExPolygons> foundation_cooldown(seam - base + 1);
+        bool valid = true;
+        for (const SupportElement *node : seam_nodes)
+            if (!foundation_for_seam(*node, base, foundation, foundation_contacts, foundation_cooldown)) {
+                valid = false;
+                break;
+            }
+        if (!valid || intersection(foundation.back(), tree.slices[seam - tree.first_layer_id].polygons).empty())
+            continue;
+        auto supported_sheath = [&](const Polygons &above, const Polygons &below) {
+            const Polygons above_shell = diff(above, offset(above, -config.support_line_width));
+            const Polygons below_shell = diff(below, offset(below, -config.support_line_width));
+            for (const ExPolygon &part : union_ex(above_shell))
+                if (intersection(to_polygons(part), below_shell).empty())
+                    return false;
+            const coord_t growth = config.maximum_move_distance + coord_t(std::ceil(config.branch_radius_increase_per_layer));
+            return area(diff(above_shell, offset(below_shell, growth))) < sqr(scaled<double>(0.01));
+        };
+        // Share the existing upper cross-section exactly. Tilted tube ends need
+        // a short collar even when their centers and radii match. Clamp successive
+        // lower sections to the inset/outset envelope of the section above using
+        // the same per-layer movement/growth budget as ordinary branches.
+        foundation.back() = tree.slices[seam - tree.first_layer_id].polygons;
+        // Leave both section boundaries' simplification tolerance inside the
+        // movement budget: extrusion-centerline offsets are generated later.
+        const coord_t growth = std::max<coord_t>(0, config.maximum_move_distance +
+            coord_t(std::ceil(config.branch_radius_increase_per_layer)) - 2 * config.resolution);
+        TreeModelVolumes collar_volumes(volumes, seam, foundation.back(), throw_on_cancel);
+        for (LayerIndex layer = seam - 1; layer >= base; --layer) {
+            const size_t i = size_t(layer - base);
+            if (supported_sheath(foundation[i + 1], foundation[i]))
+                break;
+            // A transition must never enlarge or relocate a permitted model tip.
+            if (!foundation_contacts[i].empty()) {
+                valid = false;
+                break;
+            }
+            const Polygons inner = offset(foundation[i + 1], -growth);
+            const Polygons outer = offset(foundation[i + 1], growth);
+            foundation[i] = intersection(diff_clipped(
+                union_(inner, intersection(foundation[i], outer)),
+                collar_volumes.getCollision(0, seam - layer, true)), volumes.m_bed_area);
+            if (!supported_sheath(foundation[i + 1], foundation[i])) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid)
+            continue;
+        // Recheck ground-to-seam connectivity after collar clipping. Material
+        // outside the connected foundation cannot count as a stabilizing foot.
+        Polygons connected;
+        for (size_t i = 0; valid && i < foundation.size(); ++i) {
+            for (const ExPolygon &part : union_ex(foundation[i])) {
+                const Polygons polygon = to_polygons(part);
+                if (intersection(polygon, connected).empty() && intersection(polygon, foundation_contacts[i]).empty()) {
+                    valid = false;
+                    break;
+                }
+            }
+            connected = foundation[i];
+        }
+        Polygons connected_contacts;
+        connected = foundation.back();
+        for (size_t i = foundation.size(); valid && i-- > 0;) {
+            Polygons kept;
+            for (const ExPolygon &part : union_ex(foundation[i]))
+                if (!intersection(to_polygons(part), connected).empty())
+                    append(kept, to_polygons(part));
+            foundation[i] = std::move(kept);
+            foundation_contacts[i] = intersection(foundation_contacts[i], foundation[i]);
+            append(connected_contacts, foundation_contacts[i]);
+            connected = foundation[i];
+        }
+        if (!valid || union_ex(connected_contacts).size() < 2)
+            continue;
+        for (LayerIndex layer = base; layer <= seam; ++layer) {
+            Slice &slice = tree.slices[layer - tree.first_layer_id];
+            slice.polygons = union_(foundation[layer - base]);
+            slice.bottom_contacts = config.settings.support_floor_layers > 0 ?
+                union_(foundation_contacts[layer - base]) : Polygons{};
+            slice.num_branches = 1;
+            append(cooldown_areas[layer], std::move(foundation_cooldown[layer - base]));
+        }
+    }
+
+    volumes.clear_all_but_object_collision();
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, trees.size(), 1),
         [&trees, &throw_on_cancel](const tbb::blocked_range<size_t>& range) {

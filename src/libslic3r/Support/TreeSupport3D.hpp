@@ -295,7 +295,7 @@ void create_layer_pathing(const TreeModelVolumes& volumes, const TreeSupportSett
 
 void create_nodes_from_area(const TreeModelVolumes& volumes, const TreeSupportSettings& config, std::vector<SupportElements>& move_bounds, std::function<void()> throw_on_cancel);
 
-void organic_smooth_branches_avoid_collisions(const PrintObject& print_object, const TreeModelVolumes& volumes, const TreeSupportSettings& config, const std::vector<std::pair<SupportElement*, int>>& elements_with_link_down, const std::vector<size_t>& linear_data_layers, std::function<void()> throw_on_cancel);
+void organic_smooth_branches_avoid_collisions(const PrintObject& print_object, const TreeModelVolumes& volumes, const TreeSupportSettings& config, const std::vector<std::pair<SupportElement*, int>>& elements_with_link_down, const std::vector<size_t>& linear_data_layers, std::function<void()> throw_on_cancel, bool lock_roots = false);
 
 indexed_triangle_set draw_branches(PrintObject& print_object, const TreeModelVolumes& volumes, const TreeSupportSettings& config, std::vector<SupportElements>& move_bounds, std::function<void()> throw_on_cancel);
 

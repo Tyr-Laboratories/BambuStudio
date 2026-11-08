@@ -1423,6 +1423,13 @@ SupportGeneratorLayersPtr generate_support_layers(
     std::sort(layers_sorted.begin(), layers_sorted.end(), [](auto *l1, auto *l2) { return *l1 < *l2; });
     int layer_id = 0;
     int layer_id_interface = 0;
+    // Model foundations add bottom interfaces to organic trees. Their phase
+    // must not rotate top interfaces on an unrelated build-plate tree.
+    const bool separate_bottom_phase = SupportParameters(object).support_style == smsTreeOrganic;
+    size_t layer_id_bottom_interface = 0;
+    std::vector<size_t> top_interface_ids;
+    if (separate_bottom_phase)
+        top_interface_ids.reserve(layers_sorted.size());
     assert(object.support_layers().empty());
     for (size_t i = 0; i < layers_sorted.size();) {
         // Find the last layer with roughly the same print_z, find the minimum layer height of all.
@@ -1436,6 +1443,7 @@ SupportGeneratorLayersPtr generate_support_layers(
         bool     empty = true;
         // For snug supports, layers where the direction of the support interface shall change are accounted for.
         size_t   num_interfaces = 0;
+        size_t   num_bottom_interfaces = 0;
         size_t   num_top_contacts = 0;
         double   top_contact_bottom_z = 0;
         for (size_t u = i; u < j; ++u) {
@@ -1443,6 +1451,8 @@ SupportGeneratorLayersPtr generate_support_layers(
             if (! layer.polygons.empty()) {
                 empty             = false;
                 num_interfaces   += one_of(layer.layer_type, support_types_interface);
+                num_bottom_interfaces += layer.layer_type == SupporLayerType::sltBottomContact ||
+                                         layer.layer_type == SupporLayerType::sltBottomInterface;
                 if (layer.layer_type == SupporLayerType::sltTopContact) {
                     ++ num_top_contacts;
                     assert(num_top_contacts <= 1);
@@ -1457,7 +1467,8 @@ SupportGeneratorLayersPtr generate_support_layers(
         if (! empty) {
             // Here the upper_layer and lower_layer pointers are left to null at the support layers,
             // as they are never used. These pointers are candidates for removal.
-            bool   this_layer_contacts_only = num_top_contacts > 0 && num_top_contacts == num_interfaces;
+            const size_t phase_interfaces = separate_bottom_phase ? num_interfaces - num_bottom_interfaces : num_interfaces;
+            bool   this_layer_contacts_only = num_top_contacts > 0 && num_top_contacts == phase_interfaces;
             size_t this_layer_id_interface  = layer_id_interface;
             if (this_layer_contacts_only) {
                 // Find a supporting layer for its interface ID.
@@ -1465,11 +1476,24 @@ SupportGeneratorLayersPtr generate_support_layers(
                     if (const SupportLayer &other_layer = **it; std::abs(other_layer.print_z - top_contact_bottom_z) < EPSILON) {
                         // other_layer supports this top contact layer. Assign a different support interface direction to this layer
                         // from the layer that supports it.
-                        this_layer_id_interface = other_layer.interface_id() + 1;
+                        this_layer_id_interface = (separate_bottom_phase ?
+                            top_interface_ids[other_layer.id()] : other_layer.interface_id()) + 1;
                     }
             }
+            if (separate_bottom_phase) {
+                // Retain the top phase even on a bottom-only row: a later top
+                // contact must inherit this phase, not the bottom fill's phase.
+                top_interface_ids.push_back(this_layer_id_interface);
+                if (num_bottom_interfaces > 0) {
+                    // When both interface kinds share a Z, preserve the top
+                    // direction; the independent bottom sequence still advances.
+                    if (phase_interfaces == 0)
+                        this_layer_id_interface = layer_id_bottom_interface;
+                    ++layer_id_bottom_interface;
+                }
+            }
             object.add_support_layer(layer_id ++, this_layer_id_interface, height_min, zavg);
-            if (num_interfaces && ! this_layer_contacts_only)
+            if (phase_interfaces && ! this_layer_contacts_only)
                 ++ layer_id_interface;
         }
         i = j;

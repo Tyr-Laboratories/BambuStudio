@@ -45,6 +45,14 @@ public:
         double progress_offset, 
 #endif // SLIC3R_TREESUPPORTS_PROGRESS
         const std::vector<Polygons> &additional_excluded_areas = {});
+    // Route from physical model foundations towards a seam using the ordinary
+    // downward generator: physical_layer = seam_layer - virtual_layer.
+    // seam_centers constrains branch centers, not their material footprint.
+    // The source must outlive this view and remain at a stable address. Caches
+    // are populated lazily; do not call the PrintObject precalculate() on a view.
+    // The callback is polled by lazy calculations, including source cache misses.
+    TreeModelVolumes(const TreeModelVolumes &source, LayerIndex seam_layer, const Polygons &seam_centers,
+                     std::function<void()> throw_on_cancel = {});
     TreeModelVolumes(TreeModelVolumes&&) = default;
     TreeModelVolumes& operator=(TreeModelVolumes&&) = default;
 
@@ -67,6 +75,7 @@ public:
         m_avoidance_cache_holefree_to_model.clear();
         m_wall_restrictions_cache.clear();
         m_wall_restrictions_cache_min.clear();
+        m_seam_avoidance_cache.clear();
     }
 
     enum class AvoidanceType : int8_t
@@ -513,6 +522,14 @@ private:
     RadiusLayerPolygonCache     m_avoidance_cache_to_model;
     RadiusLayerPolygonCache     m_avoidance_cache_to_model_slow;
     RadiusLayerPolygonCache     m_placeable_areas_cache;
+
+    // A reversed view shares physical collision data but owns all directional
+    // avoidance/wall caches. Blockers are added to its own collision cache.
+    const TreeModelVolumes    *m_reversed_source { nullptr };
+    std::function<void()>      m_reversed_throw_on_cancel;
+    LayerIndex                 m_seam_layer { 0 };
+    Polygons                   m_seam_excluded_centers;
+    RadiusLayerPolygonCache    m_seam_avoidance_cache;
 
     /*!
      * \brief Caches to avoid holes smaller than the radius until which the radius is always increased, as they are free of holes. 
