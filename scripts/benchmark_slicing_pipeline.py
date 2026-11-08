@@ -34,6 +34,36 @@ def command_fingerprint(path):
     return {"sha256": digest.hexdigest(), "commands": count}
 
 
+# BambuStudio GCodeProcessor::ReservedTags, CustomTags and process_tags().
+# Keep semantic tags interleaved with commands: moving a role/width tag across
+# an extrusion changes its preview even when the ordered tag list is unchanged.
+PREVIEW_TAG_PREFIXES = tuple(tag.encode() for tag in (
+    "FEATURE:", "WIPE_START", "WIPE_END", "LAYER_HEIGHT:", "LINE_WIDTH:",
+    "CHANGE_LAYER", "Z_HEIGHT:", "COLOR_CHANGE", "PAUSE_PRINTING", "CUSTOM_GCODE",
+    "_GP_", "WIPE_TOWER_START", "WIPE_TOWER_END", "MACHINE_START_GCODE_END",
+    "MACHINE_END_GCODE_START", "NOZZLE_CHANGE_START", "NOZZLE_CHANGE_END",
+    "CP_TOOLCHANGE_WIPE", "FLUSH_START", "FLUSH_END", "VFLUSH_START", "VFLUSH_END",
+    "SKIPPABLE_START", "SKIPPABLE_END", "SKIPTYPE:", "start printing object",
+    "stop printing object", "PA_LINE_CALIBRATION_START", "PA_LINE_CALIBRATION_END",
+    "MM3_PER_MM:",
+))
+
+
+def preview_fingerprint(path):
+    digest = hashlib.sha256()
+    tags = 0
+    with Path(path).open("rb") as stream:
+        for line in stream:
+            command, separator, comment = line.partition(b";")
+            if command.strip():
+                digest.update(command.strip() + b"\n")
+            if separator and comment.lstrip().startswith(PREVIEW_TAG_PREFIXES):
+                # Leading whitespace is significant to the native tag parser.
+                digest.update(b";" + comment.rstrip(b"\r\n") + b"\n")
+                tags += 1
+    return {"sha256": digest.hexdigest(), "semantic_tags": tags}
+
+
 def output_metadata(plate):
     return {key: plate[key] for key in (
         "feature_type_times", "filaments", "main_predication", "total_predication",
@@ -41,11 +71,16 @@ def output_metadata(plate):
     ) if key in plate}
 
 
-def run_slice(binary, fixture, directory, data_directory, metrics_runner):
+def equivalence_record(run):
+    return {key: run[key] for key in ("commands", "preview", "output_metadata")}
+
+
+def run_slice(binary, fixture, directory, data_directory, metrics_runner=None):
     directory.mkdir(parents=True)
     args = [str(binary), "--datadir", str(data_directory), "--debug", "2",
             "--slice", str(fixture["plate"]), "--outputdir", str(directory), fixture["path"]]
-    args = [str(metrics_runner), str(directory / "process-metrics.json"), "--", *args]
+    if metrics_runner is not None:
+        args = [str(metrics_runner), str(directory / "process-metrics.json"), "--", *args]
     started = time.monotonic()
     with (directory / "slice.log").open("wb") as log:
         result = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
@@ -60,12 +95,13 @@ def run_slice(binary, fixture, directory, data_directory, metrics_runner):
     if len(gcodes) != 1:
         raise RuntimeError(f"Expected one G-code file in {directory}")
     return {
-        "process_counters": json.loads((directory / "process-metrics.json").read_text()),
+        "process_counters": json.loads((directory / "process-metrics.json").read_text()) if metrics_runner else None,
         "elapsed_seconds": elapsed,
         "times_ms": plates[0]["times"],
         "project_times_ms": report.get("times", {}),
         "peak_rss_mb": report.get("peak_rss_mb"),
         "commands": command_fingerprint(gcodes[0]),
+        "preview": preview_fingerprint(gcodes[0]),
         "output_metadata": output_metadata(plates[0]),
     }, gcodes[0]
 
@@ -98,14 +134,25 @@ def main():
     report = {"binaries": {k: {"path": str(v), "sha256": sha256(v)} for k, v in binaries.items()},
               "metrics_runner_sha256": sha256(metrics_runner),
               "primary_metric": "retired_instructions; elapsed times are load/frequency-sensitive observations",
-              "fixtures": fixtures, "rounds": args.rounds, "runs": [], "summary": {}}
+              "fixtures": fixtures, "rounds": args.rounds, "baseline_calibrations": [], "runs": [], "summary": {}}
 
     def save():
         (output / "benchmark.json").write_text(json.dumps(report, indent=2) + "\n")
 
     save()
     for index, fixture in enumerate(fixtures):
-        reference = None
+        # Establish output references before measuring the candidate. The baseline
+        # floating-shell generator can produce different streams when launched
+        # directly versus through the counter wrapper. Require an EXACT match
+        # to an independently generated baseline stream, including preview tags
+        # and metadata; never mask the differing paths or accept a novel stream.
+        calibration, _ = run_slice(binaries["baseline"], fixture,
+                                   output / f"fixture-{index}-direct-baseline",
+                                   output / "data-baseline")
+        calibration.update(fixture=fixture["name"], launcher="direct", measured=False)
+        report["baseline_calibrations"].append(calibration)
+        references = [equivalence_record(calibration)]
+        save()
         for round_index in range(-1, args.rounds):
             warmup = round_index == -1
             order = ("baseline", "candidate") if round_index % 2 == 0 or warmup else ("candidate", "baseline")
@@ -114,21 +161,23 @@ def main():
                 directory = output / f"fixture-{index}-{label}-{variant}"
                 run, gcode = run_slice(binaries[variant], fixture, directory, output / f"data-{variant}", metrics_runner)
                 run.update(fixture=fixture["name"], variant=variant, warmup=warmup, round=round_index + 1)
-                equivalent = {key: run[key] for key in ("commands", "output_metadata")}
-                if reference is None:
-                    reference = equivalent
-                run["output_identical"] = equivalent == reference
+                equivalent = equivalence_record(run)
+                if warmup and variant == "baseline" and equivalent not in references:
+                    references.append(equivalent)
+                run["output_identical"] = equivalent in references
+                run["baseline_output_variant"] = references.index(equivalent) if run["output_identical"] else None
                 report["runs"].append(run)
                 save()
                 if not run["output_identical"]:
                     raise RuntimeError(f"Output differs from baseline: {directory}")
                 print(f"{fixture['name']} {label} {variant}: {run['process_counters']['retired_instructions'] / 1e9:.3f} G instructions, "
-                      f"{run['elapsed_seconds']:.3f}s observed; commands identical", flush=True)
+                      f"{run['elapsed_seconds']:.3f}s observed; exact baseline output variant {run['baseline_output_variant']}", flush=True)
                 # Retain warmup artifacts for diagnosis, not a large copy per timing run.
                 if not warmup:
                     gcode.unlink()
         measured = [r for r in report["runs"] if r["fixture"] == fixture["name"] and not r["warmup"]]
         summary = {}
+        summary["baseline_output_variants"] = len(references)
         for variant in binaries:
             runs = [r for r in measured if r["variant"] == variant]
             elapsed = [r["elapsed_seconds"] for r in runs]
