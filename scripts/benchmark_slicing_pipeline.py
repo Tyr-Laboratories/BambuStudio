@@ -97,11 +97,14 @@ def run_slice(binary, fixture, directory, data_directory, metrics_runner=None):
     if metrics_runner is not None:
         args = [str(metrics_runner), str(directory / "process-metrics.json"), "--", *args]
     started = time.monotonic()
-    with (directory / "slice.log").open("wb") as log:
+    # The CLI resets --outputdir. Keep the open log outside that directory so
+    # diagnostics survive both successful exports and failed slices.
+    log_path = directory.with_name(directory.name + ".log")
+    with log_path.open("wb") as log:
         result = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT)
     elapsed = time.monotonic() - started
     if result.returncode:
-        raise RuntimeError(f"Slicing failed ({result.returncode}); see {directory / 'slice.log'}")
+        raise RuntimeError(f"Slicing failed ({result.returncode}); see {log_path}")
     report = json.loads((directory / "result.json").read_text())
     plates = report["sliced_plates"]
     if len(plates) != 1:

@@ -85,6 +85,23 @@ campaign pass. Four traced slices and repeated Arachne-input probes did not
 reproduce the variation; the subsequent lifetime assertion identified the
 expired grid storage at its actual production query boundary.
 
+The next campaign passed the foundation fixture but failed on one larger-model
+support stream after five pairs and three baseline-only controls. A separate
+checked detector then found an invalid read beyond the trimmed painted-enforcer
+array: 1,545 object layers, 1,227 enforcer entries, and an attempted read at index
+1,351. A synthetic two-shelf fixture reproduces this invalid access in the checked
+original detector. Bounding the lookup by the array size passes that regression
+and retains automatic supports above the painted shelf. The full support-base
+suite passes 539 assertions in 22 cases.
+
+A guarded diagnostic slice matches the previous baseline's complete command,
+preview, and metadata record. Its detector never reaches the existing time or
+complexity cutoffs (maximum 14 regions per layer); the arena reports 16 threads.
+These observations establish the bounds defect and its correction, not that it
+caused the single unmatched stream. Fresh qualification includes this same
+correction in both binaries. Diagnostic logs now live outside the CLI output
+directory so the slicer's directory reset cannot unlink them.
+
 ## Focused work measurements
 
 | Probe | Baseline instructions | Candidate instructions | Reduction |

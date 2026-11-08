@@ -135,6 +135,62 @@ TEST_CASE("Support base projections select upward paint in print orientation", "
     CHECK(projected_area == Approx(down ? 0. : 100. * scale).margin(0.001));
 }
 
+TEST_CASE("Automatic organic supports handle enforcer paint ending below the model top", "[SupportBase][Slicing][EnforcerBounds]")
+{
+    Model model;
+    auto *model_object = model.add_object();
+    TriangleMesh fixture(its_make_cube(3., 12., 26.));
+    for (double z : {10., 25.}) {
+        TriangleMesh shelf(its_make_cube(18., 12., 1.));
+        shelf.translate(0., 0., z);
+        fixture.merge(shelf);
+    }
+    ModelVolume &volume = *model_object->add_volume(fixture);
+    model_object->add_instance()->set_offset(Vec3d(110., 100., 0.));
+    TriangleSelector selector(volume.mesh());
+    const auto &mesh = volume.mesh().its;
+    const auto transform = volume.get_matrix();
+    for (size_t i = 0; i < mesh.indices.size(); ++i) {
+        const auto &face = mesh.indices[i];
+        const Vec3f a = (transform * mesh.vertices[face[0]].cast<double>()).cast<float>();
+        const Vec3f b = (transform * mesh.vertices[face[1]].cast<double>()).cast<float>();
+        const Vec3f c = (transform * mesh.vertices[face[2]].cast<double>()).cast<float>();
+        const Vec3f center = (a + b + c) / 3.f;
+        if (std::abs(center.z() - 10.f) < 0.001f && (b-a).cross(c-a).z() < 0.f)
+            selector.set_facet(int(i), EnforcerBlockerType::ENFORCER);
+    }
+    volume.supported_facets.set(selector);
+    REQUIRE_FALSE(volume.supported_facets.empty());
+
+    auto config = support_base_config(false);
+    config.set_deserialize_strict({{"support_interface_top_layers", "0"}});
+    Print print;
+    print.set_status_silent();
+    print.auto_assign_extruders(model.objects.front());
+    print.apply(model, config);
+    PrintObject &object = *print.get_object(size_t(0));
+    object.slice();
+    auto enforcers = object.slice_support_enforcers();
+    object.project_and_append_custom_facets(false, EnforcerBlockerType::ENFORCER, enforcers);
+    while (!enforcers.empty() && enforcers.back().empty())
+        enforcers.pop_back();
+    REQUIRE_FALSE(enforcers.empty());
+    REQUIRE(enforcers.size() < object.layer_count() / 2);
+
+    object.generate_support_preview();
+    double lower_contact = 0., upper_contact = 0.;
+    for (const auto *layer : object.support_layers())
+        for (const auto &path : layer->support_fills.as_polylines()) {
+            if (layer->print_z > 9.5 && layer->print_z < 10.)
+                lower_contact += unscale<double>(path.length());
+            if (layer->print_z > 24.5 && layer->print_z < 25.)
+                upper_contact += unscale<double>(path.length());
+        }
+    // Automatic detection continues above the painted lower shelf.
+    CHECK(lower_contact > 10.);
+    CHECK(upper_contact > 10.);
+}
+
 TEST_CASE("Painted organic bases shorten nearby towers and retain distant bed supports", "[SupportBase][Slicing]")
 {
     auto config = support_base_config();

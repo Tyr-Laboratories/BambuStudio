@@ -933,7 +933,9 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
                 // add enforcer
                 ExPolygons enforced_overhangs;
                 ExPolygons blocker;
-                if (!enforcers.empty()) 
+                // Projection trims unpainted trailing layers; automatic
+                // detection still visits the entire object above that paint.
+                if (layer_nr < enforcers.size())
                     enforced_overhangs = intersection_ex(diff_ex(layer->lslices_extrudable, lower_layer->lslices_extrudable), enforcers[layer_nr]);
                 if (is_auto(stype)) {
                     // normal overhang

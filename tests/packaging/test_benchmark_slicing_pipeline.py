@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,25 @@ spec.loader.exec_module(benchmark)
 
 
 class CommandComparisonTests(unittest.TestCase):
+    def test_slice_log_survives_cli_output_directory_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "slice-output"
+
+            def reset_output(args, stdout, stderr):
+                # The real CLI clears its output directory before exporting.
+                shutil.rmtree(output)
+                output.mkdir()
+                stdout.write(b"support diagnostic\n")
+                (output / "result.json").write_text(json.dumps({"sliced_plates": [{"times": {}}]}))
+                (output / "plate_1.gcode").write_text("G1 X1 E1\n")
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(benchmark.subprocess, "run", side_effect=reset_output):
+                benchmark.run_slice(root / "slicer", {"plate": 1, "path": "fixture.3mf"},
+                                    output, root / "data")
+            self.assertEqual((root / "slice-output.log").read_text(), "support diagnostic\n")
+
     def test_resume_reuses_verified_runs_and_rejects_changed_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
