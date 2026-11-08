@@ -706,7 +706,9 @@ FloatingThickPolylines FillFloatingConcentric::resplit_order_loops(Point curr_po
 
             EdgeGrid::Grid grid;
             grid.set_bbox(bbox_line);
-            grid.create({ polyline.points }, scaled<coord_t>(10.), !all_extrusions[idx]->is_closed);
+            // EdgeGrid borrows point storage; it must survive the query below.
+            const std::vector<Points> contours{polyline.points};
+            grid.create(contours, scaled<coord_t>(10.), !all_extrusions[idx]->is_closed);
             if (grid.has_intersecting_edges())
                 is_self_intersect = true;
         }

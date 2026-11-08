@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run the production floating-polyline conversion under AddressSanitizer.
+"""Check production floating-polyline conversion and borrowed-grid lifetimes.
 
 Uses an existing Ninja native test build's compiler/linker configuration. The
 standalone probe includes the production translation unit to instrument private
-functions too; it does not change the application or its build objects.
+functions too, with a sanitizer-aware wrapper at the borrowed-grid query.
+It does not change the application or its build objects.
 """
 import argparse
 from pathlib import Path

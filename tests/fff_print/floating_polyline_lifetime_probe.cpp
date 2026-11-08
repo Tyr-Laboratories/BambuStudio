@@ -1,8 +1,31 @@
 // Standalone sanitizer probe: compile the production translation unit here so
 // its private conversion function and vector mutations are instrumented too.
 // See scripts/check_floating_polyline_lifetime.py; this is not linked into the app.
-#include "../../src/libslic3r/Fill/FillFloatingConcentric.cpp"
+#include "../../src/libslic3r/EdgeGrid.hpp"
+#include <sanitizer/asan_interface.h>
 #include <iostream>
+#include <cstdlib>
+
+// The native archive can supply uninstrumented weak Eigen inline functions.
+// Check borrowed storage explicitly at the production query boundary so that
+// sanitizer coverage does not depend on which inline definition the linker uses.
+namespace Slic3r::EdgeGrid {
+class LifetimeCheckedGrid : public Grid {
+public:
+    bool has_intersecting_edges() const {
+        for (const auto &contour : contours())
+            for (const Point *point = contour.begin(); point != contour.end(); ++point)
+                if (__asan_address_is_poisoned(point)) {
+                    std::cerr << "Floating self-intersection grid references expired point storage.\n";
+                    std::abort();
+                }
+        return Grid::has_intersecting_edges();
+    }
+};
+}
+#define Grid LifetimeCheckedGrid
+#include "../../src/libslic3r/Fill/FillFloatingConcentric.cpp"
+#undef Grid
 
 int main()
 {
@@ -60,5 +83,23 @@ int main()
     const auto thick_rebased = thick_loop.rebase_at(1);
     if (thick_rebased.is_floating.size() != thick_rebased.points.size() ||
         thick_rebased.is_floating != std::vector<bool>({true, false, false, true})) return 12;
-    std::cout << "Floating segment flags and boundary interpolation passed.\n";
+    struct FillerProbe : FillFloatingConcentric { using FillFloatingConcentric::resplit_order_loops; using FillConcentric::print_object_config; };
+    PrintObjectConfig object_config;
+    object_config.detect_floating_vertical_shell.value = true;
+    FillerProbe filler;
+    filler.print_object_config = &object_config;
+    Arachne::ExtrusionLine open_path(0, true, false);
+    for(const auto &point : Points{Point(0,0),Point(100000,0),Point(100000,100000),Point(0,100000)})
+        open_path.junctions.emplace_back(point,40000,0);
+    const auto checked = filler.resplit_order_loops(Point(0,0),{&open_path},{},{},40000);
+    if(checked.size()!=1 || checked.front().points.size()!=4) return 14;
+    const ExPolygons floating_area{ExPolygon(Polygon(Points{Point(-100000,-100000),Point(200000,-100000),Point(200000,200000),Point(-100000,200000)}))};
+    const auto floating = filler.resplit_order_loops(Point(0,0),{&open_path},floating_area,{},40000);
+    if(floating.size()!=1 || !std::all_of(floating.front().is_floating.begin(),floating.front().is_floating.end(),[](bool flag){return flag;})) return 15;
+    Arachne::ExtrusionLine crossing_path(0,true,false);
+    for(const auto &point : Points{Point(0,0),Point(100000,100000),Point(0,100000),Point(100000,0)})
+        crossing_path.junctions.emplace_back(point,40000,0);
+    const auto crossing = filler.resplit_order_loops(Point(0,0),{&crossing_path},floating_area,{},40000);
+    if(crossing.size()!=1 || std::any_of(crossing.front().is_floating.begin(),crossing.front().is_floating.end(),[](bool flag){return flag;})) return 16;
+    std::cout << "Floating flags, interpolation, grid lifetime and intersection classifications passed.\n";
 }
