@@ -27,7 +27,7 @@ FloatingPolyline FloatingPolyline::rebase_at(size_t idx)
     for (size_t j = 0; j < n - 1; ++j) {
         ret.is_floating[j] = this->is_floating[(idx + j) % (n-1)];
     }
-    ret.is_floating.emplace_back(ret.is_floating.front());
+    ret.is_floating[n - 1] = ret.is_floating.front();
     return ret;
 }
 
@@ -42,7 +42,7 @@ FloatingThickPolyline FloatingThickPolyline::rebase_at(size_t idx)
     for (size_t j = 0; j < n - 1; ++j) {
         ret.is_floating[j] = this->is_floating[(idx + j) % (n - 1)];
     }
-    ret.is_floating.emplace_back(ret.is_floating.front());
+    ret.is_floating[n - 1] = ret.is_floating.front();
     return ret;
 }
 
@@ -220,6 +220,9 @@ double interpolate_width(const ZPath& path,
     while (next_idx < path.size() && (path[next_idx].z() < 0 || path[next_idx].z() >= subject_idx_range))
         ++next_idx;
 
+    if (prev_idx < 0 && next_idx >= path.size())
+        return default_width;
+
     double width_prev;
     double width_next;
     if (prev_idx < 0) {
@@ -237,8 +240,12 @@ double interpolate_width(const ZPath& path,
         size_t next_z_idx = path[next_idx].z();
         width_next = line.get_width_at(next_z_idx);
     }
-    Point prev(path[prev_idx].x(), path[prev_idx].y());
-    Point next(path[next_idx].x(), path[next_idx].y());
+    // An untagged end uses the default width at the path endpoint. The
+    // missing tag is not a valid coordinate index into the clipped path.
+    const auto& prev_anchor = prev_idx < 0 ? path.front() : path[prev_idx];
+    const auto& next_anchor = next_idx >= path.size() ? path.back() : path[next_idx];
+    Point prev(prev_anchor.x(), prev_anchor.y());
+    Point next(next_anchor.x(), next_anchor.y());
     Point curr(path[idx].x(), path[idx].y());
     double d_total = (next - prev).cast<double>().norm();
     double d_curr = (curr - prev).cast<double>().norm();

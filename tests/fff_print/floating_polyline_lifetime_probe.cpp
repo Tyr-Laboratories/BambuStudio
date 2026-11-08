@@ -30,5 +30,35 @@ int main()
         }
         if (std::abs(total_length - (trailing_nonfloating ? 20000000. : 10000000.)) > 1.) return 3;
     }
-    std::cout << "Floating segment growth, following-segment flags, and width-transition flags passed.\n";
+    ThickPolyline source;
+    source.points = {Point(0, 0), Point(4000000, 0)};
+    source.width = {300000., 500000.};
+    const ZPath missing_before = {{0, 0, -1}, {2000000, 0, -1}, {4000000, 0, 0}};
+    const ZPath missing_after = {{0, 0, 0}, {2000000, 0, -1}, {4000000, 0, -1}};
+    const ZPath missing_both = {{0, 0, -1}, {2000000, 0, -1}, {4000000, 0, -1}};
+    if (std::abs(interpolate_width(missing_before, source, 2, 600000, 0) - 600000.) > 1.) return 4;
+    if (std::abs(interpolate_width(missing_before, source, 2, 600000, 1) - 450000.) > 1.) return 5;
+    if (std::abs(interpolate_width(missing_after, source, 2, 600000, 1) - 450000.) > 1.) return 6;
+    if (std::abs(interpolate_width(missing_after, source, 2, 600000, 2) - 600000.) > 1.) return 7;
+    if (std::abs(interpolate_width(missing_both, source, 2, 600000, 1) - 600000.) > 1.) return 8;
+    const ZPath single_unknown = {{0, 0, -1}};
+    const ZPath single_known = {{0, 0, 0}};
+    if (interpolate_width(single_unknown, source, 2, 600000, 0) != 600000.) return 9;
+    if (interpolate_width(single_known, source, 2, 600000, 0) != 300000.) return 10;
+    const ZPath both_known = {{0, 0, 0}, {2000000, 0, -1}, {4000000, 0, 1}};
+    if (interpolate_width(both_known, source, 2, 600000, 1) != 400000.) return 13;
+    FloatingPolyline loop;
+    loop.points = {Point(0, 0), Point(1000000, 0), Point(0, 1000000), Point(0, 0)};
+    loop.is_floating = {false, true, false, false};
+    const auto rebased = loop.rebase_at(1);
+    if (rebased.is_floating.size() != rebased.points.size() ||
+        rebased.is_floating != std::vector<bool>({true, false, false, true})) return 11;
+    FloatingThickPolyline thick_loop;
+    thick_loop.points = loop.points;
+    thick_loop.width = {400000., 400000., 400000., 400000., 400000., 400000.};
+    thick_loop.is_floating = loop.is_floating;
+    const auto thick_rebased = thick_loop.rebase_at(1);
+    if (thick_rebased.is_floating.size() != thick_rebased.points.size() ||
+        thick_rebased.is_floating != std::vector<bool>({true, false, false, true})) return 12;
+    std::cout << "Floating segment flags and boundary interpolation passed.\n";
 }
