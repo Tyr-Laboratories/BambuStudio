@@ -30,3 +30,20 @@ changes that show a useful gain without a material regression. Verify parallel
 plate isolation remains intact. Follow the existing authorization to update the
 Mac installation, merge and publish after qualification; preserve user state.
 Remove this pass's bulky temporary artifacts after delivery.
+
+Qualification exposed a pre-existing floating-shell segment lifetime error.
+AddressSanitizer reproduced a read after vector erase; a separate width-transition
+case also lost the preceding path's floating flag. Boundary probes confirmed
+missing-anchor buffer reads, and rebasing probes confirmed incorrect closing
+flags. Correct these narrow defects, then compare
+Tyr.22 plus these common fixes against the optimized candidate with the same
+fixes. Use fresh executable hashes and measurements; keep the failed unfixed
+campaign only as diagnostic evidence.
+
+A later diagnostic isolated another lifetime defect: floating-shell self-intersection
+testing constructed a borrowing EdgeGrid from a temporary point container. Keep
+that container alive through the query. The regression checks AddressSanitizer
+poison state at the production call boundary and both intersecting/nonintersecting
+classification outcomes. Rebuild both variants with this same correction before
+restarting the strict whole-stream campaign; do not reinterpret earlier failed
+comparisons as passing.
