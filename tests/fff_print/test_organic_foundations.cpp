@@ -469,6 +469,39 @@ TEST_CASE("Equal-width thin ledges retain substantial lower organic branching", 
         CHECK(outboard_quarter.branches >= 2);
     }
 
+    // The clear outer-left trunk is unbranched across the artificial midpoint.
+    // Its printed walls should follow the chord between its fixed endpoints,
+    // rather than preserving the several-millimeter bend from two separate runs.
+    const auto trunk_window = model_rectangle(object, 4., -4., 18., 8.);
+    std::vector<std::pair<double, Vec2d>> trunk_centroids;
+    for (const SupportLayer *layer : object.support_layers()) {
+        if (layer->print_z < 27. - EPSILON || layer->print_z > 49. + EPSILON)
+            continue;
+        const auto section = intersection_ex(layer->support_fills.polygons_covered_by_width(), trunk_window);
+        REQUIRE(section.size() == 1);
+        // Signed hole areas matter: measure the actual hollow extrusion footprint,
+        // not the solid outer contour or a branch-center implementation detail.
+        Vec2d weighted_center = Vec2d::Zero();
+        double signed_area = 0.;
+        for (const Polygon &ring : to_polygons(section)) {
+            const double ring_area = ring.area();
+            weighted_center += ring.centroid().cast<double>() * ring_area;
+            signed_area += ring_area;
+        }
+        REQUIRE(signed_area > 0.);
+        trunk_centroids.emplace_back(layer->print_z, weighted_center * (SCALING_FACTOR / signed_area));
+    }
+    REQUIRE(trunk_centroids.size() > 100);
+    double maximum_departure = 0.;
+    const auto &first = trunk_centroids.front();
+    const auto &last = trunk_centroids.back();
+    for (const auto &[z, center] : trunk_centroids) {
+        const Vec2d chord = first.second + (last.second - first.second) * ((z - first.first) / (last.first - first.first));
+        maximum_departure = std::max(maximum_departure, (center - chord).norm());
+    }
+    CAPTURE(maximum_departure);
+    CHECK(maximum_departure < 0.2);
+
     // Preserve the original layer-quantized contact interval, and require
     // every substantial printed component to stay attached through the join.
     REQUIRE_FALSE(object.support_layers().empty());
@@ -552,4 +585,66 @@ TEST_CASE("Organic foundation tips stay supported with asymmetric interface coun
         ++checked_layers;
     }
     REQUIRE(checked_layers >= 4);
+}
+
+TEST_CASE("Organic foundation interfaces follow the existing top-interface enable switch", "[OrganicFoundation][InterfaceRoles]")
+{
+    const bool short_gap = GENERATE(false, true);
+    const double roof_level = short_gap ? 18. : roof_z;
+    CAPTURE(short_gap);
+    auto without_model = foundation_model(true, false, roof_level);
+    auto with_model = foundation_model(true, false, roof_level);
+    auto config = foundation_config();
+    config.set_deserialize_strict({{"support_interface_top_layers", "0"}, {"support_interface_bottom_layers", "0"}});
+    Print without_bottom, with_bottom;
+    slice_foundation(without_bottom, without_model, config);
+    config.set_deserialize_strict({{"support_interface_bottom_layers", "2"}});
+    slice_foundation(with_bottom, with_model, config);
+    const auto &before = *without_bottom.get_object(size_t(0));
+    const auto &after = *with_bottom.get_object(size_t(0));
+    if (!short_gap) {
+        REQUIRE(branch_count_at(before, 15.4) > branch_count_at(before, 30.));
+        REQUIRE(branch_count_at(after, 15.4) > branch_count_at(after, 30.));
+    }
+    REQUIRE_FALSE(before.support_layers().empty());
+    CHECK(before.support_layers().front()->bottom_z() == Approx(platform_z + 0.2).margin(0.01));
+    CHECK(before.support_layers().back()->print_z == Approx(roof_level - 0.2).margin(0.01));
+    const auto after_layers = after.support_layers();
+    REQUIRE(before.support_layers().size() == after_layers.size());
+    size_t interface_entities = 0;
+    for (const SupportLayer *layer : before.support_layers()) {
+        const auto found = std::find_if(after_layers.begin(), after_layers.end(), [&](const SupportLayer *candidate) {
+            return std::abs(candidate->print_z - layer->print_z) < EPSILON;
+        });
+        REQUIRE(found != after_layers.end());
+        const auto expected = printed_section(before, *layer);
+        const auto actual = printed_section(after, **found);
+        const double difference = (area(diff_ex(expected, actual)) + area(diff_ex(actual, expected))) *
+                                  SCALING_FACTOR * SCALING_FACTOR;
+        CAPTURE(layer->print_z, difference);
+        CHECK(difference < 0.001);
+        const auto flat = (*found)->support_fills.flatten();
+        for (const ExtrusionEntity *entity : flat.entities)
+            interface_entities += entity->role() == erSupportMaterialInterface;
+    }
+    // A zero top-interface count disables interfaces in the existing renderer.
+    // A stored bottom count must not create interface bars above a base layer,
+    // including original support retained when a short gap cannot form a foundation.
+    CHECK(interface_entities == 0);
+
+    auto enabled_model = foundation_model(true, false, roof_level);
+    config.set_deserialize_strict({{"support_interface_top_layers", "2"}});
+    Print enabled;
+    slice_foundation(enabled, enabled_model, config);
+    const auto &object = *enabled.get_object(size_t(0));
+    REQUIRE_FALSE(object.support_layers().empty());
+    const SupportLayer &first = *object.support_layers().front();
+    CHECK(first.bottom_z() == Approx(platform_z + 0.2).margin(0.01));
+    Polygons interface_footprint;
+    const auto flat = first.support_fills.flatten();
+    for (const ExtrusionEntity *entity : flat.entities)
+        if (entity->role() == erSupportMaterialInterface)
+            append(interface_footprint, entity->polygons_covered_by_width());
+    CHECK(area(intersection_ex(interface_footprint, fixture_region(object))) *
+          SCALING_FACTOR * SCALING_FACTOR > 0.05);
 }

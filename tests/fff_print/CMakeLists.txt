@@ -100,7 +100,7 @@ target_link_libraries(support_base_tests test_common libslic3r slicer_test_suppo
 set_property(TARGET support_base_tests PROPERTY FOLDER "tests")
 add_test(support_base_tests support_base_tests ${CATCH_EXTRA_ARGS})
 
-add_executable(organic_foundation_tests fff_print_tests.cpp test_organic_foundations.cpp test_organic_foundation_volumes.cpp test_organic_interface_phase.cpp)
+add_executable(organic_foundation_tests fff_print_tests.cpp test_organic_foundations.cpp test_organic_foundation_volumes.cpp test_organic_interface_phase.cpp test_organic_foundation_chord.cpp)
 target_link_libraries(organic_foundation_tests test_common libslic3r slicer_test_support)
 set_property(TARGET organic_foundation_tests PROPERTY FOLDER "tests")
 add_test(organic_foundation_tests organic_foundation_tests ${CATCH_EXTRA_ARGS})

@@ -297,6 +297,19 @@ void create_nodes_from_area(const TreeModelVolumes& volumes, const TreeSupportSe
 
 void organic_smooth_branches_avoid_collisions(const PrintObject& print_object, const TreeModelVolumes& volumes, const TreeSupportSettings& config, const std::vector<std::pair<SupportElement*, int>>& elements_with_link_down, const std::vector<size_t>& linear_data_layers, std::function<void()> throw_on_cancel, bool lock_roots = false);
 
+// Try the shortest center path between fixed physical branch junctions. Radii
+// and consecutive physical layers are inputs; a rejected chord leaves out intact.
+bool organic_branch_chord(const std::vector<Point>& centers, const std::vector<coord_t>& radii,
+    LayerIndex first_layer, coord_t maximum_move_distance,
+    const std::function<bool(const Point&, coord_t, LayerIndex)>& is_clear,
+    std::vector<Point>& out, const std::function<void()>& throw_on_cancel);
+
+// Validate changed normalized shell components without requalifying identical
+// legacy components whose direct and movement-envelope support are unchanged.
+bool organic_changed_sheath_supported(const Polygons& above_shell, const Polygons& below_shell,
+    const Polygons& previous_above_shell, const Polygons& previous_below_shell,
+    coord_t maximum_move_distance, double maximum_unsupported_area);
+
 indexed_triangle_set draw_branches(PrintObject& print_object, const TreeModelVolumes& volumes, const TreeSupportSettings& config, std::vector<SupportElements>& move_bounds, std::function<void()> throw_on_cancel);
 
 void slice_branches(PrintObject& print_object, const TreeModelVolumes& volumes, const TreeSupportSettings& config, const std::vector<Polygons>& overhangs, std::vector<SupportElements>& move_bounds, const indexed_triangle_set& cummulative_mesh, SupportGeneratorLayersPtr& bottom_contacts, SupportGeneratorLayersPtr& top_contacts, SupportGeneratorLayersPtr& intermediate_layers, SupportGeneratorLayerStorage& layer_storage, std::function<void()> throw_on_cancel);
