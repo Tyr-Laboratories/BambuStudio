@@ -944,7 +944,6 @@ void SeamPlacer::gather_seam_candidates(const PrintObject *po, const SeamPlacerI
             }
             auto functor                            = SeamCandidateCoordinateFunctor{layer_seams.points};
             seam_data.layers[layer_idx].points_tree = std::make_unique<PrintObjectSeamData::SeamCandidatesTree>(functor, layer_seams.points.size());
-            seam_data.layers[layer_idx].points_tree->build_radius_index();
         }
     });
 }
