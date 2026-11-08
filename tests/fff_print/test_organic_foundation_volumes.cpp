@@ -130,6 +130,57 @@ TEST_CASE("Reversed foundation avoidance can terminate only at its seam", "[Orga
     CHECK(contains(obstructed.getAvoidance(scaled<coord_t>(0.4), 0, TreeModelVolumes::AvoidanceType::Fast, false, true), scene.point(35., 1.)));
 }
 
+TEST_CASE("Reversed foundation seam radii remain distinct within one cache bucket", "[OrganicFoundation][Volumes][SeamRadius]")
+{
+    FoundationVolumeScene scene;
+    TreeSupportSettings settings(TreeSupportMeshGroupSettings(scene.object()), scene.object().slicing_parameters());
+    TreeModelVolumes source(scene.object(), scene.bed(), settings.maximum_move_distance, settings.maximum_move_distance_slow, 0);
+    const LayerIndex seam = scene.layer(8.);
+    const coord_t limit = scaled<coord_t>(1.48774);
+    const coord_t below = limit - 1;
+    const coord_t above = limit + 1;
+    TreeModelVolumes bounded(source, seam, scene.seam(), {}, limit);
+    TreeModelVolumes unrestricted(source, seam, scene.seam());
+    const Point axis = scene.point(10., 10.);
+
+    for (const bool minimum_xy : {false, true}) {
+        REQUIRE(source.ceilRadius(below, minimum_xy) == source.ceilRadius(above, minimum_xy));
+        const Polygons physical_before = source.getCollision(above, seam - 4, minimum_xy);
+        const Polygons source_avoidance_before = source.getAvoidance(above, seam - 4,
+            TreeModelVolumes::AvoidanceType::Fast, false, minimum_xy);
+        for (const auto type : {TreeModelVolumes::AvoidanceType::Fast, TreeModelVolumes::AvoidanceType::Slow,
+                                TreeModelVolumes::AvoidanceType::FastSafe})
+            for (const bool to_model : {false, true})
+                for (const LayerIndex layer : {0, 1, 4, 10}) {
+                    CAPTURE(minimum_xy, int(type), to_model, layer);
+                    // Query the oversized radius both before and after caching
+                    // its allowed neighbor: neither order may cross the limit.
+                    CHECK(contains(bounded.getAvoidance(above, layer, type, to_model, minimum_xy), axis));
+                    CHECK_FALSE(contains(bounded.getAvoidance(below, layer, type, to_model, minimum_xy), axis));
+                    CHECK_FALSE(contains(bounded.getAvoidance(limit, layer, type, to_model, minimum_xy), axis));
+                    CHECK(contains(bounded.getAvoidance(above, layer, type, to_model, minimum_xy), axis));
+                    CHECK(diff(Polygons{source.m_bed_area}, bounded.getAvoidance(above, layer, type, to_model, minimum_xy)).empty());
+                    const Polygons &expected = unrestricted.getAvoidance(below, layer, type, to_model, minimum_xy);
+                    const Polygons &actual = bounded.getAvoidance(below, layer, type, to_model, minimum_xy);
+                    CHECK(diff(actual, expected).empty());
+                    CHECK(diff(expected, actual).empty());
+                }
+        // Endpoint permissions belong only to the reversed view's avoidance;
+        // they must not alter physical collisions or source routing caches.
+        CHECK(diff(physical_before, bounded.getCollision(above, 4, minimum_xy)).empty());
+        CHECK(diff(bounded.getCollision(above, 4, minimum_xy), physical_before).empty());
+        const Polygons &source_after = source.getAvoidance(above, seam - 4,
+            TreeModelVolumes::AvoidanceType::Fast, false, minimum_xy);
+        CHECK(diff(source_after, source_avoidance_before).empty());
+        CHECK(diff(source_avoidance_before, source_after).empty());
+        CHECK_FALSE(contains(unrestricted.getAvoidance(above, 4,
+            TreeModelVolumes::AvoidanceType::Fast, false, minimum_xy), axis));
+    }
+
+    TreeModelVolumes cancelled(source, seam, scene.seam(), [] { throw std::runtime_error("cancelled seam query"); }, limit);
+    CHECK_THROWS_AS(cancelled.getAvoidance(above, 0, TreeModelVolumes::AvoidanceType::Fast, false, true), std::runtime_error);
+}
+
 TEST_CASE("Reversed foundations do not land on intermediate model surfaces", "[OrganicFoundation][Volumes]")
 {
     FoundationVolumeScene scene;

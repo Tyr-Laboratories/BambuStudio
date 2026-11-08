@@ -1162,26 +1162,27 @@ static coord_t organic_tip_connect_length(const TreeSupportSettings &config)
         std::max(2. * config.min_radius - config.support_line_width, 0.0);
 }
 
-void generate_initial_areas(
-    const PrintObject               &print_object,
-    const TreeModelVolumes          &volumes,
-    const TreeSupportSettings       &config,
-    const std::vector<Polygons>     &overhangs,
-    std::vector<SupportElements>    &move_bounds,
-    InterfacePlacer                 &interface_placer,
-    std::function<void()>            throw_on_cancel)
+// Raw model contact masks and the support layer where their contacts begin.
+// Optional forbidden centers constrain landing permissions without changing the
+// shared contact preparation, roof classification, or tip sampling rules.
+struct OrganicContactArea {
+    size_t layer_idx;
+    const Polygons *polygons;
+    const Polygons *additional_forbidden_tip_centers = nullptr;
+};
+
+static void generate_initial_areas_from_contacts(
+    const TreeModelVolumes                  &volumes,
+    const TreeSupportSettings               &config,
+    const TreeSupportMeshGroupSettings      &mesh_group_settings,
+    const std::vector<OrganicContactArea>    &contacts,
+    size_t                                   num_support_layers,
+    std::vector<SupportElements>            &move_bounds,
+    InterfacePlacer                         &interface_placer,
+    std::function<void()>                     throw_on_cancel)
 {
-    using                           AvoidanceType = TreeModelVolumes::AvoidanceType;
-    TreeSupportMeshGroupSettings    mesh_group_settings(print_object);
-
-    const size_t z_distance_delta = config.z_distance_top_layers + 1;
-
+    using AvoidanceType = TreeModelVolumes::AvoidanceType;
     const bool min_xy_dist = config.xy_distance > config.xy_min_distance;
-
-#if 0
-    if (mesh.overhang_areas.size() <= z_distance_delta)
-        return;
-#endif
 
     const coord_t connect_length = organic_tip_connect_length(config);
     // As r*r=x*x+y*y (circle equation): If a circle with center at (0,0) the top most point is at (0,r) as in y=r.
@@ -1220,38 +1221,23 @@ void generate_initial_areas(
             }
         }
 
-    size_t                                          num_support_layers;
-    int                                             raft_contact_layer_idx;
-    // Layers with their overhang regions.
-    std::vector<std::pair<size_t, const Polygons*>>  raw_overhangs;
-
-    {
-        const size_t num_raft_layers     = config.raft_layers.size();
-        const size_t first_support_layer = std::max(int(num_raft_layers) - int(z_distance_delta), 1);
-        num_support_layers  = size_t(std::max(0, int(print_object.layer_count()) + int(num_raft_layers) - int(z_distance_delta)));
-        raft_contact_layer_idx = generate_raft_contact(print_object, config, interface_placer);
-        // Enumerate layers for which the support tips may be generated from overhangs above.
-        raw_overhangs.reserve(num_support_layers - first_support_layer);
-        for (size_t layer_idx = first_support_layer; layer_idx < num_support_layers; ++ layer_idx)
-            if (const size_t overhang_idx = layer_idx + z_distance_delta; ! overhangs[overhang_idx].empty())
-                raw_overhangs.push_back({ layer_idx, &overhangs[overhang_idx] });
-    }
-
     RichInterfacePlacer rich_interface_placer{ interface_placer, volumes, force_tip_to_roof, num_support_layers, move_bounds };
 
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, raw_overhangs.size()),
-        [&volumes, &config, &raw_overhangs, &mesh_group_settings,
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, contacts.size()),
+        [&volumes, &config, &contacts, &mesh_group_settings,
          min_xy_dist, roof_enabled, num_support_roof_layers, extra_outset, circle_length_to_half_linewidth_change, connect_length,
          &rich_interface_placer, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
         for (size_t raw_overhang_idx = range.begin(); raw_overhang_idx < range.end(); ++ raw_overhang_idx) {
-            size_t           layer_idx    = raw_overhangs[raw_overhang_idx].first;
-            const Polygons  &overhang_raw = *raw_overhangs[raw_overhang_idx].second;
+            size_t           layer_idx    = contacts[raw_overhang_idx].layer_idx;
+            const Polygons  &overhang_raw = *contacts[raw_overhang_idx].polygons;
 
             // take the least restrictive avoidance possible
             Polygons relevant_forbidden;
             {
-                const Polygons relevant_forbidden_raw = support_tip_forbidden(volumes, config,
+                Polygons relevant_forbidden_raw = support_tip_forbidden(volumes, config,
                     config.getRadius(0), layer_idx, min_xy_dist);
+                if (const Polygons *additional = contacts[raw_overhang_idx].additional_forbidden_tip_centers)
+                    append(relevant_forbidden_raw, *additional);
                 // prevent rounding errors down the line, points placed directly on the line of the forbidden area may not be added otherwise.
                 relevant_forbidden = offset(union_ex(relevant_forbidden_raw), scaled<float>(0.005), jtMiter, 1.2);
             }
@@ -1367,6 +1353,40 @@ void generate_initial_areas(
             }
         }
     });
+}
+
+void generate_initial_areas(
+    const PrintObject               &print_object,
+    const TreeModelVolumes          &volumes,
+    const TreeSupportSettings       &config,
+    const std::vector<Polygons>     &overhangs,
+    std::vector<SupportElements>    &move_bounds,
+    InterfacePlacer                 &interface_placer,
+    std::function<void()>            throw_on_cancel)
+{
+    TreeSupportMeshGroupSettings    mesh_group_settings(print_object);
+
+    const size_t z_distance_delta = config.z_distance_top_layers + 1;
+
+    size_t                                          num_support_layers;
+    int                                             raft_contact_layer_idx;
+    // Layers with their overhang regions.
+    std::vector<OrganicContactArea>                  raw_overhangs;
+
+    {
+        const size_t num_raft_layers     = config.raft_layers.size();
+        const size_t first_support_layer = std::max(int(num_raft_layers) - int(z_distance_delta), 1);
+        num_support_layers  = size_t(std::max(0, int(print_object.layer_count()) + int(num_raft_layers) - int(z_distance_delta)));
+        raft_contact_layer_idx = generate_raft_contact(print_object, config, interface_placer);
+        // Enumerate layers for which the support tips may be generated from overhangs above.
+        raw_overhangs.reserve(num_support_layers - first_support_layer);
+        for (size_t layer_idx = first_support_layer; layer_idx < num_support_layers; ++ layer_idx)
+            if (const size_t overhang_idx = layer_idx + z_distance_delta; ! overhangs[overhang_idx].empty())
+                raw_overhangs.push_back({ layer_idx, &overhangs[overhang_idx] });
+    }
+
+    generate_initial_areas_from_contacts(volumes, config, mesh_group_settings, raw_overhangs,
+        num_support_layers, move_bounds, interface_placer, throw_on_cancel);
 
     finalize_raft_contact(print_object, raft_contact_layer_idx, interface_placer.top_contacts_mutable(), move_bounds);
 }
@@ -5564,6 +5584,81 @@ static void smooth_organic_forest(
 
 }
 
+// Validate physical stems rather than individual graph nodes: neighboring seam
+// sections may join into one stem, while isolated stems need their own feet.
+static bool foundation_components_have_multiple_feet(
+    const std::vector<Polygons> &branch_material,
+    const std::vector<Polygons> &feet,
+    const std::function<void()> &cancel)
+{
+    if (branch_material.empty() || branch_material.size() != feet.size())
+        return false;
+    struct LabeledPart {
+        Polygons polygons;
+        size_t label;
+    };
+    std::vector<LabeledPart> above;
+    for (ExPolygon &part : union_ex(branch_material.back()))
+        above.push_back({to_polygons(std::move(part)), above.size()});
+    if (above.empty())
+        return false;
+
+    std::vector<size_t> parents(above.size());
+    for (size_t i = 0; i < parents.size(); ++i)
+        parents[i] = i;
+    auto root = [&parents](size_t label) {
+        while (parents[label] != label) {
+            parents[label] = parents[parents[label]];
+            label = parents[label];
+        }
+        return label;
+    };
+    std::vector<Polygons> reached_feet(parents.size());
+    auto collect_feet = [&](const std::vector<LabeledPart> &parts, size_t layer) {
+        for (const LabeledPart &part : parts) {
+            append(reached_feet[part.label], intersection(part.polygons, feet[layer]));
+            if (cancel)
+                cancel();
+        }
+    };
+    collect_feet(above, branch_material.size() - 1);
+
+    for (size_t layer = branch_material.size() - 1; layer-- > 0;) {
+        std::vector<LabeledPart> below;
+        for (ExPolygon &part : union_ex(branch_material[layer])) {
+            Polygons polygons = to_polygons(std::move(part));
+            size_t label = parents.size();
+            for (const LabeledPart &neighbor : above)
+                if (area(intersection(polygons, neighbor.polygons)) > 0.) {
+                    const size_t neighbor_root = root(neighbor.label);
+                    if (label == parents.size())
+                        label = neighbor_root;
+                    else
+                        parents[neighbor_root] = root(label);
+                }
+            if (label != parents.size())
+                below.push_back({std::move(polygons), root(label)});
+            if (cancel)
+                cancel();
+        }
+        collect_feet(below, layer);
+        above = std::move(below);
+        if (cancel)
+            cancel();
+    }
+
+    std::vector<Polygons> grouped_feet(parents.size());
+    for (size_t i = 0; i < parents.size(); ++i)
+        append(grouped_feet[root(i)], std::move(reached_feet[i]));
+    for (size_t i = 0; i < parents.size(); ++i) {
+        if (cancel)
+            cancel();
+        if (root(i) == i && union_ex(grouped_feet[i]).size() < 2)
+            return false;
+    }
+    return true;
+}
+
 void organic_draw_branches(
     PrintObject& print_object,
     TreeModelVolumes& volumes,
@@ -6016,7 +6111,8 @@ void organic_draw_branches(
         if (found == contact_avoidance.end()) {
             Polygon disk = make_circle(std::max<coord_t>(scaled<coord_t>(0.05), config.resolution * 2), scaled<coord_t>(0.005));
             disk.translate(node.state.result_on_layer);
-            TreeModelVolumes view(volumes, node.state.layer_idx, Polygons{disk}, throw_on_cancel);
+            TreeModelVolumes view(volumes, node.state.layer_idx, Polygons{disk}, throw_on_cancel,
+                support_element_radius(config, node));
             found = contact_avoidance.emplace(key, view.getAvoidance(config.min_radius,
                 node.state.layer_idx - physical, TreeModelVolumes::AvoidanceType::Fast, false, true)).first;
         }
@@ -6024,7 +6120,7 @@ void organic_draw_branches(
     };
     auto foundation_for_seam = [&](const SupportElement &seam_node, LayerIndex base,
                                    std::vector<Polygons> &out, std::vector<Polygons> &contacts,
-                                   std::vector<ExPolygons> &cooldown) {
+                                   std::vector<Polygons> &feet, std::vector<Polygons> &branches, std::vector<ExPolygons> &cooldown) {
         const LayerIndex seam = seam_node.state.layer_idx;
         const LayerIndex height = seam - base;
         if (height < 2)
@@ -6037,40 +6133,79 @@ void organic_draw_branches(
         // The virtual bed is the midpoint weld, not a physical plate foot.
         reverse_config.layer_start_bp_radius = 0;
         reverse_config.bp_radius = reverse_config.branch_radius;
+        // A reflected dense contact band must fit the physical bottom-interface
+        // budget. Otherwise the renderer makes its excess rows hollow base and
+        // the sampled tips above them float. Keep every branching parameter and
+        // the shared sampler, but let it generate direct tips where no dense
+        // contact material will actually be printed.
+        SupportParameters reverse_support_parameters = interface_placer.support_parameters;
+        reverse_config.settings.support_roof_layers = std::min<coord_t>(
+            reverse_config.settings.support_roof_layers, reverse_support_parameters.num_bottom_interface_layers);
+        reverse_config.settings.support_roof_enable = reverse_config.settings.support_roof_layers > 0;
+        reverse_support_parameters.num_top_interface_layers = reverse_config.settings.support_roof_layers;
+        reverse_support_parameters.num_top_base_interface_layers = std::min(
+            reverse_support_parameters.num_top_base_interface_layers, reverse_support_parameters.num_top_interface_layers);
+        reverse_support_parameters.has_top_contacts = reverse_config.settings.support_roof_enable;
 
         const Point seam_point = seam_node.state.result_on_layer;
         Polygon seam_disk = make_circle(std::max<coord_t>(scaled<coord_t>(0.05), config.resolution * 2),
                                         scaled<coord_t>(0.005));
         seam_disk.translate(seam_point);
         const Polygons seam_centers{seam_disk};
-        TreeModelVolumes reverse_volumes(volumes, seam, seam_centers, throw_on_cancel);
+        // The midpoint is a weld to an existing branch, not an unrestricted
+        // virtual build plate. Give the ordinary routing/growth solver both
+        // endpoint constraints so it joins at the upper branch's position and
+        // radius instead of growing an oversized root and reshaping it later.
+        TreeModelVolumes reverse_volumes(volumes, seam, seam_centers, throw_on_cancel,
+            support_element_radius(config, seam_node));
         std::vector<SupportElements> reverse_bounds(size_t(height + 1));
         SupportGeneratorLayerStorage temporary_storage;
         SupportGeneratorLayersPtr temporary_contacts(height + 1, nullptr);
         SupportGeneratorLayersPtr temporary_interfaces(height + 1, nullptr);
         SupportGeneratorLayersPtr temporary_base_interfaces(height + 1, nullptr);
-        InterfacePlacer temporary_placer(slicing_params, interface_placer.support_parameters, reverse_config,
+        InterfacePlacer temporary_placer(slicing_params, reverse_support_parameters, reverse_config,
             temporary_storage, temporary_contacts, temporary_interfaces, temporary_base_interfaces);
-        RichInterfacePlacer sampler(temporary_placer, reverse_volumes, false, reverse_bounds.size(), reverse_bounds);
 
-        // Existing placeables enforce full model-footprint permissions (including
-        // painted bases). Reversed avoidance restricts sampling to surfaces that
-        // can reach this seam using the same branch angles and collision rules.
+        std::vector<Polygons> landing_masks(height + 1), forbidden_centers(height + 1);
+        std::vector<OrganicContactArea> foundation_areas;
+        // A foundation starts with tip-sized contacts, not the trunk-sized
+        // center regions used to land an already-grown forward tree. Prepare
+        // the same raw contact masks as the upper generator and constrain only
+        // their permitted tip centers at the model/paint boundary.
         for (LayerIndex physical = base; physical < seam - 1; ++physical) {
             throw_on_cancel();
             const LayerIndex reversed = seam - physical;
-            Polygons allowed = diff(volumes.getPlaceableAreas(config.min_radius, physical, throw_on_cancel),
-                reverse_volumes.getAvoidance(config.min_radius, reversed,
-                    TreeModelVolumes::AvoidanceType::Fast, false, true));
-            allowed = intersection(allowed, volumes.m_bed_area);
-            for (ExPolygon &part : union_ex(allowed))
-                sample_overhang_area(to_polygons(std::move(part)), false, reversed,
-                    config.settings.support_roof_layers, organic_tip_connect_length(config), config.settings, sampler);
+            Polygons &landing = landing_masks[reversed];
+            landing = intersection(volumes.getPlaceableAreas(0, physical, throw_on_cancel), volumes.m_bed_area);
+            if (landing.empty())
+                continue;
+            const Polygons centers = offset(union_ex(landing),
+                -(config.getRadius(0) + (config.painted_bases_only ? coord_t(0) : config.xy_distance)), jtMiter, 1.2);
+            forbidden_centers[reversed] = diff(Polygons{volumes.m_bed_area}, centers);
+            foundation_areas.push_back({size_t(reversed), &landing, &forbidden_centers[reversed]});
         }
+        generate_initial_areas_from_contacts(reverse_volumes, reverse_config, reverse_config.settings,
+            foundation_areas, reverse_bounds.size(), reverse_bounds, temporary_placer, throw_on_cancel);
 
-        // A landing surface may serve several stems. Give each sampled foot to
-        // its nearest seam so independent generators do not plant overlapping
-        // copies of the entire platform and turn the foundation into a wall.
+        // A landing surface may serve several stems. Prefer each foot's
+        // nearest seam so independent generators do not duplicate a platform.
+        // Keep an original sampled route available if that preference would
+        // starve a required weld completely; final physical connectivity and
+        // distinct-foot checks decide whether the combined result is valid.
+        std::optional<std::pair<size_t, SupportElement>> closest_tip;
+        double closest_distance = std::numeric_limits<double>::max();
+        for (size_t layer = 0; layer < reverse_bounds.size(); ++layer)
+            for (const SupportElement &tip : reverse_bounds[layer]) {
+                const Point point = tip.state.target_position;
+                const double distance = (point - seam_point).cast<double>().squaredNorm();
+                if (distance < closest_distance || (distance == closest_distance && closest_tip &&
+                    (point.x() < closest_tip->second.state.target_position.x() ||
+                     (point.x() == closest_tip->second.state.target_position.x() &&
+                      point.y() < closest_tip->second.state.target_position.y())))) {
+                    closest_tip = std::make_pair(layer, tip);
+                    closest_distance = distance;
+                }
+            }
         for (SupportElements &layer : reverse_bounds)
             layer.erase(std::remove_if(layer.begin(), layer.end(), [&](const SupportElement &tip) {
                 const Point point = tip.state.target_position;
@@ -6093,6 +6228,9 @@ void organic_draw_branches(
                 return false;
             }), layer.end());
 
+        if (closest_tip && std::all_of(reverse_bounds.begin(), reverse_bounds.end(),
+                [](const SupportElements &layer) { return layer.empty(); }))
+            reverse_bounds[closest_tip->first].push_back(std::move(closest_tip->second));
         create_layer_pathing(reverse_volumes, reverse_config, reverse_bounds, throw_on_cancel);
         if (reverse_bounds.front().empty())
             return false;
@@ -6130,7 +6268,7 @@ void organic_draw_branches(
         for (LayerIndex layer = base; layer <= seam; ++layer)
             planes.emplace_back(float(layer_mid_z(slicing_params, config, layer)));
         std::vector<Polygons> candidate(height + 1);
-        std::vector<Polygons> tip_contacts(height + 1);
+        std::vector<Polygons> tip_contacts(height + 1), branch_feet(height + 1);
         for (const Tree &reverse_tree : reverse_trees) {
             for (const Branch &branch : reverse_tree.branches) {
                 indexed_triangle_set mesh;
@@ -6148,11 +6286,34 @@ void organic_draw_branches(
                     // a reflected tip, just as forward tips stop at their contact.
                     if (branch.has_tip && physical < physical_tip)
                         continue;
+                    if (branch.has_tip && physical == physical_tip && !branch.path.back()->state.supports_roof)
+                        branch_slices[physical - base] = intersection(branch_slices[physical - base],
+                            volumes.getPlaceableAreas(0, physical, throw_on_cancel));
                     append(candidate[physical - base], branch_slices[physical - base]);
                 }
-                if (branch.has_tip && physical_tip >= base && physical_tip <= seam)
-                    append(tip_contacts[physical_tip - base], branch_slices[physical_tip - base]);
+                if (branch.has_tip && physical_tip >= base && physical_tip <= seam) {
+                    append(branch_feet[physical_tip - base], branch_slices[physical_tip - base]);
+                    // A tip may now rest on a reflected interface. Only the
+                    // portion at a real model landing is a direct contact.
+                    append(tip_contacts[physical_tip - base], intersection(branch_slices[physical_tip - base],
+                        volumes.getPlaceableAreas(0, physical_tip, throw_on_cancel)));
+                }
             }
+        }
+
+        std::vector<Polygons> branch_material = candidate;
+        // The shared contact generator may create interface material between
+        // its branch tips and the model. Reflect every row along with the tree;
+        // only its contact row establishes a new model landing. Physical bottom
+        // interface roles/counts are assigned by the ordinary renderer later.
+        for (LayerIndex reversed = 0; reversed <= height; ++reversed) {
+            const size_t physical = size_t(height - reversed);
+            for (const SupportGeneratorLayersPtr *layers :
+                 {&temporary_contacts, &temporary_interfaces, &temporary_base_interfaces})
+                if (const SupportGeneratorLayer *layer = (*layers)[reversed])
+                    append(candidate[physical], layer->polygons);
+            if (const SupportGeneratorLayer *contact = temporary_contacts[reversed])
+                append(tip_contacts[physical], contact->polygons);
         }
 
         // Validate the actual clipped material, not just graph connectivity.
@@ -6161,12 +6322,16 @@ void organic_draw_branches(
         Polygons grounded_below;
         for (LayerIndex physical = base; physical <= seam; ++physical) {
             const size_t i = size_t(physical - base);
-            candidate[i] = intersection(diff_clipped(candidate[i], reverse_volumes.getCollision(0, seam - physical, true)), volumes.m_bed_area);
+            const Polygons &collision = reverse_volumes.getCollision(0, seam - physical, true);
+            candidate[i] = intersection(diff_clipped(candidate[i], collision), volumes.m_bed_area);
+            branch_material[i] = intersection(diff_clipped(branch_material[i], collision), volumes.m_bed_area);
             tip_contacts[i] = intersection(candidate[i], tip_contacts[i]);
             // A tilted tip's sliced footprint must fit its permitted landing,
             // not merely intersect it at the sampled center.
-            if (area(diff(tip_contacts[i], volumes.getPlaceableAreas(0, physical, throw_on_cancel))) > tiny_area_threshold)
+            if (const double outside = area(diff(tip_contacts[i], volumes.getPlaceableAreas(0, physical, throw_on_cancel)));
+                outside > tiny_area_threshold) {
                 return false;
+            }
             for (const ExPolygon &part : union_ex(candidate[i])) {
                 const Polygons polygon = to_polygons(part);
                 if (intersection(polygon, grounded_below).empty() && intersection(polygon, tip_contacts[i]).empty())
@@ -6177,8 +6342,8 @@ void organic_draw_branches(
         }
         // A foot that terminates in a clipped dead end cannot brace the seam.
         // Walk back from the seam and retain/count only its connected material.
-        Polygons connected_above = seam_centers;
-        Polygons all_contacts;
+        Polygons connected_above = seam_centers, branches_above = seam_centers;
+        Polygons connected_feet;
         for (LayerIndex physical = seam; physical >= base; --physical) {
             const size_t i = size_t(physical - base);
             Polygons connected;
@@ -6187,13 +6352,24 @@ void organic_draw_branches(
                     append(connected, to_polygons(part));
             candidate[i] = std::move(connected);
             tip_contacts[i] = intersection(tip_contacts[i], candidate[i]);
-            append(all_contacts, tip_contacts[i]);
+            // A continuous interface band must not make a clipped-away stem
+            // count as a second foundation branch. Trace the branch material
+            // independently of interfaces back to the midpoint.
+            Polygons connected_branches;
+            for (const ExPolygon &part : union_ex(branch_material[i]))
+                if (!intersection(to_polygons(part), branches_above).empty())
+                    append(connected_branches, to_polygons(part));
+            branch_feet[i] = intersection(branch_feet[i], connected_branches);
+            append(connected_feet, branch_feet[i]);
+            branch_material[i] = connected_branches;
+            branches_above = std::move(connected_branches);
             connected_above = candidate[i];
             throw_on_cancel();
         }
-        // Several sampled points that coalesce into one contact do not provide
-        // the separated feet this feature is meant to create.
-        if (union_ex(all_contacts).size() < 2 || candidate.back().empty() ||
+        // A graph seam node may contribute a single foot to a larger physical
+        // stem. Count separated feet per connected stem after all contributions
+        // have been combined and the midpoint join has been validated.
+        if (connected_feet.empty() || candidate.back().empty() ||
             !contains(candidate.back(), seam_point))
             return false;
         // Apply the same slope-dependent support cooling to the physical upper
@@ -6214,69 +6390,105 @@ void organic_draw_branches(
         for (size_t i = 0; i < candidate.size(); ++i) {
             append(out[i], std::move(candidate[i]));
             append(contacts[i], std::move(tip_contacts[i]));
+            append(feet[i], std::move(branch_feet[i]));
+            append(branches[i], std::move(branch_material[i]));
         }
         return true;
     };
 
     for (const FoundationRequest &request : foundation_requests) {
+        throw_on_cancel();
         Tree &tree = *request.tree;
         const LayerIndex base = request.base;
         const LayerIndex seam = request.seam;
         const auto &seam_nodes = request.nodes;
         std::vector<Polygons> foundation(seam - base + 1), foundation_contacts(seam - base + 1);
+        std::vector<Polygons> foundation_feet(seam - base + 1), foundation_branches(seam - base + 1);
         std::vector<ExPolygons> foundation_cooldown(seam - base + 1);
         bool valid = true;
         for (const SupportElement *node : seam_nodes)
-            if (!foundation_for_seam(*node, base, foundation, foundation_contacts, foundation_cooldown)) {
-                valid = false;
-                break;
-            }
-        if (!valid || intersection(foundation.back(), tree.slices[seam - tree.first_layer_id].polygons).empty())
+            foundation_for_seam(*node, base, foundation, foundation_contacts, foundation_feet, foundation_branches, foundation_cooldown);
+        const Polygons &upper_section = tree.slices[seam + 1 - tree.first_layer_id].polygons;
+        if (upper_section.empty() || intersection(foundation.back(), upper_section).empty())
             continue;
+        // Both join construction and validation use the regularized contours
+        // that reach toolpath generation. Repairing raw tube outlines cannot
+        // account for the concave corners that this existing operation fills.
+        auto regularize = [&](const Polygons &section) {
+            return polygons_simplify(smooth_outward(union_(section), config.support_line_width),
+                std::min(scaled<double>(0.03), double(config.resolution)));
+        };
         auto supported_sheath = [&](const Polygons &above, const Polygons &below) {
-            const Polygons above_shell = diff(above, offset(above, -config.support_line_width));
-            const Polygons below_shell = diff(below, offset(below, -config.support_line_width));
+            const Polygons above_contour = regularize(above);
+            const Polygons below_contour = regularize(below);
+            const Polygons above_shell = diff(above_contour, offset(above_contour, -config.support_line_width));
+            const Polygons below_shell = diff(below_contour, offset(below_contour, -config.support_line_width));
             for (const ExPolygon &part : union_ex(above_shell))
                 if (intersection(to_polygons(part), below_shell).empty())
                     return false;
-            const coord_t growth = config.maximum_move_distance + coord_t(std::ceil(config.branch_radius_increase_per_layer));
-            return area(diff(above_shell, offset(below_shell, growth))) < sqr(scaled<double>(0.01));
+            const coord_t growth = config.maximum_move_distance + coord_t(std::ceil(config.branch_radius_increase_per_layer)) +
+                2 * config.resolution;
+            const double unsupported = area(diff(above_shell, offset(below_shell, growth)));
+            return unsupported < sqr(scaled<double>(0.01));
         };
-        // Share the existing upper cross-section exactly. Tilted tube ends need
-        // a short collar even when their centers and radii match. Clamp successive
-        // lower sections to the inset/outset envelope of the section above using
-        // the same per-layer movement/growth budget as ordinary branches.
-        foundation.back() = tree.slices[seam - tree.first_layer_id].polygons;
+        // Join the native reflected slice to the first retained upper slice.
+        // Never substitute the discarded original lower slice at the weld:
+        // its direction and concave junctions belong to the old lower forest.
         // Leave both section boundaries' simplification tolerance inside the
         // movement budget: extrusion-centerline offsets are generated later.
         const coord_t growth = std::max<coord_t>(0, config.maximum_move_distance +
             coord_t(std::ceil(config.branch_radius_increase_per_layer)) - 2 * config.resolution);
+
         TreeModelVolumes collar_volumes(volumes, seam, foundation.back(), throw_on_cancel);
-        for (LayerIndex layer = seam - 1; layer >= base; --layer) {
+        for (LayerIndex layer = seam; layer >= base; --layer) {
+            throw_on_cancel();
             const size_t i = size_t(layer - base);
-            if (supported_sheath(foundation[i + 1], foundation[i]))
+            const Polygons &above = layer == seam ? upper_section : foundation[i + 1];
+            const Polygons &above_branches = layer == seam ? upper_section : foundation_branches[i + 1];
+            if (supported_sheath(above, foundation[i]))
                 break;
             // A transition must never enlarge or relocate a permitted model tip.
             if (!foundation_contacts[i].empty()) {
                 valid = false;
                 break;
             }
-            const Polygons inner = offset(foundation[i + 1], -growth);
-            const Polygons outer = offset(foundation[i + 1], growth);
-            foundation[i] = intersection(diff_clipped(
-                union_(inner, intersection(foundation[i], outer)),
-                collar_volumes.getCollision(0, seam - layer, true)), volumes.m_bed_area);
-            if (!supported_sheath(foundation[i + 1], foundation[i])) {
+
+            const Polygons above_contour = regularize(above);
+            const Polygons &collision = collar_volumes.getCollision(0, seam - layer, true);
+            bool joined = false;
+            // A full inset/outset step can merge neighboring tubes and remove
+            // the wall supporting their inner waist. Reduce the transition
+            // step until the same sheath test passes, without relaxing its
+            // tolerance or changing the ordinary forest below the join.
+            for (coord_t step = growth;; step = step > config.resolution ? step / 2 : 0) {
+                const Polygons outer = offset(above_contour, step);
+                Polygons section = step == 0 ? above :
+                    union_(offset(above_contour, -step), intersection(foundation[i], outer));
+                section = intersection(diff_clipped(section, collision), volumes.m_bed_area);
+                if (supported_sheath(above, section)) {
+                    Polygons branches = step == 0 ? above_branches :
+                        union_(offset(regularize(above_branches), -step), intersection(foundation_branches[i], outer));
+                    foundation_branches[i] = intersection(diff_clipped(branches, collision), volumes.m_bed_area);
+                    foundation[i] = std::move(section);
+                    joined = true;
+                    break;
+                }
+                if (step == 0)
+                    break;
+                throw_on_cancel();
+            }
+            if (!joined) {
                 valid = false;
                 break;
             }
         }
         if (!valid)
             continue;
-        // Recheck ground-to-seam connectivity after collar clipping. Material
+        // Recheck ground-to-seam connectivity. Material
         // outside the connected foundation cannot count as a stabilizing foot.
         Polygons connected;
         for (size_t i = 0; valid && i < foundation.size(); ++i) {
+            throw_on_cancel();
             for (const ExPolygon &part : union_ex(foundation[i])) {
                 const Polygons polygon = to_polygons(part);
                 if (intersection(polygon, connected).empty() && intersection(polygon, foundation_contacts[i]).empty()) {
@@ -6286,24 +6498,31 @@ void organic_draw_branches(
             }
             connected = foundation[i];
         }
-        Polygons connected_contacts;
         connected = foundation.back();
+        Polygons connected_branches = foundation.back();
         for (size_t i = foundation.size(); valid && i-- > 0;) {
+            throw_on_cancel();
             Polygons kept;
             for (const ExPolygon &part : union_ex(foundation[i]))
                 if (!intersection(to_polygons(part), connected).empty())
                     append(kept, to_polygons(part));
             foundation[i] = std::move(kept);
             foundation_contacts[i] = intersection(foundation_contacts[i], foundation[i]);
-            append(connected_contacts, foundation_contacts[i]);
+            Polygons kept_branches;
+            for (const ExPolygon &part : union_ex(intersection(foundation_branches[i], foundation[i])))
+                if (!intersection(to_polygons(part), connected_branches).empty())
+                    append(kept_branches, to_polygons(part));
+            foundation_feet[i] = intersection(foundation_feet[i], kept_branches);
+            foundation_branches[i] = kept_branches;
+            connected_branches = std::move(kept_branches);
             connected = foundation[i];
         }
-        if (!valid || union_ex(connected_contacts).size() < 2)
+        if (!valid || !foundation_components_have_multiple_feet(foundation_branches, foundation_feet, throw_on_cancel))
             continue;
         for (LayerIndex layer = base; layer <= seam; ++layer) {
             Slice &slice = tree.slices[layer - tree.first_layer_id];
             slice.polygons = union_(foundation[layer - base]);
-            slice.bottom_contacts = config.settings.support_floor_layers > 0 ?
+            slice.bottom_contacts = interface_placer.support_parameters.has_bottom_contacts ?
                 union_(foundation_contacts[layer - base]) : Polygons{};
             slice.num_branches = 1;
             append(cooldown_areas[layer], std::move(foundation_cooldown[layer - base]));

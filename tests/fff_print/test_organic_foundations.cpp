@@ -39,18 +39,18 @@ DynamicPrintConfig foundation_config()
     return config;
 }
 
-Model foundation_model(bool painted = true, bool mixed = false, double roof_level = roof_z, double width = 28., bool multiple_roofs = false)
+Model foundation_model(bool painted = true, bool mixed = false, double roof_level = roof_z, double width = 28., bool multiple_roofs = false, double depth = 18.)
 {
     Model model;
     auto *object = model.add_object();
-    TriangleMesh mesh(its_make_cube(width, 18., platform_z));
-    TriangleMesh upright(its_make_cube(3., 18., roof_level + 1.));
+    TriangleMesh mesh(its_make_cube(width, depth, platform_z));
+    TriangleMesh upright(its_make_cube(3., depth, roof_level + 1.));
     mesh.merge(upright);
-    TriangleMesh roof(its_make_cube(width, 18., 1.));
+    TriangleMesh roof(its_make_cube(width, depth, 1.));
     roof.translate(0., 0., roof_level);
     mesh.merge(roof);
     if (multiple_roofs) {
-        TriangleMesh lower_roof(its_make_cube(12., 18., 1.));
+        TriangleMesh lower_roof(its_make_cube(12., depth, 1.));
         lower_roof.translate(0., 0., 26.);
         mesh.merge(lower_roof);
     }
@@ -58,7 +58,7 @@ Model foundation_model(bool painted = true, bool mixed = false, double roof_leve
         TriangleMesh control = mesh;
         control.translate(80., 0., 0.);
         mesh.merge(control);
-        TriangleMesh connector(its_make_cube(width + 80., 18., 1.));
+        TriangleMesh connector(its_make_cube(width + 80., depth, 1.));
         mesh.merge(connector);
     }
     auto *volume = object->add_volume(mesh);
@@ -72,7 +72,7 @@ Model foundation_model(bool painted = true, bool mixed = false, double roof_leve
             const Vec3f a = (transform * its.vertices[face[0]].cast<double>()).cast<float>();
             const Vec3f b = (transform * its.vertices[face[1]].cast<double>()).cast<float>();
             const Vec3f c = (transform * its.vertices[face[2]].cast<double>()).cast<float>();
-            if ((b-a).cross(c-a).z() > 0.f && std::abs(a.z() - platform_z) < 0.001 && a.x() < 40.)
+            if ((b-a).cross(c-a).z() > 0.f && std::abs(a.z() - platform_z) < 0.001 && a.x() < (mixed ? 40. : width + 1.))
                 selector.set_facet(int(i), EnforcerBlockerType::ENFORCER);
         }
         volume->support_base_facets.set(selector);
@@ -398,4 +398,158 @@ TEST_CASE("Organic foundation replacement retains lower and upper overhang conta
         const auto contact = intersection_ex((*found)->support_fills.polygons_covered_by_width(), contact_region);
         CHECK(area(contact) * SCALING_FACTOR * SCALING_FACTOR > 10.);
     }
+}
+
+TEST_CASE("Equal-width thin ledges retain substantial lower organic branching", "[OrganicFoundation][ThinLedge]")
+{
+    // Both contact surfaces are 80 x 4 mm. These dimensions and settings
+    // reproduce a long, thin painted ledge whose original foundation stayed
+    // a single stem until a tiny fork immediately above the contact.
+    auto model = foundation_model(true, false, 63., 80., false, 4.);
+    auto config = foundation_config();
+    config.set_deserialize_strict({
+        {"support_top_z_distance", "0.3"}, {"support_bottom_z_distance", "0.3"},
+        {"support_interface_top_layers", "0"}, {"support_interface_bottom_layers", "2"},
+        {"support_line_width", "0.35"}, {"support_object_xy_distance", "0.2"},
+        {"tree_support_branch_angle", "35"}, {"tree_support_branch_diameter", "2.5"},
+        {"tree_support_branch_diameter_angle", "4"}, {"tree_support_branch_distance", "2"},
+        {"resolution", "0.012"}, {"slice_closing_radius", "0.012"}, {"bridge_no_support", "0"},
+        {"support_threshold_angle", "35"}
+    });
+    Print print;
+    slice_foundation(print, model, config);
+    const auto &object = *print.get_object(size_t(0));
+    const auto region = model_rectangle(object, 3.5, -4., 80.5, 8.);
+    struct Section { size_t branches = 0; double span = 0.; };
+    auto section_at = [&](double z, const Polygons &window) {
+        Section result;
+        double left = std::numeric_limits<double>::max();
+        double right = std::numeric_limits<double>::lowest();
+        const auto layers = object.support_layers();
+        const auto found = std::find_if(layers.begin(), layers.end(), [z](const SupportLayer *layer) {
+            return std::abs(layer->print_z - z) < EPSILON;
+        });
+        REQUIRE(found != layers.end());
+        for (const auto &part : intersection_ex((*found)->support_fills.polygons_covered_by_width(), window)) {
+            if (part.area() * SCALING_FACTOR * SCALING_FACTOR <= 0.05)
+                continue;
+            ++result.branches;
+            const auto bounds = get_extents(part.contour);
+            left = std::min(left, unscale<double>(bounds.min.x()));
+            right = std::max(right, unscale<double>(bounds.max.x()));
+        }
+        REQUIRE(result.branches > 0);
+        result.span = right - left;
+        return result;
+    };
+    const auto lower = section_at(18., region);
+    const auto lower_quarter = section_at(24., region);
+    const auto middle = section_at(38., region);
+    const auto upper = section_at(62., region);
+    CAPTURE(lower.branches, lower_quarter.branches, middle.branches, upper.branches,
+            lower.span, middle.span);
+    // Require sustained branching at two heights, well beyond the contact
+    // tip layers. A tiny near-contact fork on a long stem must not pass.
+    CHECK(lower.branches > middle.branches);
+    CHECK(lower_quarter.branches > middle.branches);
+    CHECK(lower.span > middle.span);
+    CHECK(upper.branches > middle.branches);
+    // One successful foundation must not conceal the other forest falling
+    // back to its original stem. These outboard windows exclude feet from
+    // the neighboring forest that cross the center of the ledge.
+    for (const auto bounds : {std::array<double, 2>{4., 25.}, std::array<double, 2>{55., 80.}}) {
+        const auto outboard = model_rectangle(object, bounds[0], -4., bounds[1], 8.);
+        const auto outboard_lower = section_at(18., outboard);
+        const auto outboard_quarter = section_at(24., outboard);
+        const auto outboard_middle = section_at(38., outboard);
+        CAPTURE(bounds[0], bounds[1], outboard_lower.branches, outboard_quarter.branches, outboard_middle.branches);
+        CHECK(outboard_lower.branches > outboard_middle.branches);
+        // Ordinary branches may already have merged to the number of seam
+        // stems here; require two actual branches, not monotonic counts.
+        CHECK(outboard_quarter.branches >= 2);
+    }
+
+    // Preserve the original layer-quantized contact interval, and require
+    // every substantial printed component to stay attached through the join.
+    REQUIRE_FALSE(object.support_layers().empty());
+    CHECK(object.support_layers().front()->bottom_z() == Approx(14.2).margin(0.01));
+    CHECK(object.support_layers().back()->print_z == Approx(62.8).margin(0.01));
+    Polygons previous;
+    for (const SupportLayer *layer : object.support_layers()) {
+        const auto section = intersection_ex(layer->support_fills.polygons_covered_by_width(), region);
+        if (layer->print_z < 15.)
+            continue;
+        REQUIRE_FALSE(section.empty());
+        if (!previous.empty()) {
+            CAPTURE(layer->print_z);
+            for (const auto &part : section)
+                if (part.area() * SCALING_FACTOR * SCALING_FACTOR > 0.05)
+                    CHECK_FALSE(intersection(to_polygons(part), previous).empty());
+        }
+        previous = to_polygons(section);
+    }
+}
+
+TEST_CASE("Organic foundation bottom interfaces inherit the top interface count", "[OrganicFoundation][SameAsTop]")
+{
+    auto explicit_model = foundation_model();
+    auto inherited_model = foundation_model();
+    auto config = foundation_config();
+    Print explicit_count, inherited_count;
+    slice_foundation(explicit_count, explicit_model, config);
+    config.set_deserialize_strict({{"support_interface_bottom_layers", "-1"}});
+    slice_foundation(inherited_count, inherited_model, config);
+    const auto &expected = *explicit_count.get_object(size_t(0));
+    const auto &actual = *inherited_count.get_object(size_t(0));
+    const auto actual_layers = actual.support_layers();
+    size_t checked_layers = 0;
+    for (const auto *layer : expected.support_layers()) {
+        if (layer->print_z > platform_z + 1. + EPSILON)
+            continue;
+        const auto found = std::find_if(actual_layers.begin(), actual_layers.end(), [&](const SupportLayer *candidate) {
+            return std::abs(candidate->print_z - layer->print_z) < EPSILON;
+        });
+        REQUIRE(found != actual_layers.end());
+        const auto before = printed_section(expected, *layer);
+        const auto after = printed_section(actual, **found);
+        const double difference = (area(diff_ex(before, after)) + area(diff_ex(after, before))) *
+                                  SCALING_FACTOR * SCALING_FACTOR;
+        CAPTURE(layer->print_z, difference);
+        // -1 means the same count as the two top-interface layers. It must
+        // preserve their bottom geometry, including actual foundation tips.
+        CHECK(difference < 0.001);
+        ++checked_layers;
+    }
+    REQUIRE(checked_layers >= 3);
+}
+
+TEST_CASE("Organic foundation tips stay supported with asymmetric interface counts", "[OrganicFoundation][BottomZero][AsymmetricInterfaces]")
+{
+    const auto counts = GENERATE(std::array<int, 2>{2, 0}, std::array<int, 2>{4, 1}, std::array<int, 2>{4, 2});
+    CAPTURE(counts[0], counts[1]);
+    auto model = foundation_model();
+    auto config = foundation_config();
+    config.set_deserialize_strict({
+        {"support_interface_top_layers", std::to_string(counts[0])},
+        {"support_interface_bottom_layers", std::to_string(counts[1])}
+    });
+    Print print;
+    slice_foundation(print, model, config);
+    const auto &object = *print.get_object(size_t(0));
+    Polygons previous;
+    size_t checked_layers = 0;
+    for (const SupportLayer *layer : object.support_layers()) {
+        if (layer->print_z > platform_z + 2. + EPSILON)
+            break;
+        const auto section = printed_section(object, *layer);
+        REQUIRE_FALSE(section.empty());
+        CAPTURE(layer->print_z);
+        if (!previous.empty())
+            for (const auto &part : section)
+                if (part.area() * SCALING_FACTOR * SCALING_FACTOR > 0.05)
+                    CHECK_FALSE(intersection(to_polygons(part), previous).empty());
+        previous = to_polygons(section);
+        ++checked_layers;
+    }
+    REQUIRE(checked_layers >= 4);
 }

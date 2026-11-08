@@ -192,7 +192,7 @@ TreeModelVolumes::TreeModelVolumes(
 }
 
 TreeModelVolumes::TreeModelVolumes(const TreeModelVolumes &source, LayerIndex seam_layer, const Polygons &seam_centers,
-                                 std::function<void()> throw_on_cancel) :
+                                 std::function<void()> throw_on_cancel, coord_t max_seam_radius) :
     m_bed_area(source.m_bed_area),
     m_max_move(source.m_max_move),
     m_max_move_slow(source.m_max_move_slow),
@@ -209,13 +209,18 @@ TreeModelVolumes::TreeModelVolumes(const TreeModelVolumes &source, LayerIndex se
     m_radius_0(source.m_radius_0),
     m_reversed_source(&source),
     m_reversed_throw_on_cancel(std::move(throw_on_cancel)),
-    m_seam_layer(seam_layer)
+    m_seam_layer(seam_layer),
+    m_max_seam_radius(max_seam_radius)
 {
     assert(seam_layer >= 0);
+    assert(max_seam_radius >= 0);
     assert(source.m_reversed_source == nullptr);
     // Include the exterior ring so shrinking avoidance cannot invent a route
     // at the bed boundary, as in the existing painted-base route domain.
-    m_seam_excluded_centers = diff(offset(m_bed_area, scaled<float>(1000.), jtMiter, 1.2), seam_centers);
+    Polygons seam_domain = offset(m_bed_area, scaled<float>(1000.), jtMiter, 1.2);
+    m_seam_excluded_centers = diff(seam_domain, seam_centers);
+    if (max_seam_radius != std::numeric_limits<coord_t>::max())
+        m_seam_blocked_domain = std::move(seam_domain);
 }
 
 void TreeModelVolumes::precalculate(const PrintObject& print_object, const coord_t max_layer, std::function<void()> throw_on_cancel)
@@ -439,6 +444,21 @@ const Polygons& TreeModelVolumes::getCollisionHolefree(coord_t radius, LayerInde
 
 const Polygons& TreeModelVolumes::getAvoidance(const coord_t orig_radius, LayerIndex layer_idx, AvoidanceType type, bool to_model, bool min_xy_dist) const
 {
+    // Routing radii do not decrease towards the seam. An oversized branch
+    // cannot reach that endpoint from any layer; let the existing solver retry
+    // without radius growth. Check the physical request before rounding or
+    // adding XY clearance, so an allowed cache neighbor cannot bypass the cap.
+    if (m_reversed_source && orig_radius > m_max_seam_radius) {
+        assert(layer_idx >= 0 && layer_idx <= m_seam_layer);
+        if (m_reversed_throw_on_cancel)
+            m_reversed_throw_on_cancel();
+        return m_seam_blocked_domain;
+    }
+    return getAvoidanceImpl(orig_radius, layer_idx, type, to_model, min_xy_dist);
+}
+
+const Polygons& TreeModelVolumes::getAvoidanceImpl(const coord_t orig_radius, LayerIndex layer_idx, AvoidanceType type, bool to_model, bool min_xy_dist) const
+{
     if (m_reversed_source) {
         assert(layer_idx >= 0 && layer_idx <= m_seam_layer);
         // Both route types reach the seam. Intermediate physical surfaces must
@@ -487,7 +507,7 @@ const Polygons& TreeModelVolumes::getAvoidance(const coord_t orig_radius, LayerI
     } else
         const_cast<TreeModelVolumes*>(this)->calculateAvoidance({ radius, layer_idx }, ! to_model, to_model);
     // Retrive failed and correct result was calculated. Now it has to be retrived.
-    return getAvoidance(orig_radius, layer_idx, type, to_model, min_xy_dist);
+    return getAvoidanceImpl(orig_radius, layer_idx, type, to_model, min_xy_dist);
 }
 
 const Polygons& TreeModelVolumes::getPlaceableAreas(const coord_t orig_radius, LayerIndex layer_idx, std::function<void()> throw_on_cancel) const
@@ -840,7 +860,7 @@ void TreeModelVolumes::calculateAvoidance(const std::vector<RadiusLayerPair> &ke
                 }
             }
             // minDist as the delta was already added, also avoidance for layer 0 will return the collision.
-            Polygons    latest_avoidance   = getAvoidance(task.radius, task.start_layer - 1, task.type, task.to_model, true);
+            Polygons    latest_avoidance   = getAvoidanceImpl(task.radius, task.start_layer - 1, task.type, task.to_model, true);
             std::vector<std::pair<RadiusLayerPair, Polygons>> data;
             data.reserve(task.max_required_layer + 1 - task.start_layer);
             for (LayerIndex layer_idx = task.start_layer; layer_idx <= task.max_required_layer; ++ layer_idx) {

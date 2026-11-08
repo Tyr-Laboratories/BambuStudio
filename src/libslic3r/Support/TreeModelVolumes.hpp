@@ -9,6 +9,7 @@
 #ifndef slic3r_TreeModelVolumes_hpp
 #define slic3r_TreeModelVolumes_hpp
 
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 
@@ -51,8 +52,11 @@ public:
     // The source must outlive this view and remain at a stable address. Caches
     // are populated lazily; do not call the PrintObject precalculate() on a view.
     // The callback is polled by lazy calculations, including source cache misses.
+    // max_seam_radius bounds requested routing radii before cache rounding;
+    // physical collisions are unchanged. The default leaves radii unrestricted.
     TreeModelVolumes(const TreeModelVolumes &source, LayerIndex seam_layer, const Polygons &seam_centers,
-                     std::function<void()> throw_on_cancel = {});
+                     std::function<void()> throw_on_cancel = {},
+                     coord_t max_seam_radius = std::numeric_limits<coord_t>::max());
     TreeModelVolumes(TreeModelVolumes&&) = default;
     TreeModelVolumes& operator=(TreeModelVolumes&&) = default;
 
@@ -333,6 +337,11 @@ private:
      */
     const Polygons& getCollisionHolefree(coord_t radius, LayerIndex layer_idx) const;
 
+    // Internal avoidance reads may use rounded collision-cache keys, including
+    // XY clearance. Only public physical-radius requests apply the seam limit.
+    const Polygons& getAvoidanceImpl(coord_t radius, LayerIndex layer_idx, AvoidanceType type,
+                                    bool to_model, bool min_xy_dist) const;
+
     /*!
      * \brief Round \p radius upwards to either a multiple of m_radius_sample_resolution or a exponentially increasing value
      *
@@ -528,6 +537,8 @@ private:
     const TreeModelVolumes    *m_reversed_source { nullptr };
     std::function<void()>      m_reversed_throw_on_cancel;
     LayerIndex                 m_seam_layer { 0 };
+    coord_t                    m_max_seam_radius { std::numeric_limits<coord_t>::max() };
+    Polygons                   m_seam_blocked_domain;
     Polygons                   m_seam_excluded_centers;
     RadiusLayerPolygonCache    m_seam_avoidance_cache;
 
