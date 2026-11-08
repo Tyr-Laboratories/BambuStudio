@@ -160,6 +160,7 @@ def main():
         report = previous
     report["verification_protocol"] = "exact commands, interleaved preview tags and metadata against all baseline control runs"
     report["benchmark_script_sha256"] = sha256(__file__)
+    report.setdefault("baseline_controls", [])
 
     def save():
         temporary = output / "benchmark.json.tmp"
@@ -176,7 +177,8 @@ def main():
             calibration.update(fixture=fixture["name"], launcher="direct", measured=False)
             report["baseline_calibrations"].append(calibration)
         fixture_runs = [r for r in report["runs"] if r["fixture"] == fixture["name"]]
-        references = classify_outputs(calibration, fixture_runs)
+        controls = [r for r in report["baseline_controls"] if r["fixture"] == fixture["name"]]
+        references = classify_outputs(calibration, fixture_runs + controls)
         save()
         for round_index in range(-1, args.rounds):
             warmup = round_index == -1
@@ -190,7 +192,7 @@ def main():
                 run.update(fixture=fixture["name"], variant=variant, warmup=warmup, round=round_index + 1)
                 report["runs"].append(run)
                 fixture_runs.append(run)
-                references = classify_outputs(calibration, fixture_runs)
+                references = classify_outputs(calibration, fixture_runs + controls)
                 save()
                 comparison = (f"exact baseline output variant {run['baseline_output_variant']}" if run["output_identical"]
                               else "unverified output; pending remaining baseline controls")
@@ -199,6 +201,22 @@ def main():
                 # Retain warmup artifacts for diagnosis, not a large copy per timing run.
                 if not warmup and run["output_identical"]:
                     gcode.unlink()
+        # Diagnose baseline nondeterminism with a bounded number of additional
+        # baseline-only controls. These never enter the paired work statistics.
+        # A candidate-only stream still fails; no tolerances are introduced.
+        while any(not r["output_identical"] for r in fixture_runs) and len(controls) < 3:
+            directory = output / f"fixture-{index}-baseline-control-{len(controls) + 1}"
+            control, _ = run_slice(binaries["baseline"], fixture, directory,
+                                   output / "data-baseline", metrics_runner)
+            control.update(fixture=fixture["name"], variant="baseline", measured=False,
+                           launcher="counter-wrapped", purpose="output-reference-only")
+            report["baseline_controls"].append(control)
+            controls.append(control)
+            references = classify_outputs(calibration, fixture_runs + controls)
+            save()
+            pending = sum(not r["output_identical"] for r in fixture_runs)
+            print(f"{fixture['name']} baseline-only control {len(controls)}: "
+                  f"{pending} candidate outputs still unverified; excluded from performance statistics", flush=True)
         if any(not r["output_identical"] for r in fixture_runs):
             raise RuntimeError(f"Candidate output not reproduced by any baseline control: {fixture['name']}")
         for directory in output.glob(f"fixture-{index}-round-*"):

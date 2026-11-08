@@ -45,6 +45,34 @@ class CommandComparisonTests(unittest.TestCase):
                 launch.assert_not_called()
                 saved = json.loads((output / "benchmark.json").read_text())
                 self.assertEqual(saved["summary"]["test"]["paired_instruction_ratios"], [1])
+                # A baseline-only diagnostic may establish an additional exact
+                # output reference, but must not enter the measured statistics.
+                for r in saved["runs"]:
+                    if r["variant"] == "candidate":
+                        r["commands"] = {"sha256": "alternate"}
+                (output / "benchmark.json").write_text(json.dumps(saved))
+                diagnostic = {**run, "commands": {"sha256": "alternate"},
+                              "process_counters": {"retired_instructions": 999999, "peak_physical_bytes": 999999}}
+                launch.return_value = diagnostic, root / "diagnostic.gcode"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    benchmark.main()
+                self.assertEqual(launch.call_count, 1)
+                self.assertEqual(launch.call_args.args[0], paths["baseline"])
+                saved = json.loads((output / "benchmark.json").read_text())
+                self.assertEqual(len(saved["baseline_controls"]), 1)
+                self.assertEqual(saved["summary"]["test"]["baseline"]["median_instructions"], 100)
+                self.assertEqual(saved["summary"]["test"]["paired_instruction_ratios"], [1])
+                # A novel candidate must still fail after at most three total
+                # diagnostic controls, including controls saved before resume.
+                for r in saved["runs"]:
+                    if r["variant"] == "candidate":
+                        r["commands"] = {"sha256": "never-observed"}
+                (output / "benchmark.json").write_text(json.dumps(saved))
+                launch.reset_mock()
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                    benchmark.main()
+                self.assertEqual(launch.call_count, 2)
+                launch.reset_mock()
                 paths["candidate"].write_text("changed executable")
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     benchmark.main()
