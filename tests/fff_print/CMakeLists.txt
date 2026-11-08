@@ -114,3 +114,8 @@ target_link_libraries(parallel_plate_tests test_common libslic3r slicer_test_sup
 target_include_directories(parallel_plate_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/libslic3r)
 set_property(TARGET parallel_plate_tests PROPERTY FOLDER "tests")
 add_test(parallel_plate_tests parallel_plate_tests ${CATCH_EXTRA_ARGS})
+
+add_executable(slicing_spatial_tests fff_print_tests.cpp test_slicing_spatial.cpp)
+target_link_libraries(slicing_spatial_tests test_common libslic3r slicer_test_support)
+set_property(TARGET slicing_spatial_tests PROPERTY FOLDER "tests")
+add_test(slicing_spatial_tests slicing_spatial_tests ${CATCH_EXTRA_ARGS})

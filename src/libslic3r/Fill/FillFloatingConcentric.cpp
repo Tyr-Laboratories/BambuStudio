@@ -27,7 +27,7 @@ FloatingPolyline FloatingPolyline::rebase_at(size_t idx)
     for (size_t j = 0; j < n - 1; ++j) {
         ret.is_floating[j] = this->is_floating[(idx + j) % (n-1)];
     }
-    ret.is_floating.emplace_back(ret.is_floating.front());
+    ret.is_floating[n - 1] = ret.is_floating.front();
     return ret;
 }
 
@@ -42,7 +42,7 @@ FloatingThickPolyline FloatingThickPolyline::rebase_at(size_t idx)
     for (size_t j = 0; j < n - 1; ++j) {
         ret.is_floating[j] = this->is_floating[(idx + j) % (n - 1)];
     }
-    ret.is_floating.emplace_back(ret.is_floating.front());
+    ret.is_floating[n - 1] = ret.is_floating.front();
     return ret;
 }
 
@@ -117,7 +117,7 @@ static ExtrusionPaths floating_thick_polyline_to_extrusion_paths(const FloatingT
                 }
                 path.polyline.append(lines[i].a);
                 if (length > SCALED_EPSILON) {
-                    if (lines[i].is_a_floating && lines[i].is_b_floating)
+                    if (is_floating)
                         path.set_customize_flag(CustomizeFlag::cfFloatingVerticalShell);
                     set_flow_for_path(path, sum / length);
                     paths.emplace_back(std::move(path));
@@ -152,10 +152,14 @@ static ExtrusionPaths floating_thick_polyline_to_extrusion_paths(const FloatingT
                     assert(width.size() == segments * 2);
                 }
 
-                // delete this line and insert new ones
+                // Erasing shifts the following segment into this slot, and
+                // inserting may reallocate. Preserve the source flags before
+                // either operation invalidates the reference to line.
+                const bool is_a_floating = line.is_a_floating;
+                const bool is_b_floating = line.is_b_floating;
                 lines.erase(lines.begin() + i);
                 for (size_t j = 0; j < segments; ++j) {
-                    FloatingThickline new_line(pp[j], pp[j + 1],width[2 * j],width[2 * j+1], line.is_a_floating,line.is_b_floating);
+                    FloatingThickline new_line(pp[j], pp[j + 1],width[2 * j],width[2 * j+1], is_a_floating, is_b_floating);
                     lines.insert(lines.begin() + i + j, new_line);
                 }
                 --i;
@@ -216,6 +220,9 @@ double interpolate_width(const ZPath& path,
     while (next_idx < path.size() && (path[next_idx].z() < 0 || path[next_idx].z() >= subject_idx_range))
         ++next_idx;
 
+    if (prev_idx < 0 && next_idx >= path.size())
+        return default_width;
+
     double width_prev;
     double width_next;
     if (prev_idx < 0) {
@@ -233,8 +240,12 @@ double interpolate_width(const ZPath& path,
         size_t next_z_idx = path[next_idx].z();
         width_next = line.get_width_at(next_z_idx);
     }
-    Point prev(path[prev_idx].x(), path[prev_idx].y());
-    Point next(path[next_idx].x(), path[next_idx].y());
+    // An untagged end uses the default width at the path endpoint. The
+    // missing tag is not a valid coordinate index into the clipped path.
+    const auto& prev_anchor = prev_idx < 0 ? path.front() : path[prev_idx];
+    const auto& next_anchor = next_idx >= path.size() ? path.back() : path[next_idx];
+    Point prev(prev_anchor.x(), prev_anchor.y());
+    Point next(next_anchor.x(), next_anchor.y());
     Point curr(path[idx].x(), path[idx].y());
     double d_total = (next - prev).cast<double>().norm();
     double d_curr = (curr - prev).cast<double>().norm();
@@ -695,7 +706,9 @@ FloatingThickPolylines FillFloatingConcentric::resplit_order_loops(Point curr_po
 
             EdgeGrid::Grid grid;
             grid.set_bbox(bbox_line);
-            grid.create({ polyline.points }, scaled<coord_t>(10.), !all_extrusions[idx]->is_closed);
+            // EdgeGrid borrows point storage; it must survive the query below.
+            const std::vector<Points> contours{polyline.points};
+            grid.create(contours, scaled<coord_t>(10.), !all_extrusions[idx]->is_closed);
             if (grid.has_intersecting_edges())
                 is_self_intersect = true;
         }
