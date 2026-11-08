@@ -2382,7 +2382,7 @@ void HelioBackgroundProcess::set_state(State state)
 
 bool HelioBackgroundProcess::helio_thread_start(std::mutex&                                slicing_mutex,
                                                  std::condition_variable&                   slicing_condition,
-                                                 BackgroundSlicingProcess::State&           slicing_state,
+                                                 std::atomic<BackgroundSlicingProcess::State>& slicing_state,
                                                  std::unique_ptr<GUI::NotificationManager>& notification_manager)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -2448,7 +2448,7 @@ void HelioBackgroundProcess::clear_helio_file_cache()
 
 void HelioBackgroundProcess::helio_threaded_process_start(std::mutex&                                slicing_mutex,
                                                           std::condition_variable&                   slicing_condition,
-                                                          BackgroundSlicingProcess::State&           slicing_state,
+                                                          std::atomic<BackgroundSlicingProcess::State>& slicing_state,
                                                           std::unique_ptr<GUI::NotificationManager>& notification_manager)
 {
     set_state(STATE_RUNNING);

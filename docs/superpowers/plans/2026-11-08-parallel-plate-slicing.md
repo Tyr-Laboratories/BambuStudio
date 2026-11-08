@@ -30,11 +30,11 @@
 
 Files: `src/libslic3r/PrintBase.{hpp,cpp}`, `src/libslic3r/GCode/GCodeProcessor.{hpp,cpp}`, `src/libslic3r/GCode.cpp`, `tests/fff_print/test_parallel_plate_slicing.cpp`, relevant CMake target.
 
-- [ ] Add failing interleaved flush-role and printer-context regressions; native two-Print serial/parallel output comparison.
-- [ ] Run the targeted cases and confirm failures attributable to shared state.
-- [ ] Move role/printer state into processor/context instances; make timestamp/result counters atomic.
-- [ ] Replace Lightning global random traversal with deterministic geometry-local choices; compare repeated and concurrent conversion.
-- [ ] Run focused processor and actual slicing comparisons, then commit.
+- [x] Add failing interleaved flush-role and printer-context regressions; native two-Print serial/parallel output comparison.
+- [x] Run the targeted cases and confirm failures attributable to shared state.
+- [x] Move role/printer state into processor/context instances; make timestamp/result counters atomic.
+- [x] Replace Lightning global random traversal with deterministic geometry-local choices; compare repeated and concurrent conversion.
+- [x] Run focused processor and actual slicing comparisons, then commit.
 
 ## Task 2: Add bounded batch admission and worker event identity
 
@@ -42,11 +42,11 @@ Files: new `src/slic3r/GUI/ParallelPlateSlicing.hpp`, `src/slic3r/GUI/Background
 
 Interfaces: UI-owned `ParallelPlateSlicing` queue with generation, pending/running/complete plate ids, concurrency limit, progress, completion and cancel operations; worker event context includes plate id and generation.
 
-- [ ] Add tests for bounded initial admission, slot replacement, out-of-order events, duplicate/stale completion, cancellation, and concurrency policy limits.
-- [ ] Confirm tests fail, then implement the small scheduler and explicit worker event identity.
-- [ ] Replace orphan-on-timeout cancellation with stop-before-reuse for every worker, including the prior automatic/single-plate job. Cancel all batch jobs before waiting for any one of them.
-- [ ] Serialize post-process environment mutation; test cancellation and metadata-preserving finalization paths.
-- [ ] Run focused queue/job tests and commit.
+- [x] Add tests for bounded initial admission, slot replacement, out-of-order events, duplicate/stale completion, cancellation, and concurrency policy limits.
+- [x] Confirm tests fail, then implement the small scheduler and explicit worker event identity.
+- [x] Replace orphan-on-timeout cancellation with stop-before-reuse for every worker, including the prior automatic/single-plate job. Cancel all batch jobs before waiting for any one of them.
+- [x] Isolate post-process child environments; test cancellation and metadata-preserving finalization paths.
+- [x] Run focused queue/job tests and commit.
 
 ## Task 3: Wire Preview All plates to the batch
 

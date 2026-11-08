@@ -43,8 +43,8 @@ process-wide counters; make them atomic. G-code flush restoration stores its
 previous extrusion role in a function static; move it to the processor instance.
 The Bambu-printer flag used by G-code processing/time formatting must also belong
 to the processor/context, not a mutable process-wide flag. External post-process
-scripts currently populate the process environment; serialize that existing
-stage while allowing slicing and G-code generation to overlap. No new shell
+scripts receive a plate-local child environment, leaving the application
+environment unchanged while slicing and G-code generation overlap. No new shell
 commands, printer actions, or networking are added to slicing.
 
 Snapshot printer-vendor and filament-mapping mode on the UI thread, allocate all

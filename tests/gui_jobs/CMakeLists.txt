@@ -3,6 +3,7 @@
 add_executable(gui_job_tests
     test_job_dispatch.cpp
     test_print_job_completion.cpp
+    test_parallel_plate_slicing.cpp
     ${PROJECT_SOURCE_DIR}/src/slic3r/GUI/Jobs/Job.cpp
 )
 get_directory_property(_job_wx_libraries DIRECTORY ${PROJECT_SOURCE_DIR}/src DEFINITION wxWidgets_LIBRARIES)

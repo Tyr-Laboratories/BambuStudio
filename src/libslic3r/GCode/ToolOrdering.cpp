@@ -2874,13 +2874,14 @@ void ToolOrdering::mark_skirt_layers(const PrintConfig &config, coordf_t max_lay
 // If multiple events are planned over a span of a single layer, use the last one.
 
 // BBS: replace model custom gcode with current plate custom gcode
-static CustomGCode::Info custom_gcode_per_print_z;
 void ToolOrdering::assign_custom_gcodes(const Print& print)
 {
     // Only valid for non-sequential print.
     assert(print.config().print_sequence == PrintSequence::ByLayer);
 
-    custom_gcode_per_print_z = print.model().get_curr_plate_custom_gcodes();
+    for (LayerTools &layer : m_layer_tools) layer.custom_gcode = nullptr;
+    m_custom_gcodes = std::make_shared<const CustomGCode::Info>(print.model().get_curr_plate_custom_gcodes());
+    const CustomGCode::Info &custom_gcode_per_print_z = *m_custom_gcodes;
     if (custom_gcode_per_print_z.gcodes.empty())
         return;
 

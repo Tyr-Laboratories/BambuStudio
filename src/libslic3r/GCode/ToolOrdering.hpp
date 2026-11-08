@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <utility>
 
 #include <boost/container/small_vector.hpp>
@@ -21,7 +22,7 @@ namespace Slic3r {
 class Print;
 class PrintObject;
 class LayerTools;
-namespace CustomGCode { struct Item; }
+namespace CustomGCode { struct Item; struct Info; }
 class PrintRegion;
 
 // Object of this class holds information about whether an extrusion is printed immediately
@@ -413,6 +414,9 @@ private:
     std::vector<unsigned int> generate_first_layer_tool_order(const Print& print);
     std::vector<unsigned int> generate_first_layer_tool_order(const PrintObject& object);
 
+    // LayerTools holds pointers into this immutable snapshot. Shared ownership
+    // preserves those pointers when ToolOrdering is copied for G-code export.
+    std::shared_ptr<const CustomGCode::Info> m_custom_gcodes;
     std::vector<LayerTools>    m_layer_tools;
     // First printing extruder, including the multi-material priming sequence.
     unsigned int               m_first_printing_extruder = (unsigned int)-1;

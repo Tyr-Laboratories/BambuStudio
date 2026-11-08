@@ -3056,7 +3056,7 @@ void TreeSupport::prune_floating_supports()
     BOOST_LOG_TRIVIAL(info) << "Tree support floating region pruning done. " << num_pruned << " regions removed.";
 }
 
-double SupportNode::diameter_angle_scale_factor;
+
 
 static void smooth_filter(const Polygon &poly, int filter_size, std::unordered_map<Point, Point, PointHash> &movements, double max_move)
 {
@@ -3117,7 +3117,7 @@ void TreeSupport::drop_nodes()
     const coordf_t radius_sample_resolution = m_ts_data->m_radius_sample_resolution;
     const bool support_on_buildplate_only = config.support_on_build_plate_only.value;
     const size_t top_interface_layers = config.support_interface_top_layers.value;
-    SupportNode::diameter_angle_scale_factor = diameter_angle_scale_factor;
+    m_ts_data->diameter_angle_scale_factor = diameter_angle_scale_factor;
     // enabled only when the wall count is set to auto or dual-wall is explicitly enabled by the user.
     const bool bottom_expand_enabled = config.tree_support_wall_count > 1 || config.tree_support_wall_count < 0;
 
@@ -4520,7 +4520,7 @@ SupportNode* TreeSupportData::create_node(const Point position, const int distan
 {
     // this function may be called from multiple threads, need to lock
     m_mutex.lock();
-    std::unique_ptr<SupportNode> node = std::make_unique<SupportNode>(position, distance_to_top, obj_layer_nr, support_roof_layers_below, to_buildplate, parent, print_z_, height_, dist_mm_to_top_, radius_);
+    std::unique_ptr<SupportNode> node = std::make_unique<SupportNode>(position, distance_to_top, obj_layer_nr, support_roof_layers_below, to_buildplate, parent, print_z_, height_, dist_mm_to_top_, radius_, diameter_angle_scale_factor);
     SupportNode* raw_ptr = node.get();
     contact_nodes.emplace_back(std::move(node));
     m_mutex.unlock();

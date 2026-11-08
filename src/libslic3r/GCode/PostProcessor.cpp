@@ -1,3 +1,4 @@
+#include <map>
 #include "PostProcessor.hpp"
 
 #include "libslic3r/Utils.hpp"
@@ -60,7 +61,7 @@ static void quote_argv_winapi(const std::wstring &argument, std::wstring &commma
 	}
 }
 
-static DWORD execute_process_winapi(const std::wstring &command_line)
+static DWORD execute_process_winapi(const std::wstring &command_line, const std::map<std::string, std::string> &overrides)
 {
     // Extract the current environment to be passed to the child process.
 	std::wstring envstr;
@@ -68,13 +69,20 @@ static DWORD execute_process_winapi(const std::wstring &command_line)
 		wchar_t *env = GetEnvironmentStrings();
 		assert(env != nullptr);
 		const wchar_t* var = env;
-		size_t totallen = 0;
-		size_t len;
-		while ((len = wcslen(var)) > 0) {
-			totallen += len + 1;
-			var += len + 1;
-		}
-		envstr = std::wstring(env, totallen);
+        while (*var) {
+            const std::wstring entry(var);
+            const auto separator = entry.find(L'=', 1); // Preserve Windows drive entries (=C:=...).
+            const std::string key = boost::to_upper_copy(boost::nowide::narrow(entry.substr(0, separator)));
+            if (overrides.find(key) == overrides.end()) {
+                envstr += entry;
+                envstr.push_back(L'\0');
+            }
+            var += entry.size() + 1;
+        }
+        for (const auto &[key, value] : overrides) {
+            envstr += boost::nowide::widen(key + "=" + value);
+            envstr.push_back(L'\0');
+        }
 		FreeEnvironmentStrings(env);
 	}
 
@@ -101,7 +109,7 @@ static DWORD execute_process_winapi(const std::wstring &command_line)
 // Run the script. If it is a perl script, run it through the bundled perl interpreter.
 // If it is a batch file, run it through the cmd.exe.
 // Otherwise run it directly.
-static int run_script(const std::string &script, const std::string &gcode, std::string &/*std_err*/)
+static int run_script(const std::string &script, const std::string &gcode, std::string &/*std_err*/, const std::map<std::string, std::string> &environment)
 {
     // Unpack the argument list provided by the user.
     int     nArgs;
@@ -141,7 +149,7 @@ static int run_script(const std::string &script, const std::string &gcode, std::
     }
     LocalFree(szArglist);
 	quote_argv_winapi(boost::nowide::widen(gcode), command_line);
-    return (int)execute_process_winapi(command_line);
+    return (int)execute_process_winapi(command_line, environment);
 }
 
 #else
@@ -153,7 +161,7 @@ static int run_script(const std::string &script, const std::string &gcode, std::
 
 namespace process = boost::process;
 
-static int run_script(const std::string &script, const std::string &gcode, std::string &std_err)
+static int run_script(const std::string &script, const std::string &gcode, std::string &std_err, const std::map<std::string, std::string> &environment)
 {
     // Try to obtain user's default shell
     const char *shell = ::getenv("SHELL");
@@ -171,7 +179,9 @@ static int run_script(const std::string &script, const std::string &gcode, std::
     BOOST_LOG_TRIVIAL(debug) << boost::format("Executing script, shell: %1%, command: %2%") % shell % command;
 
     process::ipstream istd_err;
-    process::child child(shell, "-c", command, process::std_err > istd_err);
+    process::environment child_environment = boost::this_process::environment();
+    for (const auto &[key, value] : environment) child_environment[key] = value;
+    process::child child(shell, "-c", command, child_environment, process::std_err > istd_err);
 
     std_err.clear();
     std::string line;
@@ -279,13 +289,13 @@ bool run_post_process_scripts(std::string &src_path, bool make_copy, const std::
     if (! boost::filesystem::exists(gcode_file))
         throw Slic3r::RuntimeError(std::string("Post-processor can't find exported gcode file"));
 
-    // Store print configuration into environment variables.
-    config.setenv_();
-    // Let the post-processing script know the target host ("File", "PrusaLink", "Repetier", "SL1Host", "OctoPrint", "FlashAir", "Duet", "AstroBox" ...)
-    boost::nowide::setenv("SLIC3R_PP_HOST", host.c_str(), 1);
-    // Let the post-processing script know the final file name. For "File" host, it is a full path of the target file name and its location, for example pointing to an SD card.
-    // For "PrusaLink" or "OctoPrint", it is a file name optionally with a directory on the target host.
-    boost::nowide::setenv("SLIC3R_PP_OUTPUT_NAME", output_name.c_str(), 1);
+    // Pass the plate configuration only to its child scripts. Mutating the
+    // application environment also races with concurrent PlaceholderParsers.
+    std::map<std::string, std::string> environment;
+    for (const auto &key : config.keys())
+        environment[boost::to_upper_copy("SLIC3R_" + key)] = config.opt_serialize(key);
+    environment["SLIC3R_PP_HOST"] = host;
+    environment["SLIC3R_PP_OUTPUT_NAME"] = output_name;
 
     // Path to an optional file that the post-processing script may create and populate it with a single line containing the output_name replacement.
     std::string path_output_name = path + ".output_name";
@@ -311,7 +321,7 @@ bool run_post_process_scripts(std::string &src_path, bool make_copy, const std::
                     continue;
                 BOOST_LOG_TRIVIAL(info) << "Executing script " << script << " on file " << path;
                 std::string std_err;
-                const int result = run_script(script, gcode_file.string(), std_err);
+                const int result = run_script(script, gcode_file.string(), std_err, environment);
                 if (result != 0) {
                     const std::string msg = std_err.empty() ? (boost::format("Post-processing script %1% on file %2% failed.\nError code: %3%") % script % path % result).str()
                         : (boost::format("Post-processing script %1% on file %2% failed.\nError code: %3%\nOutput:\n%4%") % script % path % result % std_err).str();

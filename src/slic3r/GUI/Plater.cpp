@@ -129,6 +129,8 @@
 #include "Jobs/PlaterWorker.hpp"
 #include "Jobs/BoostThreadWorker.hpp"
 #include "BackgroundSlicingProcess.hpp"
+#include "ParallelPlateSlicing.hpp"
+#include "libslic3r/GCode/GCodeResultSwap.hpp"
 #include "SelectMachine.hpp"
 #include "SendMultiMachinePage.hpp"
 #include "SendToPrinter.hpp"
@@ -240,6 +242,8 @@ wxDEFINE_EVENT(EVT_SCHEDULE_BACKGROUND_PROCESS,     SimpleEvent);
 wxDEFINE_EVENT(EVT_SLICING_UPDATE,                  SlicingStatusEvent);
 wxDEFINE_EVENT(EVT_SLICING_COMPLETED,               wxCommandEvent);
 wxDEFINE_EVENT(EVT_PROCESS_COMPLETED,               SlicingProcessCompletedEvent);
+wxDEFINE_EVENT(EVT_PARALLEL_PLATE_UPDATE,           SlicingStatusEvent);
+wxDEFINE_EVENT(EVT_PARALLEL_PLATE_COMPLETED,        SlicingProcessCompletedEvent);
 wxDEFINE_EVENT(EVT_EXPORT_BEGAN,                    wxCommandEvent);
 wxDEFINE_EVENT(EVT_EXPORT_FINISHED,                 wxCommandEvent);
 wxDEFINE_EVENT(EVT_IMPORT_MODEL_ID,                 wxCommandEvent);
@@ -6773,6 +6777,17 @@ public:
     ProjectDirtyStateManager dirty_state;
 
     BackgroundSlicingProcess    background_process;
+    ParallelPlateSlicing        parallel_plates;
+    std::map<int, std::unique_ptr<BackgroundSlicingProcess>> parallel_workers;
+    std::map<int, std::unique_ptr<GCodeProcessorResult>> parallel_results;
+    bool parallel_validation_failed = false;
+    void start_parallel_slicing();
+    void admit_parallel_plates();
+    void cancel_parallel_slicing(bool refresh = true);
+    void finish_parallel_slicing();
+    void on_parallel_plate_update(SlicingStatusEvent &event);
+    void on_parallel_plate_completed(SlicingProcessCompletedEvent &event);
+    void show_parallel_plate_warnings(int id, const Print &print);
     HelioBackgroundProcess      helio_background_process;
     bool helio_using_reference_material { false }; // True when user selected a reference material for unsupported filament
     bool suppressed_backround_processing_update { false };
@@ -6791,7 +6806,7 @@ public:
         //BBS
         size_t m_print_id;
 
-        void before_start() override { m->background_process.stop(); }
+        void before_start() override { m->cancel_parallel_slicing(); m->background_process.stop(); }
 
     public:
         Jobs(priv *_m) :
@@ -7363,7 +7378,7 @@ public:
     ThumbnailsList generate_thumbnails(const ThumbnailsParams& params, Camera::EType camera_type);
     //BBS
     void generate_calibration_thumbnail(ThumbnailData& data, unsigned int w, unsigned int h, const ThumbnailsParams& thumbnail_params);
-    PlateBBoxData generate_first_layer_bbox();
+    PlateBBoxData generate_first_layer_bbox(PartPlate *plate = nullptr);
 
     void bring_instance_forward() const;
 
@@ -7544,6 +7559,8 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
     background_process.set_export_began_event(EVT_EXPORT_BEGAN);
     background_process.set_export_finished_event(EVT_EXPORT_FINISHED);
     this->q->Bind(EVT_SLICING_UPDATE, &priv::on_slicing_update, this);
+    this->q->Bind(EVT_PARALLEL_PLATE_UPDATE, &priv::on_parallel_plate_update, this);
+    this->q->Bind(EVT_PARALLEL_PLATE_COMPLETED, &priv::on_parallel_plate_completed, this);
     this->q->Bind(EVT_PUBLISH, &priv::on_action_publish, this);
     this->q->Bind(EVT_REPAIR_MODEL, &priv::on_repair_model, this);
     this->q->Bind(EVT_FILAMENT_COLOR_CHANGED, &priv::on_filament_color_changed, this);
@@ -8039,6 +8056,8 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
 
 Plater::priv::~priv()
 {
+    cancel_parallel_slicing(false);
+    background_process.stop();
     if (config != nullptr)
         delete config;
     // Saves the database of visited (already shown) hints into hints.ini.
@@ -10736,6 +10755,7 @@ void Plater::priv::exit_gizmo()
 
 void Plater::priv::remove(size_t obj_idx)
 {
+    cancel_parallel_slicing();
     if (view3D->is_layers_editing_enabled())
         view3D->enable_layers_editing(false);
 
@@ -10828,6 +10848,8 @@ void Plater::priv::delete_all_objects_from_model()
 
 void Plater::priv::reset(bool apply_presets_change)
 {
+    cancel_parallel_slicing(false);
+    background_process.stop();
     Plater::TakeSnapshot snapshot(q, "Reset Project", UndoRedo::SnapshotType::ProjectSeparator);
 
     clear_warnings();
@@ -11205,6 +11227,7 @@ void Plater::priv::process_validation_warning(StringObjectException const &warni
 // Returns a bitmask of UpdateBackgroundProcessReturnState.
 unsigned int Plater::priv::update_background_process(bool force_validation, bool postpone_error_messages, bool switch_print)
 {
+    if (parallel_plates.active()) cancel_parallel_slicing();
     // bitmap of enum UpdateBackgroundProcessReturnState
     unsigned int return_state = 0;
 
@@ -11433,6 +11456,7 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
 // Restart background processing thread based on a bitmask of UpdateBackgroundProcessReturnState.
 bool Plater::priv::restart_background_process(unsigned int state)
 {
+    if (parallel_plates.active()) return false;
     if (m_ui_jobs.is_any_running()) {
         // Avoid a race condition
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", Line %1%: ui jobs running, return false")%__LINE__;
@@ -11549,6 +11573,7 @@ void Plater::priv::export_gcode(fs::path output_path, bool output_path_on_remova
 }
 unsigned int Plater::priv::update_restart_background_process(bool force_update_scene, bool force_update_preview)
 {
+    if (parallel_plates.active()) return 0;
     bool switch_print = true;
 
     //BBS: judge whether can switch print or not
@@ -12864,6 +12889,7 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
 
 void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
 {
+    if (parallel_plates.active() && !evt.status.is_helio) return;
     if (evt.status.is_helio && !helio_background_process.is_action_current(evt.generation)) {
         return;
     }
@@ -12954,6 +12980,7 @@ void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
 
 void Plater::priv::on_slicing_completed(wxCommandEvent & evt)
 {
+    if (parallel_plates.active()) return;
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": event_type %1%, string %2%") % evt.GetEventType() % evt.GetString();
     //BBS: add slice project logic
     if (m_slice_all && (m_cur_slice_plate < (partplate_list.get_plate_count() - 1))) {
@@ -13104,6 +13131,8 @@ void Plater::priv::track_slice_mesh_stat()
 //BBS: add project slice logic
 void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
 {
+    if (parallel_plates.active() || (evt.generation() != 0 && evt.generation() != background_process.event_generation())) return;
+    if (evt.success()) background_process.commit_fff_result();
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": enter, m_ignore_event %1%, status %2%")%m_ignore_event %evt.status();
     //BBS:ignore cancel event for some special case
     if (m_ignore_event)
@@ -13400,6 +13429,9 @@ void Plater::priv::on_action_open_project(SimpleEvent&)
 //BBS: GUI refactor: slice plate
 void Plater::priv::on_action_slice_plate(SimpleEvent&)
 {
+    cancel_parallel_slicing();
+    background_process.stop();
+    background_process.invalidate_events();
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice plate event\n";
         //BBS update extruder params and speed table before slicing
@@ -15876,9 +15908,235 @@ void Plater::priv::on_helio_input_dlg(SimpleEvent &a)
         }
     }
 
+void Plater::priv::start_parallel_slicing()
+{
+    cancel_parallel_slicing();
+    background_process.stop();
+    background_process.invalidate_events();
+    background_process_timer.Stop();
+    const int selected = partplate_list.get_curr_plate_index();
+    std::vector<int> pending;
+    std::vector<int> cached;
+    std::vector<std::string> validation_errors;
+    parallel_validation_failed = false;
+    process_completed_with_error = -1;
+    on_slicing_began();
+    Plater::SuppressSnapshots suppress(q);
+    try {
+        // Apply and validate serially: this is the boundary that snapshots model,
+        // presets and filament mapping into each independent Print instance.
+        for (int id = 0; id < partplate_list.get_plate_count(); ++id) {
+            auto *plate = partplate_list.get_plate(id);
+            if (!plate->has_printable_instances()) continue;
+            partplate_list.select_plate(id);
+            const unsigned state = update_background_process(true, true);
+            if (state & UPDATE_BACKGROUND_PROCESS_INVALID) {
+                parallel_validation_failed = true;
+                plate->update_slice_result_valid_state(false);
+                auto error = background_process.validate();
+                q->post_process_string_object_exception(error);
+                validation_errors.push_back("Plate " + std::to_string(id + 1) + ": " + error.string);
+                continue;
+            }
+            if (plate->is_slice_result_valid() && !plate->get_slice_result()->moves.empty()) {
+                cached.push_back(id);
+                continue;
+            }
+            if (background_process.empty()) continue;
+            plate->get_tmp_gcode_path(); // Model backup/path allocation is UI-thread-only.
+            auto worker = std::make_unique<BackgroundSlicingProcess>();
+            plate->update_slice_context(*worker);
+            // Keep in-flight buffers private: the All plates statistics view
+            // may inspect the published results while other plates are exporting.
+            auto result = std::make_unique<GCodeProcessorResult>();
+            swap_gcode_results(*result, *plate->get_slice_result());
+            worker->set_gcode_result(result.get());
+            parallel_results.emplace(id, std::move(result));
+            worker->set_finished_event(EVT_PARALLEL_PLATE_COMPLETED);
+            worker->set_thumbnail_cb([this](const ThumbnailsParams &params) {
+                return generate_thumbnails(params, Camera::EType::Ortho);
+            });
+            worker->set_skip_post_process_once(m_post_process_script_skip_choice.value_or(false));
+            worker->set_task(PrintBase::TaskParams());
+            plate->clear_helio_result();
+            plate->update_slice_result_valid_state(false);
+            plate->update_slicing_percent(0);
+            pending.push_back(id);
+            parallel_workers.emplace(id, std::move(worker));
+        }
+    } catch (...) {
+        partplate_list.select_plate(selected);
+        cancel_parallel_slicing(false);
+        partplate_list.update_slice_context_to_current_plate(background_process);
+        preview->update_gcode_result(partplate_list.get_current_slice_result());
+        throw;
+    }
+    partplate_list.select_plate(selected);
+    partplate_list.update_slice_context_to_current_plate(background_process);
+    preview->update_gcode_result(partplate_list.get_current_slice_result());
+    for (int id : cached)
+        show_parallel_plate_warnings(id, *partplate_list.get_plate(id)->fff_print());
+    for (const auto &message : validation_errors)
+        notification_manager->push_slicing_error_notification(message, {});
+    const size_t limit = ParallelPlateSlicing::concurrency(pending.size(),
+        std::thread::hardware_concurrency(), Slic3r::total_physical_memory());
+    const auto generation = parallel_plates.begin(pending, limit);
+    for (auto &[id, worker] : parallel_workers) {
+        worker->set_event_context(id, generation);
+        worker->fff_print()->set_status_callback([this, id, generation](const PrintBase::SlicingStatus &status) {
+            wxQueueEvent(q, new SlicingStatusEvent(EVT_PARALLEL_PLATE_UPDATE, id, status, generation));
+        });
+    }
+    BOOST_LOG_TRIVIAL(info) << "Parallel plate batch " << generation << ": " << pending.size() << " plates, " << limit << " slots";
+    m_slice_all = true;
+    m_slice_all_only_has_gcode = false;
+    m_is_slicing = true;
+    q->SetDropTarget(nullptr);
+    preview->get_canvas3d()->on_back_slice_begin();
+    main_frame->update_slice_print_status(MainFrame::eEventSliceUpdate, false);
+    notification_manager->set_slicing_progress_began();
+    admit_parallel_plates();
+}
+
+void Plater::priv::admit_parallel_plates()
+{
+    for (int id : parallel_plates.take_available()) {
+        BOOST_LOG_TRIVIAL(info) << "Parallel plate " << id + 1 << ": starting";
+        try {
+            if (parallel_workers.at(id)->start()) continue;
+            throw RuntimeError("The plate worker could not start.");
+        } catch (...) {
+            wxQueueEvent(q, new SlicingProcessCompletedEvent(EVT_PARALLEL_PLATE_COMPLETED, id,
+                SlicingProcessCompletedEvent::Error, std::current_exception(), parallel_plates.generation()));
+        }
+    }
+    if (parallel_plates.done()) finish_parallel_slicing();
+}
+
+void Plater::priv::on_parallel_plate_update(SlicingStatusEvent &event)
+{
+    const int id = event.GetId();
+    if (!parallel_plates.accepts(id, event.generation)) return;
+    if (event.status.percent >= 0) {
+        parallel_plates.progress(id, event.generation, event.status.percent);
+        partplate_list.get_plate(id)->update_slicing_percent(event.status.percent);
+        notification_manager->set_slicing_progress_percentage(
+            "Plate " + std::to_string(id + 1) + ": " + event.status.text,
+            float(parallel_plates.percent() / 100.));
+        if (m_is_publishing && m_publish_dlg) {
+            wxString message = from_u8(event.status.text);
+            m_publish_dlg->UpdateStatus(message, int(70 * parallel_plates.percent() / 100.), false);
+        }
+    }
+    // Warning state and previews are consumed only after this worker stops.
+}
+
+void Plater::priv::show_parallel_plate_warnings(int id, const Print &print)
+{
+    auto add = [this, id](const PrintStateBase::StateWithWarnings &state, const ModelObject *object, ObjectID oid, int step) {
+        for (const auto &warning : state.warnings) {
+            if (!warning.current) continue;
+            notification_manager->push_slicing_warning_notification(
+                "Plate " + std::to_string(id + 1) + ": " + warning.message,
+                false, object, oid, step, warning.message_id);
+            add_warning(warning, oid.id);
+        }
+    };
+    for (int step = 0; step < int(psCount); ++step)
+        add(print.step_state_with_warnings(PrintStep(step)), nullptr, print.id(), step);
+    for (const PrintObject *object : print.objects())
+        for (int step = 0; step < int(posCount); ++step)
+            add(object->step_state_with_warnings(PrintObjectStep(step)), object->model_object(), object->id(), step);
+}
+
+void Plater::priv::on_parallel_plate_completed(SlicingProcessCompletedEvent &event)
+{
+    const int id = event.GetId();
+    if (!parallel_plates.finish(id, event.generation(), event.success())) return;
+    auto &worker = *parallel_workers.at(id);
+    worker.stop();
+    auto *plate = partplate_list.get_plate(id);
+    plate->update_slice_result_valid_state(event.success());
+    if (event.success()) {
+        swap_gcode_results(*plate->get_slice_result(), *parallel_results.at(id));
+        worker.commit_fff_result();
+        plate->update_slicing_percent(100);
+        plate->cali_bboxes_data = generate_first_layer_bbox(plate);
+        show_parallel_plate_warnings(id, *worker.fff_print());
+    } else {
+        // The private result is about to be discarded. A completed export step
+        // without its matching nozzle/filament context cannot be reused on retry.
+        worker.fff_print()->set_gcode_file_invalidated();
+        process_completed_with_error = id;
+        const std::string message = event.error() ? event.format_error_message().first : _u8L("Slicing Canceled");
+        notification_manager->push_slicing_error_notification("Plate " + std::to_string(id + 1) + ": " + message, {});
+    }
+    BOOST_LOG_TRIVIAL(info) << "Parallel plate " << id + 1 << ": finished, success=" << event.success();
+    parallel_workers.erase(id);
+    parallel_results.erase(id);
+    q->mark_plate_toolbar_image_dirty();
+    admit_parallel_plates();
+}
+
+void Plater::priv::finish_parallel_slicing()
+{
+    const bool failed = parallel_validation_failed || parallel_plates.failed();
+    parallel_plates.cancel(); // Invalidates late progress events, including 100% updates.
+    parallel_workers.clear();
+    parallel_results.clear();
+    m_is_slicing = false;
+    m_slice_all = false;
+    partplate_list.update_slice_context_to_current_plate(background_process);
+    preview->update_gcode_result(partplate_list.get_current_slice_result());
+    notification_manager->set_slicing_progress_percentage(
+        failed ? _u8L("Slicing failed") : _u8L("Slicing complete"), 1.f);
+    notification_manager->set_slicing_progress_export_possible();
+    main_frame->update_slice_print_status(MainFrame::eEventSliceUpdate,
+        !partplate_list.get_curr_plate()->is_slice_result_valid(), true);
+    update_fff_scene();
+    q->SetDropTarget(new PlaterDropTarget(q));
+    if (m_is_publishing && m_publish_dlg) {
+        if (failed || !partplate_list.is_all_slice_results_valid()) {
+            wxString message = _L("Please resolve the slicing errors and publish again.");
+            m_publish_dlg->UpdateStatus(message, false);
+        }
+        else if (!m_publish_dlg->was_cancelled() && m_publish_dlg->IsShown())
+            q->publish_project();
+    }
+}
+
+void Plater::priv::cancel_parallel_slicing(bool refresh)
+{
+    if (!parallel_plates.active() && parallel_workers.empty()) return;
+    parallel_plates.cancel();
+    // Cancel every outstanding UI thumbnail task before waiting on any worker.
+    for (auto &[id, worker] : parallel_workers) worker->request_cancel();
+    for (auto &[id, worker] : parallel_workers) {
+        worker->stop();
+        worker->fff_print()->set_gcode_file_invalidated();
+    }
+    parallel_workers.clear();
+    parallel_results.clear();
+    m_is_slicing = false;
+    m_slice_all = false;
+    if (!refresh) return;
+    partplate_list.update_slice_context_to_current_plate(background_process);
+    preview->update_gcode_result(partplate_list.get_current_slice_result());
+    notification_manager->set_slicing_progress_canceled(_u8L("Slicing Canceled"));
+    main_frame->update_slice_print_status(MainFrame::eEventSliceUpdate,
+        !partplate_list.get_curr_plate()->is_slice_result_valid(), true);
+    preview->reload_print(false);
+    q->mark_plate_toolbar_image_dirty();
+    q->SetDropTarget(new PlaterDropTarget(q));
+    if (m_is_publishing && m_publish_dlg) m_publish_dlg->cancel();
+}
+
 //BBS: GUI refactor: slice all
 void Plater::priv::on_action_slice_all(SimpleEvent&)
 {
+    cancel_parallel_slicing();
+    background_process.stop();
+    background_process.invalidate_events();
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice project event\n";
         //BBS update extruder params and speed table before slicing
@@ -15893,7 +16151,9 @@ void Plater::priv::on_action_slice_all(SimpleEvent&)
         m_slice_all_only_has_gcode = true;
         m_cur_slice_plate = 0;
         //select plate
-        q->select_plate(m_cur_slice_plate);
+        process_completed_with_error = -1;
+        if (printer_technology != ptFFF || model.objects.empty() || q->only_gcode_mode() || q->is_gcode_3mf())
+            q->select_plate(m_cur_slice_plate);
         q->reslice();
         if (!m_is_publishing)
             q->select_view_3D("Preview");
@@ -16504,18 +16764,18 @@ void Plater::priv::generate_calibration_thumbnail(ThumbnailData& data, unsigned 
     preview->get_canvas3d()->render_calibration_thumbnail(data, w, h, thumbnail_params);
 }
 
-PlateBBoxData Plater::priv::generate_first_layer_bbox()
+PlateBBoxData Plater::priv::generate_first_layer_bbox(PartPlate *plate)
 {
     PlateBBoxData bboxdata;
     std::vector<BBoxData>& id_bboxes = bboxdata.bbox_objs;
     BoundingBoxf bbox_all;
-    auto                   print = this->background_process.m_fff_print;
-    auto curr_plate = this->partplate_list.get_curr_plate();
+    auto curr_plate = plate ? plate : this->partplate_list.get_curr_plate();
+    auto print = curr_plate->fff_print();
     auto curr_plate_seq = curr_plate->get_real_print_seq();
     bboxdata.is_seq_print = (curr_plate_seq == PrintSequence::ByObject);
     bboxdata.first_extruder = print->get_tool_ordering().first_extruder();
     bboxdata.bed_type       = bed_type_to_gcode_string(print->config().curr_bed_type.value);
-    bboxdata.first_layer_time = partplate_list.get_curr_plate()->get_slice_result()->initial_layer_time;
+    bboxdata.first_layer_time = curr_plate->get_slice_result()->initial_layer_time;
     // get nozzle diameter
     auto opt_nozzle_diameters = print->config().option<ConfigOptionFloatsNullable>("nozzle_diameter");
     if (opt_nozzle_diameters != nullptr)
@@ -16528,7 +16788,7 @@ PlateBBoxData Plater::priv::generate_first_layer_bbox()
     //    objects = this->background_process.m_sla_print->objects();
     //}
     auto objects = print->objects();
-    auto orig = this->partplate_list.get_curr_plate()->get_origin();
+    auto orig = curr_plate->get_origin();
     Vec2d orig2d = { orig[0], orig[1] };
 
     BBoxData data;
@@ -16554,7 +16814,7 @@ PlateBBoxData Plater::priv::generate_first_layer_bbox()
             bb.max -= orig2d;
             bbox_all.merge(bb);
             data.name = "wipe_tower";
-            data.id   = partplate_list.get_curr_plate()->get_index() + 1000;
+            data.id   = curr_plate->get_index() + 1000;
             data.bbox = {bb.min.x(), bb.min.y(), bb.max.x(), bb.max.y()};
             id_bboxes.emplace_back(data);
         }
@@ -16674,6 +16934,10 @@ void Plater::priv::init_notification_manager()
     notification_manager->init();
 
     auto cancel_callback = [this]() {
+        if (parallel_plates.active()) {
+            cancel_parallel_slicing();
+            return true;
+        }
         bool res1;
         bool res2;
 
@@ -18107,6 +18371,7 @@ bool Plater::priv::show_publish_dlg(bool show)
     } else {
         m_publish_dlg->EndModal(wxID_OK);
         //cancel the slicing
+        cancel_parallel_slicing();
         if (this->background_process.running())
             this->background_process.stop();
     }
@@ -19519,6 +19784,7 @@ void Plater::priv::take_snapshot(const std::string& snapshot_name, const UndoRed
 {
     if (m_prevent_snapshots > 0)
         return;
+    cancel_parallel_slicing();
     assert(m_prevent_snapshots >= 0);
     // Assembly stack: take a slim snapshot of m_assemble_model only, bypassing the prepare-model
     // project machinery (wipe tower / presets / sidebar). Must run before the m_single project filter.
@@ -19611,6 +19877,7 @@ void Plater::priv::take_snapshot(const std::string& snapshot_name, const UndoRed
 
 void Plater::priv::undo()
 {
+    cancel_parallel_slicing();
     const std::vector<UndoRedo::Snapshot> &snapshots = this->undo_redo_stack().snapshots();
     auto it_current = std::lower_bound(snapshots.begin(), snapshots.end(), UndoRedo::Snapshot(this->undo_redo_stack().active_snapshot_time()));
     // BBS: undo-redo until modify record
@@ -19634,6 +19901,7 @@ void Plater::priv::undo()
 
 void Plater::priv::redo()
 {
+    cancel_parallel_slicing();
     const std::vector<UndoRedo::Snapshot> &snapshots = this->undo_redo_stack().snapshots();
     auto it_current = std::lower_bound(snapshots.begin(), snapshots.end(), UndoRedo::Snapshot(this->undo_redo_stack().active_snapshot_time()));
     // BBS: undo-redo until modify record
@@ -22705,7 +22973,7 @@ void Plater::update(bool conside_update_flag, bool force_background_processing_u
 
 void Plater::object_list_changed() { p->object_list_changed(); }
 
-void Plater::stop_jobs() { p->m_ui_jobs.stop_all(); }
+void Plater::stop_jobs() { p->cancel_parallel_slicing(); p->m_ui_jobs.stop_all(); }
 
 bool Plater::is_any_job_running() const
 {
@@ -24340,6 +24608,12 @@ void Plater::reslice()
                 object->sla_points_status = sla::PointsStatus::Generating;
     }
 
+    if (p->m_slice_all && printer_technology() == ptFFF && !model().objects.empty() && !only_gcode_mode() && !is_gcode_3mf()) {
+        p->start_parallel_slicing();
+        record_slice_preset("slicing");
+        return;
+    }
+
     //FIXME Don't reslice if export of G-code or sending to OctoPrint is running.
     // bitmask of UpdateBackgroundProcessReturnState
     unsigned int state = this->p->update_background_process(true);
@@ -24901,11 +25175,12 @@ void Plater::single_snapshots_leave(SingleSnapshot *single)
 {
     p->single_snapshots_leave(single);
 }
-void Plater::undo() { p->undo(); }
-void Plater::redo() { p->redo(); }
-void Plater::undo_redo_to(size_t time_to_load) { p->undo_redo_to(time_to_load); }
+void Plater::undo() { p->cancel_parallel_slicing(); p->undo(); }
+void Plater::redo() { p->cancel_parallel_slicing(); p->redo(); }
+void Plater::undo_redo_to(size_t time_to_load) { p->cancel_parallel_slicing(); p->undo_redo_to(time_to_load); }
 void Plater::undo_to(int selection)
 {
+    p->cancel_parallel_slicing();
     if (selection == 0) {
         p->undo();
         return;
@@ -24916,6 +25191,7 @@ void Plater::undo_to(int selection)
 }
 void Plater::redo_to(int selection)
 {
+    p->cancel_parallel_slicing();
     if (selection == 0) {
         p->redo();
         return;
@@ -25145,6 +25421,7 @@ void Plater::config_change_notification(const DynamicPrintConfig &config, const 
 
 void Plater::on_config_change(const DynamicPrintConfig &config)
 {
+    p->cancel_parallel_slicing();
     bool update_scheduled = false;
     bool bed_shape_changed = false;
     //bool print_sequence_changed = false;
@@ -26416,6 +26693,7 @@ void Plater::apply_background_progress()
 //BBS: select Plate
 int Plater::select_plate(int plate_index, bool need_slice)
 {
+    if (p->parallel_plates.active()) return -1;
     int ret;
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: plate %2%, need_slice %3% ")%__LINE__ %plate_index  %need_slice;
     take_snapshot("select partplate!");

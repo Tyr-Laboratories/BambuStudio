@@ -86,7 +86,6 @@ const std::vector<std::string> GCodeProcessor::CustomTags = {
 const float GCodeProcessor::Wipe_Width = 0.05f;
 const float GCodeProcessor::Wipe_Height = 0.05f;
 
-bool GCodeProcessor::s_IsBBLPrinter = true;
 
 #if ENABLE_GCODE_VIEWER_DATA_CHECKING
 const std::string GCodeProcessor::Mm3_Per_Mm_Tag = "MM3_PER_MM:";
@@ -698,7 +697,7 @@ void GCodeProcessor::TimeProcessor::post_process(const std::string& filename, st
                     PrintEstimatedStatistics::ETimeMode mode = static_cast<PrintEstimatedStatistics::ETimeMode>(i);
                     if (mode == PrintEstimatedStatistics::ETimeMode::Normal || machine.enabled) {
                         char buf[128];
-                        if (!s_IsBBLPrinter) {
+                        if (!context.is_bbl_printer) {
                             // Klipper estimator
                             sprintf(buf, "; estimated printing time (normal mode) = %s\n",
                                 get_time_dhms(machine.time).c_str());
@@ -1605,7 +1604,7 @@ const std::vector<std::pair<GCodeProcessor::EProducer, std::string>> GCodeProces
     //{ EProducer::KissSlicer,  "KISSlicer" }
 };
 
-unsigned int GCodeProcessor::s_result_id = 0;
+std::atomic<unsigned int> GCodeProcessor::s_result_id{0};
 
 bool GCodeProcessor::contains_reserved_tag(const std::string& gcode, std::string& found_tag)
 {
@@ -2519,6 +2518,7 @@ void GCodeProcessor::reset()
     m_additional_fan_speed = 0.0f;
 
     m_extrusion_role = erNone;
+    m_pre_flush_role = erNone;
 
     m_is_helio_gcode   = false;
     m_filament_id = {static_cast<unsigned char>(-1),static_cast<unsigned char>(-1)};
@@ -2765,6 +2765,7 @@ void GCodeProcessor::finalize(bool post_process)
             m_result.extruder_types,
             m_nozzle_diameter
         );
+        context.is_bbl_printer = m_is_bbl_printer;
         m_time_processor.post_process(m_result.filename, m_result.moves, m_result.lines_ends, context);
     }
 
@@ -3292,7 +3293,6 @@ bool GCodeProcessor::get_last_position_from_gcode(const std::string &gcode_str, 
 
 void GCodeProcessor::process_tags(const std::string_view comment, bool producers_enabled)
 {
-    static ExtrusionRole prev_role;
     // producers tags
     if (producers_enabled && process_producers_tags(comment))
         return;
@@ -3378,7 +3378,7 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
 
     //BBS: flush start tag
     if (boost::starts_with(comment, custom_tags(CustomETags::FLUSH_START))) {
-        prev_role = m_extrusion_role;
+        m_pre_flush_role = m_extrusion_role;
         set_extrusion_role(erFlush);
         m_flushing = true;
         return;
@@ -3386,20 +3386,20 @@ void GCodeProcessor::process_tags(const std::string_view comment, bool producers
 
     //BBS: flush end tag
     if (boost::starts_with(comment, custom_tags(CustomETags::FLUSH_END))) {
-        set_extrusion_role(prev_role);
+        set_extrusion_role(m_pre_flush_role);
         m_flushing = false;
         return;
     }
 
     if (boost::starts_with(comment, custom_tags(CustomETags::VFLUSH_START))) {
-        prev_role = m_extrusion_role;
+        m_pre_flush_role = m_extrusion_role;
         set_extrusion_role(erFlush);
         m_virtual_flushing = true;
         return;
     }
 
     if (boost::starts_with(comment, custom_tags(CustomETags::VFLUSH_END))) {
-        set_extrusion_role(prev_role);
+        set_extrusion_role(m_pre_flush_role);
         m_virtual_flushing = false;
         return;
     }
@@ -5211,7 +5211,7 @@ void GCodeProcessor::process_G4(const GCodeReader::GCodeLine& line)
 //BBS
 void GCodeProcessor::process_G29(const GCodeReader::GCodeLine& line)
 {
-    if (s_IsBBLPrinter){
+    if (m_is_bbl_printer){
         if(m_measure_g29_time)
             simulate_st_synchronize(m_time_processor.prepare_compensation_time);
     }

@@ -718,7 +718,7 @@ DPIFrame(NULL, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, BORDERLESS_FRAME_
         if (evt.CmdDown() && evt.GetKeyCode() == 'R') {
             if (wxGetApp().check_slice_version_policy() && m_slice_enable) {
                 wxGetApp().plater()->update(true, true);
-                wxPostEvent(m_plater, SimpleEvent(EVT_GLTOOLBAR_SLICE_PLATE));
+                wxPostEvent(m_plater, SimpleEvent(evt.ShiftDown() ? EVT_GLTOOLBAR_SLICE_ALL : EVT_GLTOOLBAR_SLICE_PLATE));
             }
             return;
         }

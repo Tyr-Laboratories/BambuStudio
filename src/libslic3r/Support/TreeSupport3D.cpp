@@ -156,13 +156,13 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
 {
     std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> grouped_meshes;
 
-    //FIXME this is ugly, it does not belong here.
+    bool has_soluble_mesh = false;
     for (size_t object_id : print_object_ids) {
         const PrintObject       &print_object  = *print.get_object(object_id);
         const PrintObjectConfig &object_config = print_object.config();
         if (object_config.support_top_z_distance < EPSILON)
             // || min_feature_size < scaled<coord_t>(0.1) that is the minimum line width
-            TreeSupportSettings::soluble = true;
+            has_soluble_mesh = true;
     }
 
     size_t largest_printed_mesh_idx = 0;
@@ -179,7 +179,7 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
         //assert(object_config.support_material_style == smsTree || object_config.support_material_style == smsOrganic);
 
         bool found_existing_group = false;
-        TreeSupportSettings next_settings{ TreeSupportMeshGroupSettings{ print_object }, print_object.slicing_parameters() };
+        TreeSupportSettings next_settings{ TreeSupportMeshGroupSettings{ print_object }, print_object.slicing_parameters(), has_soluble_mesh };
         //FIXME for now only a single object per group is enabled.
 #if 0
         for (size_t idx = 0; idx < grouped_meshes.size(); ++ idx)

@@ -258,7 +258,7 @@ struct TreeSupportSettings
 {
     TreeSupportSettings() = default; // required for the definition of the config variable in the TreeSupportGenerator class.
 
-    explicit TreeSupportSettings(const TreeSupportMeshGroupSettings& mesh_group_settings, const SlicingParameters &slicing_params)
+    explicit TreeSupportSettings(const TreeSupportMeshGroupSettings& mesh_group_settings, const SlicingParameters &slicing_params, bool has_soluble_mesh = false)
         : angle(mesh_group_settings.support_tree_angle),
           angle_slow(mesh_group_settings.support_tree_angle_slow),
           support_line_width(mesh_group_settings.support_line_width),
@@ -299,7 +299,7 @@ struct TreeSupportSettings
         assert(tip_layers > 0);
         layer_start_bp_radius = (bp_radius - branch_radius) / bp_radius_increase_per_layer;
 
-        if (TreeSupportSettings::soluble) {
+        if (has_soluble_mesh || mesh_group_settings.support_top_distance < scaled<coord_t>(EPSILON)) {
             // safeOffsetInc can only work in steps of the size xy_min_distance in the worst case => xy_min_distance has to be a bit larger than 0 in this worst case and should be large enough for performance to not suffer extremely
             // When for all meshes the z bottom and top distance is more than one layer though the worst case is xy_min_distance + min_feature_size
             // This is not the best solution, but the only one to ensure areas can not lag though walls at high maximum_move_distance.
@@ -352,9 +352,6 @@ private:
     std::vector<coord_t> known_z;
 
 public:
-    // some static variables dependent on other meshes that are not currently processed.
-    // Has to be static because TreeSupportConfig will be used in TreeModelVolumes as this reduces redundancy.
-    inline static bool soluble = false;
     /*!
      * \brief Width of a single line of support.
      */

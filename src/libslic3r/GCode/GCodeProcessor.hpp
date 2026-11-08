@@ -1,6 +1,8 @@
 #ifndef slic3r_GCodeProcessor_hpp_
 #define slic3r_GCodeProcessor_hpp_
 
+#include <atomic>
+
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
@@ -520,7 +522,7 @@ namespace Slic3r {
         static const float Wipe_Width;
         static const float Wipe_Height;
 
-        static bool s_IsBBLPrinter;
+        void set_is_bbl_printer(bool value) { m_is_bbl_printer = value; }
 
 #if ENABLE_GCODE_VIEWER_DATA_CHECKING
         static const std::string Mm3_Per_Mm_Tag;
@@ -770,6 +772,7 @@ namespace Slic3r {
 
         struct TimeProcessContext
         {
+            bool is_bbl_printer = true;
             UsedFilaments used_filaments; // stores the accurate filament usage info
             std::vector<Extruder> filament_lists;
             std::vector<std::string> filament_types;
@@ -1185,6 +1188,7 @@ namespace Slic3r {
         float m_fan_speed; // percentage (part cooling fan)
         float m_additional_fan_speed; // percentage (auxiliary/side fan, M106 P2)
         ExtrusionRole m_extrusion_role;
+        ExtrusionRole m_pre_flush_role = erNone;
         std::vector<int> m_filament_maps;
         std::vector<unsigned char> m_last_filament_id;
         std::vector<unsigned char> m_filament_id;
@@ -1233,7 +1237,8 @@ namespace Slic3r {
         UsedFilaments m_used_filaments;
 
         GCodeProcessorResult m_result;
-        static unsigned int s_result_id;
+        static std::atomic<unsigned int> s_result_id;
+        bool m_is_bbl_printer = true;
 
         void ensure_nozzle_group_result(int min_filament_count);
 

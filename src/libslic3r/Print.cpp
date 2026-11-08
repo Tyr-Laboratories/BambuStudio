@@ -4090,6 +4090,7 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
 {
     try {
         GCodeProcessor processor;
+        processor.set_is_bbl_printer(is_BBL_Printer());
         if (result && result->nozzle_group_result)
             processor.initialize_from_context(result->nozzle_group_result);
         const Vec3d origin = this->get_plate_origin();

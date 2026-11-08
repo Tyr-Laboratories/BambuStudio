@@ -76,6 +76,24 @@ Existing painting outside those targets is preserved. The entire operation is on
 
 The same conservative bore limits apply as for automatic wall painting. Open channels, noncircular openings, tapered or chamfered recesses, interrupted or damaged meshes, and incomplete or nonplanar end caps may need manual painting. Review the red surfaces and sliced support Preview before printing.
 
+## Slice all plates in parallel
+
+In Preview, **All plates** prepares each plate and then slices independent plates
+concurrently. **Cmd+Shift+R** on macOS (**Ctrl+Shift+R** elsewhere) starts the same
+whole-project operation. Up to four plates run at once; machines with fewer CPU cores or
+less memory use fewer workers. Already valid cached plates are reused. Each
+plate keeps its own progress, G-code, filament/nozzle mapping and preview, and
+completed plates contribute to the whole-project statistics.
+
+Cancel stops queued work and all active workers. Results already completed stay
+available. Editing or replacing the project cancels the active batch before its
+plate data can be changed. A plate that fails validation or slicing is identified
+in the notification area; successful plates remain available, and an incomplete
+batch cannot automatically publish the project. Thumbnail rendering remains on
+the UI thread. Post-processing scripts receive their own plate configuration in
+a child environment. Individual-plate slicing and imported-G-code previews keep
+their existing workflows.
+
 ## Paint bases for Organic tree supports
 
 With **Tree Organic** selected and **On build plate only** enabled, select an object in Prepare, open **Supports Painting**, and choose **Support bases**. Paint an upward-facing surface below an overhang to allow trees to start there. This can replace a tall tower from the bed with a short tree on a raised part of the model.

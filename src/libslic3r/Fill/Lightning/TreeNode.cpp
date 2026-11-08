@@ -364,7 +364,13 @@ void Node::convertToPolylines(size_t long_line_idx, Polylines &output, bool stab
     }
     // Stable mode is used by relocated bridge stacks: repeating conversion
     // must not move the trimmed end from one branch to another after anchoring.
-    const size_t first_child_idx = stable_traversal ? 0 : rand() % m_children.size();
+    // Choose a varied child from this node's geometry, independent of other
+    // plates and TBB scheduling. SplitMix64 also disperses regularly spaced nodes.
+    uint64_t seed = uint64_t(m_p.x()) ^ (uint64_t(m_p.y()) + 0x9e3779b97f4a7c15ULL);
+    seed = (seed ^ (seed >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    seed = (seed ^ (seed >> 27)) * 0x94d049bb133111ebULL;
+    seed ^= seed >> 31;
+    const size_t first_child_idx = stable_traversal ? 0 : seed % m_children.size();
     m_children[first_child_idx]->convertToPolylines(long_line_idx, output, stable_traversal);
     output[long_line_idx].points.push_back(m_p);
 

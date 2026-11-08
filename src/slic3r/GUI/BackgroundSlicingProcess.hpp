@@ -72,10 +72,11 @@ public:
 		Error
 	};
 
-	SlicingProcessCompletedEvent(wxEventType eventType, int winid, StatusType status, std::exception_ptr exception) :
-		wxEvent(winid, eventType), m_status(status), m_exception(exception) {}
+	SlicingProcessCompletedEvent(wxEventType eventType, int winid, StatusType status, std::exception_ptr exception, std::uint64_t generation = 0) :
+		wxEvent(winid, eventType), m_status(status), m_exception(exception), m_generation(generation) {}
 	virtual wxEvent* Clone() const { return new SlicingProcessCompletedEvent(*this); }
 
+	std::uint64_t generation() const { return m_generation; }
 	StatusType 	status()    const { return m_status; }
 	bool 		finished()  const { return m_status == Finished; }
 	bool 		success()   const { return m_status == Finished; }
@@ -94,6 +95,7 @@ public:
 private:
 	StatusType 			m_status;
 	std::exception_ptr 	m_exception;
+    std::uint64_t m_generation;
 };
 
 //BBS: move it to plater.hpp
@@ -160,6 +162,11 @@ public:
 	// Cancel the background processing. Returns false if the background processing was not running.
 	// A stopped background processing may be restarted with start().
 	bool stop();
+    void request_cancel();
+    void commit_fff_result(); // UI thread, after successful completion.
+    void set_event_context(int plate_id, std::uint64_t generation) { m_event_plate_id = plate_id; m_event_generation = generation; }
+    void invalidate_events() { ++m_event_generation; }
+    std::uint64_t event_generation() const { return m_event_generation; }
 	// Cancel the background processing and reset the print. Returns false if the background processing was not running.
 	// Useful when the Model or configuration is being changed drastically.
 	bool reset();
@@ -283,16 +290,10 @@ private:
 	// Thread, on which the background processing is executed. The thread will always be present
 	// and ready to execute the slicing process.
 	boost::thread		 		m_thread;
-	// Threads orphaned by force-cancel (stop() timeout). They continue running until
-	// their computation finishes, then exit silently. Detached in the destructor.
-	std::vector<boost::thread>	m_orphaned_threads;
 	// Mutex and condition variable to synchronize m_thread with the UI thread.
 	std::mutex 		 			m_mutex;
 	std::condition_variable		m_condition;
-	State 						m_state = STATE_INITIAL;
-	// Incremented on force-cancel (stop() timeout). The background thread checks this
-	// after completing work; if it changed, the thread skips state/event updates.
-	unsigned int				m_task_generation = 0;
+	std::atomic<State> m_state{STATE_INITIAL};
 
 	// For executing tasks from the background thread on UI thread synchronously (waiting for result) using wxWidgets CallAfter().
 	// When the background proces is canceled, the UITask has to be invalidated as well, so that it will not be
@@ -314,8 +315,11 @@ private:
 	//BBS: partplate related
 	GUI::PartPlate* m_current_plate;
 	PrinterTechnology m_printer_tech = ptUnknown;
-	bool m_internal_cancelled = false;
+	std::atomic<bool> m_internal_cancelled{false};
 	bool m_skip_post_process_once = false;
+    FilamentMapMode m_filament_map_mode = FilamentMapMode::fmmAutoForFlush;
+    int m_event_plate_id = 0;
+    std::uint64_t m_event_generation = 1;
 
     PrintState<BackgroundSlicingProcessStep, bspsCount>   	m_step_state;
 	bool                set_step_started(BackgroundSlicingProcessStep step);

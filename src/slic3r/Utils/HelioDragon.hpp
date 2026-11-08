@@ -569,12 +569,12 @@ public:
 
     void helio_threaded_process_start(std::mutex&                                slicing_mutex,
                                       std::condition_variable&                   slicing_condition,
-                                      BackgroundSlicingProcess::State&           slicing_state,
+                                      std::atomic<BackgroundSlicingProcess::State>& slicing_state,
                                       std::unique_ptr<GUI::NotificationManager>& notification_manager);
 
     bool helio_thread_start(std::mutex&                                slicing_mutex,
                             std::condition_variable&                   slicing_condition,
-                            BackgroundSlicingProcess::State&           slicing_state,
+                            std::atomic<BackgroundSlicingProcess::State>& slicing_state,
                             std::unique_ptr<GUI::NotificationManager>& notification_manager);
 
     // Invalidates the prior action and reaps it only after it has completed.
