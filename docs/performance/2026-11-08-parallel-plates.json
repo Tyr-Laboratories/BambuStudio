@@ -1,0 +1,38 @@
+{
+  "revision": "f08730589",
+  "fixture_sha256": "863847c51b14fee8f5e3db0700d0dd8039ce0ffed7afa283b16c5b06dbfa623d",
+  "parallel_executable_sha256": "fabec21b20440982b9dbb8ff7cf3bcc365542b8fdf023209ecfe4f3d0b4e14ac",
+  "serial_executable_sha256": "217aa2513bc4ff880623a808c55441e4a5d974a015863e1023e60385e166147a",
+  "serial_seconds": 197.526416,
+  "parallel_seconds": 89.311133,
+  "speedup": 2.211666220828259,
+  "slots": 4,
+  "command_comparison": "Strip comments and surrounding whitespace; exclude object labels M486 and M624. Remaining ordered commands match exactly for every plate.",
+  "plate_commands": [
+    {
+      "plate": 1,
+      "bytes": 64700123,
+      "commands": 2472285,
+      "sha256": "1a1cd97e752924a384fe687194e6af312585bc6c35a29a52e26b8f2a4e8cd6c5"
+    },
+    {
+      "plate": 2,
+      "bytes": 64701308,
+      "commands": 2472294,
+      "sha256": "afc4a976795c6eeb31b5fab9f7c75559e2baba10049f5316521276e0c6b7399b"
+    },
+    {
+      "plate": 3,
+      "bytes": 64700052,
+      "commands": 2472278,
+      "sha256": "81fca0717e9881bd1ba4d3c494e19a9455746cdb743556846efeb9f8ffb9f69f"
+    },
+    {
+      "plate": 4,
+      "bytes": 64701350,
+      "commands": 2472294,
+      "sha256": "61fedbb0a1f920f5ed31695a20c7886a35e8c8d55a465fb12ac42591d20f9db0"
+    }
+  ],
+  "scope": "One fresh-process serial/parallel pair; other independent slicing jobs were active. Serial admission differs only by forcing the same batch scheduler to one slot."
+}

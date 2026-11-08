@@ -52,17 +52,17 @@ Interfaces: UI-owned `ParallelPlateSlicing` queue with generation, pending/runni
 
 Files: `src/slic3r/GUI/Plater.cpp`, relevant Plater declarations, PartPlate integration if needed.
 
-- [ ] Snapshot printer/mapping settings and eagerly allocate unique output paths on the UI thread; commit filament/nozzle maps on completion.
-- [ ] Prepare/apply/validate each eligible plate through the existing configuration path; retain cached results and report invalid plate ids.
-- [ ] Launch bounded independent workers; bind plate/generation-aware progress and completion events.
-- [ ] Update only completed plate results; retain aggregate progress until every admitted plate finishes.
-- [ ] Cancel/join on Cancel, edit/apply, job replacement, project load/clear, publishing cancel and destruction. Restore selection and suppress stale events.
-- [ ] Retain post-process consent and cached/imported-G-code behavior; prevent publishing an incomplete batch.
-- [ ] Build app, exercise multi-plate completion and cancellation in UI, measure serial versus parallel whole-project time, and commit.
+- [x] Snapshot printer/mapping settings and eagerly allocate unique output paths on the UI thread; commit filament/nozzle maps on completion.
+- [x] Prepare/apply/validate each eligible plate through the existing configuration path; retain cached results and report invalid plate ids.
+- [x] Launch bounded independent workers; bind plate/generation-aware progress and completion events.
+- [x] Update only completed plate results; retain aggregate progress until every admitted plate finishes.
+- [x] Cancel/join on Cancel, edit/apply, job replacement, project load/clear, publishing cancel and destruction. Restore selection and suppress stale events.
+- [x] Retain post-process consent and cached/imported-G-code behavior; prevent publishing an incomplete batch.
+- [x] Build app, exercise multi-plate completion and cancellation in UI, measure serial versus parallel whole-project time, and commit.
 
 ## Task 4: Release the complete optimization
 
-- [ ] Finish paired Organic benchmarks and full geometry/interface regressions; document exact artifacts, metrics and evidence limits.
-- [ ] Re-run affected GUI/core checks and packaging validation after integration review.
+- [x] Finish paired Organic benchmarks and full geometry/interface regressions; document exact artifacts, metrics and evidence limits.
+- [x] Re-run affected GUI/core checks and packaging validation after integration review.
 - [ ] Package matching app and corresponding source; install with profile/session preservation and verify the launched build.
 - [ ] Merge into default master, publish next unused Tyr release with verified assets, and remove temporary profiling/rollback artifacts.
