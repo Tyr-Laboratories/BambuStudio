@@ -104,3 +104,7 @@ add_executable(organic_foundation_tests fff_print_tests.cpp test_organic_foundat
 target_link_libraries(organic_foundation_tests test_common libslic3r slicer_test_support)
 set_property(TARGET organic_foundation_tests PROPERTY FOLDER "tests")
 add_test(organic_foundation_tests organic_foundation_tests ${CATCH_EXTRA_ARGS})
+
+add_executable(benchmark_organic_support benchmark_organic_support.cpp)
+target_link_libraries(benchmark_organic_support test_common libslic3r slicer_test_support)
+set_property(TARGET benchmark_organic_support PROPERTY FOLDER "tests")

@@ -773,7 +773,12 @@ void TreeModelVolumes::calculateCollisionHolefree(const std::vector<RadiusLayerP
         data.reserve(range.size() * keys.size());
         for (LayerIndex layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
             for (RadiusLayerPair key : keys)
-                if (layer_idx <= key.second) {
+                if (layer_idx <= key.second && !m_collision_cache_holefree.getArea({key.first, layer_idx})) {
+                    // Forward trees precompute this table in one batch. A
+                    // reversed view requests it lazily while growing away from
+                    // its seam, so an uncached layer must not recompute every
+                    // preceding layer. Keep the same polygons and allow holes
+                    // left by cancellation to be filled on a later request.
                     // Logically increase the collision by m_increase_until_radius
                     coord_t radius = key.first;
                     assert(radius == this->ceilRadius(radius));
@@ -831,6 +836,21 @@ void TreeModelVolumes::calculateAvoidance(const std::vector<RadiusLayerPair> &ke
 
     if(throw_on_cancel)
         throw_on_cancel();
+
+    if (m_reversed_source) {
+        // Slow and FastSafe consume the same hole-free collision table. Fill
+        // its missing rows once before those tasks run in parallel, instead of
+        // letting both repeatedly launch nested per-layer calculations. Warm
+        // the shared physical collision source before parallel cache readers.
+        std::vector<RadiusLayerPair> holefree_keys;
+        for (const RadiusLayerPair &key : keys)
+            if (key.first < m_increase_until_radius + m_current_min_xy_dist_delta)
+                holefree_keys.push_back(key);
+        if (!holefree_keys.empty()) {
+            getCollision(m_increase_until_radius, 0, false);
+            calculateCollisionHolefree(holefree_keys, throw_on_cancel);
+        }
+    }
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, avoidance_tasks.size(), 1),
         [this, &avoidance_tasks, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {

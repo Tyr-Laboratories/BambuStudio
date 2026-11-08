@@ -195,6 +195,39 @@ TEST_CASE("Reversed foundations do not land on intermediate model surfaces", "[O
     }
 }
 
+TEST_CASE("Lazy reversed avoidance work grows linearly with the requested height", "[OrganicFoundation][Volumes][CacheWork]")
+{
+    FoundationVolumeScene scene;
+    TreeSupportSettings settings(TreeSupportMeshGroupSettings(scene.object()), scene.object().slicing_parameters());
+    TreeModelVolumes source(scene.object(), scene.bed(), settings.maximum_move_distance, settings.maximum_move_distance_slow, 0);
+    const LayerIndex seam = scene.layer(15.);
+    source.precalculate(scene.object(), seam, [] {});
+    // Cancellation polls mark actual per-layer work without a timing assertion
+    // that depends on CPU speed or other processes. A cold lazy lookup must not
+    // rebuild layers 0..N for every newly requested layer of the same radius.
+    auto work = [&](LayerIndex height) {
+        std::atomic<size_t> polls{0};
+        TreeModelVolumes reversed(source, seam, scene.seam(), [&] { ++polls; });
+        reversed.getAvoidance(settings.min_radius, height, TreeModelVolumes::AvoidanceType::FastSafe, false, true);
+        return polls.load();
+    };
+    const size_t short_work = work(20);
+    const size_t tall_work = work(40);
+    CAPTURE(short_work, tall_work);
+    CHECK(tall_work <= short_work * 2.25);
+
+    TreeModelVolumes incremental(source, seam, scene.seam());
+    incremental.getAvoidance(settings.min_radius, 20, TreeModelVolumes::AvoidanceType::FastSafe, false, true);
+    TreeModelVolumes cold(source, seam, scene.seam());
+    for (const auto type : {TreeModelVolumes::AvoidanceType::FastSafe, TreeModelVolumes::AvoidanceType::Fast,
+                            TreeModelVolumes::AvoidanceType::Slow}) {
+        const Polygons &expected = cold.getAvoidance(settings.min_radius, 40, type, false, true);
+        const Polygons &actual = incremental.getAvoidance(settings.min_radius, 40, type, false, true);
+        CHECK(diff(actual, expected).empty());
+        CHECK(diff(expected, actual).empty());
+    }
+}
+
 TEST_CASE("Reversed foundation wall restrictions use the next physical layer above", "[OrganicFoundation][Volumes]")
 {
     FoundationVolumeScene scene;
