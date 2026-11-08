@@ -152,10 +152,14 @@ static ExtrusionPaths floating_thick_polyline_to_extrusion_paths(const FloatingT
                     assert(width.size() == segments * 2);
                 }
 
-                // delete this line and insert new ones
+                // Erasing shifts the following segment into this slot, and
+                // inserting may reallocate. Preserve the source flags before
+                // either operation invalidates the reference to line.
+                const bool is_a_floating = line.is_a_floating;
+                const bool is_b_floating = line.is_b_floating;
                 lines.erase(lines.begin() + i);
                 for (size_t j = 0; j < segments; ++j) {
-                    FloatingThickline new_line(pp[j], pp[j + 1],width[2 * j],width[2 * j+1], line.is_a_floating,line.is_b_floating);
+                    FloatingThickline new_line(pp[j], pp[j + 1],width[2 * j],width[2 * j+1], is_a_floating, is_b_floating);
                     lines.insert(lines.begin() + i + j, new_line);
                 }
                 --i;
