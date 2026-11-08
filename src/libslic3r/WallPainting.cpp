@@ -228,6 +228,21 @@ std::vector<std::pair<Line,int>> BoundaryPolicy::split(const Line &line) const
     std::vector<BoundarySpan> nearby;
     for (size_t index:m_index->within(middle,radius*radius)) nearby.push_back(m_spans[index]);
     const auto cuts=endpoints(line,nearby);
+    if (!nearby.empty()) {
+        const int count=nearby.front().count;
+        if (std::all_of(nearby.begin(),nearby.end(),[count](const BoundarySpan &span){return span.count==count;})) {
+            // Include integer projection rounding and count_at's shared-vertex
+            // tolerance before treating the entire neighborhood as uniform.
+            const double guarded_radius=radius+3.;
+            const auto guarded=m_index->within(middle,guarded_radius*guarded_radius);
+            if (std::all_of(guarded.begin(),guarded.end(),[&](size_t index){return m_spans[index].count==count;})) {
+                // Retain the original cut coalescer's endpoint rounding. Only
+                // the repeated count queries at interior cuts are redundant.
+                result.emplace_back(Line(along(line,cuts.front()),along(line,cuts.back())),count);
+                return result;
+            }
+        }
+    }
     for (size_t c=1;c<cuts.size();++c) {
         const int count=count_at(along(line,(cuts[c-1]+cuts[c])/2.));
         const Point end=along(line,cuts[c]);

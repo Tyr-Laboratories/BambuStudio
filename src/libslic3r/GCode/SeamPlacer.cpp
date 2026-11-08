@@ -609,6 +609,7 @@ void compute_global_occlusion(GlobalModelInfo &result, const PrintObject *po, st
     result.mesh_samples                    = sample_its_uniform_parallel(SeamPlacer::raycasting_visibility_samples_count, triangle_set);
     result.mesh_samples_coordinate_functor = CoordinateFunctor(&result.mesh_samples.positions);
     result.mesh_samples_tree               = KDTreeIndirect<3, float, CoordinateFunctor>(result.mesh_samples_coordinate_functor, result.mesh_samples.positions.size());
+    result.mesh_samples_tree.build_radius_index();
 
     // The following code determines search area for random visibility samples on the mesh when calculating visibility of each perimeter point
     // number of random samples in the given radius (area) is approximately poisson distribution
@@ -943,6 +944,7 @@ void SeamPlacer::gather_seam_candidates(const PrintObject *po, const SeamPlacerI
             }
             auto functor                            = SeamCandidateCoordinateFunctor{layer_seams.points};
             seam_data.layers[layer_idx].points_tree = std::make_unique<PrintObjectSeamData::SeamCandidatesTree>(functor, layer_seams.points.size());
+            seam_data.layers[layer_idx].points_tree->build_radius_index();
         }
     });
 }

@@ -4,6 +4,7 @@
 #define slic3r_KDTreeIndirect_hpp_
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <vector>
 
@@ -33,9 +34,9 @@ public:
     KDTreeIndirect(CoordinateFn coordinate) : coordinate(coordinate) {}
     KDTreeIndirect(CoordinateFn coordinate, std::vector<size_t> indices) : coordinate(coordinate) { this->build(indices); }
     KDTreeIndirect(CoordinateFn coordinate, size_t num_indices) : coordinate(coordinate) { this->build(num_indices); }
-    KDTreeIndirect(KDTreeIndirect &&rhs) : m_nodes(std::move(rhs.m_nodes)), coordinate(std::move(rhs.coordinate)) {}
-    KDTreeIndirect& operator=(KDTreeIndirect &&rhs) { m_nodes = std::move(rhs.m_nodes); coordinate = std::move(rhs.coordinate); return *this; }
-    void clear() { m_nodes.clear(); }
+    KDTreeIndirect(KDTreeIndirect &&rhs) : m_nodes(std::move(rhs.m_nodes)), m_radius_bounds(std::move(rhs.m_radius_bounds)), coordinate(std::move(rhs.coordinate)) {}
+    KDTreeIndirect& operator=(KDTreeIndirect &&rhs) { m_nodes = std::move(rhs.m_nodes); m_radius_bounds = std::move(rhs.m_radius_bounds); coordinate = std::move(rhs.coordinate); return *this; }
+    void clear() { m_nodes.clear(); m_radius_bounds.clear(); }
 
     void build(size_t num_indices)
     {
@@ -48,6 +49,7 @@ public:
 
     void build(std::vector<size_t> &indices)
     {
+        m_radius_bounds.clear();
         if (indices.empty())
             clear();
         else {
@@ -74,6 +76,44 @@ public:
     void visit(Visitor &visitor) const
     {
         visit_recursive(0, 0, visitor);
+    }
+
+    // Optional tight subtree bounds for indexes queried repeatedly by radius.
+    // Build before sharing the immutable tree with query threads. Other users
+    // retain the original storage and traversal; rebuilding invalidates bounds.
+    void build_radius_index()
+    {
+        m_radius_bounds.resize(m_nodes.size());
+        for (size_t node = m_nodes.size(); node-- > 0;) {
+            if (m_nodes[node] == npos)
+                continue;
+            auto &bounds = m_radius_bounds[node];
+            for (size_t d = 0; d < NumDimensions; ++d)
+                bounds.minimum[d] = bounds.maximum[d] = coordinate(m_nodes[node], d);
+            for (size_t child : {node * 2 + 1, node * 2 + 2}) {
+                if (child >= m_nodes.size() || m_nodes[child] == npos)
+                    continue;
+                for (size_t d = 0; d < NumDimensions; ++d) {
+                    bounds.minimum[d] = std::min(bounds.minimum[d], m_radius_bounds[child].minimum[d]);
+                    bounds.maximum[d] = std::max(bounds.maximum[d], m_radius_bounds[child].maximum[d]);
+                }
+            }
+        }
+    }
+
+    bool has_radius_index() const { return !m_radius_bounds.empty(); }
+
+    // Retain the original preorder, including floating-point accumulation order
+    // in callers, while excluding subtrees whose boxes cannot meet the sphere.
+    template<typename PointType, typename Visitor>
+    void visit_within_radius(const PointType &center, CoordType radius_squared, Visitor &visitor) const
+    {
+        if (m_nodes.empty())
+            return;
+        if (m_radius_bounds.empty())
+            visit_recursive(0, 0, visitor);
+        else
+            visit_radius_recursive(0, 0, center, radius_squared, visitor);
     }
 
     CoordinateFn coordinate;
@@ -186,7 +226,34 @@ private:
         }
     }
 
+    template<typename PointType, typename Visitor>
+    void visit_radius_recursive(size_t node, size_t dimension, const PointType &center,
+                                CoordType radius_squared, Visitor &visitor) const
+    {
+        if (node >= m_nodes.size() || m_nodes[node] == npos)
+            return;
+        const auto &bounds = m_radius_bounds[node];
+        CoordType lower_bound = 0;
+        for (size_t d = 0; d < NumDimensions; ++d) {
+            const CoordType distance = std::max(CoordType(0), std::max(bounds.minimum[d] - center[d], center[d] - bounds.maximum[d]));
+            lower_bound += distance * distance;
+        }
+        if (lower_bound > radius_squared + CoordType(EPSILON))
+            return;
+        const unsigned int mask = visitor(m_nodes[node], dimension);
+        if (mask & unsigned(VisitorReturnMask::STOP))
+            return;
+
+        const size_t next_dimension = dimension + 1 == NumDimensions ? 0 : dimension + 1;
+        if (mask & unsigned(VisitorReturnMask::CONTINUE_LEFT))
+            visit_radius_recursive(node * 2 + 1, next_dimension, center, radius_squared, visitor);
+        if (mask & unsigned(VisitorReturnMask::CONTINUE_RIGHT))
+            visit_radius_recursive(node * 2 + 2, next_dimension, center, radius_squared, visitor);
+    }
+
     std::vector<size_t> m_nodes;
+    struct RadiusBounds { std::array<CoordType, NumDimensions> minimum, maximum; };
+    std::vector<RadiusBounds> m_radius_bounds;
 };
 
 // Find a closest point using Euclidian metrics.
@@ -288,11 +355,12 @@ std::vector<size_t> find_nearby_points(const KDTreeIndirectType &kdtree, const P
         const PointType center;
         const CoordType max_distance_squared;
         const FilterFn filter;
+        const bool indexed;
         std::vector<size_t> result;
 
         Visitor(const KDTreeIndirectType &kdtree, const PointType& center, const CoordType &max_distance,
                 FilterFn filter) :
-            kdtree(kdtree), center(center), max_distance_squared(max_distance*max_distance), filter(filter) {
+            kdtree(kdtree), center(center), max_distance_squared(max_distance*max_distance), filter(filter), indexed(kdtree.has_radius_index()) {
         }
         unsigned int operator()(size_t idx, size_t dimension) {
             if (this->filter(idx)) {
@@ -305,11 +373,14 @@ std::vector<size_t> find_nearby_points(const KDTreeIndirectType &kdtree, const P
                     result.push_back(idx);
                 }
             }
-            return kdtree.descent_mask(center[dimension], max_distance_squared, idx, dimension);
+            // Tight child boxes already include the split-plane constraints.
+            // Avoid fetching the split coordinate again in the indexed path.
+            return indexed ? (unsigned(VisitorReturnMask::CONTINUE_LEFT) | unsigned(VisitorReturnMask::CONTINUE_RIGHT)) :
+                kdtree.descent_mask(center[dimension], max_distance_squared, idx, dimension);
         }
     } visitor(kdtree, center, max_distance, filter);
 
-    kdtree.visit(visitor);
+    kdtree.visit_within_radius(center, visitor.max_distance_squared, visitor);
     return visitor.result;
 }
 
