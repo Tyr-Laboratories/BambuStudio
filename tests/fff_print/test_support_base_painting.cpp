@@ -15,6 +15,164 @@
 
 using namespace Slic3r;
 
+namespace {
+using SlopeDirection = TriangleSelector::SlopeDirection;
+
+enum class BasePaintTool { Sphere, Circle, SmartFill };
+
+// An open triangle isolates the direction filter from unrelated closed-model
+// topology. Its center is the cursor hit and its outward normal is prescribed.
+TriangleMesh slope_triangle(const Vec3f &normal)
+{
+    const Vec3f u(normal.z(), 0.f, -normal.x());
+    const Vec3f v(0.f, 1.f, 0.f);
+    indexed_triangle_set mesh;
+    mesh.vertices = {-2.f * u - 2.f * v, 2.f * u - 2.f * v, 4.f * v};
+    mesh.indices = {Vec3i(0, 1, 2)};
+    return TriangleMesh(mesh);
+}
+
+void paint_slope(TriangleSelector &selector, const TriangleMesh &mesh, BasePaintTool tool,
+                 float angle, SlopeDirection direction, const Transform3d &transform = Transform3d::Identity(),
+                 EnforcerBlockerType state = EnforcerBlockerType::ENFORCER, float radius = 40.f,
+                 bool explicit_direction = true)
+{
+    const auto &face = mesh.its.indices.front();
+    const auto &vertices = mesh.its.vertices;
+    const Vec3f center = (vertices[face[0]] + vertices[face[1]] + vertices[face[2]]) / 3.f;
+    const Vec3f normal = (vertices[face[1]] - vertices[face[0]]).cross(vertices[face[2]] - vertices[face[0]]).normalized();
+    if (tool == BasePaintTool::SmartFill) {
+        if (explicit_direction)
+            selector.seed_fill_select_triangles(center, 0, transform, {}, 180.f, angle, true, direction);
+        else
+            selector.seed_fill_select_triangles(center, 0, transform, {}, 180.f, angle, true);
+        selector.seed_fill_apply_on_triangles(state);
+    } else {
+        auto cursor = TriangleSelector::SinglePointCursor::cursor_factory(
+            center, center + 20.f * normal, radius,
+            tool == BasePaintTool::Sphere ? TriangleSelector::SPHERE : TriangleSelector::CIRCLE,
+            transform, {});
+        if (explicit_direction)
+            selector.select_patch(0, std::move(cursor), state, transform, true, angle, direction);
+        else
+            selector.select_patch(0, std::move(cursor), state, transform, true, angle);
+    }
+}
+} // namespace
+
+TEST_CASE("Support base brushes and smart fill mirror the stock slope filter upward", "[SupportBase][Underhang]")
+{
+    const auto tool = GENERATE(BasePaintTool::Sphere, BasePaintTool::Circle, BasePaintTool::SmartFill);
+    const float angle = GENERATE(0.f, 33.f, 65.f, 90.f);
+    const auto direction = GENERATE(SlopeDirection::Downward, SlopeDirection::Upward);
+    struct Surface { Vec3f normal; float from_up; };
+    const std::vector<Surface> surfaces = {
+        {Vec3f(0.f, 0.f, 1.f), 0.f}, {Vec3f(.5f, 0.f, std::sqrt(.75f)), 30.f},
+        {Vec3f(std::sqrt(.75f), 0.f, .5f), 60.f}, {Vec3f(1.f, 0.f, 0.f), 90.f},
+        {Vec3f(std::sqrt(.75f), 0.f, -.5f), 120.f}, {Vec3f(.5f, 0.f, -std::sqrt(.75f)), 150.f},
+        {Vec3f(0.f, 0.f, -1.f), 180.f}
+    };
+    for (const auto &surface : surfaces) {
+        CAPTURE(int(tool), angle, int(direction), surface.from_up);
+        const TriangleMesh mesh = slope_triangle(surface.normal);
+        TriangleSelector selector(mesh);
+        paint_slope(selector, mesh, tool, angle, direction);
+        const float from_direction = direction == SlopeDirection::Upward ? surface.from_up : 180.f - surface.from_up;
+        // Downward retains the stock floating point boundary at exactly 90°;
+        // upward must never admit a vertical surface, including at its maximum.
+        if (!(direction == SlopeDirection::Downward && angle == 90.f && surface.from_up == 90.f))
+            CHECK(selector.has_facets(EnforcerBlockerType::ENFORCER) == (angle == 0.f || from_direction < angle));
+        if (direction == SlopeDirection::Downward) {
+            TriangleSelector stock(mesh);
+            paint_slope(stock, mesh, tool, angle, direction, Transform3d::Identity(), EnforcerBlockerType::ENFORCER, 40.f, false);
+            CHECK(stock.serialize() == selector.serialize());
+        }
+    }
+}
+
+TEST_CASE("Support base slope filters use world normals after rotation reflection and scaling", "[SupportBase][Underhang]")
+{
+    const auto tool = GENERATE(BasePaintTool::Sphere, BasePaintTool::Circle, BasePaintTool::SmartFill);
+    struct SurfaceTransform { const char *name; Vec3f normal; Transform3d transform; bool paintable; };
+    Transform3d tilt = Transform3d::Identity();
+    tilt.rotate(Eigen::AngleAxisd(PI / 3., Vec3d::UnitY()));
+    Transform3d turn_upright = Transform3d::Identity();
+    turn_upright.rotate(Eigen::AngleAxisd(-PI / 2., Vec3d::UnitY()));
+    Transform3d mirror_xy = Transform3d::Identity(); mirror_xy.scale(Vec3d(-1., 1., 1.));
+    Transform3d mirror_z = Transform3d::Identity(); mirror_z.scale(Vec3d(1., 1., -1.));
+    Transform3d stretch_x = Transform3d::Identity(); stretch_x.scale(Vec3d(3., 1., 1.));
+    Transform3d stretch_z = Transform3d::Identity(); stretch_z.scale(Vec3d(1., 1., 3.));
+    Transform3d mixed = Transform3d::Identity();
+    mixed.rotate(Eigen::AngleAxisd(PI / 6., Vec3d::UnitY())); mixed.scale(Vec3d(-3., 2., 1.));
+    const std::vector<SurfaceTransform> cases = {
+        {"flat top tilted beyond threshold", Vec3f::UnitZ(), tilt, false},
+        {"vertical facet rotated upward", Vec3f::UnitX(), turn_upright, true},
+        {"top reflected horizontally", Vec3f::UnitZ(), mirror_xy, true},
+        {"top reflected downward", Vec3f::UnitZ(), mirror_z, false},
+        {"bottom reflected upward", -Vec3f::UnitZ(), mirror_z, true},
+        {"steep slope flattened by X scale", Vec3f(std::sqrt(.75f), 0.f, .5f), stretch_x, true},
+        {"shallow slope steepened by Z scale", Vec3f(.5f, 0.f, std::sqrt(.75f)), stretch_z, false},
+        {"rotated reflected and nonuniformly scaled", Vec3f(std::sqrt(.75f), 0.f, .5f), mixed, true}
+    };
+    for (const auto &test : cases) {
+        CAPTURE(int(tool), test.name);
+        const TriangleMesh mesh = slope_triangle(test.normal);
+        TriangleSelector selector(mesh);
+        paint_slope(selector, mesh, tool, 45.f, SlopeDirection::Upward, test.transform);
+        CHECK(selector.has_facets(EnforcerBlockerType::ENFORCER) == test.paintable);
+    }
+}
+
+TEST_CASE("Support base direction filtering remains local while fill traverses neighboring faces", "[SupportBase][Underhang]")
+{
+    const auto tool = GENERATE(BasePaintTool::Sphere, BasePaintTool::Circle, BasePaintTool::SmartFill);
+    const TriangleMesh mesh(its_make_cube(10., 10., 10.));
+    TriangleSelector selector(mesh);
+    int top = -1;
+    for (size_t i = 0; i < mesh.its.indices.size(); ++i) {
+        const auto &face = mesh.its.indices[i];
+        const auto &v = mesh.its.vertices;
+        if ((v[face[1]] - v[face[0]]).cross(v[face[2]] - v[face[0]]).z() > 0.f) { top = int(i); break; }
+    }
+    REQUIRE(top >= 0);
+    const auto &face = mesh.its.indices[top];
+    const Vec3f hit = (mesh.its.vertices[face[0]] + mesh.its.vertices[face[1]] + mesh.its.vertices[face[2]]) / 3.f;
+    if (tool == BasePaintTool::SmartFill) {
+        selector.seed_fill_select_triangles(hit, top, Transform3d::Identity(), {}, 180.f, 90.f, true, SlopeDirection::Upward);
+        selector.seed_fill_apply_on_triangles(EnforcerBlockerType::ENFORCER);
+    } else {
+        selector.select_patch(top, TriangleSelector::SinglePointCursor::cursor_factory(
+            hit, hit + Vec3f(0.f, 0.f, 20.f), 100.f,
+            tool == BasePaintTool::Sphere ? TriangleSelector::SPHERE : TriangleSelector::CIRCLE, Transform3d::Identity(), {}),
+            EnforcerBlockerType::ENFORCER, Transform3d::Identity(), true, 90.f, SlopeDirection::Upward);
+    }
+    const auto selected = selector.get_facets(EnforcerBlockerType::ENFORCER);
+    REQUIRE(selected.indices.size() == 2);
+    for (const auto &selected_face : selected.indices)
+        for (int vertex : selected_face)
+            CHECK(selected.vertices[vertex].z() == Approx(10.f));
+}
+
+TEST_CASE("Support base filters retain split facets and apply to painting and erasing", "[SupportBase][Underhang]")
+{
+    const auto tool = GENERATE(BasePaintTool::Sphere, BasePaintTool::Circle, BasePaintTool::SmartFill);
+    const TriangleMesh mesh = slope_triangle(Vec3f::UnitZ());
+    TriangleSelector selector(mesh);
+    paint_slope(selector, mesh, BasePaintTool::Sphere, 0.f, SlopeDirection::Downward,
+                Transform3d::Identity(), EnforcerBlockerType::ENFORCER, .5f);
+    REQUIRE(selector.get_triangles().size() > mesh.its.indices.size());
+    REQUIRE(selector.has_facets(EnforcerBlockerType::ENFORCER));
+    const auto partial = selector.serialize();
+    paint_slope(selector, mesh, tool, 45.f, SlopeDirection::Downward,
+                Transform3d::Identity(), EnforcerBlockerType::NONE);
+    CHECK(selector.serialize() == partial);
+    paint_slope(selector, mesh, tool, 45.f, SlopeDirection::Upward,
+                Transform3d::Identity(), EnforcerBlockerType::NONE);
+    CHECK_FALSE(selector.has_facets(EnforcerBlockerType::ENFORCER));
+    paint_slope(selector, mesh, tool, 45.f, SlopeDirection::Upward);
+    CHECK(selector.has_facets(EnforcerBlockerType::ENFORCER));
+}
+
 TEST_CASE("Support base paint is independent, copied, and erased independently", "[SupportBase][Model]")
 {
     Model model;

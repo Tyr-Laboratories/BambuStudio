@@ -21,6 +21,9 @@ protected:
     struct Vertex;
 
 public:
+    // Direction of the world-space face normal accepted by the slope filter.
+    enum class SlopeDirection { Downward, Upward };
+
     enum CursorType {
         CIRCLE,
         SPHERE,
@@ -232,15 +235,17 @@ public:
                       EnforcerBlockerType       new_state,                     // enforcer or blocker?
                       const Transform3d        &trafo_no_translate,            // matrix to get from mesh to world without translation
                       bool                      triangle_splitting,            // If triangles will be split base on the cursor or not
-                      float                     highlight_by_angle_deg = 0.f); // The maximal angle of overhang. If it is set to a non-zero value, it is possible to paint only the triangles of overhang defined by this angle in degrees.
+                      float                     highlight_by_angle_deg = 0.f, // The maximal face slope from horizontal. Zero disables the slope filter.
+                      SlopeDirection            direction = SlopeDirection::Downward);
 
     void seed_fill_select_triangles(const Vec3f        &hit,                          // point where to start
                                     int                 facet_start,                  // facet of the original mesh (unsplit) that the hit point belongs to
                                     const Transform3d  &trafo_no_translate,           // matrix to get from mesh to world without translation
                                     const ClippingPlane &clp,                         // Clipping plane to limit painting to not clipped facets only
                                     float               seed_fill_angle,              // the maximal angle between two facets to be painted by the same color
-                                    float               highlight_by_angle_deg = 0.f, // The maximal angle of overhang. If it is set to a non-zero value, it is possible to paint only the triangles of overhang defined by this angle in degrees.
-                                    bool                force_reselection = false);   // force reselection of the triangle mesh even in cases that mouse is pointing on the selected triangle
+                                    float               highlight_by_angle_deg = 0.f, // The maximal face slope from horizontal. Zero disables the slope filter.
+                                    bool                force_reselection = false,   // force reselection of the triangle mesh even in cases that mouse is pointing on the selected triangle
+                                    SlopeDirection      direction = SlopeDirection::Downward);
 
     void bucket_fill_select_triangles(const Vec3f         &hit,                        // point where to start
                                       int                  facet_start,                // facet of the original mesh (unsplit) that the hit point belongs to

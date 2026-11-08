@@ -26,6 +26,12 @@
 
 Integration: commit and push `codex/support-base-painting`, then merge only this feature into public `master` after verification.
 
+## Underhang filter follow-up
+
+- [x] Mirror the existing brush and Fill angle test to accept upward-facing facets for base painting, retaining the default downward test for other painters.
+- [x] Add the base-mode checkbox, angle slider, matching highlight, independent channel values, and Undo restoration. Invalidate pending Fill selections when filter controls change.
+- [x] Verify brush and Fill results on horizontal, sloped, vertical, downward-facing, transformed, and split facets; rebuild and review the native app before packaging the follow-up release.
+
 ## Review focus
 
 Check independent paint survives geometry sharing and mesh changes. Check invalid or undersized paint cannot enable unrestricted model contact. Check merged branches preserve their valid destination. Check raft/contact-gap indexing. Check ordinary routing remains unchanged when the feature is ineffective or unrestricted model contact is already enabled.

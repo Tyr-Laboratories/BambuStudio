@@ -286,7 +286,7 @@ int TriangleSelector::select_unsplit_triangle(const Vec3f &hit, int facet_idx) c
     return this->select_unsplit_triangle(hit, facet_idx, neighbors);
 }
 
-void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&cursor, EnforcerBlockerType new_state, const Transform3d& trafo_no_translate, bool triangle_splitting, float highlight_by_angle_deg)
+void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&cursor, EnforcerBlockerType new_state, const Transform3d& trafo_no_translate, bool triangle_splitting, float highlight_by_angle_deg, SlopeDirection direction)
 {
     assert(facet_start < m_orig_size_indices);
 
@@ -310,7 +310,11 @@ void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&c
         }
     }
 
-    const float highlight_angle_limit = -cos(Geometry::deg2rad(highlight_by_angle_deg));
+    float highlight_angle_limit = -cos(Geometry::deg2rad(highlight_by_angle_deg));
+    // At 90 degrees float rounding may make the stock limit slightly positive.
+    // A support-base filter must still exclude exactly vertical surfaces.
+    if (direction == SlopeDirection::Upward)
+        highlight_angle_limit = std::min(0.f, highlight_angle_limit);
 
     // BBS
     std::vector<int> start_facets;
@@ -348,6 +352,8 @@ void TriangleSelector::select_patch(int facet_start, std::unique_ptr<Cursor> &&c
             const Vec3f& facet_normal = m_face_normals[m_triangles[facet].source_triangle];
             Matrix3f     normal_matrix = static_cast<Matrix3f>(trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
             float        world_normal_z = (normal_matrix* facet_normal).normalized().z();
+            if (direction == SlopeDirection::Upward)
+                world_normal_z = -world_normal_z;
             if (!visited[facet] && (highlight_by_angle_deg == 0.f || world_normal_z < highlight_angle_limit)) {
                 if (select_triangle(facet, new_state, triangle_splitting)) {
                     // add neighboring facets to list to be processed later
@@ -373,7 +379,7 @@ bool TriangleSelector::is_facet_clipped(int facet_idx, const ClippingPlane &clp)
 
 void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_start, const Transform3d& trafo_no_translate,
                                                   const ClippingPlane &clp, float seed_fill_angle, float highlight_by_angle_deg,
-                                                  bool force_reselection)
+                                                  bool force_reselection, SlopeDirection direction)
 {
     assert(facet_start < m_orig_size_indices);
 
@@ -388,7 +394,9 @@ void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_st
     facet_queue.push(facet_start);
 
     const double facet_angle_limit     = cos(Geometry::deg2rad(seed_fill_angle)) - EPSILON;
-    const float  highlight_angle_limit = -cos(Geometry::deg2rad(highlight_by_angle_deg));
+    float        highlight_angle_limit = -cos(Geometry::deg2rad(highlight_by_angle_deg));
+    if (direction == SlopeDirection::Upward)
+        highlight_angle_limit = std::min(0.f, highlight_angle_limit);
 
     // Depth-first traversal of neighbors of the face hit by the ray thrown from the mouse cursor.
     while (!facet_queue.empty()) {
@@ -398,6 +406,8 @@ void TriangleSelector::seed_fill_select_triangles(const Vec3f &hit, int facet_st
         const Vec3f &facet_normal = m_face_normals[m_triangles[current_facet].source_triangle];
         Matrix3f     normal_matrix  = static_cast<Matrix3f>(trafo_no_translate.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
         float        world_normal_z = (normal_matrix * facet_normal).normalized().z();
+        if (direction == SlopeDirection::Upward)
+            world_normal_z = -world_normal_z;
         if (!visited[current_facet] && (highlight_by_angle_deg == 0.f || world_normal_z < highlight_angle_limit)) {
             if (m_triangles[current_facet].is_split()) {
                 for (int split_triangle_idx = 0; split_triangle_idx <= m_triangles[current_facet].number_of_split_sides(); ++split_triangle_idx) {

@@ -41,6 +41,8 @@ protected:
     wxString handle_snapshot_action_name(bool shift_down, Button button_down) const override;
     EnforcerBlockerType get_right_button_state_type() const override
         { return m_paint_support_bases ? EnforcerBlockerType::NONE : EnforcerBlockerType::BLOCKER; }
+    TriangleSelector::SlopeDirection get_painting_slope_direction() const override
+        { return m_paint_support_bases ? TriangleSelector::SlopeDirection::Upward : TriangleSelector::SlopeDirection::Downward; }
     std::array<float, 4> get_cursor_sphere_left_button_color() const override
         { return m_paint_support_bases ? std::array<float, 4>{0.05f, 0.8f, 0.35f, 0.4f} : GLGizmoPainterBase::get_cursor_sphere_left_button_color(); }
     std::array<float, 4> get_cursor_sphere_right_button_color() const override
@@ -63,10 +65,15 @@ private:
     void tool_changed(wchar_t old_tool, wchar_t new_tool);
     void set_base_painting(bool enabled);
     void refresh_mode_descriptions();
+    void clear_slope_filter_preview();
     void on_load(cereal::BinaryInputArchive &ar) override;
     void on_save(cereal::BinaryOutputArchive &ar) const override;
     bool m_paint_support_bases = false;
     bool m_requirements_overhangs_only = false;
+    bool m_bases_underhangs_only = false;
+    float m_requirements_highlight_angle_deg = 0.f;
+    float m_bases_highlight_angle_deg = 40.f;
+    bool m_restore_slope_angles = false;
 
     void on_opening() override;
     void on_shutdown() override;
