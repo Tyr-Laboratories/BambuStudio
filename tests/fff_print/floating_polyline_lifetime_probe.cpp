@@ -7,14 +7,15 @@
 int main()
 {
     using namespace Slic3r;
-    for (bool trailing_nonfloating : {false, true}) {
+    for (double trailing_width : {0., 600000., 800000.}) {
+        const bool trailing_nonfloating = trailing_width > 0;
         FloatingThickPolyline polyline;
         polyline.points = {Point(0, 0), Point(10000000, 0)};
         polyline.width = {200000., 600000.};
         polyline.is_floating = {true, true};
         if (trailing_nonfloating) {
             polyline.points.emplace_back(20000000, 0);
-            polyline.width.insert(polyline.width.end(), {600000., 600000.});
+            polyline.width.insert(polyline.width.end(), {trailing_width, trailing_width});
             polyline.is_floating.push_back(false);
         }
         auto paths = floating_thick_polyline_to_extrusion_paths(
@@ -29,5 +30,5 @@ int main()
         }
         if (std::abs(total_length - (trailing_nonfloating ? 20000000. : 10000000.)) > 1.) return 3;
     }
-    std::cout << "Floating segment growth and following-segment flags passed.\n";
+    std::cout << "Floating segment growth, following-segment flags, and width-transition flags passed.\n";
 }

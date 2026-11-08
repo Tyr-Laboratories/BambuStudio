@@ -117,7 +117,7 @@ static ExtrusionPaths floating_thick_polyline_to_extrusion_paths(const FloatingT
                 }
                 path.polyline.append(lines[i].a);
                 if (length > SCALED_EPSILON) {
-                    if (lines[i].is_a_floating && lines[i].is_b_floating)
+                    if (is_floating)
                         path.set_customize_flag(CustomizeFlag::cfFloatingVerticalShell);
                     set_flow_for_path(path, sum / length);
                     paths.emplace_back(std::move(path));
