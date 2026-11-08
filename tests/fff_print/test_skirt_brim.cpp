@@ -32,13 +32,13 @@ static int get_brim_tool(const std::string &gcode)
 TEST_CASE("Skirt height is honored", "[Skirt]") {
     DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
     config.set_deserialize_strict({
-    	{ "skirts",					1 },
+        { "skirt_loops",					1 },
     	{ "skirt_height", 			5 },
-    	{ "perimeters", 			0 },
-    	{ "support_material_speed", 99 },
+        { "wall_loops", 			0 },
+        { "support_speed", 99 },
 		// avoid altering speeds unexpectedly
-    	{ "cooling", 				false },
-    	{ "first_layer_speed", 		"100%" }
+        { "slow_down_for_layer_cooling", 				false },
+        { "initial_layer_speed", 		99.0 }
     });
 
 	std::string gcode;
@@ -50,12 +50,14 @@ TEST_CASE("Skirt height is honored", "[Skirt]") {
     }
 
     std::map<double, bool> layers_with_skirt;
-    double support_speed = config.opt<Slic3r::ConfigOptionFloat>("support_material_speed")->value * MM_PER_MIN;
-	GCodeReader parser;
-    parser.parse_buffer(gcode, [&layers_with_skirt, &support_speed] (Slic3r::GCodeReader &self, const Slic3r::GCodeReader::GCodeLine &line) {
-        if (line.extruding(self) && self.f() == Approx(support_speed)) {
-            layers_with_skirt[self.z()] = 1;
-        }
+    bool is_skirt = false;
+    GCodeReader parser;
+    parser.apply_config(config);
+    parser.parse_buffer(gcode, [&layers_with_skirt, &is_skirt] (Slic3r::GCodeReader &self, const Slic3r::GCodeReader::GCodeLine &line) {
+        if (line.comment().find(" FEATURE: ") == 0)
+            is_skirt = line.comment() == " FEATURE: Skirt";
+        if (is_skirt && line.extruding(self) && line.dist_XY(self) > 0)
+            layers_with_skirt[line.new_Z(self)] = true;
     });
     REQUIRE(layers_with_skirt.size() == (size_t)config.opt_int("skirt_height"));
 }
@@ -63,36 +65,42 @@ TEST_CASE("Skirt height is honored", "[Skirt]") {
 SCENARIO("Original Slic3r Skirt/Brim tests", "[SkirtBrim]") {
     GIVEN("A default configuration") {
 	    DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
-		config.set_num_extruders(4);
+        config.set_num_filaments(4);
+        config.set_key_value("filament_type", new ConfigOptionStrings(std::vector<std::string>(4, "PLA")));
+        config.set_key_value("filament_is_support", new ConfigOptionBools(std::vector<unsigned char>(4, false)));
+        config.set_key_value("filament_map", new ConfigOptionInts(std::vector<int>(4, 1)));
+        config.set_key_value("flush_volumes_matrix", new ConfigOptionFloats(std::vector<double>(16, 0.)));
 		config.set_deserialize_strict({
-			{ "support_material_speed", 		99 },
-			{ "first_layer_height", 			0.3 },
-        	{ "gcode_comments", 				true },
+            { "support_speed", 		99 },
+            { "initial_layer_print_height", 			0.3 },
         	// avoid altering speeds unexpectedly
-        	{ "cooling", 						false },
-        	{ "first_layer_speed", 				"100%" },
+            { "slow_down_for_layer_cooling", 						false },
+            { "initial_layer_speed", 				99.0 },
         	// remove noise from top/solid layers
-        	{ "top_solid_layers", 				0 },
-        	{ "bottom_solid_layers", 			1 },
-			{ "start_gcode",					"T[initial_tool]\n" }
+            { "top_shell_layers", 				0 },
+            { "bottom_shell_layers", 			1 },
+            { "machine_start_gcode",					"T[initial_extruder]\n" }
         });
 
         WHEN("Brim width is set to 5") {
         	config.set_deserialize_strict({
-				{ "perimeters", 		0 },
-				{ "skirts", 			0 },
-				{ "brim_width", 		5 }
+                { "wall_loops", 		0 },
+                { "skirt_loops", 			0 },
+                { "brim_type", "outer_only" },
+                { "brim_width", 		5 }
 			});
 			THEN("Brim is generated") {
 		        std::string gcode = Slic3r::Test::slice({TestMesh::cube_20x20x20}, config);
                 bool brim_generated = false;
-                double support_speed = config.opt<Slic3r::ConfigOptionFloat>("support_material_speed")->value * MM_PER_MIN;
-			    Slic3r::GCodeReader parser;
-                parser.parse_buffer(gcode, [&brim_generated, support_speed] (Slic3r::GCodeReader& self, const Slic3r::GCodeReader::GCodeLine& line) {
-                    if (self.z() == Approx(0.3) || line.new_Z(self) == Approx(0.3)) {
-                        if (line.extruding(self) && self.f() == Approx(support_speed)) {
-                            brim_generated = true;
-                        }
+                bool is_brim = false;
+                Slic3r::GCodeReader parser;
+                parser.apply_config(config);
+                parser.parse_buffer(gcode, [&brim_generated, &is_brim] (Slic3r::GCodeReader& self, const Slic3r::GCodeReader::GCodeLine& line) {
+                    if (line.comment().find(" FEATURE: ") == 0)
+                        is_brim = line.comment() == " FEATURE: Brim";
+                    if (is_brim && line.extruding(self) && line.dist_XY(self) > 0) {
+                        REQUIRE(line.new_Z(self) == Approx(0.3));
+                        brim_generated = true;
                     }
                 });
                 REQUIRE(brim_generated);
@@ -101,8 +109,9 @@ SCENARIO("Original Slic3r Skirt/Brim tests", "[SkirtBrim]") {
 
         WHEN("Skirt area is smaller than the brim") {
             config.set_deserialize_strict({
-            	{ "skirts", 	1 },
-            	{ "brim_width", 10}
+                { "skirt_loops", 	1 },
+                { "brim_type", "outer_only" },
+                { "brim_width", 10}
             });
             THEN("Gcode generates") {
                 REQUIRE(! Slic3r::Test::slice({TestMesh::cube_20x20x20}, config).empty());
@@ -111,7 +120,7 @@ SCENARIO("Original Slic3r Skirt/Brim tests", "[SkirtBrim]") {
 
         WHEN("Skirt height is 0 and skirts > 0") {
             config.set_deserialize_strict({
-            	{ "skirts", 	  2 },
+                { "skirt_loops", 	  2 },
             	{ "skirt_height", 0 }
             });
             THEN("Gcode generates") {
@@ -154,14 +163,15 @@ SCENARIO("Original Slic3r Skirt/Brim tests", "[SkirtBrim]") {
 
         WHEN("brim width to 1 with layer_width of 0.5") {
         	config.set_deserialize_strict({
-				{ "skirts", 						0 },
-				{ "first_layer_extrusion_width", 	0.5 },
-				{ "brim_width", 					1 }
+                { "skirt_loops", 						0 },
+                { "initial_layer_line_width", 	0.5 },
+                { "brim_type", "outer_only" },
+                { "brim_width", 					1 }
         	});			
             THEN("2 brim lines") {
 		        Slic3r::Print print;
 		        Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, config);
-                REQUIRE(print.brim().entities.size() == 2);
+                REQUIRE(print.get_brimMap().at(print.objects().front()->id()).items_count() == 2);
             }
         }
 
@@ -200,16 +210,16 @@ SCENARIO("Original Slic3r Skirt/Brim tests", "[SkirtBrim]") {
         WHEN("Object is plated with overhang support and a brim") {
         	config.set_deserialize_strict({
 	            { "layer_height", 				0.4 },
-	            { "first_layer_height", 		0.4 },
-	            { "skirts", 					1 },
+                { "initial_layer_print_height", 		0.4 },
+                { "skirt_loops", 					1 },
 	            { "skirt_distance", 			0 },
-	            { "support_material_speed", 	99 },
-	            { "perimeter_extruder", 		1 },
-	            { "support_material_extruder", 	2 },
-	            { "infill_extruder", 			3 },			// ensure that a tool command gets emitted.
-	            { "cooling", 					false },		// to prevent speeds to be altered
-	            { "first_layer_speed", 			"100%" },		// to prevent speeds to be altered
-				{ "start_gcode",				"T[initial_tool]\n" }
+                { "support_speed", 	99 },
+                { "wall_filament", 		1 },
+                { "support_filament", 	2 },
+                { "sparse_infill_filament", 			3 },			// ensure that a tool command gets emitted.
+                { "slow_down_for_layer_cooling", 					false },		// to prevent speeds to be altered
+                { "initial_layer_speed", 			99.0 },		// to prevent speeds to be altered
+                { "machine_start_gcode",				"T[initial_extruder]\n" }
         	});
 
             THEN("overhang generates?") {
@@ -217,7 +227,7 @@ SCENARIO("Original Slic3r Skirt/Brim tests", "[SkirtBrim]") {
                 REQUIRE(! Slic3r::Test::slice({TestMesh::overhang}, config).empty());
             }
 
-            // config.set("support_material", true);      // to prevent speeds to be altered
+            // config.set("enable_support", true);      // to prevent speeds to be altered
 
 #if 0
 			// This test is not finished.
@@ -258,7 +268,11 @@ SCENARIO("Original Slic3r Skirt/Brim tests", "[SkirtBrim]") {
 
         }
         WHEN("Large minimum skirt length is used.") {
-            config.set("min_skirt_length", 20);
+            struct RestoreMinimumSkirtLength {
+                float saved = Print::min_skirt_length;
+                ~RestoreMinimumSkirtLength() { Print::min_skirt_length = saved; }
+            } restore_minimum_skirt_length;
+            Print::min_skirt_length = 20;
             THEN("Gcode generation doesn't crash") {
                 REQUIRE(! Slic3r::Test::slice({TestMesh::cube_20x20x20}, config).empty());
             }

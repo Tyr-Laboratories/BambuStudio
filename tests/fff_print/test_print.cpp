@@ -10,13 +10,20 @@ using namespace Slic3r;
 using namespace Slic3r::Test;
 
 SCENARIO("PrintObject: Perimeter generation", "[PrintObject]") {
-    GIVEN("20mm cube and default config") {
+    GIVEN("20mm cube, three Classic walls and 0.25mm layers") {
         WHEN("make_perimeters() is called")  {
             Slic3r::Print print;
-            Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, { { "fill_density", 0 } });
+            Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
+                { "sparse_infill_density", 0 },
+                { "wall_loops", 3 },
+                { "wall_generator", "classic" },
+                { "layer_height", 0.25 },
+                { "initial_layer_print_height", 0.25 },
+                { "top_one_wall_type", "not apply" }
+            });
 			const PrintObject &object = *print.objects().front();
-			THEN("67 layers exist in the model") {
-                REQUIRE(object.layers().size() == 66);
+            THEN("80 layers exist in the model") {
+                REQUIRE(object.layers().size() == 80);
             }
             THEN("Every layer in region 0 has 1 island of perimeters") {
                 for (const Layer *layer : object.layers())
@@ -37,7 +44,7 @@ SCENARIO("Print: Skirt generation", "[Print]") {
             Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
             	{ "skirt_height", 	1 },
         		{ "skirt_distance", 1 },
-        		{ "skirts", 		2 }
+                { "skirt_loops", 		2 }
             });
             THEN("Skirt Extrusion collection has 2 loops in it") {
                 REQUIRE(print.skirt().items_count() == 2);
@@ -51,20 +58,23 @@ SCENARIO("Print: Changing number of solid surfaces does not cause all surfaces t
     GIVEN("sliced 20mm cube and config with top_solid_surfaces = 2 and bottom_solid_surfaces = 1") {
         Slic3r::DynamicPrintConfig config = Slic3r::DynamicPrintConfig::full_print_config();
 		config.set_deserialize_strict({
-			{ "top_solid_layers",		2 },
-			{ "bottom_solid_layers",	1 },
+            { "top_shell_layers",		2 },
+            { "top_shell_thickness", 0.0 },
+            { "bottom_shell_thickness", 0.0 },
+            { "bottom_shell_layers",	1 },
 			{ "layer_height",			0.25 }, // get a known number of layers
-			{ "first_layer_height",		0.25 }
+            { "initial_layer_print_height",		0.25 }
 			});
         Slic3r::Print print;
         Slic3r::Model model;
         Slic3r::Test::init_print({TestMesh::cube_20x20x20}, print, model, config);
-        // Precondition: Ensure that the model has 2 solid top layers (39, 38)
+        // Precondition: Ensure that the model has 2 solid top layers (79, 78)
         // and one solid bottom layer (0).
 		auto test_is_solid_infill = [&print](size_t obj_id, size_t layer_id) {
 		    const Layer &layer = *(print.objects().at(obj_id)->get_layer((int)layer_id));
 		    // iterate over all of the regions in the layer
-		    for (const LayerRegion *region : layer.regions()) {
+            for (const LayerRegion *region : layer.regions()) {
+                REQUIRE(!region->fill_surfaces.surfaces.empty());
 		        // for each region, iterate over the fill surfaces
 		        for (const Surface &surface : region->fill_surfaces.surfaces)
 		            CHECK(surface.is_solid());
@@ -75,7 +85,7 @@ SCENARIO("Print: Changing number of solid surfaces does not cause all surfaces t
         test_is_solid_infill(0, 79); // should be solid
         test_is_solid_infill(0, 78); // should be solid
         WHEN("Model is re-sliced with top_solid_layers == 3") {
-			config.set("top_solid_layers", 3);
+            config.set("top_shell_layers", 3);
 			print.apply(model, config);
             print.process();
             THEN("Print object does not have 0 solid bottom layers.") {
@@ -91,37 +101,44 @@ SCENARIO("Print: Changing number of solid surfaces does not cause all surfaces t
 }
 
 SCENARIO("Print: Brim generation", "[Print]") {
-    GIVEN("20mm cube and default config, 1mm first layer width") {
+    GIVEN("20mm cube, a 0.2mm first layer and explicit outer brim") {
         WHEN("Brim is set to 3mm")  {
 	        Slic3r::Print print;
 	        Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
-	        	{ "first_layer_extrusion_width", 	1 },
-	        	{ "brim_width", 					3 }
+                { "initial_layer_print_height", 0.2 },
+                { "initial_layer_line_width", 	1 },
+                { "brim_type", "outer_only" },
+                { "brim_width", 					3 }
 	        });
-            THEN("Brim Extrusion collection has 3 loops in it") {
-                REQUIRE(print.brim().items_count() == 3);
+            // Brim is quantized to pairs of lines. With 1mm width and
+            // 0.2mm height the 0.957mm spacing fits one pair inside 3mm.
+            THEN("Brim Extrusion collection has 2 loops in it") {
+                REQUIRE(print.get_brimMap().at(print.objects().front()->id()).items_count() == 2);
             }
         }
         WHEN("Brim is set to 6mm")  {
 	        Slic3r::Print print;
 	        Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
-	        	{ "first_layer_extrusion_width", 	1 },
-	        	{ "brim_width", 					6 }
+                { "initial_layer_print_height", 0.2 },
+                { "initial_layer_line_width", 	1 },
+                { "brim_type", "outer_only" },
+                { "brim_width", 					6 }
 	        });
             THEN("Brim Extrusion collection has 6 loops in it") {
-                REQUIRE(print.brim().items_count() == 6);
+                REQUIRE(print.get_brimMap().at(print.objects().front()->id()).items_count() == 6);
             }
         }
         WHEN("Brim is set to 6mm, extrusion width 0.5mm")  {
 	        Slic3r::Print print;
 	        Slic3r::Test::init_and_process_print({TestMesh::cube_20x20x20}, print, {
-	        	{ "first_layer_extrusion_width", 	1 },
-	        	{ "brim_width", 					6 },
-	        	{ "first_layer_extrusion_width", 	0.5 }
+                { "initial_layer_print_height", 0.2 },
+                { "brim_type", "outer_only" },
+                { "brim_width", 6 },
+                { "initial_layer_line_width", 0.5 }
 	        });
 			print.process();
             THEN("Brim Extrusion collection has 12 loops in it") {
-                REQUIRE(print.brim().items_count() == 14);
+                REQUIRE(print.get_brimMap().at(print.objects().front()->id()).items_count() == 12);
             }
         }
     }

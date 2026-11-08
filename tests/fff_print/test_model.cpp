@@ -1,5 +1,7 @@
 #include <catch2/catch.hpp>
 
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/ModelArrange.hpp"
@@ -42,15 +44,17 @@ SCENARIO("Model construction", "[Model]") {
 				}
             }
             model_object->add_instance();
-            arrange_objects(model, InfiniteBed{scaled(Vec2d(100, 100))}, ArrangeParams{scaled(min_object_distance(config))});
+            arrange_on_print_bed(model, config);
 			model_object->ensure_on_bed();
 			print.auto_assign_extruders(model_object);
 			THEN("Print works?") {
 				print.set_status_silent();
 				print.apply(model, config);
 				print.process();
-				boost::filesystem::path temp = boost::filesystem::unique_path();
-                print.export_gcode(temp.string(), nullptr, nullptr);
+                const boost::filesystem::path temp = boost::filesystem::temp_directory_path() /
+                    boost::filesystem::unique_path("bambu-model-test-%%%%-%%%%-%%%%.gcode");
+                GCodeProcessorResult result;
+                print.export_gcode(temp.string(), &result, nullptr);
                 REQUIRE(boost::filesystem::exists(temp));
 				REQUIRE(boost::filesystem::is_regular_file(temp));
 				REQUIRE(boost::filesystem::file_size(temp) > 0);

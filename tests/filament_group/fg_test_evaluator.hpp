@@ -203,7 +203,8 @@ inline FullEvalResult full_evaluate_map(const FilamentGroupContext& ctx,
     return result;
 }
 
-inline TestResult run_and_evaluate(const FilamentGroupContext& ctx) {
+inline TestResult run_and_evaluate(const FilamentGroupContext& ctx,
+                                  std::vector<std::vector<int>>* retained_groups = nullptr) {
     TestResult result;
 
     auto start = std::chrono::high_resolution_clock::now();
@@ -211,6 +212,8 @@ inline TestResult run_and_evaluate(const FilamentGroupContext& ctx) {
 
     FilamentGroup fg(ctx);
     result.filament_map = fg.calc_filament_group(&algo_cost);
+    if (retained_groups)
+        *retained_groups = fg.get_memoryed_groups();
 
     auto end = std::chrono::high_resolution_clock::now();
     result.elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();

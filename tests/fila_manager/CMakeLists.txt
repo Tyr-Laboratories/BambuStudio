@@ -1,12 +1,9 @@
 # STUDIO-17977 / openspec 20260506耗材管理器AMS同步渐变多拼色:
 # fila_manager unit tests target.
 #
-# Why this target stays slim (no libslic3r_gui dependency):
-#   wgtFilaManagerStore.{h,cpp} only depends on nlohmann::json, std,
-#   boost (uuid / filesystem / log) and libslic3r/Utils.hpp - none of
-#   which require wxWidgets. Compiling wgtFilaManagerStore.cpp directly
-#   into the test binary avoids dragging the entire GUI into the test,
-#   which would significantly slow down the per-PR test cycle on Windows.
+# FilamentSpool serialization now uses the production GUI tray-label formatter.
+# Link that implementation rather than compiling the store without its GUI
+# dependencies. Tests still use isolated spool data and never contact devices.
 #
 # When the parallel change "20260506耗材管理器AMS自动同步云端" lands its
 # AmsAutoPushThrottle / wgtFilaManagerCloudSync tests, append the
@@ -17,7 +14,6 @@ get_filename_component(_TEST_NAME ${CMAKE_CURRENT_LIST_DIR} NAME)
 
 add_executable(${_TEST_NAME}_tests
     ${_TEST_NAME}_tests_main.cpp
-    ${PROJECT_SOURCE_DIR}/src/slic3r/GUI/fila_manager/wgtFilaManagerStore.cpp
 )
 
 target_include_directories(${_TEST_NAME}_tests PRIVATE
@@ -26,8 +22,13 @@ target_include_directories(${_TEST_NAME}_tests PRIVATE
 
 target_link_libraries(${_TEST_NAME}_tests
     test_common
+    libslic3r_gui
     libslic3r
 )
+if (APPLE)
+    target_link_libraries(${_TEST_NAME}_tests
+        "-framework AVFoundation" "-framework AVKit" "-framework CoreMedia" "-framework VideoToolbox")
+endif()
 
 set_property(TARGET ${_TEST_NAME}_tests PROPERTY FOLDER "tests")
 

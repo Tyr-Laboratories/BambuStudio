@@ -7,6 +7,7 @@ add_executable(${_TEST_NAME}_tests
 	test_fill.cpp
 	test_flow.cpp
 	test_gcode.cpp
+	test_gcode_z_parsing.cpp
 	test_gcodewriter.cpp
 	test_gcodewriter_travel.cpp
 	test_model.cpp
@@ -36,7 +37,7 @@ add_executable(support_material_on_wipe_tower_tests
 	test_data.hpp
 	test_support_material_on_wipe_tower.cpp
 	)
-target_link_libraries(support_material_on_wipe_tower_tests test_common libslic3r
+target_link_libraries(support_material_on_wipe_tower_tests test_common libslic3r slicer_test_support
 	libcurl
 	OpenSSL::SSL OpenSSL::Crypto
 )
@@ -52,7 +53,7 @@ add_executable(periodic_modifier_tests
 	test_data.hpp
 	test_periodic_modifier.cpp
 	)
-target_link_libraries(periodic_modifier_tests test_common libslic3r
+target_link_libraries(periodic_modifier_tests test_common libslic3r slicer_test_support
 	libcurl
 	OpenSSL::SSL OpenSSL::Crypto
 )

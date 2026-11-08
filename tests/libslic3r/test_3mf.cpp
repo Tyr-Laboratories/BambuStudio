@@ -85,7 +85,8 @@ SCENARIO("2D convex hull of sinking object", "[3mf]") {
         // load a model
         Model model;
         std::string src_file = std::string(TEST_DATA_DIR) + "/test_3mf/Prusa.stl";
-        load_stl(src_file.c_str(), &model);
+        REQUIRE(load_stl(src_file.c_str(), &model));
+        REQUIRE(model.objects.size() == 1);
         model.add_default_instances();
 
         WHEN("model is rotated, scaled and set as sinking") {
@@ -98,34 +99,50 @@ SCENARIO("2D convex hull of sinking object", "[3mf]") {
             instance->set_offset(Vec3d::Zero());
             instance->set_scaling_factor({ 2.0, 2.0, 2.0 });
 
-            // calculate 2D convex hull
-            Polygon hull_2d = object->convex_hull_2d(instance->get_transformation().get_matrix());
+            const BoundingBoxf3 bounds = object->instance_bounding_box(*instance);
+            REQUIRE(bounds.min.z() < 0.0);
+            REQUIRE(bounds.max.z() > 0.0);
+            REQUIRE(object->volumes.size() == 1);
+            const ModelVolume* volume = object->volumes.front();
+            const Transform3d transform = instance->get_transformation().get_matrix();
 
-            // verify result
-            Points result = {
-                { -91501496, -15914144 },
-                { 91501496, -15914144 },
-                { 91501496, 4243 },
-                { 78229680, 4246883 },
-                { 56898100, 4246883 },
-                { -85501496, 4242641 },
-                { -91501496, 4243 }
+            // Keep reference coordinates in millimeters so changes to the internal
+            // fixed-point scale do not change this geometry regression.
+            const auto require_hull_matches = [](const Polygon& hull, const std::vector<Vec2d>& expected) {
+                REQUIRE(hull.points.size() == expected.size());
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    CAPTURE(i);
+                    // Allow 1um error due to floating point rounding.
+                    CHECK(unscale<double>(hull.points[i].x()) == Approx(expected[i].x()).epsilon(0.0).margin(0.001));
+                    CHECK(unscale<double>(hull.points[i].y()) == Approx(expected[i].y()).epsilon(0.0).margin(0.001));
+                }
             };
 
-            // Allow 1um error due to floating point rounding.
-            bool res = hull_2d.points.size() == result.size();
-            if (res)
-                for (size_t i = 0; i < result.size(); ++ i) {
-                    const Point &p1 = result[i];
-                    const Point &p2 = hull_2d.points[i];
-                    if (std::abs(p1.x() - p2.x()) > 1 || std::abs(p1.y() - p2.y()) > 1) {
-                        res = false;
-                        break;
-                    }
-                }
+            THEN("the above-bed mesh hull matches the sinking reference") {
+                // Arrangement now projects the complete 3D hull. Exercise the
+                // explicit clipping helper to retain the original sinking check.
+                const Transform3f volume_transform = (transform * volume->get_matrix()).cast<float>();
+                const Polygon hull = its_convex_hull_2d_above(volume->mesh().its, volume_transform, 0.0f);
+                require_hull_matches(hull, {
+                    { -91.501496, -15.914144 },
+                    { 91.501496, -15.914144 },
+                    { 91.501496, 0.004243 },
+                    { 78.229680, 4.246883 },
+                    { 56.898100, 4.246883 },
+                    { -85.501496, 4.242641 },
+                    { -91.501496, 0.004243 }
+                });
+            }
 
-            THEN("2D convex hull should match with reference") {
-                REQUIRE(res);
+            THEN("the arrangement hull includes the complete transformed object") {
+                require_hull_matches(object->convex_hull_2d(transform), {
+                    { -91.501495, -15.914144 },
+                    { 91.501495, -15.914144 },
+                    { 91.501495, 13.792824 },
+                    { 34.846497, 14.717717 },
+                    { -85.501495, 13.917982 },
+                    { -91.501495, 13.792824 }
+                });
             }
         }
     }

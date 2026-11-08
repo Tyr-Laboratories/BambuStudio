@@ -24,6 +24,9 @@ using namespace Slic3r;
 
 using VD = Geometry::VoronoiDiagram;
 
+// These fixtures exercise the original Boost diagram, including reproductions
+// of its degeneracies. Keep repair disabled when constructing through the wrapper.
+
 // https://svn.boost.org/trac10/ticket/12067
 // This bug seems to be confirmed.
 // Vojtech supposes that there may be no Voronoi edges produced for
@@ -61,7 +64,7 @@ TEST_CASE("Voronoi missing edges - points 12067", "[Voronoi]")
 
     // Construction of the Voronoi Diagram.
     VD vd;
-    construct_voronoi(pts.begin(), pts.end(), &vd);
+    vd.construct_voronoi(pts.begin(), pts.end());
 
 #ifdef VORONOI_DEBUG_OUT
     dump_voronoi_to_svg(debug_out_path("voronoi-pts.svg").c_str(),
@@ -189,7 +192,7 @@ TEST_CASE("Voronoi missing edges - Alessandro gapfill 12707", "[Voronoi]")
 
     Lines lines = to_lines(poly);
     VD vd;
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 
 #ifdef VORONOI_DEBUG_OUT
     dump_voronoi_to_svg(debug_out_path("voronoi-lines.svg").c_str(),
@@ -297,7 +300,7 @@ TEST_CASE("Voronoi weirdness", "[Voronoi]")
 
     VD vd;
     Lines lines = to_lines(poly);
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 
 #ifdef VORONOI_DEBUG_OUT
     dump_voronoi_to_svg(debug_out_path("voronoi-weirdness.svg").c_str(),
@@ -321,7 +324,7 @@ TEST_CASE("Voronoi division by zero 12903", "[Voronoi]")
     }
 
     VD vd;
-    construct_voronoi(pts.begin(), pts.end(), &vd);
+    vd.construct_voronoi(pts.begin(), pts.end());
 
 #ifdef VORONOI_DEBUG_OUT
     // Scale the voronoi vertices and input points, so that the dump_voronoi_to_svg will display them correctly.
@@ -1318,7 +1321,7 @@ TEST_CASE("Voronoi NaN coordinates 12139", "[Voronoi][!hide][!mayfail]")
 #endif
 
     VD vd;
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 
     for (const auto& edge : vd.edges())
         if (edge.is_finite()) {
@@ -1334,6 +1337,15 @@ TEST_CASE("Voronoi NaN coordinates 12139", "[Voronoi][!hide][!mayfail]")
     dump_voronoi_to_svg(debug_out_path("voronoi-NaNs.svg").c_str(),
         vd, Points(), lines, Polygons(), Lines(), 0.015);
 #endif
+}
+
+// The captured coordinates below predate Bambu's coordinate scaling and use
+// one million integer units per millimeter. Keep those integers unchanged: tiny
+// edges reproduce the original degeneracies. Offset distances and arc accuracy
+// must use the same captured units, independently of SCALING_FACTOR.
+static constexpr double captured_fixture_scale(double millimeters)
+{
+    return millimeters * 1'000'000.;
 }
 
 struct OffsetTest {
@@ -1359,22 +1371,23 @@ TEST_CASE("Voronoi offset", "[VoronoiOffset]")
 
   VD vd;
   Lines lines = to_lines(poly_with_hole);
-  construct_voronoi(lines.begin(), lines.end(), &vd);
+  vd.construct_voronoi(lines.begin(), lines.end(), false);
 
   for (const OffsetTest &ot : {
-            OffsetTest { scale_(0.2), 1, 1 },
-            OffsetTest { scale_(0.4), 1, 1 },
-            OffsetTest { scale_(0.5), 1, 2 },
-            OffsetTest { scale_(0.505), 1, 2 },
-            OffsetTest { scale_(0.51), 1, 2 },
-            OffsetTest { scale_(0.52), 1, 1 },
-            OffsetTest { scale_(0.53), 1, 1 },
-            OffsetTest { scale_(0.54), 1, 1 },
-            OffsetTest { scale_(0.55), 1, 0 }
+            OffsetTest { captured_fixture_scale(0.2), 1, 1 },
+            OffsetTest { captured_fixture_scale(0.4), 1, 1 },
+            OffsetTest { captured_fixture_scale(0.5), 1, 2 },
+            OffsetTest { captured_fixture_scale(0.505), 1, 2 },
+            OffsetTest { captured_fixture_scale(0.51), 1, 2 },
+            OffsetTest { captured_fixture_scale(0.52), 1, 1 },
+            OffsetTest { captured_fixture_scale(0.53), 1, 1 },
+            OffsetTest { captured_fixture_scale(0.54), 1, 1 },
+            OffsetTest { captured_fixture_scale(0.55), 1, 0 }
       }) {
+      CAPTURE(ot.distance);
 
 #if 0
-      Polygons offsetted_polygons_out = Slic3r::Voronoi::offset(vd, lines, ot.distance, scale_(0.005));
+      Polygons offsetted_polygons_out = Slic3r::Voronoi::offset(vd, lines, ot.distance, captured_fixture_scale(0.005));
 #ifdef VORONOI_DEBUG_OUT
       dump_voronoi_to_svg(debug_out_path("voronoi-offset-out-%lf.svg", ot.distance).c_str(),
           vd, Points(), lines, offsetted_polygons_out);
@@ -1382,7 +1395,7 @@ TEST_CASE("Voronoi offset", "[VoronoiOffset]")
       REQUIRE(offsetted_polygons_out.size() == ot.num_outer);
 #endif
 
-      Polygons offsetted_polygons_in = Slic3r::Voronoi::offset(vd, lines, - ot.distance, scale_(0.005));
+      Polygons offsetted_polygons_in = Slic3r::Voronoi::offset(vd, lines, - ot.distance, captured_fixture_scale(0.005));
 #ifdef VORONOI_DEBUG_OUT
       dump_voronoi_to_svg(debug_out_path("voronoi-offset-in-%lf.svg", ot.distance).c_str(),
           vd, Points(), lines, offsetted_polygons_in);
@@ -1425,7 +1438,7 @@ TEST_CASE("Voronoi offset 2", "[VoronoiOffset]")
 
   VD vd;
   Lines lines = to_lines(poly);
-  construct_voronoi(lines.begin(), lines.end(), &vd);
+  vd.construct_voronoi(lines.begin(), lines.end(), false);
 
   for (const OffsetTest &ot : {
             OffsetTest { scale_(0.2), 2, 2 },
@@ -1495,7 +1508,7 @@ TEST_CASE("Voronoi offset 3", "[VoronoiOffset]")
 
   VD vd;
   Lines lines = to_lines(poly);
-  construct_voronoi(lines.begin(), lines.end(), &vd);  
+  vd.construct_voronoi(lines.begin(), lines.end(), false);
 
   for (const OffsetTest &ot : {
             OffsetTest { scale_(0.2), 2, 2 },
@@ -1746,31 +1759,32 @@ TEST_CASE("Voronoi offset with edge collapse", "[VoronoiOffset4]")
 
   VD vd;
   Lines lines = to_lines(poly);
-  construct_voronoi(lines.begin(), lines.end(), &vd);
+  vd.construct_voronoi(lines.begin(), lines.end(), false);
 
   for (const OffsetTest &ot : {
-            OffsetTest { scale_(0.2), 2, 2 },
-            OffsetTest { scale_(0.4), 2, 2 },
-            OffsetTest { scale_(0.49), 2, 3 },
-            OffsetTest { scale_(0.51), 2, 2 },
-            OffsetTest { scale_(0.56), 2, 2 },
-            OffsetTest { scale_(0.6), 2, 2 },
-            OffsetTest { scale_(0.7), 2, 2 },
-            OffsetTest { scale_(0.8), 2, 2 },
-            OffsetTest { scale_(0.9), 2, 2 },
-            OffsetTest { scale_(0.99), 1, 2 },
-            OffsetTest { scale_(1.0), 1, 2 },
-            OffsetTest { scale_(1.01), 1, 2 },
+            OffsetTest { captured_fixture_scale(0.2), 2, 2 },
+            OffsetTest { captured_fixture_scale(0.4), 2, 2 },
+            OffsetTest { captured_fixture_scale(0.49), 2, 3 },
+            OffsetTest { captured_fixture_scale(0.51), 2, 2 },
+            OffsetTest { captured_fixture_scale(0.56), 2, 2 },
+            OffsetTest { captured_fixture_scale(0.6), 2, 2 },
+            OffsetTest { captured_fixture_scale(0.7), 2, 2 },
+            OffsetTest { captured_fixture_scale(0.8), 2, 2 },
+            OffsetTest { captured_fixture_scale(0.9), 2, 2 },
+            OffsetTest { captured_fixture_scale(0.99), 1, 2 },
+            OffsetTest { captured_fixture_scale(1.0), 1, 2 },
+            OffsetTest { captured_fixture_scale(1.01), 1, 2 },
       }) {
+      CAPTURE(ot.distance);
 
-      Polygons offsetted_polygons_out = Slic3r::Voronoi::offset(vd, lines, ot.distance, scale_(0.005));
+      Polygons offsetted_polygons_out = Slic3r::Voronoi::offset(vd, lines, ot.distance, captured_fixture_scale(0.005));
 #ifdef VORONOI_DEBUG_OUT
       dump_voronoi_to_svg(debug_out_path("voronoi-offset3-out-%lf.svg", ot.distance).c_str(),
           vd, Points(), lines, offsetted_polygons_out);
 #endif
       REQUIRE(offsetted_polygons_out.size() == ot.num_outer);
 
-      Polygons offsetted_polygons_in = Slic3r::Voronoi::offset(vd, lines, - ot.distance, scale_(0.005));
+      Polygons offsetted_polygons_in = Slic3r::Voronoi::offset(vd, lines, - ot.distance, captured_fixture_scale(0.005));
 #ifdef VORONOI_DEBUG_OUT
       dump_voronoi_to_svg(debug_out_path("voronoi-offset3-in-%lf.svg", ot.distance).c_str(),
           vd, Points(), lines, offsetted_polygons_in);
@@ -1780,7 +1794,7 @@ TEST_CASE("Voronoi offset with edge collapse", "[VoronoiOffset4]")
 }
 
 // A sample extracted from file medallion_printable_fixed-teeth.stl from https://www.thingiverse.com/thing:1347129
-// This test for offset scale_(2.9) and bigger
+// This test for offset captured_fixture_scale(2.9) and bigger
 // triggers assert(r < std::max(d0, d1) + EPSILON) in function first_circle_segment_intersection_parameter.
 TEST_CASE("Voronoi offset 5", "[VoronoiOffset5]")
 {
@@ -1857,22 +1871,23 @@ TEST_CASE("Voronoi offset 5", "[VoronoiOffset5]")
 
     VD vd;
     Lines lines = to_lines(poly);
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 
     for (const OffsetTest &ot : {
-            OffsetTest { scale_(2.8), 1, 1 },
-            OffsetTest { scale_(2.9), 1, 1 },
-            OffsetTest { scale_(3.0), 1, 1 },
+            OffsetTest { captured_fixture_scale(2.8), 1, 1 },
+            OffsetTest { captured_fixture_scale(2.9), 1, 1 },
+            OffsetTest { captured_fixture_scale(3.0), 1, 1 },
     }) {
+        CAPTURE(ot.distance);
 
-        Polygons offsetted_polygons_out = Slic3r::Voronoi::offset(vd, lines, ot.distance, scale_(0.005));
+        Polygons offsetted_polygons_out = Slic3r::Voronoi::offset(vd, lines, ot.distance, captured_fixture_scale(0.005));
 #ifdef VORONOI_DEBUG_OUT
         dump_voronoi_to_svg(debug_out_path("voronoi-offset5-out-%lf.svg", ot.distance).c_str(),
             vd, Points(), lines, offsetted_polygons_out);
 #endif
         REQUIRE(offsetted_polygons_out.size() == ot.num_outer);
 
-        Polygons offsetted_polygons_in = Slic3r::Voronoi::offset(vd, lines, - ot.distance, scale_(0.005));
+        Polygons offsetted_polygons_in = Slic3r::Voronoi::offset(vd, lines, - ot.distance, captured_fixture_scale(0.005));
 #ifdef VORONOI_DEBUG_OUT
         dump_voronoi_to_svg(debug_out_path("voronoi-offset5-in-%lf.svg", ot.distance).c_str(),
             vd, Points(), lines, offsetted_polygons_in);
@@ -1915,7 +1930,7 @@ TEST_CASE("Voronoi skeleton", "[VoronoiSkeleton]")
 
     VD vd;
     Lines lines = to_lines(poly);
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
     Slic3r::Voronoi::annotate_inside_outside(vd, lines);
     Slic3r::Voronoi::annotate_inside_outside(vd, lines);
     static constexpr double threshold_alpha = M_PI / 12.; // 30 degrees
@@ -1966,7 +1981,7 @@ TEST_CASE("Voronoi missing vertex 1", "[VoronoiMissingVertex1]")
 
     VD    vd;
     Lines lines = to_lines(poly);
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 #ifdef VORONOI_DEBUG_OUT
     dump_voronoi_to_svg(debug_out_path("voronoi-missing-vertex1-out.svg").c_str(), vd, Points(), lines);
 #endif
@@ -2006,7 +2021,7 @@ TEST_CASE("Voronoi missing vertex 2", "[VoronoiMissingVertex2]")
 
     VD    vd;
     Lines lines = to_lines(poly);
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 #ifdef VORONOI_DEBUG_OUT
     dump_voronoi_to_svg(debug_out_path("voronoi-missing-vertex2-out.svg").c_str(), vd, Points(), lines);
 #endif
@@ -2047,7 +2062,7 @@ TEST_CASE("Voronoi missing vertex 3", "[VoronoiMissingVertex3]")
 
     VD vd;
     Lines lines = to_lines(poly);
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 #ifdef VORONOI_DEBUG_OUT
     dump_voronoi_to_svg(debug_out_path("voronoi-missing-vertex3-out.svg").c_str(), vd, Points(), lines);
 #endif
@@ -2080,7 +2095,7 @@ TEST_CASE("Duplicate Voronoi vertices", "[Voronoi]")
 
     VD    vd;
     Lines lines = to_lines(poly);
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 #ifdef VORONOI_DEBUG_OUT
     dump_voronoi_to_svg(debug_out_path("voronoi-duplicate-vertices-out.svg").c_str(), vd, Points(), lines);
 #endif
@@ -2120,7 +2135,7 @@ TEST_CASE("Intersecting Voronoi edges", "[Voronoi]")
 
     VD    vd;
     Lines lines = to_lines(poly);
-    construct_voronoi(lines.begin(), lines.end(), &vd);
+    vd.construct_voronoi(lines.begin(), lines.end(), false);
 #ifdef VORONOI_DEBUG_OUT
     dump_voronoi_to_svg(debug_out_path("voronoi-intersecting-edges-out.svg").c_str(), vd, Points(), lines);
 #endif

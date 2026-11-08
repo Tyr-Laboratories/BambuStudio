@@ -48,7 +48,7 @@ TEST_CASE("Raycaster with loaded drillholes", "[sla_raycast]")
     // Load the cube and make it hollow.
     TriangleMesh cube = load_model("20mm_cube.obj");
     sla::HollowingConfig hcfg;
-    std::unique_ptr<TriangleMesh> cube_inside = sla::generate_interior(cube, hcfg);
+    sla::InteriorPtr cube_inside = sla::generate_interior(cube, hcfg);
     REQUIRE(cube_inside);
     
     // Helper bb
@@ -62,7 +62,7 @@ TEST_CASE("Raycaster with loaded drillholes", "[sla_raycast]")
     float hole_length = 10.;
     sla::DrainHoles holes = { sla::DrainHole{p, normal, radius, hole_length} };
     
-    cube.merge(*cube_inside);
+    cube.merge(TriangleMesh{sla::get_mesh(*cube_inside)});
     
     sla::IndexedMesh emesh{cube};
     emesh.load_holes(holes);
