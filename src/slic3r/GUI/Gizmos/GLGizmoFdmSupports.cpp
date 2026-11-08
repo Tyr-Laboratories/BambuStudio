@@ -61,7 +61,6 @@ void GLGizmoFdmSupports::on_shutdown()
     m_print_instance.print_object = NULL;
     m_print_instance.model_instance = NULL;
 
-    m_highlight_by_angle_threshold_deg = 0.f;
     m_parent.use_slope(false);
     m_parent.toggle_model_objects_visibility(true);
 }
@@ -70,9 +69,9 @@ void GLGizmoFdmSupports::on_shutdown()
 void GLGizmoFdmSupports::on_opening()
 {
     m_angle_threshold_deg = 40;
-    m_parent.set_slope_normal_angle(90.f - m_angle_threshold_deg);
-    if (m_parent.is_using_slope() == m_paint_support_bases) {
-        m_parent.use_slope(!m_paint_support_bases);
+    m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
+    if (!m_parent.is_using_slope()) {
+        m_parent.use_slope(true);
         m_parent.set_as_dirty();
     }
     m_print_instance.print_object = NULL;
@@ -130,6 +129,20 @@ void GLGizmoFdmSupports::refresh_mode_descriptions()
     m_desc["enforce"] = m_paint_support_bases ? _L("Paint support bases") : _L("Enforce supports");
     m_desc["block"] = m_paint_support_bases ? _L("Erase support bases") : _L("Block supports");
     m_desc["remove_all"] = m_paint_support_bases ? _L("Erase all support bases") : _L("Erase all support requirements");
+    m_desc["on_overhangs_only"] = m_paint_support_bases ? _L("On underhangs only") : _L("On overhangs only");
+    m_desc["highlight_by_angle"] = m_paint_support_bases ? _L("Highlight underhang areas") : _L("Highlight overhang areas");
+}
+
+void GLGizmoFdmSupports::clear_slope_filter_preview()
+{
+    for (auto &selector : m_triangle_selectors) {
+        selector->seed_fill_unselect_all_triangles();
+        selector->request_update_render_data();
+    }
+    m_seed_fill_last_mesh_id = -1;
+    m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
+    m_parent.use_slope(true);
+    m_parent.set_as_dirty();
 }
 
 void GLGizmoFdmSupports::set_base_painting(bool enabled)
@@ -141,30 +154,38 @@ void GLGizmoFdmSupports::set_base_painting(bool enabled)
     update_model_object();
     if (enabled) {
         m_requirements_overhangs_only = m_paint_on_overhangs_only;
-        m_paint_on_overhangs_only = false;
+        m_requirements_highlight_angle_deg = m_highlight_by_angle_threshold_deg;
+        m_paint_on_overhangs_only = m_bases_underhangs_only;
+        m_highlight_by_angle_threshold_deg = m_bases_highlight_angle_deg;
     } else {
+        m_bases_underhangs_only = m_paint_on_overhangs_only;
+        m_bases_highlight_angle_deg = m_highlight_by_angle_threshold_deg;
         m_paint_on_overhangs_only = m_requirements_overhangs_only;
+        m_highlight_by_angle_threshold_deg = m_requirements_highlight_angle_deg;
     }
     m_paint_support_bases = enabled;
     refresh_mode_descriptions();
     update_from_model_object(false);
-    m_parent.use_slope(!enabled);
-    m_parent.set_as_dirty();
+    clear_slope_filter_preview();
 }
 
 void GLGizmoFdmSupports::on_load(cereal::BinaryInputArchive &ar)
 {
     GLGizmoPainterBase::on_load(ar);
-    ar(m_paint_support_bases, m_requirements_overhangs_only, m_paint_on_overhangs_only);
-    if (m_paint_support_bases)
-        m_paint_on_overhangs_only = false;
+    ar(m_paint_support_bases, m_requirements_overhangs_only, m_bases_underhangs_only,
+       m_requirements_highlight_angle_deg, m_bases_highlight_angle_deg,
+       m_paint_on_overhangs_only, m_highlight_by_angle_threshold_deg, m_current_tool);
+    m_restore_slope_angles = true;
+    m_seed_fill_last_mesh_id = -1;
     refresh_mode_descriptions();
 }
 
 void GLGizmoFdmSupports::on_save(cereal::BinaryOutputArchive &ar) const
 {
     GLGizmoPainterBase::on_save(ar);
-    ar(m_paint_support_bases, m_requirements_overhangs_only, m_paint_on_overhangs_only);
+    ar(m_paint_support_bases, m_requirements_overhangs_only, m_bases_underhangs_only,
+       m_requirements_highlight_angle_deg, m_bases_highlight_angle_deg,
+       m_paint_on_overhangs_only, m_highlight_by_angle_threshold_deg, m_current_tool);
 }
 
 void GLGizmoFdmSupports::render_painter_gizmo() const
@@ -254,10 +275,14 @@ void GLGizmoFdmSupports::render_triangles(const Selection& selection) const
 
         float normal_z = -::cos(Geometry::deg2rad(m_highlight_by_angle_threshold_deg));
         Matrix3f normal_matrix = static_cast<Matrix3f>(trafo_matrix.matrix().block(0, 0, 3, 3).inverse().transpose().cast<float>());
+        // Only reverse the slope comparison. Geometry, lighting and mirror
+        // winding still use the original object-to-world transformation.
+        if (m_paint_support_bases)
+            normal_matrix *= -1.f;
 
         shader->set_uniform("volume_world_matrix", trafo_matrix);
         shader->set_uniform("volume_mirrored", is_left_handed);
-        shader->set_uniform("slope.actived", !m_paint_support_bases && m_parent.is_using_slope());
+        shader->set_uniform("slope.actived", m_parent.is_using_slope());
         shader->set_uniform("slope.volume_world_normal_matrix", normal_matrix);
         shader->set_uniform("slope.normal_z", normal_z);
         m_triangle_selectors[mesh_id]->render(m_imgui, trafo_matrix);
@@ -299,11 +324,15 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
     wchar_t old_tool = m_current_tool;
 
     int support_threshold_angle = get_selection_support_threshold_angle();
-    // when support painting tool is on, reset highlight threshold angle
-    if (m_support_threshold_angle == -1) {
-        m_highlight_by_angle_threshold_deg = support_threshold_angle;
+    // Preserve stock requirements initialization on opening for this object.
+    // It must not overwrite an active base angle or a restored Undo snapshot.
+    if (m_support_threshold_angle == -1 && !m_restore_slope_angles) {
+        m_requirements_highlight_angle_deg = float(std::max(0, support_threshold_angle));
+        if (!m_paint_support_bases)
+            m_highlight_by_angle_threshold_deg = m_requirements_highlight_angle_deg;
         m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
     }
+    m_restore_slope_angles = false;
     m_support_threshold_angle = support_threshold_angle;
 
     const float approx_height = m_imgui->scaled(23.f);
@@ -408,11 +437,10 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
         }
     }
 
-    if (!m_paint_support_bases) {
-        m_imgui->bbl_checkbox(m_desc["on_overhangs_only"], m_paint_on_overhangs_only);
-        if (ImGui::IsItemHovered())
-            m_imgui->tooltip(format_wxstr(_L("Allows painting only on facets selected by: \"%1%\""), m_desc["highlight_by_angle"]), max_tooltip_width);
-    }
+    if (m_imgui->bbl_checkbox(m_desc["on_overhangs_only"], m_paint_on_overhangs_only))
+        clear_slope_filter_preview();
+    if (ImGui::IsItemHovered())
+        m_imgui->tooltip(format_wxstr(_L("Allows painting only on facets selected by: \"%1%\""), m_desc["highlight_by_angle"]), max_tooltip_width);
     ImGui::Separator();
 
     if (m_current_tool != old_tool)
@@ -476,7 +504,7 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
         ImGui::BBLDragFloat("##gap_area_input", &TriangleSelectorPatch::gap_area, 0.05f, 0.0f, 0.0f, "%.2f");
     }
 
-    if (!m_paint_support_bases) {
+    {
         float position_before_text_y = ImGui::GetCursorPos().y;
         ImGui::AlignTextToFramePadding();
         m_imgui->text(m_desc["highlight_by_angle"]);
@@ -491,15 +519,10 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
 
         std::string format_str = std::string("%.f");
         ImGui::PushItemWidth(sliders_width);
-        wxString tooltip = _L("Highlight faces according to overhang angle.");
-        if (m_imgui->bbl_slider_float_style("##angle_threshold_deg", &m_highlight_by_angle_threshold_deg, 0.f, 90.f, format_str.data(), 1.0f, true, tooltip)) {
-            m_parent.set_slope_normal_angle(90.f - m_highlight_by_angle_threshold_deg);
-            if (!m_parent.is_using_slope()) {
-                m_parent.use_slope(true);
-                m_parent.set_as_dirty();
-            }
-        }
-        if (ImGui::IsItemHovered()) {
+        wxString tooltip = m_paint_support_bases ? _L("Highlight upward-facing areas, including horizontal top surfaces, according to underhang angle.") :
+                                                  _L("Highlight faces according to overhang angle.");
+        bool angle_changed = m_imgui->bbl_slider_float_style("##angle_threshold_deg", &m_highlight_by_angle_threshold_deg, 0.f, 90.f, format_str.data(), 1.0f, true, tooltip);
+        if (!m_paint_support_bases && ImGui::IsItemHovered()) {
             ImGui::BeginTooltip();
             if (m_support_threshold_angle != 0) {
                 wxString str_tooltip = (_L("Auto support threshold angle: ") + std::to_string(m_support_threshold_angle));
@@ -512,8 +535,14 @@ void GLGizmoFdmSupports::on_render_input_window(float x, float y, float bottom_l
         }
         ImGui::SameLine(drag_left_width);
         ImGui::PushItemWidth(1.5 * slider_icon_width);
-        ImGui::BBLDragFloat("##angle_threshold_deg_input", &m_highlight_by_angle_threshold_deg, 0.05f, 0.0f, 0.0f, "%.2f");
+        angle_changed |= ImGui::BBLDragFloat("##angle_threshold_deg_input", &m_highlight_by_angle_threshold_deg, 0.05f, 0.0f, 90.0f, "%.2f");
+        if (angle_changed) {
+            m_highlight_by_angle_threshold_deg = std::clamp(m_highlight_by_angle_threshold_deg, 0.f, 90.f);
+            clear_slope_filter_preview();
+        }
+    }
 
+    if (!m_paint_support_bases) {
         m_imgui->disabled_begin(m_round_hole_fill_pending);
         if (m_imgui->button(m_desc.at("block_round_holes"))) {
             m_round_hole_fill_pending = true;

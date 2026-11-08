@@ -315,6 +315,8 @@ protected:
     BucketFillType m_bucket_fill_mode           = BucketFillType::EdgeDetect;
     bool     m_paint_on_overhangs_only          = false;
     float    m_highlight_by_angle_threshold_deg = 0.f;
+    virtual TriangleSelector::SlopeDirection get_painting_slope_direction() const
+        { return TriangleSelector::SlopeDirection::Downward; }
 
     static constexpr float SmartFillAngleMin  = 0.0f;
     static constexpr float SmartFillAngleMax  = 90.f;

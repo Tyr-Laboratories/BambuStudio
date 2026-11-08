@@ -8,7 +8,7 @@ The paint permits a base; it does not create an overhang or require support by i
 
 ## Interaction and compatibility
 
-Add a **Support bases** mode to the existing Supports Painting tool. Use a distinct color, left-click to mark, and right-click or Shift+left-click to erase. Normal support painting keeps its current controls. The overhang-only brush filter does not apply to bases. Erase-all affects the active mode. Base edits participate in undo, project saving, model copying, mesh operations, and support reslicing.
+Add a **Support bases** mode to the existing Supports Painting tool. Use a distinct color, left-click to mark, and right-click or Shift+left-click to erase. Normal support painting keeps its current controls. **On underhangs only** and **Highlight underhang areas** mirror the existing overhang checkbox and angle slider for bases, selecting upward-facing surfaces in print orientation. Horizontal top surfaces are eligible; vertical walls and downward-facing undersides are excluded. Reuse the existing 0–90 degree behavior, including the zero-angle filter bypass, and retain separate checkbox and angle values for each channel through mode changes and Undo. Erase-all affects the active mode. Base edits participate in undo, project saving, model copying, mesh operations, and support reslicing.
 
 Store base paint in an independent model facet annotation and 3MF extension, so older readers can ignore it without interpreting it as ordinary support paint. Preserve existing projects unchanged when no base paint exists.
 
