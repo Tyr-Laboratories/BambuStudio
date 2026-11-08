@@ -214,8 +214,11 @@ def link_inventory(build, repo):
     blocks = (build / 'build.ninja').read_text().split('\n\n')
     for block in blocks:
         lines = block.splitlines()
-        if (lines and lines[0].startswith('build ') and 'CXX_EXECUTABLE_LINKER' in lines[0]
-                and 'BambuStudio.app/Contents/MacOS/BambuStudio:' in lines[0]):
+        # CMake can emit either a bundle or a raw executable which the public
+        # app packager subsequently stages into its bundle.
+        if (lines and lines[0].startswith(('build src/BambuStudio:',
+                                          'build src/BambuStudio.app/Contents/MacOS/BambuStudio:'))
+                and 'CXX_EXECUTABLE_LINKER' in lines[0]):
             libraries = next(line.split('=', 1)[1] for line in lines if 'LINK_LIBRARIES =' in line)
             break
     else:

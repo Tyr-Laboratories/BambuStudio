@@ -58,11 +58,14 @@ class NativeSources(unittest.TestCase):
         metadata = ('build src/BambuStudio.app/Contents/MacOS/BambuStudio: CXX_EXECUTABLE_LINKER__Release\n'
                     '  LINK_LIBRARIES = /local/BambuStudio_deps/usr/local/lib/libboost_thread.a '
                     '-lwxregexu-3.1 -framework Cocoa /SDK/usr/lib/libz.tbd src/miniz/libminiz_static.a\n')
-        (build / 'build.ninja').write_text(metadata)
-        result = self.sources.link_inventory(build, self.root)
-        self.assertEqual(result['linked_source_groups'], ['Boost', 'wxWidgets'])
-        self.assertEqual(result['system_frameworks'], ['Cocoa'])
-        self.assertNotIn('-lwxregexu-3.1', result['system_libraries'])
+        for target in ('src/BambuStudio.app/Contents/MacOS/BambuStudio', 'src/BambuStudio'):
+            with self.subTest(target=target):
+                (build / 'build.ninja').write_text(metadata.replace(
+                    'src/BambuStudio.app/Contents/MacOS/BambuStudio', target))
+                result = self.sources.link_inventory(build, self.root)
+                self.assertEqual(result['linked_source_groups'], ['Boost', 'wxWidgets'])
+                self.assertEqual(result['system_frameworks'], ['Cocoa'])
+                self.assertNotIn('-lwxregexu-3.1', result['system_libraries'])
         (build / 'build.ninja').write_text(metadata.replace('libboost_thread.a', 'libunknown.a'))
         with self.assertRaises(RuntimeError):
             self.sources.link_inventory(build, self.root)
