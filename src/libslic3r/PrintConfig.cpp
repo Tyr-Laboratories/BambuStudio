@@ -1032,6 +1032,7 @@ PrintConfigDef::PrintConfigDef()
     this->init_fff_params();
     this->init_extruder_option_keys();
     assign_printer_technology_to_unknown(this->options, ptFFF);
+    this->init_filament_option_keys();
     this->init_sla_params();
     assign_printer_technology_to_unknown(this->options, ptSLA);
 }
@@ -6843,7 +6844,6 @@ void PrintConfigDef::init_filament_option_keys()
         "deretraction_speed",
         "long_retractions_when_cut",
         "retract_before_wipe",
-        "filament_retract_length_nc",
         "retract_restart_extra",
         "retract_when_changing_layer",
         "retraction_distances_when_cut",
@@ -6855,6 +6855,7 @@ void PrintConfigDef::init_filament_option_keys()
         "z_hop",
         "z_hop_types"
     };
+        "filament_retract_length_nc",
     assert(std::is_sorted(m_filament_retract_keys.begin(), m_filament_retract_keys.end()));
 }
 
@@ -7848,7 +7849,7 @@ DynamicPrintConfig DynamicPrintConfig::full_print_config()
 	return DynamicPrintConfig((const PrintRegionConfig&)FullPrintConfig::defaults());
 }
 
-DynamicPrintConfig::DynamicPrintConfig(const StaticPrintConfig& rhs) : DynamicConfig(rhs, rhs.keys_ref())
+DynamicPrintConfig::DynamicPrintConfig(const StaticPrintConfig& rhs)
 {
 }
 
@@ -7864,6 +7865,9 @@ double min_object_distance(const ConfigBase &cfg)
     const ConfigOptionEnum<PrinterTechnology> *opt_printer_technology = cfg.option<ConfigOptionEnum<PrinterTechnology>>("printer_technology");
     auto printer_technology = opt_printer_technology ? opt_printer_technology->value : ptUnknown;
 
+    // Static generic enum vectors contain values but no serialization dictionary.
+    // Create definition-backed dynamic options before copying their values.
+    this->apply_only(rhs, rhs.keys_ref());
     double ret = 0.;
 
     if (printer_technology == ptSLA)

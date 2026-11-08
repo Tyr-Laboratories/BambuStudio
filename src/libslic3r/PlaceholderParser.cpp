@@ -2,10 +2,12 @@
 #include "Exception.hpp"
 #include "Flow.hpp"
 #include <cstring>
+#include <cmath>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
 #include <map>
+#include <set>
 #ifdef _MSC_VER
     #include <stdlib.h>  // provides **_environ
 #else
@@ -737,9 +739,15 @@ namespace client
         static std::map<std::string, std::string> tag_to_error_message;
 
         size_t get_extruder_id() const {
-            const ConfigOptionInts * filament_map_opt = external_config->option<ConfigOptionInts>("filament_map");
-            if (filament_map_opt && current_extruder_id < filament_map_opt->values.size()) {
-                return filament_map_opt->values[current_extruder_id];
+            // Per-layer mappings are installed in the parser configuration;
+            // explicit macro overrides take priority over those and the external defaults.
+            const ConfigOption *mapping = resolve_symbol("filament_map");
+            const auto *filament_map_opt = mapping != nullptr && mapping->type() == coInts ?
+                static_cast<const ConfigOptionVector<int> *>(mapping) : nullptr;
+            if (filament_map_opt && current_extruder_id < filament_map_opt->values.size() &&
+                filament_map_opt->values[current_extruder_id] > 0) {
+                // filament_map stores one-based physical extruder numbers.
+                return static_cast<size_t>(filament_map_opt->values[current_extruder_id] - 1);
             }
             return 0;
         }
@@ -840,6 +848,85 @@ namespace client
             output.it_range = opt_key;
         }
 
+        // Resolve every ratio dependency at the same active extruder. Speed
+        // options may be vectors even when their percentage is a scalar, and
+        // nullable/non-nullable vectors share their ConfigOptionVector base.
+        template <typename Iterator>
+        static double resolve_numeric_ratio(
+            const MyContext *ctx, std::string key, const ConfigOption *option,
+            const boost::iterator_range<Iterator> &position)
+        {
+            double result = 1.;
+            std::set<std::string> visited;
+            while (true) {
+                if (!visited.insert(key).second)
+                    ctx->throw_exception("Cyclic ratio_over dependency", position);
+
+                size_t index = 0;
+                if (option->is_vector()) {
+                    const auto *vector = static_cast<const ConfigOptionVectorBase *>(option);
+                    if (vector->empty())
+                        ctx->throw_exception("Indexing an empty vector variable", position);
+                    if (vector->size() > 1)
+                        index = ctx->get_extruder_id();
+                    if (index >= vector->size())
+                        index = 0;
+                    if (vector->nullable() && vector->is_nil(index))
+                        ctx->throw_exception("Undefined numeric variable", position);
+                }
+
+                FloatOrPercent value;
+                switch (option->type()) {
+                case coFloat:
+                case coPercent:
+                    value.value = option->getFloat();
+                    break;
+                case coInt:
+                    value.value = option->getInt();
+                    break;
+                case coFloats:
+                case coPercents:
+                    value.value = static_cast<const ConfigOptionVector<double> *>(option)->get_at(index);
+                    break;
+                case coInts:
+                    value.value = static_cast<const ConfigOptionVector<int> *>(option)->get_at(index);
+                    break;
+                case coFloatOrPercent: {
+                    const auto *scalar = static_cast<const ConfigOptionFloatOrPercent *>(option);
+                    // Preserve legacy automatic-width resolution only for the
+                    // float-or-percent width type. Current widths are floats.
+                    if (boost::ends_with(key, "line_width")) {
+                        value.value = Flow::extrusion_width(key, scalar, *ctx,
+                            static_cast<unsigned int>(ctx->current_extruder_id));
+                    } else {
+                        value = {scalar->value, scalar->percent};
+                    }
+                    break;
+                }
+                case coFloatsOrPercents:
+                    value = static_cast<const ConfigOptionVector<FloatOrPercent> *>(option)->get_at(index);
+                    break;
+                default:
+                    ctx->throw_exception("Non-numeric ratio_over dependency", position);
+                }
+                if (!std::isfinite(value.value))
+                    ctx->throw_exception("Undefined or non-finite numeric variable", position);
+                result *= value.value * (value.percent ? 0.01 : 1.);
+                if (!std::isfinite(result))
+                    ctx->throw_exception("Non-finite ratio_over result", position);
+                if (!value.percent)
+                    return result;
+
+                const ConfigOptionDef *definition = print_config_def.get(key);
+                if (definition == nullptr || definition->ratio_over.empty())
+                    ctx->throw_exception("FloatOrPercent variable failed to resolve the \"ratio_over\" dependencies", position);
+                key = definition->ratio_over;
+                option = ctx->resolve_symbol(key);
+                if (option == nullptr)
+                    ctx->throw_exception("FloatOrPercent variable failed to resolve the \"ratio_over\" dependencies", position);
+            }
+        }
+
         template <typename Iterator>
         static void scalar_variable_reference(
             const MyContext                 *ctx,
@@ -848,52 +935,11 @@ namespace client
         {
             if (opt.opt->is_vector()) {
                 switch (opt.opt->type()) {
-                case coFloats: {
-                    const ConfigOptionFloatsNullable* opt_floats = static_cast<const ConfigOptionFloatsNullable *>(opt.opt);
-                    if (opt_floats->size() == 1) {  // old version
-                        output.set_d(static_cast<const ConfigOptionFloatsNullable *>(opt.opt)->get_at(0));
-                    }
-                    else {
-                        output.set_d(static_cast<const ConfigOptionFloatsNullable *>(opt.opt)->get_at(ctx->get_extruder_id()));
-                    }
+                case coFloats:
+                case coFloatsOrPercents:
+                    output.set_d(resolve_numeric_ratio(ctx,
+                        std::string(opt.it_range.begin(), opt.it_range.end()), opt.opt, opt.it_range));
                     break;
-                }
-                case coFloatsOrPercents: {
-                    const ConfigOptionFloatsOrPercentsNullable * opt_floats = static_cast<const ConfigOptionFloatsOrPercentsNullable *>(opt.opt);
-                    size_t index = 0;  // old version only one value
-                    if (opt_floats->size() > 1) {
-                        index = ctx->get_extruder_id();
-                    }
-                    std::string opt_key(opt.it_range.begin(), opt.it_range.end());
-                    if (!opt_floats->get_at(index).percent) {
-                        // Not a percent, just return the value.
-                        output.set_d(opt_floats->get_at(index).value);
-                    } else {
-
-                        FloatOrPercent opt_value = opt_floats->get_at(index);
-                        double         v         = opt_value.value;
-                        if (opt_value.percent) {
-                            // Resolve dependencies using the "ratio_over" link to a parent value.
-                            const ConfigOptionDef *opt_def = print_config_def.get(opt_key);
-                            assert(opt_def != nullptr);
-                            assert(opt_def->type == coFloatsOrPercents);
-                            v *= 0.01;
-                            while (true) {
-                                const ConfigOption *opt_parent = opt_def->ratio_over.empty() ? nullptr : ctx->resolve_symbol(opt_def->ratio_over);
-                                if (opt_parent == nullptr) {
-                                    ctx->throw_exception("FloatOrPercentNullable variable failed to resolve the \"ratio_over\" dependencies", opt.it_range);
-                                }
-                                if (opt_parent->type() == coFloat || opt_parent->type() == coFloatOrPercent) {
-                                    v *= opt_parent->getFloat();
-                                    if (opt_parent->type() == coFloat || !static_cast<const ConfigOptionFloatOrPercent *>(opt_parent)->percent) break;
-                                    v *= 0.01; // percent to ratio
-                                }
-                            }
-                        }
-                        output.set_d(v);
-                    }
-                    break;
-                }
                 default: ctx->throw_exception("Unknown scalar variable type", opt.it_range);
                 }
             }
@@ -906,43 +952,9 @@ namespace client
                 case coPoint:   output.set_s(opt.opt->serialize());  break;
                 case coBool:    output.set_b(opt.opt->getBool());    break;
                 case coFloatOrPercent:
-                {
-                    std::string opt_key(opt.it_range.begin(), opt.it_range.end());
-                    if (boost::ends_with(opt_key, "line_width")) {
-                    	// Extrusion width supports defaults and a complex graph of dependencies.
-                        output.set_d(Flow::extrusion_width(opt_key, *ctx, static_cast<unsigned int>(ctx->current_extruder_id)));
-                    } else if (! static_cast<const ConfigOptionFloatOrPercent*>(opt.opt)->percent) {
-                    	// Not a percent, just return the value.
-                        output.set_d(opt.opt->getFloat());
-                    } else {
-                    	// Resolve dependencies using the "ratio_over" link to a parent value.
-			            const ConfigOptionDef  *opt_def = print_config_def.get(opt_key);
-			            assert(opt_def != nullptr);
-			            double v = opt.opt->getFloat() * 0.01; // percent to ratio
-			            for (;;) {
-			            	const ConfigOption *opt_parent = opt_def->ratio_over.empty() ? nullptr : ctx->resolve_symbol(opt_def->ratio_over);
-			            	if (opt_parent == nullptr)
-			                    ctx->throw_exception("FloatOrPercent variable failed to resolve the \"ratio_over\" dependencies", opt.it_range);
-			                if (boost::ends_with(opt_def->ratio_over, "line_width")) {
-                    			// Extrusion width supports defaults and a complex graph of dependencies.
-                                assert(opt_parent->type() == coFloatOrPercent);
-                        		v *= Flow::extrusion_width(opt_def->ratio_over, static_cast<const ConfigOptionFloatOrPercent*>(opt_parent), *ctx, static_cast<unsigned int>(ctx->current_extruder_id));
-                        		break;
-                        	}
-                        	if (opt_parent->type() == coFloat || opt_parent->type() == coFloatOrPercent) {
-			            		v *= opt_parent->getFloat();
-			            		if (opt_parent->type() == coFloat || ! static_cast<const ConfigOptionFloatOrPercent*>(opt_parent)->percent)
-			            			break;
-			            		v *= 0.01; // percent to ratio
-			            	}
-		            		// Continue one level up in the "ratio_over" hierarchy.
-			    	        opt_def = print_config_def.get(opt_def->ratio_over);
-			    	        assert(opt_def != nullptr);
-			            }
-                        output.set_d(v);
-	                }
-		            break;
-		        }
+                    output.set_d(resolve_numeric_ratio(ctx,
+                        std::string(opt.it_range.begin(), opt.it_range.end()), opt.opt, opt.it_range));
+                    break;
                 //BBS: Add enum. Otherwise enum can not be judged in placeholder
                 case coEnum:    output.set_s(opt.opt->serialize());  break;
                 default:

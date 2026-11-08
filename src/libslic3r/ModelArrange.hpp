@@ -37,6 +37,9 @@ bool arrange_objects(Model &              model,
 {
     ModelInstancePtrs instances;
     auto&& input = get_arrange_polys(model, instances);
+    // The packing API expects each candidate to carry its own clearance.
+    for (ArrangePolygon &polygon : input)
+        polygon.inflation = params.min_obj_distance / 2;
     arrangement::arrange(input, bed, params);
     
     return apply_arrange_polys(input, instances, vfn);
@@ -50,6 +53,8 @@ void duplicate(Model &              model,
                VirtualBedFn         vfn = throw_if_out_of_bed)
 {
     ArrangePolygons copies(copies_num, get_arrange_poly(model));
+    for (ArrangePolygon &polygon : copies)
+        polygon.inflation = params.min_obj_distance / 2;
     arrangement::arrange(copies, bed, params);
     duplicate(model, copies, vfn);
 }

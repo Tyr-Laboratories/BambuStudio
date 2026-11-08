@@ -52,6 +52,8 @@ public:
     PackResult trypack(Item& item,
                        const Range& = Range())
     {
+        if (item.area() <= 0)
+            return PackResult();
         auto r = _trypack(item);
         if(!r && Base::config_.allow_rotations) {
 
@@ -123,7 +125,14 @@ protected:
                     getY(v) < bin_.height();
         }
 
-        return can_be_packed? PackResult(item) : PackResult();
+        if (!can_be_packed)
+            return PackResult();
+
+        PackResult result(item);
+        // Bottom-left placement has no optimization cost. A successful
+        // placement must still carry a valid score for the shared selector.
+        result.score_ = 0.;
+        return result;
     }
 
     void setInitialPosition(Item& item) {

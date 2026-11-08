@@ -2276,6 +2276,7 @@ public:
 		    case coPercents:        { auto opt = new ConfigOptionPercentsNullable();archive(*opt); return opt; }
 		    case coBools:           { auto opt = new ConfigOptionBoolsNullable();	archive(*opt); return opt; }
 		    case coFloatsOrPercents:{ auto opt = new ConfigOptionFloatsOrPercentsNullable();archive(*opt); return opt; }
+            case coEnums:          { auto opt = new ConfigOptionEnumsGenericNullable(this->enum_keys_map); archive(*opt); return opt; }
             default: throw ConfigurationError(std::string("ConfigOptionDef::load_option_from_archive(): Unknown nullable option type for option ") + this->opt_key);
 		    }
     	} else {
@@ -2299,6 +2300,7 @@ public:
             // BBS
             case coEnums:           { auto opt = new ConfigOptionEnumsGeneric(this->enum_keys_map); archive(*opt); return opt; }
             case coIntsGroups:      { auto opt = new ConfigOptionIntsGroups();      archive(*opt); return opt; }
+            case coPointsGroups:    { auto opt = new ConfigOptionPointsGroups();    archive(*opt); return opt; }
 		    default:                throw ConfigurationError(std::string("ConfigOptionDef::load_option_from_archive(): Unknown option type for option ") + this->opt_key);
 		    }
 		}
@@ -2312,6 +2314,7 @@ public:
 		    case coPercents:        archive(*static_cast<const ConfigOptionPercentsNullable*>(opt));break;
 		    case coBools:           archive(*static_cast<const ConfigOptionBoolsNullable*>(opt)); 	break;
             case coFloatsOrPercents: archive(*static_cast<const ConfigOptionFloatsOrPercentsNullable*>(opt)); break;
+            case coEnums:           archive(*static_cast<const ConfigOptionEnumsGenericNullable*>(opt)); break;
             default: throw ConfigurationError(std::string("ConfigOptionDef::save_option_to_archive(): Unknown nullable option type for option ") + this->opt_key);
 		    }
 		} else {
@@ -2335,6 +2338,7 @@ public:
             // BBS
             case coEnums:           archive(*static_cast<const ConfigOptionEnumsGeneric*>(opt));    break;
             case coIntsGroups:      archive(*static_cast<const ConfigOptionIntsGroups *>(opt));     break;
+            case coPointsGroups:    archive(*static_cast<const ConfigOptionPointsGroups *>(opt));   break;
 		    default:                throw ConfigurationError(std::string("ConfigOptionDef::save_option_to_archive(): Unknown option type for option ") + this->opt_key);
 		    }
 		}

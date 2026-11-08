@@ -3150,15 +3150,15 @@ bool GCodeProcessor::get_last_z_from_gcode(const std::string& gcode_str, double&
                     && z_pos + 2 < line_str.size()) {
                     // Try to parse the numeric value.
                     std::string z_sub = line_str.substr(z_pos + 2);
-                    char* c = &z_sub[0];
-                    char* end = c + sizeof(z_sub.c_str());
+                    const char* c = z_sub.data();
+                    const char* end = c + z_sub.size();
 
                     auto is_end_of_word = [](char c) {
                         return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0 || c == ';';
                     };
 
                     auto [pend, ec] = fast_float::from_chars(c, end, temp_z);
-                    if (pend != c && is_end_of_word(*pend)) {
+                    if (pend != c && (pend == end || is_end_of_word(*pend))) {
                         // The axis value has been parsed correctly.
                         z = temp_z;
                         is_z_changed = true;
@@ -3215,13 +3215,13 @@ bool GCodeProcessor::get_last_position_from_gcode(const std::string &gcode_str, 
                     if (z_pos != line_str.npos && z_pos + 2 < line_str.size()) {
                         // Try to parse the numeric value.
                         std::string z_sub = line_str.substr(z_pos + 2);
-                        char       *c     = &z_sub[0];
-                        char       *end   = c + sizeof(z_sub.c_str());
+                        const char *c     = z_sub.data();
+                        const char *end   = c + z_sub.size();
 
                         auto is_end_of_word = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0 || c == ';'; };
 
                         auto [pend, ec] = fast_float::from_chars(c, end, temp_z);
-                        if (pend != c && is_end_of_word(*pend)) {
+                        if (pend != c && (pend == end || is_end_of_word(*pend))) {
                             // The axis value has been parsed correctly.
                             x            = temp_z;
                             is_z_changed = true;
@@ -3241,13 +3241,13 @@ bool GCodeProcessor::get_last_position_from_gcode(const std::string &gcode_str, 
                     if (z_pos != line_str.npos && z_pos + 2 < line_str.size()) {
                         // Try to parse the numeric value.
                         std::string z_sub = line_str.substr(z_pos + 2);
-                        char       *c     = &z_sub[0];
-                        char       *end   = c + sizeof(z_sub.c_str());
+                        const char *c     = z_sub.data();
+                        const char *end   = c + z_sub.size();
 
                         auto is_end_of_word = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0 || c == ';'; };
 
                         auto [pend, ec] = fast_float::from_chars(c, end, temp_z);
-                        if (pend != c && is_end_of_word(*pend)) {
+                        if (pend != c && (pend == end || is_end_of_word(*pend))) {
                             // The axis value has been parsed correctly.
                             y            = temp_z;
                             is_z_changed = true;
@@ -3265,13 +3265,13 @@ bool GCodeProcessor::get_last_position_from_gcode(const std::string &gcode_str, 
                     if (z_pos != line_str.npos && z_pos + 2 < line_str.size()) {
                         // Try to parse the numeric value.
                         std::string z_sub = line_str.substr(z_pos + 2);
-                        char       *c     = &z_sub[0];
-                        char       *end   = c + sizeof(z_sub.c_str());
+                        const char *c     = z_sub.data();
+                        const char *end   = c + z_sub.size();
 
                         auto is_end_of_word = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0 || c == ';'; };
 
                         auto [pend, ec] = fast_float::from_chars(c, end, temp_z);
-                        if (pend != c && is_end_of_word(*pend)) {
+                        if (pend != c && (pend == end || is_end_of_word(*pend))) {
                             // The axis value has been parsed correctly.
                             z            = temp_z;
                             is_z_changed = true;

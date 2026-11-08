@@ -76,10 +76,9 @@ public:
 
     void accept(PackResult& r) {
         if(r) {
-            //r.item_ptr_->translation(r.move_);
-            //r.item_ptr_->rotation(r.rot_);
-            //items_.emplace_back(*(r.item_ptr_));
-            static_cast<Subclass*>(this)->accept(r);
+            r.item_ptr_->translation(r.move_);
+            r.item_ptr_->rotation(r.rot_);
+            items_.emplace_back(*(r.item_ptr_));
             farea_valid_ = false;
         }
     }

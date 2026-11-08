@@ -399,7 +399,10 @@ template<>
 inline bp2d::Box boundingBox(const PathImpl& sh, const PathTag&)
 {
     bp2d::Box b;
+    if (boost::geometry::is_empty(sh))
+        return b;
     boost::geometry::envelope(sh, b);
+    b.defined = true;
     return b;
 }
 
@@ -408,7 +411,10 @@ inline bp2d::Box boundingBox<bp2d::Shapes>(const bp2d::Shapes& shapes,
                                            const MultiPolygonTag&)
 {
     bp2d::Box b;
+    if (boost::geometry::is_empty(shapes))
+        return b;
     boost::geometry::envelope(shapes, b);
+    b.defined = true;
     return b;
 }
 #endif
