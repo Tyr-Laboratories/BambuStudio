@@ -64,5 +64,7 @@ Files: `src/slic3r/GUI/Plater.cpp`, relevant Plater declarations, PartPlate inte
 
 - [x] Finish paired Organic benchmarks and full geometry/interface regressions; document exact artifacts, metrics and evidence limits.
 - [x] Re-run affected GUI/core checks and packaging validation after integration review.
-- [ ] Package matching app and corresponding source; install with profile/session preservation and verify the launched build.
-- [ ] Merge into default master, publish next unused Tyr release with verified assets, and remove temporary profiling/rollback artifacts.
+- [x] Package matching app and corresponding source; install with profile/session preservation and verify the launched build.
+- [x] Merge into default master, publish next unused Tyr release with verified assets, and remove temporary profiling/rollback artifacts.
+
+Completed 2026-11-08: installed and published [Tyr.22](https://github.com/Tyr-Laboratories/BambuStudio/releases/tag/v2.8.4.57-tyr.22), source revision `7e80a105b`. All five release asset sizes/digests and anonymous downloads were verified. All 2,649 profile settings and the account session were preserved; five `.info` files refreshed only their update timestamps. Temporary builds, profiling fixtures and rollback copies were removed.
