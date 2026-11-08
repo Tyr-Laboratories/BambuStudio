@@ -2,16 +2,14 @@
 
 namespace Slic3r {
 
-std::vector<double> Extruder::m_share_E = {0.,0.};
-std::vector<double> Extruder::m_share_retracted = {0.,0.};
-
-
 // TODO(米粒)：后续增加通过 (GCodeConfig, volume_type, extruder_type) 取参数的接口
 
-Extruder::Extruder(unsigned int id, GCodeConfig *config, bool share_extruder) :
+Extruder::Extruder(unsigned int id, GCodeConfig *config, bool share_extruder,
+                   std::shared_ptr<SharedState> shared_state) :
     m_id(id),
     m_config(config),
-    m_share_extruder(share_extruder)
+    m_share_extruder(share_extruder),
+    m_shared_state(shared_state ? std::move(shared_state) : std::make_shared<SharedState>())
 {
     reset();
     // cache values that are going to be called often
@@ -63,11 +61,11 @@ double Extruder::extrude(double dE)
     // BBS
     if (m_share_extruder) {
         if (m_config->use_relative_e_distances)
-            m_share_E[extruder_id()] = 0.;
-        m_share_E[extruder_id()] += dE;
+            m_shared_state->E[extruder_id()] = 0.;
+        m_shared_state->E[extruder_id()] += dE;
         m_absolute_E += dE;
         if (dE < 0.)
-            m_share_retracted[extruder_id()] -= dE;
+            m_shared_state->retracted[extruder_id()] -= dE;
     } else {
         // in case of relative E distances we always reset to 0 before any output
         if (m_config->use_relative_e_distances)
@@ -92,13 +90,13 @@ double Extruder::retract(double length, double restart_extra)
     // BBS
     if (m_share_extruder) {
         if (m_config->use_relative_e_distances)
-            m_share_E[extruder_id()] = 0.;
-        double to_retract = std::max(0., length - m_share_retracted[extruder_id()]);
+            m_shared_state->E[extruder_id()] = 0.;
+        double to_retract = std::max(0., length - m_shared_state->retracted[extruder_id()]);
         m_restart_extra   = restart_extra;
         if (to_retract > 0.) {
-            m_share_E[extruder_id()]             -= to_retract;
+            m_shared_state->E[extruder_id()]             -= to_retract;
             m_absolute_E          -= to_retract;
-            m_share_retracted[extruder_id()]     += to_retract;
+            m_shared_state->retracted[extruder_id()]     += to_retract;
         }
         return to_retract;
     } else {
@@ -120,9 +118,9 @@ double Extruder::unretract()
 {
     // BBS
     if (m_share_extruder) {
-        double dE = m_share_retracted[extruder_id()] + m_restart_extra;
+        double dE = m_shared_state->retracted[extruder_id()] + m_restart_extra;
         this->extrude(dE);
-        m_share_retracted[extruder_id()]     = 0.;
+        m_shared_state->retracted[extruder_id()]     = 0.;
         m_restart_extra                  = 0.;
         return dE;
     } else {

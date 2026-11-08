@@ -7,6 +7,7 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/GCode/PostProcessor.hpp"
 #include "libslic3r/GCode/GCodeResultSwap.hpp"
+#include "libslic3r/GCodeWriter.hpp"
 
 #include <future>
 #include <boost/filesystem.hpp>
@@ -14,6 +15,33 @@
 #include <sstream>
 
 using namespace Slic3r;
+
+TEST_CASE("Shared-nozzle filament state belongs to one plate writer", "[ParallelPlate][Extruder]")
+{
+    const bool relative = GENERATE(false, true);
+    auto prepare = [&](GCodeWriter &writer) {
+        writer.config.single_extruder_multi_material.value = true;
+        writer.config.use_relative_e_distances.value = relative;
+        writer.config.filament_map.values = {1, 1, 2};
+        writer.set_extruders({0, 1, 2});
+        writer.init_extruder(0, 0);
+    };
+    GCodeWriter a, b;
+    prepare(a);
+    a.filament()->extrude(10.);
+    REQUIRE(a.filament()->retract(1., 0.) == Approx(1.));
+    REQUIRE(a.extruders()[1].get_share_retracted_length() == Approx(1.));
+    REQUIRE(a.extruders()[2].get_share_retracted_length() == Approx(0.));
+    const double axis_a = a.filament()->E();
+    prepare(b);
+    b.filament()->extrude(20.);
+    b.filament()->retract(2., 0.);
+    REQUIRE(a.filament()->E() == Approx(axis_a));
+    REQUIRE(a.filament()->get_share_retracted_length() == Approx(1.));
+    REQUIRE(a.filament()->unretract() == Approx(1.));
+    REQUIRE(b.filament()->get_share_retracted_length() == Approx(2.));
+    REQUIRE(b.filament()->unretract() == Approx(2.));
+}
 
 TEST_CASE("Interleaved plate processors restore their own flush roles", "[ParallelPlate][Processor]")
 {
@@ -91,6 +119,7 @@ TEST_CASE("Independent plates slice and export equivalent serial and concurrent 
             {"sparse_infill_pattern", variant ? "lightning" : "grid"},
             {"sparse_infill_density", "15%"}, {"brim_type", "no_brim"},
             {"enable_prime_tower", "0"}, {"enable_arc_fitting", "0"},
+            {"single_extruder_multi_material", "1"},
             {"machine_start_gcode", ""}, {"machine_end_gcode", ""}
         });
         auto print = std::make_unique<Print>();

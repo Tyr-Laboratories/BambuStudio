@@ -4,6 +4,8 @@
 #include "libslic3r.h"
 #include "Point.hpp"
 #include "PrintConfig.hpp"
+#include <array>
+#include <memory>
 
 
 namespace Slic3r {
@@ -13,18 +15,23 @@ class GCodeConfig;
 class Extruder
 {
 public:
-    Extruder(unsigned int id, GCodeConfig *config, bool share_extruder);
+    // Filaments using the same physical nozzle share axes within one writer,
+    // never with another plate's export or temporary flow calculations.
+    struct SharedState {
+        std::array<double, 2> E {0., 0.};
+        std::array<double, 2> retracted {0., 0.};
+    };
+    Extruder(unsigned int id, GCodeConfig *config, bool share_extruder,
+             std::shared_ptr<SharedState> shared_state = nullptr);
     virtual ~Extruder() {}
 
     void   reset() {
         // BBS
         if (m_share_extruder) {
-            m_share_E = { 0.,0.};
-            m_share_retracted = { 0.,0. };
-        } else {
-            m_E             = 0;
-            m_retracted     = 0;
+            *m_shared_state = SharedState{};
         }
+        m_E             = 0;
+        m_retracted     = 0;
         m_restart_extra = 0;
         m_absolute_E    = 0;
     }
@@ -39,8 +46,8 @@ public:
     double extrude(double dE);
     double retract(double length, double restart_extra);
     double unretract();
-    double E() const { return m_share_extruder ? m_share_E[extruder_id()] : m_E; }
-    void   reset_E() { m_E = 0.; m_share_E[extruder_id()] = 0.; }
+    double E() const { return m_share_extruder ? m_shared_state->E[extruder_id()] : m_E; }
+    void   reset_E() { m_E = 0.; m_shared_state->E[extruder_id()] = 0.; }
     double e_per_mm(double mm3_per_mm) const { return mm3_per_mm * m_e_per_mm3; }
     double e_per_mm3() const { return m_e_per_mm3; }
     // Used filament volume in mm^3.
@@ -64,7 +71,7 @@ public:
 
     bool is_share_extruder() const { return m_share_extruder; }
     double get_single_retracted_length() const { return m_retracted; }
-    double get_share_retracted_length() const { return m_share_retracted[extruder_id()]; }
+    double get_share_retracted_length() const { return m_shared_state->retracted[extruder_id()]; }
 
 private:
     // Private constructor to create a key for a search in std::set.
@@ -87,8 +94,7 @@ private:
     // BBS.
     // Create shared E and retraction data for single extruder multi-material machine
     bool          m_share_extruder;
-    static std::vector<double> m_share_E;
-    static std::vector<double> m_share_retracted;
+    std::shared_ptr<SharedState> m_shared_state;
 };
 
 // Sort Extruder objects by the extruder id by default.

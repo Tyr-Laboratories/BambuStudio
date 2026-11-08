@@ -47,6 +47,12 @@ scripts receive a plate-local child environment, leaving the application
 environment unchanged while slicing and G-code generation overlap. No new shell
 commands, printer actions, or networking are added to slicing.
 
+Bambu shared-nozzle extrusion and retraction axes belong to one writer. Its
+filaments share physical-nozzle state with each other, while other plates and
+temporary flow-calculation extruders remain independent. Cover both absolute
+and relative extrusion modes and use the Bambu shared-nozzle setting in actual
+serial/concurrent export comparisons.
+
 Snapshot printer-vendor and filament-mapping mode on the UI thread, allocate all
 temporary plate paths before launch, and commit mapping changes on completion.
 Lightning child traversal must use geometry-local deterministic choices instead

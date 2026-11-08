@@ -74,8 +74,10 @@ void GCodeWriter::set_extruders(std::vector<unsigned int> extruder_ids)
     std::fill(m_curr_filament_extruder.begin(), m_curr_filament_extruder.end(), nullptr);
     m_filament_extruders.clear();
     m_filament_extruders.reserve(extruder_ids.size());
+    const auto shared_state = std::make_shared<Extruder::SharedState>();
     for (unsigned int extruder_id : extruder_ids)
-        m_filament_extruders.emplace_back(Extruder(extruder_id, &this->config, config.single_extruder_multi_material.value));
+        m_filament_extruders.emplace_back(extruder_id, &this->config,
+            config.single_extruder_multi_material.value, shared_state);
 
     /*  we enable support for multiple extruder if any extruder greater than 0 is used
         (even if prints only uses that one) since we need to output Tx commands
