@@ -1,6 +1,7 @@
 #include "BridgeAwareCubicMaterial.hpp"
 
 #include "ClipperUtils.hpp"
+#include "ExtrusionEntityCollection.hpp"
 #include "Fill/Fill.hpp"
 #include "Flow.hpp"
 #include "Layer.hpp"
@@ -95,10 +96,15 @@ bool clip_to_box(const Point &a, const Point &b, const BoundingBox &box, double 
 LayerMaterial printed_material(const Layer &layer, const std::vector<std::vector<size_t>> &groups_regions)
 {
     LayerMaterial material;
-    Polygons no_overlap;
+    Polygons wall_beads;
     Polygons may_print, surely;
     for (const LayerRegion *region : layer.regions()) {
-        append(no_overlap, to_polygons(region->fill_no_overlap_expolygons));
+        // The walls are final when the plan is built: their beads by nominal width (the gap fill between them included) are the
+        // walls on both sides. The surfaces' wall band (lslices less the no-overlap fill area) is wider by the gap the perimeter
+        // generator leaves between the last wall and the infill, which prints nothing: counting it as support held strand ends
+        // 0.2 to 0.5 mm from any bead (found by the K2 checker on the small cube, 9 November 2026).
+        region->perimeters.polygons_covered_by_width(wall_beads, 0.f);
+        region->thin_fills.polygons_covered_by_width(wall_beads, 0.f);
         const bool sparse_region = is_sparse_region(*region);
         for (const Surface &surface : region->fill_surfaces.surfaces) {
             if (surface.surface_type == stInternalVoid)
@@ -114,7 +120,7 @@ LayerMaterial printed_material(const Layer &layer, const std::vector<std::vector
             append(surely, to_polygons(opening_ex(area, float(scale_(SOLID_RULE * s_role)), ClipperLib::jtRound, ARC_TOLERANCE)));
         }
     }
-    material.walls         = diff_ex(layer.lslices, no_overlap);
+    material.walls         = intersection_ex(union_ex(wall_beads), layer.lslices);
     append(may_print, to_polygons(material.walls));
     append(surely, to_polygons(material.walls));
     material.may_print     = union_ex(may_print);

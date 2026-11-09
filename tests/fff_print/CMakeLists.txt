@@ -121,7 +121,7 @@ target_link_libraries(slicing_spatial_tests test_common libslic3r slicer_test_su
 set_property(TARGET slicing_spatial_tests PROPERTY FOLDER "tests")
 add_test(slicing_spatial_tests slicing_spatial_tests ${CATCH_EXTRA_ARGS})
 
-add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cubic_settings.cpp test_bridge_aware_cubic_lattice.cpp)
+add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cubic_settings.cpp test_bridge_aware_cubic_lattice.cpp test_bridge_aware_cubic_plan.cpp)
 target_link_libraries(bridge_aware_cubic_tests test_common libslic3r slicer_test_support)
 target_include_directories(bridge_aware_cubic_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/libslic3r)
 set_property(TARGET bridge_aware_cubic_tests PROPERTY FOLDER "tests")

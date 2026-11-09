@@ -145,7 +145,7 @@ std::vector<SimpleSettingData> SettingsFactory::get_visible_options(const std::s
         //Shell
         "wall_loops", "painted_wall_loops", "extra_wall_slope_angle", "top_shell_layers", "bottom_shell_layers", "top_shell_thickness", "bottom_shell_thickness",
         //Infill
-        "sparse_infill_density", "sparse_infill_pattern", "bridge_aware_cubic_max_gap", "conformal_infill", "conformal_stagger", "conformal_link_keep_layers", "conformal_link_flip_layers", "conformal_pole", "conformal_ray_count", "conformal_hub_radius", "top_surface_pattern", "bottom_surface_pattern", "infill_combination", "infill_direction", "infill_wall_overlap",
+        "sparse_infill_density", "sparse_infill_pattern", "conformal_infill", "conformal_stagger", "conformal_link_keep_layers", "conformal_link_flip_layers", "conformal_pole", "conformal_ray_count", "conformal_hub_radius", "top_surface_pattern", "bottom_surface_pattern", "infill_combination", "infill_direction", "infill_wall_overlap",
         //speed
         "inner_wall_speed", "outer_wall_speed", "sparse_infill_speed", "internal_solid_infill_speed", "top_surface_speed", "gap_infill_speed"
         };

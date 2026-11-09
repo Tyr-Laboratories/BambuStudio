@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -194,13 +195,20 @@ inline double sparse_length(const Slic3r::Print &print)
     return result;
 }
 
-// A path of the fills of a print, as the cases compare them.
+// A path of the fills of a print, as the cases compare them: its role, cross-section (height, width, volume per mm), region and
+// vertices.
 struct FillPath {
     Slic3r::ExtrusionRole role;
     Slic3r::Points        points;
     float                 height;
+    float                 width;
+    double                mm3_per_mm;
+    size_t                region;
 
-    bool operator==(const FillPath &rhs) const { return role == rhs.role && points == rhs.points && height == rhs.height; }
+    bool operator==(const FillPath &rhs) const
+    {
+        return role == rhs.role && points == rhs.points && height == rhs.height && width == rhs.width && mm3_per_mm == rhs.mm3_per_mm && region == rhs.region;
+    }
     bool operator!=(const FillPath &rhs) const { return ! (*this == rhs); }
 };
 
@@ -212,10 +220,10 @@ inline std::vector<std::vector<FillPath>> fill_paths(const Slic3r::Print &print,
     std::vector<std::vector<FillPath>> layers;
     for (const Layer *layer : print.get_object(size_t(0))->layers()) {
         std::vector<FillPath> &out = layers.emplace_back();
-        for (const LayerRegion *region : layer->regions())
-            paths(region->fills, [&out, role](const ExtrusionPath &path) {
+        for (size_t region = 0; region < layer->regions().size(); ++region)
+            paths(layer->regions()[region]->fills, [&out, role, region](const ExtrusionPath &path) {
                 if (! role || path.role() == *role)
-                    out.push_back({ path.role(), path.polyline.points, path.height });
+                    out.push_back({ path.role(), path.polyline.points, path.height, path.width, path.mm3_per_mm, region });
             });
     }
     return layers;
@@ -230,34 +238,57 @@ inline size_t different_layers(const std::vector<std::vector<FillPath>> &a, cons
     return different;
 }
 
-// The segments a layer's fills deposit: role, height and the two ends (ordered), with collinear vertices within `tolerance_mm`
-// removed, so that the same lines compare equal however the fill groups were ordered or their polylines split.
+// The segments a layer's fills deposit, each with its path's role, cross-section and region.
 struct FillSegment {
     Slic3r::ExtrusionRole role;
-    float                 height;
+    float                 height, width;
+    double                mm3_per_mm;
+    size_t                region;
     Slic3r::Point         a, b;
+    bool same_kind(const FillSegment &o) const { return role == o.role && height == o.height && width == o.width && mm3_per_mm == o.mm3_per_mm && region == o.region; }
 };
 
-inline std::vector<FillSegment> fill_segments(const std::vector<FillPath> &paths, double tolerance_mm)
+inline std::vector<FillSegment> fill_segments(const std::vector<FillPath> &paths)
 {
-    using namespace Slic3r;
     std::vector<FillSegment> out;
-    for (const FillPath &path : paths) {
-        Polyline polyline(path.points);
-        polyline.simplify(scale_(tolerance_mm));
-        for (size_t i = 1; i < polyline.points.size(); ++i) {
-            Point a = polyline.points[i - 1], b = polyline.points[i];
-            if (a == b) continue;
-            if (std::make_pair(a.x(), a.y()) > std::make_pair(b.x(), b.y())) std::swap(a, b);
-            out.push_back({ path.role, path.height, a, b });
-        }
-    }
+    for (const FillPath &path : paths)
+        for (size_t i = 1; i < path.points.size(); ++i)
+            if (path.points[i - 1] != path.points[i])
+                out.push_back({ path.role, path.height, path.width, path.mm3_per_mm, path.region, path.points[i - 1], path.points[i] });
     return out;
 }
 
-// Whether two prints deposit the same fill segments on every layer, regardless of order: the same count, each segment of one
-// matched by an unused segment of the other with the same role and height and both ends within `tolerance_mm`. The message
-// names the first layer that differs.
+// Whether a segment lies, within `tolerance` (scaled), on segments of the same kind among `others`: both ends of each such
+// segment within the tolerance of its line, and their projections covering it. Collinear splits at different vertices compare
+// equal this way, whichever side has more of them.
+inline bool covered_by(const FillSegment &s, const std::vector<FillSegment> &others, double tolerance)
+{
+    const Slic3r::Vec2d a = s.a.cast<double>(), d = (s.b - s.a).cast<double>();
+    const double length = d.norm();
+    if (length < 1.) return true;
+    const Slic3r::Vec2d u = d / length;
+    std::vector<std::pair<double, double>> intervals;
+    for (const FillSegment &o : others) {
+        if (!o.same_kind(s)) continue;
+        const Slic3r::Vec2d oa = o.a.cast<double>() - a, ob = o.b.cast<double>() - a;
+        if (std::abs(oa.x() * u.y() - oa.y() * u.x()) > tolerance || std::abs(ob.x() * u.y() - ob.y() * u.x()) > tolerance) continue;
+        double t0 = oa.dot(u), t1 = ob.dot(u);
+        if (t0 > t1) std::swap(t0, t1);
+        intervals.emplace_back(t0, t1);
+    }
+    std::sort(intervals.begin(), intervals.end());
+    double cursor = 0.;
+    for (const auto &interval : intervals) {
+        if (interval.first > cursor + tolerance) return false;
+        cursor = std::max(cursor, interval.second);
+        if (cursor >= length - tolerance) return true;
+    }
+    return cursor >= length - tolerance;
+}
+
+// Whether two prints deposit the same fills on every layer, regardless of the order of paths: every segment of each covered by
+// segments of the same role, cross-section and region of the other within `tolerance_mm`, and the same total length of each
+// role. The message names the first layer that differs.
 inline bool same_fill_paths(const std::vector<std::vector<FillPath>> &a, const std::vector<std::vector<FillPath>> &b,
                             double tolerance_mm, std::string &message)
 {
@@ -265,41 +296,25 @@ inline bool same_fill_paths(const std::vector<std::vector<FillPath>> &a, const s
     if (a.size() != b.size()) { message = "layer counts " + std::to_string(a.size()) + " and " + std::to_string(b.size()); return false; }
     const double tolerance = scale_(tolerance_mm);
     for (size_t i = 0; i < a.size(); ++i) {
-        const std::vector<FillSegment> sa = fill_segments(a[i], tolerance_mm), sb = fill_segments(b[i], tolerance_mm);
-        if (sa.size() != sb.size()) {
-            message = "layer " + std::to_string(i) + ": " + std::to_string(sa.size()) + " against " + std::to_string(sb.size()) + " segments";
-            return false;
-        }
-        std::vector<bool> used(sb.size(), false);
-        std::vector<const FillSegment*> unmatched;
-        for (const FillSegment &s : sa) {
-            bool matched = false;
-            for (size_t j = 0; j < sb.size() && !matched; ++j) {
-                if (used[j] || sb[j].role != s.role || sb[j].height != s.height) continue;
-                const bool same_way = (s.a - sb[j].a).cast<double>().norm() <= tolerance && (s.b - sb[j].b).cast<double>().norm() <= tolerance;
-                const bool reversed = (s.a - sb[j].b).cast<double>().norm() <= tolerance && (s.b - sb[j].a).cast<double>().norm() <= tolerance;
-                if (same_way || reversed) {
-                    used[j] = true;
-                    matched = true;
-                }
+        // Path counts are not compared: the connector may chain the same lines differently where a fill group's boundary
+        // moved by Clipper's safety offset; the segments and their total length per role pin the deposited geometry.
+        const std::vector<FillSegment> sa = fill_segments(a[i]), sb = fill_segments(b[i]);
+        std::map<int, double> length_a, length_b;
+        for (const FillSegment &s : sa) length_a[int(s.role)] += unscale<double>((s.b - s.a).cast<double>().norm());
+        for (const FillSegment &s : sb) length_b[int(s.role)] += unscale<double>((s.b - s.a).cast<double>().norm());
+        for (const auto &[role, length] : length_a)
+            if (std::abs(length - length_b[role]) > tolerance_mm * double(sa.size() + sb.size())) {
+                message = "layer " + std::to_string(i) + ": the total length of role " + std::to_string(role) + " differs by " + std::to_string(length - length_b[role]) + " mm";
+                return false;
             }
-            if (!matched)
-                unmatched.push_back(&s);
-        }
-        if (!unmatched.empty()) {
-            const auto describe = [](const FillSegment &s) {
-                return "role " + std::to_string(int(s.role)) + " " + std::to_string(unscale<double>(s.a.x())) + "," + std::to_string(unscale<double>(s.a.y())) +
-                       " -> " + std::to_string(unscale<double>(s.b.x())) + "," + std::to_string(unscale<double>(s.b.y()));
-            };
-            message = "layer " + std::to_string(i) + ": " + std::to_string(unmatched.size()) + " segments without counterpart; first:";
-            for (size_t k = 0; k < std::min<size_t>(4, unmatched.size()); ++k)
-                message += " [" + describe(*unmatched[k]) + "]";
-            message += "; unmatched on the other side:";
-            size_t shown = 0;
-            for (size_t j = 0; j < sb.size() && shown < 4; ++j)
-                if (!used[j]) { message += " [" + describe(sb[j]) + "]"; ++shown; }
-            return false;
-        }
+        const auto describe = [](const FillSegment &s) {
+            return "role " + std::to_string(int(s.role)) + " " + std::to_string(unscale<double>(s.a.x())) + "," + std::to_string(unscale<double>(s.a.y())) +
+                   " -> " + std::to_string(unscale<double>(s.b.x())) + "," + std::to_string(unscale<double>(s.b.y()));
+        };
+        for (const FillSegment &s : sa)
+            if (!covered_by(s, sb, tolerance)) { message = "layer " + std::to_string(i) + ": uncovered in the second print: " + describe(s); return false; }
+        for (const FillSegment &s : sb)
+            if (!covered_by(s, sa, tolerance)) { message = "layer " + std::to_string(i) + ": uncovered in the first print: " + describe(s); return false; }
     }
     return true;
 }

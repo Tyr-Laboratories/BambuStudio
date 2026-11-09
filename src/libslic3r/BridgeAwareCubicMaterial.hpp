@@ -4,9 +4,9 @@
 // Bridge aware cubic: one definition of printed material and void (rewrite architecture, section 3.3), the fill boundary the
 // filler clips to (3.8), and an index over areas for the plan's many point and segment queries.
 //
-// Two sides, both conservative: what MAY print (M⁺: walls, every non-sparse surface, the pattern's courses) is the roof side of
-// the overhang rule, what SURELY prints (M⁻: walls, the parts of non-sparse surfaces at least 1.1 spacings wide, the courses)
-// is the support side. The void V is everything inside the outline that does not surely print.
+// Two sides, both conservative: what MAY print (M⁺: the walls' beads, every non-sparse surface, the pattern's courses) is the
+// roof side of the overhang rule, what SURELY prints (M⁻: the walls' beads, the parts of non-sparse surfaces at least 1.1
+// spacings wide, the courses) is the support side. The void V is everything inside the outline that does not surely print.
 
 #include "libslic3r.h"
 #include "BoundingBox.hpp"
@@ -27,7 +27,7 @@ namespace BridgeAwareCubic {
 
 struct LayerMaterial
 {
-    ExPolygons              walls;           // lslices − ∪ fill_no_overlap_expolygons: the perimeters and the gap fill between them
+    ExPolygons              walls;           // the beads of the perimeters and the gap fill between them, by nominal width, inside lslices
     ExPolygons              may_print;       // M⁺
     ExPolygons              surely_prints;   // M⁻
     ExPolygons              void_area;       // V = lslices − M⁻

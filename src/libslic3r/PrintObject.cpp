@@ -1,3 +1,4 @@
+#include "Fill/BridgeAwareCubicPlan.hpp"
 #include "Exception.hpp"
 #include "Print.hpp"
 #include "BoundingBox.hpp"
@@ -1006,6 +1007,9 @@ void PrintObject::prepare_infill()
                         original_sparse[index][region_id].push_back(surface);
         }
     }
+    // Bridge aware cubic plans once, before the bridges, so that the anchoring previews show its lines.
+    this->prepare_bridge_aware_cubic();
+    m_print->throw_if_canceled();
     this->bridge_over_infill();
     this->add_internal_bridge_layers(original_sparse);
     m_print->throw_if_canceled();
@@ -1120,6 +1124,30 @@ static std::vector<std::vector<ExPolygon>> conformal_modifier_islands(const Prin
         if (row.size() > 1)
             row = union_ex(row);
     return out;
+}
+
+const BridgeAwareCubic::ObjectPlan* PrintObject::bridge_aware_cubic_plan() const
+{
+    if (m_bridge_aware_cubic_plan == nullptr && m_shared_object != nullptr)
+        return m_shared_object->bridge_aware_cubic_plan();
+    return m_bridge_aware_cubic_plan.get();
+}
+
+void PrintObject::prepare_bridge_aware_cubic()
+{
+    m_bridge_aware_cubic_plan.reset();
+    bool wanted = false;
+    for (const PrintRegion &region : this->all_regions()) {
+        const PrintRegionConfig &config = region.config();
+        if (config.sparse_infill_pattern.value == ipBridgeAwareCubic && config.sparse_infill_density.value > 0. && config.sparse_infill_density.value < 100.)
+            wanted = true;
+    }
+    if (!wanted)
+        return;
+    BOOST_LOG_TRIVIAL(info) << "Bridge aware cubic plan - Start" << log_memory_info();
+    std::unique_ptr<BridgeAwareCubic::ObjectPlan> plan = BridgeAwareCubic::ObjectPlan::build(*this, [this]() { m_print->throw_if_canceled(); });
+    m_bridge_aware_cubic_plan = std::move(plan);
+    BOOST_LOG_TRIVIAL(info) << "Bridge aware cubic plan - End" << log_memory_info();
 }
 
 void PrintObject::infill()
