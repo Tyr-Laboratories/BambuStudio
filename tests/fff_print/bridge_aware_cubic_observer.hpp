@@ -174,15 +174,50 @@ inline std::string exported_gcode(const BACFixtures::Workspace &workspace, Model
     return out;
 }
 
-// Slices the model with the settings, exports it into the workspace and reads the extrusions back.
-inline std::vector<EmittedPath> exported_extrusions(const BACFixtures::Workspace &workspace, Model model, const DynamicPrintConfig &settings,
-                                                    const std::string &name)
+// Slices the model with the settings into the print, exports it into the workspace and reads the extrusions back.
+inline std::vector<EmittedPath> exported_extrusions(Print &print, const BACFixtures::Workspace &workspace, Model model,
+                                                    const DynamicPrintConfig &settings, const std::string &name)
 {
-    Print print;
     const DynamicPrintConfig config = observed(settings);
     BACFixtures::slice(print, model, config);
     const std::string filename = print.export_gcode((workspace.path / name).string(), nullptr);
     return read_extrusions(filename, config);
+}
+
+inline std::vector<EmittedPath> exported_extrusions(const BACFixtures::Workspace &workspace, Model model, const DynamicPrintConfig &settings,
+                                                    const std::string &name)
+{
+    Print print;
+    return exported_extrusions(print, workspace, std::move(model), settings, name);
+}
+
+// A place (mm, on the bed) where a sparse infill path of the export leaves the area the stock pipeline gives its layer's infill:
+// the regions' fill areas, which reach into the walls by the infill/wall overlap, grown by the print's resolution, by which the
+// path simplification may move a vertex. Cubic's lines end half a spacing inside it.
+inline std::optional<Vec2d> sparse_outside_fill_area(const Print &print, const std::vector<EmittedPath> &paths)
+{
+    std::map<int, ExPolygons> areas;
+    for (const PrintObject *object : print.objects())
+        for (const PrintInstance &instance : object->instances())
+            for (const Layer *layer : object->layers())
+                for (const LayerRegion *region : layer->regions())
+                    for (ExPolygon area : region->fill_expolygons) {
+                        area.translate(instance.shift);
+                        areas[plane_key(layer->print_z)].push_back(std::move(area));
+                    }
+    for (auto &[key, area] : areas)
+        area = offset_ex(union_ex(area), float(scale_(print.config().resolution.value)));
+    std::map<int, Polylines> sparse;
+    for (const EmittedPath &path : paths)
+        if (path.role == erInternalInfill)
+            sparse[plane_key(path.z)].push_back(path.path);
+    for (const auto &[key, lines] : sparse) {
+        const auto it = areas.find(key);
+        for (const Polyline &piece : it == areas.end() ? lines : diff_pl(lines, it->second))
+            if (piece.length() > SCALED_EPSILON)
+                return unscale(piece.last_point());
+    }
+    return std::nullopt;
 }
 
 inline double diameter_mm(const Points &points)

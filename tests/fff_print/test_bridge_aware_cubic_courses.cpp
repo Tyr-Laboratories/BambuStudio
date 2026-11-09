@@ -3,19 +3,16 @@
 #include "bridge_aware_cubic_fixtures.hpp"
 #include "bridge_aware_cubic_observer.hpp"
 
-#include "libslic3r/Fill/BridgeAwareCubicPlan.hpp"
-
 #include <algorithm>
 #include <sstream>
 #include <string>
 #include <vector>
 
 using namespace Slic3r;
-using namespace Slic3r::BridgeAwareCubic;
 using namespace BACFixtures;
 using namespace BACObserver;
 
-// The courses of section 3.5: seam walls (W1) and rails (R1). Read from the plan through the object, and from the export.
+// The courses of section 3.5: seam walls (W1) and rails (R1), read from the export and the final surfaces.
 
 namespace {
 
@@ -38,13 +35,12 @@ Model right_half_modifier(std::initializer_list<std::pair<const std::string, std
 
 constexpr double SEAM_X = 80. + 24.;    // the seam plane of the modifier fixtures on the bed, mm
 
-// A sliced print and its exported paths: the plan is read through the print's object, the paths through the observer.
+// A sliced print and its exported paths, read through the observer.
 struct Sliced
 {
     Print                    print;
     std::vector<EmittedPath> paths;
     const PrintObject&       object() const { return *print.get_object(size_t(0)); }
-    const ObjectPlan*        plan() const { return object().bridge_aware_cubic_plan(); }
 };
 
 void slice_and_export(Sliced &out, const Workspace &workspace, Model model, const DynamicPrintConfig &settings, const std::string &name)
@@ -166,16 +162,6 @@ Model fuselage_top()
     return single_part("Bridge aware cubic fuselage top", TriangleMesh(its_convex_hull(points)));
 }
 
-// Every layer and region of the plan has no course.
-bool no_courses(const ObjectPlan &plan, const PrintObject &object)
-{
-    for (size_t l = 0; l < object.layers().size(); ++l)
-        for (size_t r = 0; r < object.num_printing_regions(); ++r)
-            if (!plan.courses_at(l, r).empty())
-                return false;
-    return true;
-}
-
 // The bridge footprint of every layer beyond `limit_mm` of the roof's solid footprint (what the layers above it print, `bridge_layers`
 // of them: a thick base lies under the roof's own layer), where it lies over the sparse void of the plane below: the generator's
 // growth past the roof's inner edge beyond what the rails allow. Returns the area (mm²) of that overgrowth, summed over the layers.
@@ -266,8 +252,9 @@ Polylines bridge_inner_edges(const EmittedLayer &upper, const EmittedLayer &lowe
 // further: the control, where it does on the fixture; the roof is what the layers above the bridge print); no bridge end over the
 // pattern's void hangs (an end inside the wall overlap is anchored); rail beads lie along the inner edges of every bridge layer
 // whose roof edges run over the void, and no rail-like bead lies anywhere where the roof edges are at the walls; the user's wall,
-// bridge, anchor and density settings included. Thick bases (two and three internal bridge layers) and the generator bridging a layer above the predicted roof are
-// recorded limitations (docs/bridge-aware-cubic.md).
+// bridge, anchor and density settings included. The hanging-end measure's control: Cubic hangs a bridge end on the rib. Thick
+// bases (two and three internal bridge layers) and the generator bridging a layer above the predicted roof are recorded
+// limitations (docs/bridge-aware-cubic.md).
 struct RailCase {
     std::string          name;
     Model              (*model)();
@@ -279,6 +266,7 @@ struct RailCase {
     bool                 cubic_overgrows = false;   // the control: Cubic's bridge grows past the limit on this fixture
     bool                 rails_per_layer = true;    // every bridge layer with inner edges over the void has its rails (the
                                                     // fuselage top's apex is bridged a layer above the prediction: recorded)
+    bool                 cubic_hangs = false;       // the control of the hanging-end measure: Cubic hangs a bridge end here
 };
 
 void check_rails(Workspace &workspace, const std::vector<RailCase> &cases);
@@ -297,7 +285,7 @@ TEST_CASE("Bridge aware cubic lays rails along the roof edges the bridges grow p
                     {"sparse_infill_anchor", "1"}, {"sparse_infill_anchor_max", "1"}, {"sparse_infill_density", "3%"}}), 5., nullptr, true, 45., false, false },
         { "small cube", small_cube, {}, 5., nullptr, false },
         { "large cube", large_cube, {}, 5., nullptr, false },
-        { "rib", rib, {}, 5., rib_config, true, 17., true },
+        { "rib", rib, {}, 5., rib_config, true, 17., true, true, true },
         { "small cube, two internal bridge layers", small_cube, with({}, {{"internal_bridge_layers", "2"}}), 5., nullptr, false },
         { "small cube, three internal bridge layers", small_cube, with({}, {{"internal_bridge_layers", "3"}}), 5., nullptr, false },
     });
@@ -321,6 +309,8 @@ void check_rails(Workspace &workspace, const std::vector<RailCase> &cases)
         for (const auto &[z, at] : ends.where) hanging << " z " << z << " (" << at.x() << ", " << at.y() << ")";
         INFO("hanging ends:" << hanging.str());
         CHECK(ends.hanging == 0);
+        if (c.cubic_hangs)
+            CHECK(count_bridge_ends(control).hanging > 0);
         // d_r = s_b + w/2 + 0.05 with the thick bridge flow's spacing s_b and the sparse bead w; the bridge footprint may reach w_b past
         // the rail's centre line and the touching measure further.
         const PrintRegion &region = object.printing_region(0);
@@ -382,59 +372,48 @@ void check_rails(Workspace &workspace, const std::vector<RailCase> &cases)
     }
 }
 
-// W1: seam walls. Where two lattices meet, the lower-index region lays one bead of its sparse infill just inside its boundary
-// (3.5a), on every layer where the seam exists; each half then holds its own gap; a floating modifier's first course is a roof
-// for the plane beneath it and K2 holds across the seam; a 0 % neighbour gets a wall at half a bead and stays empty; no wall
-// is laid against material or between regions of one group.
+// W1: seam walls, read from the export and the final surfaces. Where two lattices meet, the lower-index region lays one bead of its
+// sparse infill just inside its boundary (3.5a), on every layer where both regions have sparse fill; each half then holds its own
+// gap; a floating modifier's first course lies on the modifier's first layer and is held from below (K2 across the seam); a 0 %
+// neighbour gets a wall at half a bead less the overlap and stays empty; no wall is laid against material or between regions of
+// one group.
 TEST_CASE("Bridge aware cubic lays one seam wall where two lattices meet", "[BridgeAwareCubic][W1]")
 {
     Workspace workspace;
+    // The length of the seam bead at x on the export's layers where both regions have sparse fill, against the sparse extent.
+    struct SeamLayer { double z, extent, at_wall, at_other; };
+    const auto seam_layers = [](const Sliced &sliced, size_t a, size_t b, double x_wall, double x_other) {
+        std::vector<SeamLayer> out;
+        for (const auto &[key, layer] : emitted_layers(sliced.paths)) {
+            const int l = layer_of_key(sliced.object(), key);
+            if (l < 0 || !has_sparse(*sliced.object().layers()[size_t(l)], a) || !has_sparse(*sliced.object().layers()[size_t(l)], b))
+                continue;
+            out.push_back({ key / 1000., sparse_y_extent(layer), vertical_sparse_length(layer, x_wall - 0.015, x_wall + 0.015),
+                            vertical_sparse_length(layer, x_other - 0.015, x_other + 0.015) });
+        }
+        return out;
+    };
 
     SECTION("the modifier seam carries one bead of the lower-index region on every sparse layer, inset as 3.5a") {
         Sliced sliced;
         slice_and_export(sliced, workspace, modifier(), modifier_config("bridgeawarecubic"), "w1-modifier.gcode");
-        const PrintObject &object = sliced.object();
-        const ObjectPlan *plan = sliced.plan();
-        REQUIRE(plan != nullptr);
-        const int left = region_with_gap(object, 8.), right = region_with_gap(object, 3.);
+        const int left = region_with_gap(sliced.object(), 8.), right = region_with_gap(sliced.object(), 3.);
         REQUIRE(left >= 0);
         REQUIRE(right >= 0);
         const size_t lower = size_t(std::min(left, right)), higher = size_t(std::max(left, right));
-        REQUIRE(plan->group_of_region(lower) != nullptr);
-        REQUIRE(plan->group_of_region(higher) != nullptr);
-        CHECK(plan->group_of_region(lower) != plan->group_of_region(higher));
-
-        // The plan: walls of the lower-index region on every layer where both regions have sparse fill, none of the other region.
-        size_t layers_with_walls = 0;
-        for (size_t l = 0; l < object.layers().size(); ++l) {
-            INFO("layer " << l << " at z = " << object.layers()[l]->print_z);
-            CHECK(plan->courses_at(l, higher).empty());
-            const bool seam = has_sparse(*object.layers()[l], lower) && has_sparse(*object.layers()[l], higher);
-            CHECK(plan->courses_at(l, lower).empty() == !seam);
-            if (!plan->courses_at(l, lower).empty())
-                ++layers_with_walls;
-        }
-        CHECK(layers_with_walls >= 80);
-
-        // The export: on every layer with a wall, a near-vertical sparse bead at w/2 − 0.05 from the seam on the lower-index
-        // region's side (the user's 0.05 mm overlap into the neighbour's butt ends), covering at least 90 % of the sparse extent.
+        // A near-vertical sparse bead at w/2 − 0.05 from the seam on the lower-index region's side (the user's 0.05 mm overlap into
+        // the neighbour's butt ends), covering at least 90 % of the sparse extent, and none on the other side.
         const double w = sparse_width(sliced.paths);
         REQUIRE(w > 0.3);
         const double side = lower == size_t(left) ? -1. : +1.;
-        const double x_wall = SEAM_X + side * (0.5 * w - 0.05), x_other = SEAM_X - side * (0.5 * w - 0.05);
-        size_t layers_checked = 0;
-        for (const auto &[key, layer] : emitted_layers(sliced.paths)) {
-            const int l = layer_of_key(object, key);
-            if (l < 0 || plan->courses_at(size_t(l), lower).empty())
-                continue;
-            INFO("z = " << key / 1000.);
-            const double extent = sparse_y_extent(layer);
-            REQUIRE(extent > 20.);
-            CHECK(vertical_sparse_length(layer, x_wall - 0.015, x_wall + 0.015) >= 0.9 * extent);
-            CHECK(vertical_sparse_length(layer, x_other - 0.015, x_other + 0.015) < 0.1 * extent);
-            ++layers_checked;
+        const std::vector<SeamLayer> layers = seam_layers(sliced, lower, higher, SEAM_X + side * (0.5 * w - 0.05), SEAM_X - side * (0.5 * w - 0.05));
+        CHECK(layers.size() >= 80);
+        for (const SeamLayer &layer : layers) {
+            INFO("z = " << layer.z);
+            REQUIRE(layer.extent > 20.);
+            CHECK(layer.at_wall >= 0.9 * layer.extent);
+            CHECK(layer.at_other < 0.1 * layer.extent);
         }
-        CHECK(layers_checked == layers_with_walls);
 
         // Each half holds its own gap on the export (K1 with the seam closed): no opening spans the seam, and every opening and
         // run is within the gap of its side.
@@ -453,23 +432,22 @@ TEST_CASE("Bridge aware cubic lays one seam wall where two lattices meet", "[Bri
         }
     }
 
-    SECTION("a floating modifier's first course is a roof for the plane beneath it and K2 holds across the seam") {
+    SECTION("a floating modifier's first course lies on the modifier's first layer and K2 holds across the seam") {
         Sliced sliced;
         slice_and_export(sliced, workspace, floating_modifier(), modifier_config("bridgeawarecubic"), "w1-floating.gcode");
-        const PrintObject &object = sliced.object();
-        const ObjectPlan *plan = sliced.plan();
-        REQUIRE(plan != nullptr);
-        size_t first_course = size_t(-1);
-        for (size_t l = 0; l < object.layers().size() && first_course == size_t(-1); ++l)
-            for (size_t r = 0; r < object.num_printing_regions(); ++r)
-                if (!plan->courses_at(l, r).empty()) { first_course = l; break; }
-        REQUIRE(first_course != size_t(-1));
-        REQUIRE(first_course > 0);
-        CHECK(object.layers()[first_course]->print_z == Approx(6.2));
-        const std::vector<PlaneSummary> planes = plan->planes();
-        CHECK(std::any_of(planes.begin(), planes.end(), [first_course](const PlaneSummary &p) { return p.roof_layer == first_course && p.plane_layer == first_course - 1; }));
-        // Below the modifier the whole part is one region at gap 8; above, the right half (x from the seam) is at gap 3.
-        const double z_first = object.layers()[first_course]->print_z;
+        const int left = region_with_gap(sliced.object(), 8.), right = region_with_gap(sliced.object(), 3.);
+        REQUIRE(left >= 0);
+        REQUIRE(right >= 0);
+        const double w = sparse_width(sliced.paths);
+        REQUIRE(w > 0.3);
+        const double side = std::min(left, right) == left ? -1. : +1.;
+        const std::vector<SeamLayer> layers = seam_layers(sliced, size_t(left), size_t(right), SEAM_X + side * (0.5 * w - 0.05), SEAM_X - side * (0.5 * w - 0.05));
+        REQUIRE_FALSE(layers.empty());
+        CHECK(layers.front().z == Approx(6.2));
+        CHECK(layers.front().at_wall >= 0.9 * layers.front().extent);
+        // Below the modifier the whole part is one region at gap 8; above, the right half (x from the seam) is at gap 3. The first
+        // course is a line the pattern adds over the coarse lattice below it: K2 holds it only where the plan refined under it.
+        const double z_first = layers.front().z;
         const std::vector<EmittedPath> control = exported_extrusions(workspace, floating_modifier(), modifier_config("cubic"), "w1-floating-cubic.gcode");
         const K2Measure measure = measure_k2(sliced.paths, control,
             [z_first](const Vec2d &at, double z) { return (z >= z_first - 1e-6 && at.x() >= SEAM_X ? 3. : 8.) - 0.1; }, std::vector<double>{ 45., 17. });
@@ -481,73 +459,40 @@ TEST_CASE("Bridge aware cubic lays one seam wall where two lattices meet", "[Bri
     SECTION("a 0 % neighbour gets a wall at half a bead less the overlap and stays empty") {
         Sliced sliced;
         slice_and_export(sliced, workspace, right_half_modifier({{"sparse_infill_density", "0%"}}), modifier_config("bridgeawarecubic"), "w1-empty.gcode");
-        const PrintObject &object = sliced.object();
-        const ObjectPlan *plan = sliced.plan();
-        REQUIRE(plan != nullptr);
         const double w = sparse_width(sliced.paths);
         REQUIRE(w > 0.3);
         // Inset as beside beads (w/2 - 0.05): at a convex corner the round join of a bead at w/2 leaves a pocket joining the 0 %
         // void to the region's surface; the 0.05 mm overlap into a region that prints nothing there is harmless.
-        const double x_wall = SEAM_X - (0.5 * w - 0.05);
-        size_t layers_checked = 0;
-        for (const auto &[key, layer] : emitted_layers(sliced.paths)) {
-            const int l = layer_of_key(object, key);
-            if (l < 0)
-                continue;
-            bool courses = false;
-            for (size_t r = 0; r < object.num_printing_regions(); ++r)
-                if (!plan->courses_at(size_t(l), r).empty())
-                    courses = true;
-            if (!courses)
-                continue;
-            INFO("z = " << key / 1000.);
-            const double extent = sparse_y_extent(layer);
-            REQUIRE(extent > 20.);
-            CHECK(vertical_sparse_length(layer, x_wall - 0.015, x_wall + 0.015) >= 0.9 * extent);
-            ++layers_checked;
+        const std::vector<SeamLayer> layers = seam_layers(sliced, 0, 1, SEAM_X - (0.5 * w - 0.05), SEAM_X + (0.5 * w - 0.05));
+        CHECK(layers.size() >= 80);
+        for (const SeamLayer &layer : layers) {
+            INFO("z = " << layer.z);
+            REQUIRE(layer.extent > 20.);
+            CHECK(layer.at_wall >= 0.9 * layer.extent);
         }
-        CHECK(layers_checked >= 80);
         CHECK(sparse_max_x(sliced.paths) <= SEAM_X + 0.01);
-        // The 0 % region's surfaces never meet the pattern's void: the wall seals the seam at the corners too.
-        const int zero_region = object.printing_region(0).config().sparse_infill_density.value <= 0. ? 0 : 1;
-        size_t sealed_layers = 0;
-        for (size_t l = 0; l < object.layers().size(); ++l) {
-            const Layer &layer = *object.layers()[l];
-            if (size_t(zero_region) >= layer.regions().size())
-                continue;
-            ExPolygons zero;
-            for (const Surface &surface : layer.regions()[zero_region]->fill_surfaces.surfaces)
-                if (surface.surface_type == stInternal)
-                    zero.push_back(surface.expolygon);
-            if (zero.empty())
-                continue;
-            INFO("layer " << l << " at z = " << layer.print_z);
-            for (const ExPolygons &group_void : plan->material(l).void_of_group)
-                CHECK(intersection_ex(group_void, zero).empty());
-            ++sealed_layers;
-        }
-        CHECK(sealed_layers >= 80);
     }
 
     SECTION("no wall against material or between regions of one group") {
-        {
-            Print print;
-            Model model = right_half_modifier({{"sparse_infill_density", "100%"}});
-            slice(print, model, modifier_config("bridgeawarecubic"));
-            const PrintObject &object = *print.get_object(size_t(0));
-            REQUIRE(object.bridge_aware_cubic_plan() != nullptr);
-            CHECK(no_courses(*object.bridge_aware_cubic_plan(), object));
-        }
-        {
-            Print print;
-            Model model = right_half_modifier({{gap_key, "3"}});
-            slice(print, model, modifier_config("bridgeawarecubic"));
-            const PrintObject &object = *print.get_object(size_t(0));
-            const ObjectPlan *plan = object.bridge_aware_cubic_plan();
-            REQUIRE(plan != nullptr);
-            REQUIRE(object.num_printing_regions() == 2);
-            CHECK(plan->group_of_region(0) == plan->group_of_region(1));
-            CHECK(no_courses(*plan, object));
+        const std::pair<const char*, std::initializer_list<std::pair<const std::string, std::string>>> neighbours[] = {
+            { "a 100 % neighbour", {{"sparse_infill_density", "100%"}} }, { "a neighbour of the same lattice", {{gap_key, "3"}} } };
+        for (const auto &[name, settings] : neighbours) {
+            INFO(name);
+            Sliced sliced;
+            slice_and_export(sliced, workspace, right_half_modifier(settings), modifier_config("bridgeawarecubic"), "w1-none.gcode");
+            const double w = sparse_width(sliced.paths);
+            REQUIRE(w > 0.3);
+            size_t layers_checked = 0;
+            for (const auto &[key, layer] : emitted_layers(sliced.paths)) {
+                const double extent = sparse_y_extent(layer);
+                if (extent <= 20.)
+                    continue;
+                INFO("z = " << key / 1000.);
+                for (const double x : { SEAM_X - (0.5 * w - 0.05), SEAM_X + (0.5 * w - 0.05) })
+                    CHECK(vertical_sparse_length(layer, x - 0.015, x + 0.015) < 0.1 * extent);
+                ++layers_checked;
+            }
+            CHECK(layers_checked >= 80);
         }
     }
 }

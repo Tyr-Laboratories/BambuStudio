@@ -105,9 +105,10 @@ std::set<size_t> plane_layers_of(const std::vector<PlaneSummary> &planes, size_t
 
 } // namespace
 
-// M1: printed material. A solid strip narrower than 1.1 spacings may print (roof side) but surely does not (support side);
-// the wall band is material on both sides; the void meets the sparse surfaces; the fill boundary is FillCubic's inset, less the
-// courses' beads at the perimeter overlap; the area index agrees with the polygons.
+// M1: printed material, the rule applied to a sliced part's surfaces. A solid strip narrower than 1.1 spacings may print (roof
+// side) but surely does not (support side); the wall band is material on both sides; the void meets the sparse surfaces; a seam
+// wall separates two groups' voids; the fill boundary is FillCubic's inset, less the courses' beads kept at w/2 − 0.05 from their
+// centre lines; the area index agrees with the polygons.
 TEST_CASE("Bridge aware cubic material has one definition with two sides", "[BridgeAwareCubic][M1]")
 {
     SECTION("a narrow solid strip is a roof above and void below") {
@@ -133,37 +134,49 @@ TEST_CASE("Bridge aware cubic material has one definition with two sides", "[Bri
         CHECK_FALSE(material.void_of_group.front().empty());
     }
 
-    SECTION("a seam wall separates the voids of two groups on every layer") {
+    SECTION("a seam wall separates the voids of two groups, which meet without it") {
         Print print;
         Model model = modifier();
         slice(print, model, modifier_config("bridgeawarecubic"));
         const PrintObject &object = *print.get_object(size_t(0));
-        const ObjectPlan *plan = object.bridge_aware_cubic_plan();
-        REQUIRE(plan != nullptr);
-        REQUIRE(plan->groups().size() == 2);
+        const std::vector<std::vector<size_t>> groups = pattern_groups(object);
+        REQUIRE(groups.size() == 2);
         size_t layers_with_both = 0;
-        for (size_t l = 0; l < object.layers().size(); ++l) {
-            const LayerMaterial &material = plan->material(l);
+        for (const Layer *layer : object.layers()) {
+            LayerMaterial material = printed_material(*layer, groups);
             REQUIRE(material.void_of_group.size() == 2);
             if (material.void_of_group[0].empty() || material.void_of_group[1].empty())
                 continue;
-            INFO("layer " << l << " at z = " << object.layers()[l]->print_z);
+            INFO("layer at z = " << layer->print_z);
+            CHECK_FALSE(intersection_ex(material.void_of_group[0], material.void_of_group[1]).empty());
+            // A bead of the lower-index region along the seam, half a bead less the overlap inside its surface (3.5a).
+            const auto sparse_of = [layer](size_t region_id) {
+                return get_extents(surfaces_of(*layer, [layer, region_id](const LayerRegion &region, const Surface &surface) {
+                    return &region == layer->regions()[region_id] && is_sparse(region, surface); }));
+            };
+            const BoundingBox lower = sparse_of(groups[0].front()), higher = sparse_of(groups[1].front());
+            const double w = layer->regions()[groups[0].front()]->flow(frInfill).width();
+            const coord_t inset = coord_t(scale_(0.5 * w - 0.05));
+            const coord_t x = lower.max.x() <= higher.min.x() + SCALED_EPSILON ? lower.max.x() - inset : lower.min.x() + inset;
+            const BoundingBox outline = get_extents(layer->lslices);
+            add_courses(material, { Polyline(Point(x, outline.min.y() - coord_t(scale_(1.))), Point(x, outline.max.y() + coord_t(scale_(1.)))) },
+                        w, *layer, groups);
             CHECK(intersection_ex(material.void_of_group[0], material.void_of_group[1]).empty());
             ++layers_with_both;
         }
         CHECK(layers_with_both >= 80);
     }
 
-    SECTION("the fill boundary is the island inset by half a spacing, less the courses at the perimeter overlap") {
+    SECTION("the fill boundary is the island inset by half a spacing, less the courses' beads") {
         const double s_f = 0.357, w = 0.4;
         const ExPolygon island(Polygon({ Point::new_scale(0., 0.), Point::new_scale(30., 0.), Point::new_scale(30., 20.), Point::new_scale(0., 20.) }));
-        const ExPolygons plain = fill_boundary(island, {}, s_f, w, 15.);
+        const ExPolygons plain = fill_boundary(island, {}, s_f, w);
         const ExPolygons expected = offset_ex(island, float(coord_t(float(scale_(-0.5 * s_f)))), ClipperLib::jtMiter, 3.);
         CHECK(diff_ex(plain, expected).empty());
         CHECK(diff_ex(expected, plain).empty());
 
         const Polylines courses{ Polyline(Point::new_scale(-1., 10.), Point::new_scale(31., 10.)) };
-        const ExPolygons cut = fill_boundary(island, courses, s_f, w, 15.);
+        const ExPolygons cut = fill_boundary(island, courses, s_f, w);
         const double keep = 0.5 * w - 0.05;    // a line ends inside the course's bead (3.8 as amended): the filler's nub fuses it
         const AreaIndex index(cut);
         CHECK_FALSE(index.contains(Point::new_scale(15., 10. + keep - 0.01)));

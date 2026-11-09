@@ -269,13 +269,19 @@ TEST_CASE("Bridge aware cubic bounds every opening and run under roofs with edge
 
 // K2: the pattern's added lines are held. On the fixtures, every added sparse piece off the hold set of the plane below is at
 // most G − 0.1 mm long between held points, and no added line ends free over the void. The Cubic control has no added line, and
-// taking away the sparse lines of the layer below the lowest plane leaves that plane's added lines free.
+// taking away the sparse lines of the layer below the lowest plane leaves that plane's added lines free. Every sparse line stays
+// inside the area the stock pipeline gives the infill.
 void check_k2(Workspace &workspace, const std::vector<ExportFixture> &fixtures)
 {
     for (const ExportFixture &fixture : fixtures) {
         INFO(fixture.name);
-        const std::vector<EmittedPath> paths = exported_extrusions(workspace, fixture.model(), settings_of(fixture, "bridgeawarecubic"), fixture.name + "-k2-bac.gcode");
+        Print print;
+        const std::vector<EmittedPath> paths = exported_extrusions(print, workspace, fixture.model(), settings_of(fixture, "bridgeawarecubic"), fixture.name + "-k2-bac.gcode");
         const std::vector<EmittedPath> control = exported_extrusions(workspace, fixture.model(), settings_of(fixture, "cubic"), fixture.name + "-k2-cubic.gcode");
+        // Every line stays inside the area the stock pipeline gives the infill (K1n carries the measure's control).
+        const std::optional<Vec2d> outside = sparse_outside_fill_area(print, paths);
+        INFO("a sparse path leaves the fill area at " << (outside ? *outside : Vec2d::Zero()).transpose());
+        CHECK_FALSE(outside.has_value());
         // The modifier fixture has two gaps: 3 mm on its right half (x from 24 mm of the part, placed at x = 80), 8 mm on the left.
         const double left_gap = fixture.gap;
         const auto gap_b = [&fixture, left_gap](const Vec2d &at, double) { return (fixture.name == "modifier" && at.x() >= 80. + 24. ? 3. : left_gap) - 0.1; };
@@ -367,6 +373,10 @@ void check_k2(Workspace &workspace, const std::vector<ExportFixture> &fixtures)
     }
 }
 
+const std::initializer_list<std::pair<const std::string, std::string>> k2_user_settings = {
+    {"wall_loops", "1"}, {"wall_generator", "arachne"}, {"infill_wall_overlap", "75%"}, {"detect_narrow_internal_solid_infill", "1"},
+    {"thick_bridges", "1"}, {"sparse_infill_anchor", "1"}, {"sparse_infill_anchor_max", "1"}, {"sparse_infill_density", "3%"} };
+
 TEST_CASE("Bridge aware cubic holds every line it adds", "[BridgeAwareCubic][K2]")
 {
     Workspace workspace;
@@ -379,6 +389,10 @@ TEST_CASE("Bridge aware cubic holds every line it adds", "[BridgeAwareCubic][K2]
         // Without anchors (no nub, no join) every end holds from below.
         { "small cube, no anchor", small_cube, with({}, {{"sparse_infill_anchor", "0"}}), 5. },
         { "small cube, no connections", small_cube, with({}, {{"sparse_infill_anchor_max", "0"}}), 5. },
+        // The user's settings: one Arachne wall at 75 % overlap, narrow solid infill, thick bridges, 1 mm anchors, 3 % density (on
+        // the rib they leave one free end: docs/bridge-aware-cubic.md).
+        { "large cube, the user's settings", large_cube, with({}, k2_user_settings), 5. },
+        { "partial roof, the user's settings", partial_roof, with({}, k2_user_settings), 5. },
     });
 }
 
@@ -391,14 +405,37 @@ TEST_CASE("Bridge aware cubic holds every line it adds across a seam", "[BridgeA
 }
 
 // K1n: the nozzle-floor gap. At a gap of 0.4 mm (the nozzle diameter) the refinement saturates into solid columns under the roof
-// and the part slices. K1 and K2 do not hold there yet (a known limitation, docs/bridge-aware-cubic.md).
+// and the part slices; the columns' lines, whose cells reach past the island at the walls, stay inside the area the stock
+// pipeline gives the infill, on the fixtures' walls and on the user's (one Arachne wall the infill overlaps by 75 %). K1 and K2
+// do not hold there yet (a known limitation, docs/bridge-aware-cubic.md).
 TEST_CASE("Bridge aware cubic slices at the nozzle-floor gap", "[BridgeAwareCubic][K1n]")
 {
     Workspace workspace;
-    const DynamicPrintConfig settings = with(fixture_config(0.4, "bridgeawarecubic"), {{"sparse_infill_density", "3%"}});
-    std::vector<EmittedPath> paths;
-    REQUIRE_NOTHROW(paths = exported_extrusions(workspace, small_cube(), settings, "k1n.gcode"));
-    CHECK_FALSE(measure_planes(paths, 0.4, 0.4).empty());
+    const DynamicPrintConfig fixture = with(fixture_config(0.4, "bridgeawarecubic"), {{"sparse_infill_density", "3%"}});
+    for (const DynamicPrintConfig &settings : { fixture, with(fixture, {{"wall_loops", "1"}, {"wall_generator", "arachne"}, {"infill_wall_overlap", "75%"}}) }) {
+        Print print;
+        std::vector<EmittedPath> paths;
+        REQUIRE_NOTHROW(paths = exported_extrusions(print, workspace, small_cube(), settings, "k1n.gcode"));
+        CHECK_FALSE(measure_planes(paths, 0.4, 0.4).empty());
+        const std::optional<Vec2d> outside = sparse_outside_fill_area(print, paths);
+        INFO("a sparse path leaves the fill area at " << (outside ? *outside : Vec2d::Zero()).transpose());
+        CHECK_FALSE(outside.has_value());
+        // The measure's control: a bead from the rightmost sparse vertex one bead further out leaves the fill area.
+        const EmittedPath *rightmost = nullptr;
+        Point far = Point::Zero();
+        for (const EmittedPath &path : paths)
+            if (path.role == erInternalInfill)
+                for (const Point &p : path.path.points)
+                    if (rightmost == nullptr || p.x() > far.x()) {
+                        rightmost = &path;
+                        far = p;
+                    }
+        REQUIRE(rightmost != nullptr);
+        std::vector<EmittedPath> injected = paths;
+        injected.push_back(*rightmost);
+        injected.back().path = Polyline(far, far + Point(coord_t(scale_(rightmost->width)), 0));
+        CHECK(sparse_outside_fill_area(print, injected).has_value());
+    }
 }
 
 // S3: infill combination (3.9a). The pattern's combined surfaces equal Cubic's (the void surfaces and the thick surfaces per
@@ -612,64 +649,32 @@ TEST_CASE("Bridge aware cubic honours fill multiline as bands", "[BridgeAwareCub
     check_k2(workspace, bands);
 }
 
-// S5: instances and shared objects. Two instances of one object print the same plan alike (the measures of each instance's half
-// of the bed agree); two identical objects share one plan (the second object's slicing is the first's) and both slice.
-TEST_CASE("Bridge aware cubic prints every instance and shared object alike", "[BridgeAwareCubic][S5]")
+// S5: a shared object. Print slices one of two identical objects and the other prints its layers; an object sliced alone and then
+// shared (an identical object added before it, which the print slices instead) reads its source's plan, not the one it made
+// alone. Instances and shared copies print one object's layers, translated: K1 measures a second instance at a fractional offset.
+TEST_CASE("Bridge aware cubic gives a shared object its source's plan", "[BridgeAwareCubic][S5]")
 {
-    Workspace workspace;
-    SECTION("two instances") {
-        Model model = small_cube();
-        ModelObject *object = model.objects.front();
-        ModelInstance *second = object->add_instance(*object->instances.front());
-        second->set_offset(object->instances.front()->get_offset() + Vec3d(70., 0., 0.));
-        const std::vector<EmittedPath> paths = exported_extrusions(workspace, std::move(model), fixture_config(5., "bridgeawarecubic"), "s5-instances.gcode");
-        std::vector<EmittedPath> left, right;
-        for (const EmittedPath &path : paths)
-            (unscale<double>(get_extents(path.path).center().x()) < 80. + 32. + 19. ? left : right).push_back(path);
-        const std::vector<PlaneMeasure> a = measure_planes(left, 0.4, 5.), b = measure_planes(right, 0.4, 5.);
-        REQUIRE_FALSE(a.empty());
-        REQUIRE(a.size() == b.size());
-        for (size_t i = 0; i < a.size(); ++i) {
-            INFO("plane below z = " << a[i].lower / 1000. << " mm");
-            CHECK(a[i].lower == b[i].lower);
-            CHECK(a[i].widest_opening == Approx(b[i].widest_opening).margin(1e-6));
-            CHECK(a[i].longest_run == Approx(b[i].longest_run).margin(1e-6));
-            CHECK(a[i].widest_opening <= 5.);
-            CHECK(a[i].longest_run <= 5.);
-        }
-    }
-    SECTION("a shared object") {
-        Model model = small_cube();
-        // Print shares objects whose meshes, configs and transformations agree but for x and y; Model::add_object sets the copy's
-        // extruder, as the GUI sets every object's.
-        model.objects.front()->config.set_key_value("extruder", new ConfigOptionInt(1));
-        ModelObject *copy = model.add_object(*model.objects.front());
-        copy->instances.front()->set_offset(model.objects.front()->instances.front()->get_offset() + Vec3d(70., 0., 0.));
-        Print print;
-        const DynamicPrintConfig settings = observed(fixture_config(5., "bridgeawarecubic"));
-        slice(print, model, settings);
-        REQUIRE(print.objects().size() == 2);
-        const PrintObject &first = *print.get_object(0), &second = *print.get_object(1);
-        const PrintObject &sharing = second.get_shared_object() != nullptr ? second : first;
-        REQUIRE(sharing.get_shared_object() != nullptr);
-        CHECK(sharing.bridge_aware_cubic_plan() != nullptr);
-        CHECK(sharing.bridge_aware_cubic_plan() == sharing.get_shared_object()->bridge_aware_cubic_plan());
-        // Both copies print, and each holds K1 alike: the bed's halves measured apart, as for two instances.
-        const std::string filename = print.export_gcode((workspace.path / "s5-shared.gcode").string(), nullptr);
-        std::vector<EmittedPath> left, right;
-        for (const EmittedPath &path : read_extrusions(filename, settings))
-            (unscale<double>(get_extents(path.path).center().x()) < 80. + 32. + 19. ? left : right).push_back(path);
-        const std::vector<PlaneMeasure> a = measure_planes(left, 0.4, 5.), b = measure_planes(right, 0.4, 5.);
-        REQUIRE_FALSE(a.empty());
-        REQUIRE(a.size() == b.size());
-        for (size_t i = 0; i < a.size(); ++i) {
-            INFO("plane below z = " << a[i].lower / 1000. << " mm");
-            CHECK(a[i].widest_opening == Approx(b[i].widest_opening).margin(1e-6));
-            CHECK(a[i].longest_run == Approx(b[i].longest_run).margin(1e-6));
-            CHECK(a[i].widest_opening <= 5.);
-            CHECK(a[i].longest_run <= 5.);
-        }
-    }
+    Model model = small_cube();
+    // Print shares objects whose meshes, configs and transformations agree but for x and y; Model::add_object sets the copy's
+    // extruder, as the GUI sets every object's.
+    model.objects.front()->config.set_key_value("extruder", new ConfigOptionInt(1));
+    const DynamicPrintConfig settings = fixture_config(5., "bridgeawarecubic");
+    Print print;
+    slice(print, model, settings);
+    REQUIRE(print.objects().size() == 1);
+    const PrintObject *alone = print.get_object(0);
+    REQUIRE(alone->bridge_aware_cubic_plan() != nullptr);
+    ModelObject *copy = model.add_object(*model.objects.front());
+    copy->instances.front()->set_offset(model.objects.front()->instances.front()->get_offset() + Vec3d(70., 0., 0.));
+    std::rotate(model.objects.begin(), model.objects.end() - 1, model.objects.end());
+    slice(print, model, settings);
+    REQUIRE(print.objects().size() == 2);
+    const PrintObject &first = *print.get_object(0), &second = *print.get_object(1);
+    const PrintObject &sharing = second.get_shared_object() != nullptr ? second : first;
+    REQUIRE(sharing.get_shared_object() != nullptr);
+    CHECK(&sharing == alone);    // the object that shares holds a plan of its own from its slice alone
+    REQUIRE(sharing.get_shared_object()->bridge_aware_cubic_plan() != nullptr);
+    CHECK(sharing.bridge_aware_cubic_plan() == sharing.get_shared_object()->bridge_aware_cubic_plan());
 }
 
 // D1: determinism. Two slices of one project export the same G-code byte for byte, and a reslice after a setting changed exports

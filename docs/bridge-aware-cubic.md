@@ -16,25 +16,36 @@ scripts (`scripts/bridge_aware_cubic_acceptance/`, see its README) are in place.
 | 1 | done (fedc2d147) | the four Cubic fixture projects' G-code equals master's byte for byte but for the embedded `; bridge_aware_cubic_max_gap = 5`; ctest as on master |
 | 2 | done (e040f2ffb) | L1, L2 pass |
 | 3 | done (d04dd8e56, f9c4b13d5) | M1, P1 pass |
-| 4-5a | done (d10faed9d, c9c197be3) | P2, K1 (openings and runs) on the cubes, phases, instances, densities and gaps; K2 on the cubes, the rib and the 40 mm box at 3 %; V1. Anchors: every pattern line goes through the stock connector and gets a nub where it meets another line, with the stock sparse infill anchor settings (user, 9 November 2026). |
-| 5b-6c | done (01fe19e87, 64ace2a9a, 38c1ee3b2, 8a66896e7) | the pass (3.8), seam walls (W1, M1), rails (R1), K1 on roofs with edges over the void and on the modifier, K2 across the seam; columns land |
+| 4-5a | built (d10faed9d, c9c197be3); fixture gates met, Heimdall gate not met | P2, K1 (openings and runs) on the cubes, phases, instances, densities and gaps; K2 on the cubes, the rib and the 40 mm box at 3 %, and with the user's settings on the large cube and the partial roof; V1. Anchors: every pattern line goes through the stock connector and gets a nub where it meets another line, with the stock sparse infill anchor settings (user, 9 November 2026). Heimdall: K2 counts 1,662 free added ends and 59 long stretches on plates 1-5 (run 5) against the stage gate of 86 (below). |
+| 5b-6c | built (01fe19e87, 64ace2a9a, 38c1ee3b2, 8a66896e7); fixture gates met, Heimdall gate not met | the pass (3.8), seam walls (W1, M1), rails (R1), K1 on roofs with edges over the void and on the modifier, K2 across the seam; columns land. Heimdall: 135 hanging bridge ends over the sparse void on the 16 plates (run 5) against 0, and the longest hanging stretch within Cubic's on 14 of the 16 plates (below). No fixture reproduces a hanging end of the pattern. |
 | 5c | done (Task 10) | the family change of 3.7 step 6, after Heimdall run 2 measured +19.1 % time; K2 unchanged on the fixtures |
 | 7a | done, corrected after review | S3 (infill combination): the surfaces combine as Cubic's; outside the single-layer zones a combined island prints the plan's lattice at the combined thickness, inside them the plan's lines print at layer height on every layer of the group, resting on lines of their own planes; S3 reads only the surfaces and the export |
 | 7b | done (Task 16) | S4: at N = 2 the bands equal Cubic's away from the roof, and K1 and K2 hold with bands; at N = 1 the four fixtures' G-code is byte-identical |
 | 8a | done (Task 17) | S5 (instances, a shared object and its plan), S6 (settings unchanged but for the pattern and the gap; bridge angles as Cubic's), D1 (byte-identical exports, reslices as fresh slices) |
 | 8b | done (Task 18) | S7 (nine stress settings on the small cube, a pocket block and a blind cavity, variable layer height, arc fitting); the hidden X1 (timing, information only) and X2 (the benchmark's fixture projects, carried over unchanged) |
 | 8c | done (Task 19) | S2 at 1 %, with conformal infill, on a raft, in spiral vase mode and at 100 % with and without combination (fills equal Cubic's); the 100 % configuration check says of the pattern what it says of Cubic; S1 was complete |
-| 9-10 | in progress | |
+| 9 | done (Task 20) | the release gate passes (below) after a construction fix of the plan's cost |
+| 10 | review done, one fix round (below) | the whole-branch review (Opus): one construction defect fixed (a saturated cell's lines printed past the island), the shared-file change outside the hook list reverted, five test gaps closed |
 
 Known limitations (findings the construction does not yet meet, 9 November 2026; the local debug dump `[BACDebug]` measures them):
 
 - Thick bases (`internal_bridge_layers` 2 and 3, this fork's feature; the default and the user's parts use 1): the stock generator's first pass makes the one-bead vertical-shell strips along the walls into bridge surfaces, and `add_internal_bridge_layers` re-anchors them as bases on a preview of the layer below from which the big base has already taken the sparse area; they grow up to a cell over the coarse lattice beside the roof, and their ends hang. K1 fails on the partial roof's planes at 9.0 and 9.4 mm (openings of 5.1 and 12.6 mm) and R1's overgrowth measure reads 67 and 91 mm² against 0.05 allowed.
 - The rib (vertical-shell thickening off, a stress fixture): the plane under the rib's first layer reads an opening of 7.6 mm from the void band between the body's top fill, which stops half a spacing short of its surface's edge, and the one-bead solid ring the stock pipeline lays under the rib's walls; the plan counts the top surface as printing to its edge (3.3) and sees no void there. A limitation of the measure on this fixture.
-- K1n (the nozzle-floor gap, 0.4 mm at 3 %): the part slices and the solid columns print, which is what its test checks; K1
-  and K2 do not hold. The plane below z 17.4 mm reads an opening of 0.49 mm against the 0.4 mm gap, and K2 reports 594 free ends
-  and 191 stretches longer than G_b (0.3 mm there). Before Task 10 they were placed at the columns' lowest layers, where nubs fold
+- K1n (the nozzle-floor gap, 0.4 mm at 3 %): the part slices, the solid columns print and their lines stay inside the infill
+  area, which is what its test checks; K1 and K2 do not hold. The plane below z 17.4 mm reads an opening of 0.49 mm against the
+  0.4 mm gap, and K2 reports 592 free ends and 191 stretches longer than G_b (0.3 mm there; 594 and 191 before the columns' lines
+  were clipped to the fill boundary). Before Task 10 they were placed at the columns' lowest layers, where nubs fold
   back at face junctions; printing a face shorter than a bead (lengthened to one) moved the counts from 599 and 221 only.
-- The candidate-test pin (hook 7): on Heimdall plate 1 sliced as Cubic the new app's moves equal the baseline's but for 22 lines of one Arachne outer-wall loop's start at z 214.2 mm (the loop's seam moved about 1 mm); two slices with the new app agree with each other, and every bridge and infill move matches, so the extraction left the bridging unchanged. The baseline was made by an earlier build of the branch.
+- K2 with the user's settings (one Arachne wall at 75 % overlap, narrow solid infill, thick bridges, 1 mm anchors, 3 %) holds on
+  the small and large cubes, the 40 mm box, the partial roof and the fuselage top, and leaves one free end on the rib (at
+  102.7, 84.6 mm on the bed), the stress fixture with vertical-shell thickening off. Not yet examined.
+- Recorded at the final review, not fixed: the rails take the thick bridge flow's spacing whatever `thick_bridges` says (about
+  0.07 mm further out without it; the user's parts have it on, the fixtures off, and R1 measures them with the same flow); a
+  course that a narrow surface laid after the plan cuts in its middle runs on from both sides and joins across it; the filler's
+  carry of a strand end to the boundary may cross another line on the way; a bulk line's run-on into a rail's zone is undone
+  only near walls, so with no walls at a steep angle (about 70 degrees or more at 0.12 mm layers) an end could land half a
+  spacing past the island (S7's no-walls row stays inside); W1 no longer pins the seam wall's sealing of a 0 % neighbour at
+  convex corners, a property of the plan's material with no consequence found on the export.
 - R1 does not try a roof the candidate test rejects (one the generator fills with solid infill); rails are checked where bridges exist.
 - At the fuselage top's apex the generator bridges one layer above the roof the candidate test predicted: rails lie at 23.8 and
   24.0 mm under predicted bridges at 24.0 and 24.2 mm, the generator prints solid at 24.2 and bridges at 24.4 mm, whose inner edges
@@ -48,17 +59,37 @@ Known limitations (findings the construction does not yet meet, 9 November 2026;
   anchor: on Heimdall plate 10 at z 186.4 one 38 mm line, which holds nothing up (the area above it is sparse too). The bridge
   check counts such lines among its free stretches.
 
-Budgets of the architecture's 1.4 (9 November 2026), all over but the case count; raising them is the user's decision (R8):
+Release gate (`scripts/bridge_aware_cubic_benchmark/run_benchmark.py`, official 2.9.1.70 against this branch's app on X2's
+projects, slice instructions retired, a warm-up and five alternating pairs, 9 November 2026). The first complete run (app at
+5be6edb42) failed on the large cube; the sweep's boundary queries and a stock config copy per path were most of the cost, and
+ad1a10e16 cut them without changing a path:
+
+| Case | 5be6edb42: median, worst | ad1a10e16: median, worst | Build parity (fork Cubic over official) |
+| --- | --- | --- | --- |
+| small cube | 1.38, 1.39 | 1.17, 1.17 | 0.98 |
+| large cube | 2.94, 2.94 | 1.76, 1.76 | 0.98 |
+| rib | 1.11, 1.12 | 1.09, 1.09 | 0.98 |
+| modifier | 1.47, 1.48 | 1.26, 1.27 | 0.98 |
+
+The gate needed one new reviewed exception: `flow_above_internal_bridges`, which the fork's master added after the baseline
+review, at exactly 100 % (neutral: `bridge_flow_mask` stays empty).
+
+Budgets of the architecture's 1.4 (9 November 2026, after the final review's fix round), all over but the case count; raising them
+is the user's decision (R8):
 
 | Quantity | Limit | Now |
 | --- | --- | --- |
-| Source lines in the pattern's units (`Fill/BridgeAwareCubic*`, `Fill/FillBridgeAwareCubic*`, `BridgeAwareCubicMaterial`, `BridgeAwareCubicVerify`) | 4,000 | 4,705 |
-| Test lines (the test files, fixtures and observer) | 2,500 | 4,391 |
-| Test cases | 40 | 24 |
-| Changed lines in shared files (hook 7's 57 moved lines apart) | 150 | 198 (116 outside `PrintObject.cpp`, 14 of them build registration) |
+| Source lines in the pattern's units (`Fill/BridgeAwareCubic*`, `Fill/FillBridgeAwareCubic*`, `BridgeAwareCubicMaterial`, `BridgeAwareCubicVerify`) | 4,000 | 4,833 |
+| Test lines (the five test files, the fixtures and the observer) | 2,500 | 3,901 |
+| Test cases | 40 | 25 (23 run by `[BridgeAwareCubic]`, and the hidden X1 and X2) |
+| Lines added in shared files, hook 7's moved candidate test (about 65 lines) apart | 150 | about 180 (245 added and 76 removed in all; 113 of the added outside `PrintObject.cpp`, 21 of them build registration) |
 
-Cubic baselines for the acceptance: the 16 Heimdall plates sliced with master's build (0568b9dad): 4,255.4 g, 308.0 h of
-model print time (`$BAC_DATA/baselines/cubic/`).
+Cubic baselines for the acceptance: the 16 Heimdall plates sliced with master's build (0568b9dad, master with the two hunks
+fixed that it needed to compile): 4,255.4 g, 312.7 h estimated (308.0 h of model print time plus the printer's preparation time on
+each plate; the tables compare estimated times) (`$BAC_DATA/baselines/cubic/`). Hook 7 and the other shared changes leave Cubic
+alone on the user's parts: Heimdall plate 1 sliced as Cubic with the app at 3664d9ee8 equals the baseline move for move (2,921,978
+moves), and the baseline app reproduces its own output (also under another allocator); an earlier build of the branch (9 November,
+09:19) had differed by one outer-wall seam at z 214.2 mm.
 
 Heimdall acceptance runs (all 16 plates, `scripts/bridge_aware_cubic_acceptance/measure/measure.sh`; Cubic: 4,255.4 g, 312.7 h
 estimated, 492 k sparse paths, 0.99 M retractions; budgets of the architecture's 1.4):
@@ -69,16 +100,26 @@ estimated, 492 k sparse paths, 0.99 M retractions; budgets of the architecture's
 | 2 | 6e823809f | 4,522.9 g (+6.3 %) | 372.4 h (+19.1 %) | 1.44 M (533 k) | 1.79 M | 1,791, 187 |
 | 3 | + family change | 4,533.7 g (+6.5 %) | 365.7 h (+16.9 %) | 1.38 M (379 k) | 1.64 M | 1,825, 119 |
 | 4 | 06deb8b89 | 4,479.5 g (+5.3 %) | 360.2 h (+15.2 %) | 1.34 M (618 k, nearly all column pieces) | 1.62 M | 1,791, 59 |
+| 5 | ad1a10e16 | 4,479.9 g (+5.3 %) | 360.3 h (+15.2 %) | 1.34 M (618 k) | 1.62 M | 1,662, 59 |
 
 The bridge check of runs 1 to 3 measured nothing: it read the internal bridge layers from the old branch's probe dumps. It now
 finds them in the G-code (a bridge path inside the outline of the layer below) and measures, as the export observer does, the
 free stretches and hanging ends over the sparse void below. On plate 4 (run 2's app): Cubic 3,120 free stretches over 5 mm
 (longest 79 mm), 7 hanging ends (longest hanging stretch 38 mm); the pattern 1 (7.0 mm), 11 hanging ends (longest 0.27 mm).
 
-Run 4, all 16 plates: internal bridge stretches over 5 mm free over the void, Cubic 41,564 (longest 181 mm), the pattern 81
+Runs 4 and 5, all 16 plates: internal bridge stretches over 5 mm free over the void, Cubic 41,564 (longest 181 mm), the pattern 81
 (longest 36.6 mm on plate 10 at z 186.4, 34.4 mm on plate 13 at z 186.4, 29.9 mm on plate 12 at z 15.6, 26.2 mm on plate 2 at
-z 145.0); hanging bridge ends, Cubic 150 (longest 177 mm), the pattern 137 (longest 5.1 mm, most under 0.3 mm). The long free
-stretches and the hanging ends over 1 mm are under investigation.
+z 145.0); hanging bridge ends, Cubic 150 (longest 177 mm), the pattern 135 in run 5 (longest 5.1 mm, most under 0.3 mm). The 36.6 mm
+stretch is one bridge line that the stock generator ran across a sparse area to a distant anchor, holding nothing up (known
+limitations); the other long stretches are not yet examined.
+
+K2 on plates 1 to 5, run 5: 1,662 free added ends and 59 free posts, by the geometry of the free piece (a local classification of
+the checker's report): 908 end in a connector hook along an island edge that faces same-layer material (a floating vertical
+shell, a bridge, a top surface, gap fill), the anchors the user accepted as Cubic's boundary behaviour, which the checker counts
+because Cubic has no hook on that line; 643 are lattice-direction ends beside a solid surface of the layer (hooks along edges
+parallel to a lattice direction among them, and ends of lines a later surface cut more than a spacing from its edge); 159 lie
+with nothing within 1 mm, of which those checked on plate 1 are places the sweep records as unheld ("no admissible piece for
+the column"); 11 end beside walls. The target is zero (R20); the stage gate of 86 is not met.
 
 What a released build will do: plan once per object before the bridge generator, from the sliced surfaces; print Cubic's lines plus
 the plan's strands and courses through the ordinary fill machinery; run no check. What a development build adds: the verifier and

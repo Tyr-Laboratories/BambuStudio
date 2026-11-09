@@ -1129,7 +1129,7 @@ static std::vector<std::vector<ExPolygon>> conformal_modifier_islands(const Prin
 
 const BridgeAwareCubic::ObjectPlan* PrintObject::bridge_aware_cubic_plan() const
 {
-    if (m_bridge_aware_cubic_plan == nullptr && m_shared_object != nullptr)
+    if (m_shared_object != nullptr)
         return m_shared_object->bridge_aware_cubic_plan();
     return m_bridge_aware_cubic_plan.get();
 }
@@ -1756,9 +1756,10 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "internal_bridge_layers"
             || opt_key == "bridge_aware_cubic_max_gap"
             // The bridge generator's anchoring preview fills the sparse layer below with the anchor settings, and the bridge aware
-            // cubic plan reads them (its fused ends): both run in posPrepareInfill.
+            // cubic plan reads them (its fused ends) and the top surfaces' flow (its printed material): both run in posPrepareInfill.
             || opt_key == "sparse_infill_anchor"
             || opt_key == "sparse_infill_anchor_max"
+            || opt_key == "top_surface_line_width"
             //BBS
         ) {
             steps.emplace_back(posPrepareInfill);
@@ -1773,7 +1774,6 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "internal_solid_infill_pattern"
             || opt_key == "sub_top_surface_pattern"
             || opt_key == "external_fill_link_max_length"
-            || opt_key == "top_surface_line_width"
             || opt_key == "initial_layer_line_width"
             || opt_key == "detect_floating_vertical_shell") {
             steps.emplace_back(posInfill);

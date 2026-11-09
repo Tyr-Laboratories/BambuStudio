@@ -53,9 +53,8 @@ std::vector<SparseIsland> sparse_islands(const Layer &layer);
 
 // The boundary the filler clips the lattice to: the island inset by half the sparse spacing (as FillCubic insets it), less the
 // courses' beads kept at w/2 − 0.05 from a course's centre line, so that a line ends inside the course's bead and the filler's
-// nub fuses it to the course. `infill_wall_overlap_percent` is kept for the callers and no longer enters.
-ExPolygons fill_boundary(const ExPolygon &island, const Polylines &courses, double spacing_mm, double width_mm,
-                         double infill_wall_overlap_percent);
+// nub fuses it to the course.
+ExPolygons fill_boundary(const ExPolygon &island, const Polylines &courses, double spacing_mm, double width_mm);
 
 // An index over ExPolygons (scaled, absolute) for point containment and for the parts of a segment that lie inside.
 class AreaIndex

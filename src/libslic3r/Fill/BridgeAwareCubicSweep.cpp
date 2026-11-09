@@ -953,24 +953,25 @@ private:
         {
             const LayerPrint &lp = print_set(below);
             auto it = lp.strands_by_plane.find(item.plane);
-            if (it != lp.strands_by_plane.end())
-                for (const Interval &i : it->second)
-                    if (i.first <= y + m_lambda && i.second >= y - m_lambda) {
-                        const double need_lo = item.t0 + a, need_hi = item.t1 - a;    // what must print below to hold the whole item
-                        Intervals uncovered = complement(Intervals{ i }, need_lo, need_hi);
-                        bool placed = true;
-                        for (const Interval &u : uncovered) {
-                            // A piece of λ at the uncovered part, abutting the interval, inside the boundary.
-                            double lo = u.first <= need_lo + 1e-9 ? u.second - m_lambda : u.first;
-                            double hi = lo + m_lambda;
-                            if (inside_boundary_interval(item.plane, lo, hi, below))
-                                add_strand(below, Strand{ item.plane, lo, hi, StrandKind::Column, item.gap });
-                            else
-                                placed = false;
-                        }
-                        if (placed)
-                            return;
+            // A copy: add_strand() reassigns the plane's intervals, and a partial placement goes on to the next interval.
+            const Intervals planned = it != lp.strands_by_plane.end() ? it->second : Intervals();
+            for (const Interval &i : planned)
+                if (i.first <= y + m_lambda && i.second >= y - m_lambda) {
+                    const double need_lo = item.t0 + a, need_hi = item.t1 - a;    // what must print below to hold the whole item
+                    Intervals uncovered = complement(Intervals{ i }, need_lo, need_hi);
+                    bool placed = true;
+                    for (const Interval &u : uncovered) {
+                        // A piece of λ at the uncovered part, abutting the interval, inside the boundary.
+                        double lo = u.first <= need_lo + 1e-9 ? u.second - m_lambda : u.first;
+                        double hi = lo + m_lambda;
+                        if (inside_boundary_interval(item.plane, lo, hi, below))
+                            add_strand(below, Strand{ item.plane, lo, hi, StrandKind::Column, item.gap });
+                        else
+                            placed = false;
                     }
+                    if (placed)
+                        return;
+                }
         }
         // Continue: a new piece within α along the trace, steered onto the quickest landing. A piece lands only when a crossing
         // covers it whole (c exceeds λ/2 by a few hundredths), so the next piece is aimed exactly at where the crossing will be

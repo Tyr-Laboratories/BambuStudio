@@ -383,34 +383,39 @@ Model blind_cavity()
     return single_part("Bridge aware cubic blind cavity", std::move(block));
 }
 
-// S7: stress settings. The slice completes, and where the contract applies K1 holds: at the nozzle-floor gap K1 is a recorded
-// limitation (docs/bridge-aware-cubic.md), under combination S3 measures it on the unfolded paths, and arc fitting is read by S6.
+// S7: stress settings. The slice completes, every sparse line stays inside the area the stock pipeline gives the infill, and where
+// the contract applies K1 holds: at the nozzle-floor gap K1 is a recorded limitation (docs/bridge-aware-cubic.md), under
+// combination S3 measures it on the unfolded paths, and arc fitting is read by S6. The control, on every row where Cubic's cells
+// are wider than the gap: Cubic on the same part and settings opens wider than the gap somewhere.
 TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[BridgeAwareCubic][S7]")
 {
     Workspace workspace;
-    struct Stress { const char *name; std::initializer_list<std::pair<const std::string, std::string>> settings; double gap; bool k1; };
+    struct Stress { const char *name; std::initializer_list<std::pair<const std::string, std::string>> settings; double gap; bool k1, control; };
     const std::vector<Stress> stresses = {
-        { "gap at the nozzle", {}, 0.4, false },
-        { "60 %", {{"sparse_infill_density", "60%"}}, 5., true },
-        { "0.003 %", {{"sparse_infill_density", "0.003%"}}, 5., true },
-        { "gap 1000", {}, 1000., true },
-        { "raft", {{"raft_layers", "3"}}, 5., true },
+        { "gap at the nozzle", {}, 0.4, false, false },
+        { "60 %", {{"sparse_infill_density", "60%"}}, 5., true, false },
+        { "0.003 %", {{"sparse_infill_density", "0.003%"}}, 5., true, true },
+        { "gap 1000", {}, 1000., true, false },
+        { "raft", {{"raft_layers", "3"}}, 5., true, true },
         { "the user's walls and bridges", {{"wall_loops", "1"}, {"wall_generator", "arachne"}, {"infill_wall_overlap", "75%"},
-                                          {"detect_narrow_internal_solid_infill", "1"}, {"thick_bridges", "1"}}, 5., true },
-        { "no walls", {{"wall_loops", "0"}}, 5., true },
-        { "combination", {{"infill_combination", "1"}}, 5., false },
-        { "a 0.6 mm sparse bead", {{"sparse_infill_line_width", "0.6"}}, 5., true },
+                                          {"detect_narrow_internal_solid_infill", "1"}, {"thick_bridges", "1"}}, 5., true, true },
+        { "no walls", {{"wall_loops", "0"}}, 5., true, true },
+        { "combination", {{"infill_combination", "1"}}, 5., false, false },
+        { "a 0.6 mm sparse bead", {{"sparse_infill_line_width", "0.6"}}, 5., true, true },
     };
     struct Part { const char *name; Model (*model)(); };
     const Part parts[] = { { "small cube", small_cube }, { "pocket block", pocket_block }, { "blind cavity", blind_cavity } };
-    size_t cubic_exceeds = 0;    // the control: rows where Cubic on the same settings opens wider than the gap somewhere
     for (const Part &part : parts)
         for (const Stress &stress : stresses) {
             INFO(part.name << ", " << stress.name);
             const DynamicPrintConfig settings = with(fixture_config(stress.gap, "bridgeawarecubic"), stress.settings);
+            Print print;
             std::vector<EmittedPath> paths;
-            REQUIRE_NOTHROW(paths = exported_extrusions(workspace, part.model(), settings, "s7.gcode"));
+            REQUIRE_NOTHROW(paths = exported_extrusions(print, workspace, part.model(), settings, "s7.gcode"));
             CHECK_FALSE(paths.empty());
+            const std::optional<Vec2d> outside = sparse_outside_fill_area(print, paths);
+            INFO("a sparse vertex outside the fill area at " << (outside ? *outside : Vec2d::Zero()).transpose());
+            CHECK_FALSE(outside.has_value());
             if (!stress.k1)
                 continue;
             const std::vector<PlaneMeasure> planes = measure_planes(paths, 0.4, stress.gap);
@@ -420,11 +425,12 @@ TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[Brid
                 CHECK(plane.widest_opening <= stress.gap);
                 CHECK(plane.longest_run <= stress.gap);
             }
-            const std::vector<PlaneMeasure> control = measure_planes(
-                exported_extrusions(workspace, part.model(), with(fixture_config(stress.gap, "cubic"), stress.settings), "s7-cubic.gcode"), 0.4, stress.gap);
-            cubic_exceeds += std::any_of(control.begin(), control.end(), [&stress](const PlaneMeasure &p) { return p.widest_opening > stress.gap; });
+            if (stress.control) {
+                const std::vector<PlaneMeasure> control = measure_planes(
+                    exported_extrusions(workspace, part.model(), with(fixture_config(stress.gap, "cubic"), stress.settings), "s7-cubic.gcode"), 0.4, stress.gap);
+                CHECK(std::any_of(control.begin(), control.end(), [&stress](const PlaneMeasure &p) { return p.widest_opening > stress.gap; }));
+            }
         }
-    CHECK(cubic_exceeds > 0);
     SECTION("variable layer height") {
         Model model = small_cube();
         model.objects.front()->layer_height_profile.set(std::vector<coordf_t>{ 0., .2, 3., .2, 5., .12, 12., .12, 18., .24 });

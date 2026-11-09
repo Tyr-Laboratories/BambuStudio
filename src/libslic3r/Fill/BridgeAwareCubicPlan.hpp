@@ -181,7 +181,7 @@ private:
     void collect_planes(const PrintObject &object, const std::function<void()> &cancel);
     void collect_boundaries(const PrintObject &object, const std::function<void()> &cancel);
     // The fill boundary of a group on a layer (3.8) from the layer's sparse islands and the group's boundary courses so far.
-    ExPolygons group_boundary(const PrintObject &object, size_t layer_index, size_t g, const std::vector<SparseIsland> &islands) const;
+    ExPolygons group_boundary(size_t layer_index, size_t g, const std::vector<SparseIsland> &islands) const;
 
     std::vector<GroupPlan>                    m_groups;
     std::vector<std::vector<size_t>>          m_groups_regions;

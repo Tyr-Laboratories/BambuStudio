@@ -155,8 +155,7 @@ std::vector<SparseIsland> sparse_islands(const Layer &layer)
     return out;
 }
 
-ExPolygons fill_boundary(const ExPolygon &island, const Polylines &courses, double spacing_mm, double width_mm,
-                         double infill_wall_overlap_percent)
+ExPolygons fill_boundary(const ExPolygon &island, const Polylines &courses, double spacing_mm, double width_mm)
 {
     // FillCubic: ExPolygonWithOffset(expolygon, 0, float(scale_(overlap − 0.5 · spacing))) with overlap 0, miter joins, limit 3.
     const coord_t inset = coord_t(float(scale_(-0.5 * spacing_mm)));
@@ -165,8 +164,7 @@ ExPolygons fill_boundary(const ExPolygon &island, const Polylines &courses, doub
         // A line ends inside a course's bead, w/2 − 0.05 from its centre line (the user's anchoring rule, 9 November 2026: a line
         // that meets another extrusion is fused to it by a nub along it), not half a spacing short of it as at a perimeter: the
         // course is one bead, often on one layer only (a rail), and a hook along a band half a spacing from it would hang over the
-        // void. `infill_wall_overlap_percent` no longer enters; the signature stays for the callers.
-        (void)infill_wall_overlap_percent;
+        // void.
         const double keep = std::max(0.01, 0.5 * width_mm - COURSE_OVERLAP_MM);
         boundary = diff_ex(boundary, offset(courses, float(scale_(keep)), ClipperLib::jtRound, ARC_TOLERANCE));
     }
@@ -287,10 +285,14 @@ bool AreaIndex::contains(const Point &point) const
             if (x > x_lo && x <= x_hi)
                 inside = !inside;
         }
-        // The leg along x = centre.x: the edges crossing that line at a y in [y_lo, y_hi), where the state along it changes.
+        // The leg along x = centre.x: the edges crossing that line between its ends, where the state along it changes. On the ray
+        // cast's rule a point at the crossing's own height reads the side above an edge rising to the right and the side below
+        // one falling to the right or flat (a flat edge acts through its ends), so a crossing at the leg's lower end counts only
+        // for a rising edge and one at its upper end only for the others.
         if ((s.x() > centre.x()) != (e.x() > centre.x())) {
             const double y = double(s.y()) + double(centre.x() - s.x()) * double(e.y() - s.y()) / double(e.x() - s.x());
-            if (y >= double(y_lo) && y < double(y_hi))
+            const bool rising = (int64_t(e.y()) - s.y()) * (int64_t(e.x()) - s.x()) > 0;
+            if (rising ? (y >= double(y_lo) && y < double(y_hi)) : (y > double(y_lo) && y <= double(y_hi)))
                 inside = !inside;
         }
     }

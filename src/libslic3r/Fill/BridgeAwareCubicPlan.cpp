@@ -635,10 +635,9 @@ void ObjectPlan::collect_planes(const PrintObject &object, const std::function<v
     m_rail_bands.clear();    // used only while the planes are made
 }
 
-ExPolygons ObjectPlan::group_boundary(const PrintObject &object, size_t layer_index, size_t g, const std::vector<SparseIsland> &islands) const
+ExPolygons ObjectPlan::group_boundary(size_t layer_index, size_t g, const std::vector<SparseIsland> &islands) const
 {
     const GroupPlan &group = m_groups[g];
-    const PrintRegionConfig &config = object.printing_region(group.m_regions.front()).config();
     Polylines courses;
     for (const size_t region_id : group.m_regions)
         append(courses, m_boundary_courses[layer_index][region_id]);
@@ -650,8 +649,7 @@ ExPolygons ObjectPlan::group_boundary(const PrintObject &object, size_t layer_in
                 of_group = true;
         if (!of_group)
             continue;
-        append(boundary, fill_boundary(island.island, courses, group.m_lattice.spacing, group.m_lattice.width,
-                                       config.infill_wall_overlap.get_abs_value(100.)));
+        append(boundary, fill_boundary(island.island, courses, group.m_lattice.spacing, group.m_lattice.width));
     }
     return union_ex(boundary);
 }
@@ -664,7 +662,7 @@ void ObjectPlan::collect_boundaries(const PrintObject &object, const std::functi
         const std::vector<SparseIsland> islands = sparse_islands(*object.layers()[i]);
         for (size_t g = 0; g < m_groups.size(); ++g) {
             GroupPlan &group = m_groups[g];
-            group.m_boundaries[i].boundary = group_boundary(object, i, g, islands);
+            group.m_boundaries[i].boundary = group_boundary(i, g, islands);
             group.m_boundaries[i].index    = AreaIndex(group.m_boundaries[i].boundary);
         }
     }
@@ -1112,7 +1110,8 @@ void refine(GroupPlan &group, ObjectPlan &plan, const std::function<void()> &can
 // Section 3.6c: a cell that fails but whose children would reach 100 % density becomes a solid column. Its refinement faces
 // print on every layer of the window as strands along the section's edges; between two faces of one family, alternating between
 // two families from layer to layer, parallel courses divide the face spacing into ⌈spacing / s_f⌉ equal parts, none on a face,
-// each clipped to the section shrunk by W_N/2 − w/4. The window opens on the layer at or just below the height where the section
+// each clipped to the section shrunk by W_N/2 − w/4. Faces and courses are clipped to the fill boundary of their layer, each
+// piece at least a bead long. The window opens on the layer at or just below the height where the section
 // first grows past G_b and closes at the highest plane that failed in the cell.
 static void solid_column(GroupPlan &group, ObjectPlan &plan, const Cell &cell, const std::vector<const RefinementPlane*> &failing)
 {
@@ -1148,7 +1147,10 @@ static void solid_column(GroupPlan &group, ObjectPlan &plan, const Cell &cell, c
         if (!(z > range.first && z < range.second))
             continue;
         const Polygon p = section(lattice, cell, z);
-        if (p.points.size() < 3)
+        // The cell reaches past the island where it meets a wall: its faces and courses end on the fill boundary, as the needed
+        // strands do, where the connector anchors them; never past it, where the filler's run-on would carry them out of the part.
+        const LayerBoundary &boundary = group.boundary(l);
+        if (p.points.size() < 3 || boundary.index.empty())
             continue;
         // The refinement faces: strands along the section's edges that lie on them.
         for (int k = 0; k < 3; ++k)
@@ -1166,15 +1168,25 @@ static void solid_column(GroupPlan &group, ObjectPlan &plan, const Cell &cell, c
                         hi = std::max(hi, tv);
                     }
                 }
-                // An edge shorter than a bead is lengthened to one about its middle, as a needed strand is (3.6b): the courses
-                // end on every face, short ones included. An edge no longer than the vertex margin is a vertex.
+                // An edge no longer than the vertex margin is a vertex. The rest is clipped to the fill boundary, and a piece shorter
+                // than a bead is lengthened to one about its middle within its boundary interval, as a needed strand is (3.6b): the
+                // courses end on every face, short ones included. A boundary interval shorter than a bead is a gap.
                 if (hi - lo > plan.vertex_margin()) {
-                    if (hi - lo < w) {
-                        const double mid = 0.5 * (lo + hi);
-                        lo = mid - 0.5 * w;
-                        hi = mid + 0.5 * w;
+                    const double p_lo = lo - w, p_hi = hi + w;    // the probe reaches a bead past the edge, room to lengthen a piece
+                    for (const auto &in : boundary.index.segment_inside(lattice.scaled(t.point(p_lo)), lattice.scaled(t.point(p_hi)))) {
+                        const double bl = p_lo + in.first * (p_hi - p_lo), bh = p_lo + in.second * (p_hi - p_lo);
+                        double a = std::max(lo, bl), b = std::min(hi, bh);
+                        if (bh - bl < w - 1e-4 || b <= a)
+                            continue;
+                        if (b - a < w) {
+                            const double mid = 0.5 * (a + b);
+                            a = mid - 0.5 * w;
+                            b = mid + 0.5 * w;
+                            if (a < bl) { b += bl - a; a = bl; }
+                            if (b > bh) { a -= b - bh; b = bh; }
+                        }
+                        group.add_strand(l, Strand{ f, a, b, StrandKind::SolidFace, smallest_gap });
                     }
-                    group.add_strand(l, Strand{ f, lo, hi, StrandKind::SolidFace, smallest_gap });
                 }
             }
         // The courses: one family per layer, alternating.
@@ -1203,12 +1215,15 @@ static void solid_column(GroupPlan &group, ObjectPlan &plan, const Cell &cell, c
             const double c = c0 + (face_spacing * i) / parts * (lattice.normal(k).dot(upper_face.origin - lower_face.origin) > 0 ? 1. : -1.);
             const Vec2d origin = c * n;
             const Point a = lattice.scaled(origin + (t_lo - 1.) * d), b = lattice.scaled(origin + (t_hi + 1.) * d);
-            for (const auto &interval : shrunk_index.segment_inside(a, b)) {
-                const Vec2d pa = origin + (t_lo - 1. + interval.first * (t_hi - t_lo + 2.)) * d;
-                const Vec2d pb = origin + (t_lo - 1. + interval.second * (t_hi - t_lo + 2.)) * d;
-                if ((pb - pa).norm() >= w - 1e-4)
-                    courses.emplace_back(Points{ lattice.scaled(pa), lattice.scaled(pb) });
-            }
+            const std::vector<std::pair<double, double>> in_boundary = boundary.index.segment_inside(a, b);
+            for (const auto &in_section : shrunk_index.segment_inside(a, b))
+                for (const auto &in : in_boundary) {
+                    const double first = std::max(in_section.first, in.first), second = std::min(in_section.second, in.second);
+                    const Vec2d pa = origin + (t_lo - 1. + first * (t_hi - t_lo + 2.)) * d;
+                    const Vec2d pb = origin + (t_lo - 1. + second * (t_hi - t_lo + 2.)) * d;
+                    if (second > first && (pb - pa).norm() >= w - 1e-4)
+                        courses.emplace_back(Points{ lattice.scaled(pa), lattice.scaled(pb) });
+                }
         }
         if (!courses.empty()) {
             plan.add_courses(l, region_id, courses, false);

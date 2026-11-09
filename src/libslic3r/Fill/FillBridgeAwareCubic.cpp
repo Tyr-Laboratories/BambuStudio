@@ -264,7 +264,6 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
     for (const End &end : ends) {
         const size_t i = end.path;
         const Point &p = end.p;
-        const Point &before = end.front ? paths[i].points[1] : paths[i].points[paths[i].points.size() - 2];
         // The candidate segments within reach: of another path, or of this chain beyond the end's own segment.
         std::optional<Line> best;
         double best_distance = reach_scaled;
@@ -296,7 +295,6 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
             continue;
         // An end within half a bead of the met line is a junction whether it stops short of the line or overshoots it by up to
         // that much (the beads overlap either way, and the sweep's rule (iv) counts both as fused).
-        (void)before;
         const double t = std::min(1., std::max(0., (p.cast<double>() - a).dot(d) / (length * length)));
         const Vec2d q = a + t * d;
         const double room_forward = (1. - t) * length, room_backward = t * length;
@@ -441,9 +439,7 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     // business; only the courses this layer does not have (rails) make a zone from below.
     if (!courses_below.empty() && !boundary_courses.empty())
         courses_below = diff_pl(courses_below, offset(boundary_courses, float(scale_(lattice.width)), ClipperLib::jtRound, float(scale_(0.001))));
-    const PrintRegionConfig &config = m_layer->regions()[this->lock_region_id]->region().config();
-    const double overlap_percent = config.infill_wall_overlap.get_abs_value(100.);
-    ExPolygons boundary = fill_boundary(island, boundary_courses, lattice.spacing, lattice.width, overlap_percent);
+    ExPolygons boundary = fill_boundary(island, boundary_courses, lattice.spacing, lattice.width);
     // The connector's boundary: the island's inset without the courses' cut, less a zone around each boundary course of the layer
     // and of the layer below, wide enough that the line ends there lie well inside it. At a course of the layer those ends are
     // junctions with the course (a nub along it, like any line met), not the connector's (a hook along a band beside the course,
@@ -453,7 +449,7 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     const double zone = 1.5 * lattice.width + 0.5 * lattice.spacing;
     Polylines zone_courses = boundary_courses;
     append(zone_courses, courses_below);
-    const ExPolygons plain_boundary = zone_courses.empty() ? boundary : fill_boundary(island, Polylines(), lattice.spacing, lattice.width, overlap_percent);
+    const ExPolygons plain_boundary = zone_courses.empty() ? boundary : fill_boundary(island, Polylines(), lattice.spacing, lattice.width);
     ExPolygons virtual_zones;    // what the connector's boundary leaves out: no hook may run along their edges (below)
     if (!zone_courses.empty())
         virtual_zones = union_ex(offset(zone_courses, float(scale_(zone)), ClipperLib::jtRound, float(scale_(0.001))));
@@ -543,7 +539,20 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     // The ends carried on to the boundary, with where the plan ended them: a carry the connector did not anchor is undone after it
     // (the carried stretch would hang over the void; the plan held the end where it was).
     std::map<std::pair<coord_t, coord_t>, Point> carried_from;
-    for (const Line &line : is_combined ? Lines() : group->strands_at(m_layer_index, bbox)) {
+    // A band (3.9b) ends where the plan ended it, on its farthest sub-line's boundary crossing, past the nearer sub-lines' own
+    // crossings: each sub-line is first clipped to the plan's fill boundary, so that it ends on its own crossing there and the
+    // clip below cuts it only where a surface laid after the plan took the area (which the run-on is for). A single line already
+    // ends inside the plan's boundary.
+    Lines planned = is_combined ? Lines() : group->strands_at(m_layer_index, bbox);
+    if (lattice.multiline > 1) {
+        Lines clipped;
+        for (const Line &line : planned)
+            for (const auto &interval : group->boundary(m_layer_index).index.segment_inside(line.a, line.b))
+                if (const Point a = along(line, interval.first), b = along(line, interval.second); a != b)
+                    clipped.emplace_back(a, b);
+        planned = std::move(clipped);
+    }
+    for (const Line &line : planned) {
         const double length = (line.b - line.a).cast<double>().norm();
         const std::vector<std::pair<double, double>> on_surface = surface_index.segment_inside(line.a, line.b);
         for (const auto &interval : index.segment_inside(line.a, line.b)) {

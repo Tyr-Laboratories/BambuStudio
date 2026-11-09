@@ -62,3 +62,26 @@ print('| Plate | ' + ' | '.join(r.replace('_', ' ') for r in big) + ' |')
 print('| --- |' + ' --- |' * len(big))
 for p in plates:
     print(f'| {p} | ' + ' | '.join(f'{f(bx[p], r) - f(cubic.get(p, {}), r):+.2f}' for r in big) + ' |')
+# The architecture's 7.4 per plate against Cubic: instructions retired and peak RSS (the Cubic baseline's own run, summary.txt),
+# and the bridge check's hanging internal bridge ends over the sparse void and the longest hanging stretch (bridges/pN.json,
+# written by analyse2.sh next to the summary).
+import json
+base = read(BAC_DATA + '/baselines/cubic/summary.txt', 'bac plate')
+bridges = _os.path.join(_os.path.dirname(_os.path.abspath(sys.argv[1])), 'bridges')
+print()
+print('Per plate against Cubic: instructions retired, peak RSS, hanging bridge ends and the longest hanging stretch (Cubic / pattern):')
+print('| Plate | Instructions G | Ratio | Peak RSS MB | Hanging ends | Longest hanging stretch mm | Within Cubic\'s |')
+print('| --- | --- | --- | --- | --- | --- | --- |')
+for p in plates:
+    c, b = base.get(p, {}), bx[p]
+    ratio = f"{f(b,'instructions')/f(c,'instructions'):.2f}" if f(c, 'instructions') else ''
+    hang = longest = within = ''
+    path = _os.path.join(bridges, f'p{p}.json')
+    if _os.path.exists(path):
+        d = json.load(open(path))
+        lc = max([h[0] for h in d['cubic'].get('hang_longest', [])] or [0.])
+        lb = max([h[0] for h in d['bac'].get('hang_longest', [])] or [0.])
+        hang = f"{d['cubic']['hanging']} / {d['bac']['hanging']}"
+        longest = f'{lc:.2f} / {lb:.2f}'
+        within = 'yes' if lb <= lc else 'no'
+    print(f"| {p} | {f(c,'instructions')/1e9:,.0f} / {f(b,'instructions')/1e9:,.0f} | {ratio} | {int(f(c,'rss_mb')):,} / {int(f(b,'rss_mb')):,} | {hang} | {longest} | {within} |")
