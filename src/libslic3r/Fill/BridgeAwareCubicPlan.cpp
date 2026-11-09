@@ -232,6 +232,32 @@ void ObjectPlan::collect_material(const PrintObject &object, const std::function
 // moment it is planned. Between two of the pattern's groups the region with the lower index lays the wall; against another
 // pattern, a 0 % region or air the pattern's region always does. A boundary is open by what lies next to it, never by what is
 // missing: material of any shape opens nothing.
+// Joins the pieces that meet end to end (a closed contour clipped by Clipper comes back split at its start vertex).
+static void join_end_to_end(Polylines &pieces)
+{
+    for (bool joined = true; joined;) {
+        joined = false;
+        for (size_t i = 0; i < pieces.size() && !joined; ++i)
+            for (size_t j = 0; j < pieces.size() && !joined; ++j) {
+                if (i == j || pieces[i].points.size() < 2 || pieces[j].points.size() < 2)
+                    continue;
+                Points &a = pieces[i].points, &b = pieces[j].points;
+                if (a.back() == b.front()) {
+                    a.insert(a.end(), b.begin() + 1, b.end());
+                } else if (a.back() == b.back()) {
+                    a.insert(a.end(), b.rbegin() + 1, b.rend());
+                } else if (a.front() == b.back()) {
+                    a.insert(a.begin(), b.begin(), b.end() - 1);
+                } else if (a.front() == b.front()) {
+                    a.insert(a.begin(), b.rbegin(), b.rend() - 1);
+                } else
+                    continue;
+                pieces.erase(pieces.begin() + j);
+                joined = true;
+            }
+    }
+}
+
 void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::function<void()> &cancel)
 {
     constexpr double DELTA_S = 0.01;    // δ_s: a boundary is open where it lies within this of the neighbour, mm
@@ -245,7 +271,7 @@ void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::functi
         std::vector<ExPolygons> sparse(region_count);
         std::vector<char>       kind(region_count, 0);
         std::set<int>           groups_present;
-        bool other_lattice = false, void_region = false, all_walled = true;
+        bool other_lattice = false, void_region = false;
         for (size_t r = 0; r < region_count && r < layer.regions().size(); ++r) {
             const LayerRegion &lr = *layer.regions()[r];
             for (const Surface &surface : lr.fill_surfaces.surfaces)
@@ -265,8 +291,6 @@ void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::functi
                 else
                     other_lattice = true;
             }
-            if (config.wall_loops.value <= 0)
-                all_walled = false;
         }
         if (groups_present.empty())
             continue;
@@ -278,10 +302,9 @@ void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::functi
             if (kind[r] != 'b' || m_group_of_region[r] < 0)
                 continue;
             open_air[r] = diff_pl(to_polylines(sparse[r]), offset_ex(layer.lslices, -float(scale_(DELTA_S))));
-            open_air[r].erase(std::remove_if(open_air[r].begin(), open_air[r].end(), [](const Polyline &p) { return p.length() < scale_(0.05); }), open_air[r].end());
+            open_air[r].erase(std::remove_if(open_air[r].begin(), open_air[r].end(), [](const Polyline &p) { return p.length() < scale_(DELTA_S); }), open_air[r].end());    // slivers of the clip
             any_air = any_air || !open_air[r].empty();
         }
-        (void)all_walled;
         // A layer whose sparse fill is all of one group, no region at 0 % and no sparse boundary at the air, has no seam.
         if (groups_present.size() == 1 && !other_lattice && !void_region && !any_air)
             continue;
@@ -329,27 +352,7 @@ void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::functi
                 const double reach = std::sqrt((inset + w) * (inset + w) + inset * inset) + DELTA_S;
                 const Polygons near_open = offset(open, float(scale_(reach)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
                 Polylines pieces = intersection_pl(to_polylines(inset_area), near_open);
-                for (bool joined = true; joined;) {
-                    joined = false;
-                    for (size_t i = 0; i < pieces.size() && !joined; ++i)
-                        for (size_t j = 0; j < pieces.size() && !joined; ++j) {
-                            if (i == j || pieces[i].points.size() < 2 || pieces[j].points.size() < 2)
-                                continue;
-                            Points &a = pieces[i].points, &b = pieces[j].points;
-                            if (a.back() == b.front()) {
-                                a.insert(a.end(), b.begin() + 1, b.end());
-                            } else if (a.back() == b.back()) {
-                                a.insert(a.end(), b.rbegin() + 1, b.rend());
-                            } else if (a.front() == b.back()) {
-                                a.insert(a.begin(), b.begin(), b.end() - 1);
-                            } else if (a.front() == b.front()) {
-                                a.insert(a.begin(), b.rbegin(), b.rend() - 1);
-                            } else
-                                continue;
-                            pieces.erase(pieces.begin() + j);
-                            joined = true;
-                        }
-                }
+                join_end_to_end(pieces);
                 for (Polyline &piece : pieces)
                     if (piece.length() >= scale_(w - 1e-4))
                         walls.push_back(std::move(piece));
@@ -406,6 +409,9 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
             continue;
         const LayerMaterial &upper = m_materials[n];
         const Polylines roof_edge = to_polylines(upper.may_print);
+        // The roof's own material, the walls' beads left out: with the walls in the offset the rail's contour turned d_r short of
+        // every wall and the rail never reached it (review, 9 November 2026).
+        const ExPolygons roof_material = diff_ex(upper.may_print, upper.walls);
         for (size_t g = 0; g < m_groups.size(); ++g) {
           GroupPlan &group = m_groups[g];
           const int B = group.m_bridge_layers;
@@ -414,7 +420,7 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
           // assumed the stack trimmed to the base).
           for (int k = 1; k <= B; ++k) {
             if (int(n) - k < 1)
-                break;
+                break;    // nothing lies under layer 0 to hold a rail, and the generator anchors nothing on it
             const size_t m_r = size_t(int(n) - k);
             if (g >= m_materials[m_r].void_of_group.size() || m_materials[m_r].void_of_group[g].empty())
                 continue;
@@ -429,10 +435,9 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
             const Polygons    near_sparse = offset(sparse_n, float(scale_(DELTA_S)));
             const ExPolygons &void_m      = m_materials[m_r].void_of_group[g];
             const double      w           = group.m_lattice.width;
-            ExPolygons boundary_m;
-            bool       boundary_known = false;
-            Polylines  rails;
-            ExPolygons band;
+            // E of every candidate, grouped by its region's rail distance d_r, so that one contour is cut once for all of them
+            // (candidates whose edges meet would otherwise lay the shared stretch twice, and each cost a whole-layer offset).
+            std::map<long, std::pair<double, Polylines>> edges_by_distance;
             for (const PrintObject::BridgeCandidate &candidate : candidates) {
                 if (candidate.worth_bridging.empty() || candidate.region == nullptr)
                     continue;
@@ -449,25 +454,33 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
                 edge = intersection_pl(edge, void_m);
                 if (edge.empty())
                     continue;
-                const Polygons   near_edge = offset(edge, float(scale_(d_r + 0.01)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
-                const ExPolygons grown     = offset_ex(upper.may_print, float(scale_(d_r)), ClipperLib::jtRound, ARC_TOLERANCE);
+                auto &entry = edges_by_distance[std::lround(d_r * 1e6)];
+                entry.first = d_r;
+                append(entry.second, std::move(edge));
+            }
+            if (edges_by_distance.empty())
+                continue;
+            // The group's sparse surfaces at m_r (not the inset fill boundary): the rail reaches the walls' beads, since a bridge
+            // ray that passes beyond a rail's end grows on until the next anchor, and the filler prints a course whole up to the
+            // island's edge.
+            Polygons surfaces_m;
+            for (const size_t r : group.m_regions)
+                if (r < object.layers()[m_r]->regions().size())
+                    for (const Surface &s : object.layers()[m_r]->regions()[r]->fill_surfaces.surfaces)
+                        if (s.surface_type == stInternal)
+                            append(surfaces_m, to_polygons(s.expolygon));
+            const ExPolygons boundary_m = union_ex(surfaces_m);
+            Polylines  rails;
+            ExPolygons band;
+            for (auto &[key, entry] : edges_by_distance) {
+                const double     d_r       = entry.first;
+                const Polygons   near_edge = offset(entry.second, float(scale_(d_r + 0.01)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
+                const ExPolygons grown     = offset_ex(roof_material, float(scale_(d_r)), ClipperLib::jtRound, ARC_TOLERANCE);
                 Polylines rail = intersection_pl(to_polylines(grown), near_edge);
                 if (rail.empty())
                     continue;
-                // Clipped to the group's sparse surfaces at m_r (not the inset fill boundary): the rail must reach the walls'
-                // beads, since a bridge ray that passes beyond a rail's end grows on until the next anchor; the filler prints a
-                // course whole up to the island's edge.
-                if (!boundary_known) {
-                    Polygons surfaces_m;
-                    for (const size_t r : group.m_regions)
-                        if (r < object.layers()[m_r]->regions().size())
-                            for (const Surface &s : object.layers()[m_r]->regions()[r]->fill_surfaces.surfaces)
-                                if (s.surface_type == stInternal)
-                                    append(surfaces_m, to_polygons(s.expolygon));
-                    boundary_m     = union_ex(surfaces_m);
-                    boundary_known = true;
-                }
                 rail = intersection_pl(rail, boundary_m);
+                join_end_to_end(rail);    // a closed contour comes back split at its start vertex
                 for (Polyline &piece : rail)
                     if (piece.length() >= scale_(w - 1e-4))
                         rails.push_back(std::move(piece));
@@ -499,13 +512,17 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
             add_courses(m_r, region_id, rails, true);
             group.mark_courses();
             BridgeAwareCubic::add_courses(m_materials[m_r], rails, w, rail_layer, m_groups_regions);
-            m_statistics.rails += rails.size();
-            if (k == 1) {
+#if SLIC3R_BAC_DEVELOPMENT_CHECKS
+            if (k == 1 && g == 0) {
+                // The roofs the rails were laid for, for the development check of the generator's predictions (5.2).
                 ExPolygons predicted;
                 for (const PrintObject::BridgeCandidate &candidate : candidates)
                     append(predicted, union_ex(candidate.worth_bridging));
                 m_statistics.rail_roofs.emplace_back(n, std::move(predicted));
             }
+#endif
+            // The band of the rail under the lowest bridge layer widens the roof's planes (the bands of the rails under the
+            // other layers of a thick stack lie under the stack's own bridges, 3.5b's recorded limitation at B > 1).
             if (!band.empty() && k == 1)
                 append(m_rail_bands[g][n], union_ex(band));
           }
@@ -605,6 +622,7 @@ void ObjectPlan::collect_planes(const PrintObject &object, const std::function<v
         std::sort(group.m_planes.begin(), group.m_planes.end(), [](const Plane &a, const Plane &b) {
             return a.plane_layer != b.plane_layer ? a.plane_layer < b.plane_layer : a.roof_layer < b.roof_layer;
         });
+    m_rail_bands.clear();    // used only while the planes are made
 }
 
 ExPolygons ObjectPlan::group_boundary(const PrintObject &object, size_t layer_index, size_t g, const std::vector<SparseIsland> &islands) const

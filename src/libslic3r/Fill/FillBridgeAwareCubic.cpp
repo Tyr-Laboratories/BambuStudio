@@ -72,9 +72,9 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
             }
     if (ends.empty())
         return;
-    // The direction of a path's end segment, pointing into the path.
-    const auto end_direction = [&paths](size_t i, bool front) {
-        const Points &pts = paths[i].points;
+    // The direction of a path's end segment, pointing into the path (the path has at least two points).
+    const auto end_direction = [](const Polyline &path, bool front) {
+        const Points &pts = path.points;
         const Point &a = front ? pts.front() : pts.back(), &b = front ? pts[1] : pts[pts.size() - 2];
         Vec2d d = (b - a).cast<double>();
         const double n = d.norm();
@@ -93,10 +93,25 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
         std::vector<size_t> merged_into(paths.size());
         for (size_t i = 0; i < paths.size(); ++i) merged_into[i] = i;
         const auto root = [&merged_into](size_t i) { while (merged_into[i] != i) i = merged_into[i]; return i; };
+        // An end's path after the joins so far: the root of its merge set, and whether the end is still that path's front or
+        // back (an end an earlier join absorbed into the interior takes no further part). The original path of a joined end is
+        // empty, so nothing reads it.
+        const auto live_end = [&](size_t e, size_t &path_index, bool &front) {
+            path_index = root(ends[e].path);
+            const Points &pts = paths[path_index].points;
+            if (pts.size() < 2)
+                return false;
+            front = pts.front() == ends[e].p;
+            return front || pts.back() == ends[e].p;
+        };
         for (size_t e = 0; e < ends.size(); ++e) {
             if (consumed[e])
                 continue;
-            const Vec2d de = end_direction(ends[e].path, ends[e].front);
+            size_t path_e = 0;
+            bool front_e = false;
+            if (!live_end(e, path_e, front_e))
+                continue;
+            const Vec2d de = end_direction(paths[path_e], front_e);
             std::optional<size_t> mate;
             double best = join_scaled;
             const int cx = cell_of(ends[e].p.x()), cy = cell_of(ends[e].p.y());
@@ -106,13 +121,17 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
                     if (it == end_grid.end())
                         continue;
                     for (const size_t f : it->second) {
-                        if (f == e || consumed[f] || root(ends[f].path) == root(ends[e].path))
+                        if (f == e || consumed[f])
+                            continue;
+                        size_t path_f = 0;
+                        bool front_f = false;
+                        if (!live_end(f, path_f, front_f) || path_f == path_e)
                             continue;
                         const double d = (ends[f].p - ends[e].p).cast<double>().norm();
                         if (d > best)
                             continue;
                         // Parallel lines meet only head on (the gap between them within half a bead).
-                        const Vec2d df = end_direction(ends[f].path, ends[f].front);
+                        const Vec2d df = end_direction(paths[path_f], front_f);
                         if (std::abs(de.x() * df.y() - de.y() * df.x()) < std::sin(5. * M_PI / 180.)) {
                             const Vec2d gap = (ends[f].p - ends[e].p).cast<double>();
                             if (std::abs(gap.x() * de.y() - gap.y() * de.x()) > 0.5 * reach_scaled)
@@ -231,6 +250,62 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
     }
 }
 
+// Trims from each path's ends the segments that run off the lattice directions inside a zone the connector could not see as
+// material (the band beside a course of the layer or of the layer below), unless they run along the
+// island's own boundary (both ends within half a bead of it: a hook along the wall, Cubic's) or along a course of the layer (the
+// course itself, or a nub along it): the connector's boundary excludes those zones, so no line end lies on their edges, but a hook
+// from an end on the wall can turn the corner onto such an edge and hang over the void. Nothing on a lattice line is touched; a
+// path left with one point is dropped.
+void trim_virtual_hooks(Polylines &paths, const ExPolygons &zones, const ExPolygons &island_boundary, const Polylines &courses,
+                        const BridgeAwareCubic::LatticeParams &lattice, double reach_scaled)
+{
+    if (zones.empty() || paths.empty() || island_boundary.empty())
+        return;
+    const BridgeAwareCubic::AreaIndex zone_index(zones);
+    EdgeGrid::Grid wall_grid;
+    wall_grid.set_bbox(get_extents(island_boundary).inflated(coord_t(scale_(1.))));
+    wall_grid.create(island_boundary, coord_t(scale_(2.)));
+    EdgeGrid::Grid course_grid;
+    std::vector<Points> course_points;
+    for (const Polyline &course : courses)
+        if (course.points.size() >= 2)
+            course_points.push_back(course.points);
+    if (!course_points.empty()) {
+        BoundingBox all;
+        for (const Points &pts : course_points)
+            for (const Point &pt : pts)
+                all.merge(pt);
+        course_grid.set_bbox(all.inflated(coord_t(scale_(1.))));
+        course_grid.create(course_points, coord_t(scale_(2.)), true);
+    }
+    const auto near_wall   = [&](const Point &p) { return wall_grid.closest_point_signed_distance(p, coord_t(reach_scaled)).valid(); };
+    const auto near_course = [&](const Point &p) { return !course_points.empty() && course_grid.closest_point_signed_distance(p, coord_t(reach_scaled)).valid(); };
+    const double cos_tolerance = std::cos(2. * M_PI / 180.);
+    const auto virtual_segment = [&](const Point &a, const Point &b) {
+        const Vec2d d = (b - a).cast<double>();
+        const double n = d.norm();
+        if (n <= 0.)
+            return true;
+        for (int k = 0; k < 3; ++k)
+            if (std::abs(d.dot(lattice.direction(k))) >= n * cos_tolerance)
+                return false;    // on a lattice direction: a line or a nub along one
+        const Point mid((a.x() + b.x()) / 2, (a.y() + b.y()) / 2);
+        if (!zone_index.contains(mid))
+            return false;
+        if (near_course(a) && near_course(b))
+            return false;    // a course, or a nub along it
+        return !(near_wall(a) && near_wall(b));    // along the wall: Cubic's hook, kept; a turn off the wall is not
+    };
+    for (Polyline &pl : paths) {
+        Points &pts = pl.points;
+        while (pts.size() >= 2 && virtual_segment(pts[0], pts[1]))
+            pts.erase(pts.begin());
+        while (pts.size() >= 2 && virtual_segment(pts[pts.size() - 2], pts.back()))
+            pts.pop_back();
+    }
+    paths.erase(std::remove_if(paths.begin(), paths.end(), [](const Polyline &pl) { return pl.points.size() < 2; }), paths.end());
+}
+
 } // namespace
 
 void FillBridgeAwareCubic::bind(const BridgeAwareCubic::ObjectPlan &plan, const Layer &layer)
@@ -262,6 +337,10 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
         if (m_layer_index > 0)
             append(courses_below, m_plan->boundary_courses_at(m_layer_index - 1, region_id));
     }
+    // A course of the layer below that this layer repeats (a seam wall, laid on every layer of its seam) is this layer's own
+    // business; only the courses this layer does not have (rails) make a zone from below.
+    if (!courses_below.empty() && !boundary_courses.empty())
+        courses_below = diff_pl(courses_below, offset(boundary_courses, float(scale_(lattice.width)), ClipperLib::jtRound, float(scale_(0.001))));
     const PrintRegionConfig &config = m_layer->regions()[this->lock_region_id]->region().config();
     const double overlap_percent = config.infill_wall_overlap.get_abs_value(100.);
     const ExPolygons boundary = fill_boundary(island, boundary_courses, lattice.spacing, lattice.width, overlap_percent);
@@ -274,11 +353,16 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     const double zone = 1.5 * lattice.width + 0.5 * lattice.spacing;
     Polylines zone_courses = boundary_courses;
     append(zone_courses, courses_below);
-    const ExPolygons connector_boundary = zone_courses.empty() ? boundary
-        : diff_ex(fill_boundary(island, Polylines(), lattice.spacing, lattice.width, overlap_percent),
-                  offset(zone_courses, float(scale_(zone)), ClipperLib::jtRound, float(scale_(0.001))));
+    const ExPolygons plain_boundary = zone_courses.empty() ? boundary : fill_boundary(island, Polylines(), lattice.spacing, lattice.width, overlap_percent);
+    ExPolygons virtual_zones;    // what the connector's boundary leaves out: no hook may run along their edges (below)
+    if (!zone_courses.empty())
+        virtual_zones = union_ex(offset(zone_courses, float(scale_(zone)), ClipperLib::jtRound, float(scale_(0.001))));
+    const ExPolygons connector_boundary = virtual_zones.empty() ? boundary : diff_ex(plain_boundary, virtual_zones);
     const AreaIndex below_zone(courses_below.empty() ? ExPolygons()
         : union_ex(offset(courses_below, float(scale_(zone)), ClipperLib::jtRound, float(scale_(0.001)))));
+    // The walls' beads and their overlap band: a bulk end whose run-on would land there stays at the fill boundary (Cubic's depth).
+    const AreaIndex wall_band(courses_below.empty() ? ExPolygons()
+        : offset_ex(m_plan->material(m_layer_index).walls, float(scale_(lattice.spacing)), ClipperLib::jtRound, float(scale_(0.001))));
 
     Polylines out;
     // 4. Courses of the layer, clipped to the island, printed whole (each clipped alone: Clipper splits open paths clipped together).
@@ -325,6 +409,10 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
                     if (!on_surface)
                         on_surface = surface_index.segment_inside(line.a, line.b);
                     run_on_to_surface(line, length, *on_surface, interval, a, b, at_a, at_b);
+                    if (at_a && !wall_band.empty() && wall_band.contains(a))
+                        a = along(line, interval.first);
+                    if (at_b && !wall_band.empty() && wall_band.contains(b))
+                        b = along(line, interval.second);
                 }
             }
             bulk.emplace_back(Points{ a, b });
@@ -377,6 +465,8 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
         connect_infill(std::move(lines), to_polygons(connector_boundary), get_extents(island.contour), connected, this->spacing, params);
     if (!params.dont_connect() && params.anchor_length > 0.f)
         anchor_junctions(connected, connector_boundary, reach, scale_(double(params.anchor_length)), scale_(std::min(lattice.width, gap_b)));
+    if (!virtual_zones.empty() && !params.dont_connect())
+        trim_virtual_hooks(connected, virtual_zones, plain_boundary, courses, lattice, reach);
     append(out, std::move(connected));
     return out;
 }

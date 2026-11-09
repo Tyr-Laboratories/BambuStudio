@@ -22,6 +22,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -638,19 +639,42 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
                 if (i == 0 || i + 1 >= own.path.points.size()) return false;
                 return is_hook(own.path.points[i - 1], own.path.points[i]) != is_hook(own.path.points[i], own.path.points[i + 1]);
             };
-            // A closed path (a course laid as a loop) has no ends: its first and last vertices count as fused.
+            // A closed path (a course laid as a loop) has no ends. It is measured from a vertex that is held (over the hold set)
+            // or fused, round to itself, so that a stretch through its start point is one stretch; without such a vertex the whole
+            // loop is one piece whose length is a stretch. Its first and last vertices count as fused (a loop has no free end).
             const bool closed = path->path.points.size() > 2 && path->path.first_point() == path->path.last_point();
-            std::vector<bool> fused_vertex(path->path.points.size(), false);
-            for (size_t i = 0; i < path->path.points.size(); ++i)
-                fused_vertex[i] = fused(*path, i) || hook_junction(*path, i) || (closed && (i == 0 || i + 1 == path->path.points.size()));
+            Polyline measured = path->path;
+            std::vector<size_t> orig(measured.points.size());
+            std::iota(orig.begin(), orig.end(), 0);
+            if (closed) {
+                const size_t ring = path->path.points.size() - 1;
+                size_t pivot = 0;
+                for (size_t i = 0; i < ring; ++i) {
+                    const Point &v = path->path.points[i];
+                    if (std::any_of(hold.begin(), hold.end(), [&v](const ExPolygon &e) { return e.contains(v); }) || fused(*path, i)) {
+                        pivot = i;
+                        break;
+                    }
+                }
+                if (pivot > 0) {
+                    measured.points.assign(path->path.points.begin() + pivot, path->path.points.begin() + ring);
+                    measured.points.insert(measured.points.end(), path->path.points.begin(), path->path.points.begin() + pivot + 1);
+                    for (size_t i = 0; i < measured.points.size(); ++i)
+                        orig[i] = (pivot + i) % ring;
+                }
+            }
+            const size_t n_pts = measured.points.size();
+            std::vector<bool> fused_vertex(n_pts, false);
+            for (size_t i = 0; i < n_pts; ++i)
+                fused_vertex[i] = fused(*path, orig[i]) || hook_junction(*path, orig[i]) || (closed && (i == 0 || i + 1 == n_pts));
             struct Part { Polyline line; bool start_fused, end_fused; };
             std::vector<Part> parts;
             {
                 Part part{ Polyline(), fused_vertex.front(), false };
-                for (size_t i = 0; i < path->path.points.size(); ++i) {
-                    const Point &v = path->path.points[i];
+                for (size_t i = 0; i < n_pts; ++i) {
+                    const Point &v = measured.points[i];
                     part.line.points.push_back(v);
-                    if (i > 0 && i + 1 < path->path.points.size() && fused_vertex[i]) {
+                    if (i > 0 && i + 1 < n_pts && fused_vertex[i]) {
                         part.end_fused = true;
                         parts.push_back(part);
                         part = Part{ Polyline(), true, false };

@@ -238,6 +238,7 @@ def main():
             plen = shapely.LineString(pts).length
             if plen <= 0:
                 continue
+            orig_pts = pts   # the path as emitted: the own entry of own_paths
             # The arc length from each vertex to the path's start, to exclude the path's own geometry near a vertex.
             arc = [0.0]
             for i in range(1, len(pts)):
@@ -251,7 +252,7 @@ def main():
                 v = shapely.Point(pts[vi])
                 for j in own_tree.query(v, predicate='dwithin', distance=max_w / 2 + args.tol):
                     line, opts, ow = own_paths[j]
-                    if opts is pts:
+                    if opts is orig_pts:
                         # Own path: only parts farther than one bead along the path, and in the interior of that part.
                         near = False
                         for i in range(1, len(pts)):
@@ -281,11 +282,25 @@ def main():
                 sg = (pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
                 return not along_lattice(*sg) and on_reference_line(*sg, ref, ref_tree, overlap=False)
 
+            closed = len(pts) > 2 and pts[0] == pts[-1]   # a course laid as a loop has no ends
+            if closed:
+                # Measured from a vertex that is held (over the hold set) or fused, round to itself, so that a stretch through the
+                # start point is one stretch; without such a vertex the whole loop is one piece whose length is a stretch.
+                hold_w = holds[round(w, 4)]
+                pivot = 0
+                for i in range(len(pts) - 1):
+                    if hold_w.covers(shapely.Point(pts[i])) or fused(i):
+                        pivot = i
+                        break
+                if pivot > 0:
+                    pts = pts[pivot:-1] + pts[:pivot + 1]
+                    arc = [0.0]
+                    for i in range(1, len(pts)):
+                        arc.append(arc[-1] + math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]))
             hooks = [False] + [is_hook(i) for i in range(1, len(pts))]
             # A junction: a vertex fused to another bead, or the vertex where a lattice line turns into a connector hook along the
             # boundary (Cubic's boundary behaviour, accepted by the user): the hook is measured as a connection piece of its own
             # and the line's end at the junction is not free.
-            closed = len(pts) > 2 and pts[0] == pts[-1]   # a course laid as a loop has no ends
             fused_vertex = [fused(i) or (0 < i < len(pts) - 1 and hooks[i] != hooks[i + 1]) or (closed and (i == 0 or i == len(pts) - 1)) for i in range(len(pts))]
             # The parts of the path between its junction vertices.
             parts, part, part_start = [], [pts[0]], 0

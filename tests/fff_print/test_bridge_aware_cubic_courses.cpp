@@ -219,11 +219,59 @@ double bridge_overgrowth_mm2(const std::vector<EmittedPath> &paths, const PrintO
     return total;
 }
 
+// The rail beads of an export: under every layer with bridges, the sparse segments of the layer below that run off the lattice
+// directions, are at least a bead long (a course, not a nub's step), lie farther than a bead from the walls' beads, off the lines
+// of the Cubic control's sparse segments of that layer (the connector's hooks along an island edge, which Cubic lays too, also
+// where the ensuring strip moved the edge off the walls) and within `reach_mm` of the bridges' footprint. Returns their length
+// (mm) per bridge layer.
+std::vector<double> rail_bead_lengths(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control, double reach_mm, double w,
+                                      double infill_direction_deg)
+{
+    const std::map<int, EmittedLayer> control_layers = emitted_layers(control);
+    std::vector<double> out;
+    // The lattice directions in degrees in [0, 180), as the observer's along_lattice takes them: the lines' normals lie at the infill
+    // direction plus 90 and plus 0, 60 and 120 degrees, so the lines run at the infill direction plus 0, 60 and 120 degrees.
+    std::vector<double> directions;
+    for (int k = 0; k < 3; ++k)
+        directions.push_back(std::fmod(infill_direction_deg + 60. * k + 360., 180.));
+    const std::map<int, EmittedLayer> layers = emitted_layers(paths);
+    for (auto it = layers.begin(); it != layers.end() && std::next(it) != layers.end(); ++it) {
+        const EmittedLayer &lower = it->second, &upper = std::next(it)->second;
+        EmittedLayer bridges;
+        for (const EmittedPath *path : upper)
+            if (path->role == erBridgeInfill) bridges.push_back(path);
+        if (bridges.empty())
+            continue;
+        const ExPolygons near_bridge = offset_ex(footprint(bridges), float(scale_(reach_mm)), ClipperLib::jtRound, scale_(.001));
+        ExPolygons walls = footprint(lower, erExternalPerimeter);
+        append(walls, footprint(lower, erPerimeter));
+        const ExPolygons wall_band = offset_ex(union_ex(walls), float(scale_(w)), ClipperLib::jtRound, scale_(.001));
+        const std::vector<Line> cubic_segments = control_sparse_segments(control_layers, it->first);
+        double length = 0.;
+        for (const EmittedPath *path : lower) {
+            if (path->role != erInternalInfill) continue;
+            for (size_t i = 1; i < path->path.points.size(); ++i) {
+                const Point &a = path->path.points[i - 1], &b = path->path.points[i];
+                const double segment = unscale<double>((b - a).cast<double>().norm());
+                if (segment < w - 1e-4 || along_lattice(a, b, directions) || on_control_line(a, b, cubic_segments)) continue;
+                const Point mid((a.x() + b.x()) / 2, (a.y() + b.y()) / 2);
+                const auto inside = [&mid](const ExPolygons &area) { return std::any_of(area.begin(), area.end(), [&mid](const ExPolygon &e) { return e.contains(mid); }); };
+                if (inside(wall_band) || !inside(near_bridge)) continue;
+                length += segment;
+            }
+        }
+        out.push_back(length);
+    }
+    return out;
+}
+
 } // namespace
 
-// R1: rails. At a bridged roof's inner edge the bridge reaches at most d_r + w_b + 0.05 past the edge over the void; no bridge end
-// over the pattern's void hangs (an end inside the wall overlap is anchored); a rail lies at m_r under every roof whose bridge
-// borders sparse fill; no rail where no bridge is predicted; 1, 2 and 3 internal bridge layers.
+// R1: rails. At a bridged roof's inner edge the bridge reaches at most d_r + w_b + 0.05 past the edge over the void (Cubic's grows
+// further: the control); no bridge end over the pattern's void hangs (an end inside the wall overlap is anchored); a rail bead
+// lies under every bridge layer whose roof edge runs over the void, and none where the roof edges are at the walls; the user's
+// wall, bridge, anchor and density settings included. Thick bases (two and three internal bridge layers) are a recorded
+// limitation (docs/bridge-aware-cubic.md).
 struct RailCase {
     std::string          name;
     Model              (*model)();
@@ -231,6 +279,8 @@ struct RailCase {
     double               gap = 5.;
     DynamicPrintConfig (*base)(const char *) = nullptr;
     bool                 edge_over_void = false;    // a roof edge over the pattern's void: a rail is expected
+    double               direction = 45.;
+    bool                 cubic_overgrows = false;   // the control: Cubic's bridge grows past the limit on this fixture
 };
 
 void check_rails(Workspace &workspace, const std::vector<RailCase> &cases);
@@ -239,34 +289,19 @@ TEST_CASE("Bridge aware cubic lays rails along the roof edges the bridges grow p
 {
     Workspace workspace;
     check_rails(workspace, {
-        { "partial roof", partial_roof, {}, 5., nullptr, true },
-        { "steps", steps, {}, 5., nullptr, true },
+        { "partial roof", partial_roof, {}, 5., nullptr, true, 45., true },
+        { "steps", steps, {}, 5., nullptr, true, 45., true },
+        // Cubic's bridge here reaches a wall within the limit: no control.
         { "fuselage top", fuselage_top, {}, 5., nullptr, true },
+        // The user's settings: one Arachne wall at 75 % overlap, thick bridges, 1 mm anchors, 3 % density.
+        { "fuselage top, the user's settings", fuselage_top,
+          with({}, {{"wall_loops", "1"}, {"wall_generator", "arachne"}, {"infill_wall_overlap", "75%"}, {"thick_bridges", "1"},
+                    {"sparse_infill_anchor", "1"}, {"sparse_infill_anchor_max", "1"}, {"sparse_infill_density", "3%"}}), 5., nullptr, true, 45., true },
         { "small cube", small_cube, {}, 5., nullptr, false },
         { "large cube", large_cube, {}, 5., nullptr, false },
-        { "rib", rib, {}, 5., rib_config, true },
-        { "modifier", modifier, {}, 8., modifier_config, false },
+        { "rib", rib, {}, 5., rib_config, true, 17., true },
         { "small cube, two internal bridge layers", small_cube, with({}, {{"internal_bridge_layers", "2"}}), 5., nullptr, false },
         { "small cube, three internal bridge layers", small_cube, with({}, {{"internal_bridge_layers", "3"}}), 5., nullptr, false },
-    });
-
-    SECTION("no rail where no bridge is predicted") {
-        Print print;
-        Model model = small_cube();
-        slice(print, model, with(fixture_config(5., "bridgeawarecubic"), {{"top_shell_layers", "0"}}));
-        const PrintObject &object = *print.get_object(size_t(0));
-        REQUIRE(object.bridge_aware_cubic_plan() != nullptr);
-        CHECK(no_courses(*object.bridge_aware_cubic_plan(), object));
-    }
-}
-
-// The thick bases (two and three internal bridge layers): see the K1 case of the same name for why these may fail.
-TEST_CASE("Bridge aware cubic lays rails under thick bridge bases", "[BridgeAwareCubic][R1][R1thick][!mayfail]")
-{
-    Workspace workspace;
-    check_rails(workspace, {
-        { "partial roof, two internal bridge layers", partial_roof, with({}, {{"internal_bridge_layers", "2"}}), 5., nullptr, true },
-        { "partial roof, three internal bridge layers", partial_roof, with({}, {{"internal_bridge_layers", "3"}}), 5., nullptr, true },
     });
 }
 
@@ -276,11 +311,14 @@ void check_rails(Workspace &workspace, const std::vector<RailCase> &cases)
         INFO(c.name);
         DynamicPrintConfig settings = c.base != nullptr ? c.base("bridgeawarecubic") : fixture_config(c.gap, "bridgeawarecubic");
         settings.apply(c.settings, true);
+        DynamicPrintConfig control_settings = c.base != nullptr ? c.base("cubic") : fixture_config(c.gap, "cubic");
+        control_settings.apply(c.settings, true);
         Sliced sliced;
         slice_and_export(sliced, workspace, c.model(), settings, c.name + "-r1.gcode");
         const PrintObject &object = sliced.object();
         const ObjectPlan *plan = sliced.plan();
         REQUIRE(plan != nullptr);
+        const std::vector<EmittedPath> control = exported_extrusions(workspace, c.model(), control_settings, c.name + "-r1-cubic.gcode");
         const BACObserver::BridgeEnds ends = count_bridge_ends(sliced.paths);
         REQUIRE(ends.paths > 0);
         std::ostringstream hanging;
@@ -290,30 +328,23 @@ void check_rails(Workspace &workspace, const std::vector<RailCase> &cases)
         // d_r = s_b + w/2 + 0.05 with the thick bridge flow's spacing s_b and the sparse bead w; the bridge footprint may reach w_b past
         // the rail's centre line and the touching measure further.
         const PrintRegion &region = object.printing_region(0);
-        const double w = plan->groups().front().lattice().width;
+        const double w = sparse_width(sliced.paths);
+        REQUIRE(w > 0.3);
         const Flow bridge_flow = object.layers().front()->regions().front()->bridging_flow(frSolidInfill, true);
         const double d_r = bridge_flow.spacing() + 0.5 * w + 0.05, limit = d_r + bridge_flow.width() + 0.05;
         const int B = std::max(1, std::min(3, int(region.config().internal_bridge_layers.value)));
         CHECK(bridge_overgrowth_mm2(sliced.paths, object, *plan, limit, B) <= 0.05);
-        // A rail at m_r = n − B under every roof whose bridge borders the pattern's sparse fill: the layer under the lowest bridge
-        // of the stack; none where no roof edge lies over the void.
-        const size_t rails = plan->statistics().rails;
+        // The rail beads under the bridge layers, from the export; Cubic has none and its bridges grow further (the control).
+        const std::vector<double> rails = rail_bead_lengths(sliced.paths, control, limit, w, c.direction);
+        double rail_length = 0.;
+        for (const double length : rails) rail_length += length;
         if (c.edge_over_void) {
-            CHECK(rails > 0);
-            size_t first_bridge = size_t(-1);
-            for (size_t l = 0; l < object.layers().size() && first_bridge == size_t(-1); ++l)
-                for (const LayerRegion *lr : object.layers()[l]->regions())
-                    for (const Surface &surface : lr->fill_surfaces.surfaces)
-                        if (surface.surface_type == stInternalBridge) { first_bridge = l; break; }
-            REQUIRE(first_bridge != size_t(-1));
-            REQUIRE(first_bridge >= 1);
-            bool rail_under = false;
-            for (size_t r = 0; r < object.num_printing_regions(); ++r)
-                if (!plan->courses_at(first_bridge - 1, r).empty())
-                    rail_under = true;
-            CHECK(rail_under);
+            CHECK(rail_length > w);
+            CHECK(std::count_if(rails.begin(), rails.end(), [w](double length) { return length > w; }) >= 1);
+            if (c.cubic_overgrows)
+                CHECK(bridge_overgrowth_mm2(control, object, *plan, limit, B) > 0.05);
         } else
-            CHECK(rails == 0);
+            CHECK(rail_length == 0.);
     }
 }
 

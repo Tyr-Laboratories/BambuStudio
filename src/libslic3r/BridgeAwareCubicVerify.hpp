@@ -52,6 +52,8 @@ VerificationReport verify(const PrintObject &object, const ObjectPlan &plan, con
 
 // The plan checks of 5.2, formatted: one message per finding, naming the object, the region's settings, the heights and the place.
 std::vector<std::string> plan_warnings(const PrintObject &object);
+// The rails laid for roofs the generator did not bridge (3.5b prediction misses), from the final surfaces: after the bridges.
+std::vector<std::string> rail_warnings(const PrintObject &object);
 
 } // namespace BridgeAwareCubic
 } // namespace Slic3r

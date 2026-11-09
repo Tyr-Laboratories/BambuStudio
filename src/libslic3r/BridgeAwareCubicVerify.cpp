@@ -254,9 +254,22 @@ std::vector<std::string> plan_warnings(const PrintObject &object)
         out.push_back(name + ": the refinement visited more than 1,000,000 cells (" + std::to_string(stats.visits) + ")");
     for (const size_t layer : stats.thick_layers)
         out.push_back(name + ": the layer at " + height(layer) + " is too thick for the lattice to rest on itself (the drift of a plane's trace exceeds half a bead)");
-    // Rails laid for roofs the generator did not bridge in the end (prediction misses, 3.5b), from the final surfaces.
+    for (const GroupPlan &group : plan->groups())
+        if (!group.regions().empty())
+            (void)region_text(group.regions().front());
+    return out;
+}
+
+std::vector<std::string> rail_warnings(const PrintObject &object)
+{
+    std::vector<std::string> out;
+    const ObjectPlan *plan = object.bridge_aware_cubic_plan();
+    if (plan == nullptr)
+        return out;
+    // Rails laid for roofs the generator did not bridge in the end (prediction misses, 3.5b): read from the final surfaces, so
+    // only after bridge_over_infill has run.
     size_t misses = 0;
-    for (const auto &[roof_layer, predicted] : stats.rail_roofs) {
+    for (const auto &[roof_layer, predicted] : plan->statistics().rail_roofs) {
         if (roof_layer >= object.layers().size())
             continue;
         ExPolygons bridged;
@@ -268,10 +281,8 @@ std::vector<std::string> plan_warnings(const PrintObject &object)
             ++misses;
     }
     if (misses > 0)
-        out.push_back(name + ": " + std::to_string(misses) + " rail(s) laid for roofs the bridge generator did not bridge in the end");
-    for (const GroupPlan &group : plan->groups())
-        if (!group.regions().empty())
-            (void)region_text(group.regions().front());
+        out.push_back("Bridge aware cubic, object \"" + object.model_object()->name + "\": " + std::to_string(misses) +
+                      " roof(s) got rails but the bridge generator did not bridge them in the end");
     return out;
 }
 

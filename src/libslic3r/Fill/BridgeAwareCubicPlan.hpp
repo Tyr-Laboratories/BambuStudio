@@ -71,8 +71,7 @@ struct PlanStatistics
     std::vector<Place> unheld;                     // sweep stretches and pieces left unheld, with the reason
     std::vector<Place> courses_over_other_void;    // lowest courses over another pattern's void, a 0 % region or air
     std::vector<size_t> thick_layers;              // layers whose height gives s_m ≥ w/2
-    size_t             rails = 0;                  // rails laid
-    std::vector<std::pair<size_t, ExPolygons>> rail_roofs;   // (roof layer, the candidate area each rail was laid for): the verifier counts the roofs the generator did not bridge
+    std::vector<std::pair<size_t, ExPolygons>> rail_roofs;   // development builds: (roof layer, the candidate area the rails were laid for), for the verifier's count of roofs the generator did not bridge
 };
 
 // The fill boundary of a group on one layer (3.8): every island of the group's sparse fill inset as the filler insets it,

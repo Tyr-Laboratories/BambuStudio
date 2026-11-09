@@ -332,6 +332,30 @@ private:
                     return true;
             }
         }
+        // A boundary course of the layer (a seam wall, a rail): the line ends inside its bead (3.8) and the filler's nub fuses it,
+        // in the course's interior (half a bead from its ends; a closed course has none).
+        const Point  P = m_lattice.scaled(p);
+        const double reach_scaled = scale_(reach), end_margin = scale_(0.5 * m_w);
+        for (const size_t region_id : m_group.regions())
+            for (const Polyline &course : m_plan.boundary_courses_at(m, region_id)) {
+                if (course.points.size() < 2)
+                    continue;
+                const bool   course_closed = course.first_point() == course.last_point();
+                const double total = double(course.length());
+                double arc = 0.;
+                for (size_t i = 1; i < course.points.size(); ++i) {
+                    const Line   seg(course.points[i - 1], course.points[i]);
+                    const double seg_length = seg.length();
+                    if (seg.distance_to(P) <= reach_scaled) {
+                        const Vec2d  a = seg.a.cast<double>(), d = (seg.b - seg.a).cast<double>();
+                        const double t    = seg_length > 0. ? std::min(1., std::max(0., (P.cast<double>() - a).dot(d) / (seg_length * seg_length))) : 0.;
+                        const double foot = arc + t * seg_length;
+                        if (course_closed || (foot >= end_margin && total - foot >= end_margin))
+                            return true;
+                    }
+                    arc += seg_length;
+                }
+            }
         return false;
     }
 
@@ -465,26 +489,54 @@ private:
                 {
                     const double gb = gap - MU, step_mm = 0.5 * m_lambda;
                     const double length = unscale<double>(course.length());
-                    double along = 0., unheld_from = -1.;
+                    // Stations every half bead; a closed course's last station stops short of its start point, which is station 0.
                     std::vector<double> stations;
-                    for (double s = 0.; s <= length + 1e-9; s += step_mm)
-                        stations.push_back(std::min(s, length));
-                    for (size_t i = 0; i < stations.size(); ++i) {
-                        along = stations[i];
-                        const Point at = point_at_arc_length(course, along);
-                        const bool held = point_held(m_lattice.relative(at), m);
-                        if (!held && unheld_from < 0.)
-                            unheld_from = along;
-                        if ((held || i + 1 == stations.size()) && unheld_from >= 0.) {
-                            const double unheld_to = held ? along : length;
-                            // Holders every G_b at most along an unheld stretch longer than G_b, starting half a stretch in.
-                            if (unheld_to - unheld_from > gb) {
-                                const int n = int(std::ceil((unheld_to - unheld_from) / gb));
-                                for (int k = 1; k < n; ++k)
-                                    to_hold.push_back(point_at_arc_length(course, unheld_from + (unheld_to - unheld_from) * double(k) / double(n)));
-                            }
-                            unheld_from = -1.;
+                    for (double st = 0.; st < length - (closed ? 0.5 * step_mm : -1e-9); st += step_mm)
+                        stations.push_back(std::min(st, length));
+                    if (!closed && (stations.empty() || stations.back() < length - 1e-9))
+                        stations.push_back(length);
+                    const size_t count = stations.size();
+                    if (count > 0) {
+                        std::vector<char> held_at(count, 0);
+                        for (size_t i = 0; i < count; ++i)
+                            held_at[i] = point_held(m_lattice.relative(point_at_arc_length(course, stations[i])), m) ? 1 : 0;
+                        // A stretch over the void runs from the last held station before it to the first held station after it
+                        // (the transitions lie between stations, so a stretch is never undercounted); an open course's ends bound
+                        // it; a closed course is walked from a held station round to itself, so that a stretch through its start
+                        // point is one stretch, and with no held station it is one stretch of its whole length.
+                        size_t start = 0;
+                        if (closed) {
+                            const auto first_held = std::find(held_at.begin(), held_at.end(), char(1));
+                            start = first_held == held_at.end() ? 0 : size_t(first_held - held_at.begin());
                         }
+                        const auto place_along = [&](double from, double to) {
+                            // Holders every G_b at most over a stretch longer than G_b (arc positions past the length wrap round).
+                            if (to - from <= gb)
+                                return;
+                            const int n = int(std::ceil((to - from) / gb));
+                            for (int k = 1; k < n; ++k) {
+                                double st = from + (to - from) * double(k) / double(n);
+                                if (closed && st >= length)
+                                    st -= length;
+                                to_hold.push_back(point_at_arc_length(course, st));
+                            }
+                        };
+                        double last_held = closed ? stations[start] : 0.;
+                        bool   in_unheld = !closed && held_at.front() == 0;
+                        const size_t steps = closed ? count + 1 : count;
+                        for (size_t j = closed ? 1 : 0; j < steps; ++j) {
+                            const size_t i   = (start + j) % count;
+                            const double arc = stations[i] + (closed && start + j >= count ? length : 0.);
+                            if (held_at[i]) {
+                                if (in_unheld)
+                                    place_along(last_held, arc);
+                                last_held = arc;
+                                in_unheld = false;
+                            } else
+                                in_unheld = true;
+                        }
+                        if (in_unheld)    // an open course ends over the void; a closed course had no held station at all
+                            place_along(last_held, closed ? stations[start] + length : length);
                     }
                 }
                 for (const Point &end : to_hold) {
