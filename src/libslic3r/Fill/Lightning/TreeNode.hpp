@@ -233,7 +233,8 @@ public:
     /*!
      * Convert the tree into polylines
      * 
-     * At each junction one line is chosen at random to continue
+     * At each junction one line is chosen reproducibly from its location to continue.
+     * Stable traversal instead continues the first child, for relocated bridge stacks.
      * 
      * The lines start at a leaf and end in a junction
      * 
@@ -253,7 +254,8 @@ protected:
     /*!
      * Convert the tree into polylines
      * 
-     * At each junction one line is chosen at random to continue
+     * At each junction one line is chosen reproducibly from its location to continue.
+     * Stable traversal instead continues the first child, for relocated bridge stacks.
      * 
      * The lines start at a leaf and end in a junction
      * 

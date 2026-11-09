@@ -26,7 +26,7 @@ add_executable(${_TEST_NAME}_tests
 target_include_directories(${_TEST_NAME}_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src
 )
-target_link_libraries(${_TEST_NAME}_tests test_common libslic3r
+target_link_libraries(${_TEST_NAME}_tests test_common libslic3r slicer_test_support
     libcurl
     OpenSSL::SSL OpenSSL::Crypto
 )

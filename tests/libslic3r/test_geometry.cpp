@@ -381,13 +381,13 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(200,200),
             Point(100,200)}));
         THEN("It has 4 convex points counterclockwise"){
-            REQUIRE(square.concave_points(PI*4/3).size() == 0);
-            REQUIRE(square.convex_points(PI*2/3).size() == 4);
+            REQUIRE(square.concave_points().size() == 0);
+            REQUIRE(square.convex_points().size() == 4);
         }
         THEN("It has 4 concave points clockwise"){
             square.make_clockwise();
-            REQUIRE(square.concave_points(PI*4/3).size() == 4);
-            REQUIRE(square.convex_points(PI*2/3).size() == 0);
+            REQUIRE(square.concave_points().size() == 4);
+            REQUIRE(square.convex_points().size() == 0);
         }
     }
     GIVEN("A Square with an extra colinearvertex"){
@@ -398,8 +398,8 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(100,200),
             Point(100,100)}));
         THEN("It has 4 convex points counterclockwise"){
-            REQUIRE(square.concave_points(PI*4/3).size() == 0);
-            REQUIRE(square.convex_points(PI*2/3).size() == 4);
+            REQUIRE(square.concave_points().size() == 0);
+            REQUIRE(square.convex_points().size() == 4);
         }
     }
     GIVEN("A Square with an extra collinear vertex in different order"){
@@ -410,8 +410,8 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(150,100),
             Point(200,100)}));
         THEN("It has 4 convex points counterclockwise"){
-            REQUIRE(square.concave_points(PI*4/3).size() == 0);
-            REQUIRE(square.convex_points(PI*2/3).size() == 4);
+            REQUIRE(square.concave_points().size() == 0);
+            REQUIRE(square.convex_points().size() == 4);
         }
     }
 
@@ -422,8 +422,8 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(31286371,461008)
         }));
         THEN("it has three convex vertices"){
-            REQUIRE(triangle.concave_points(PI*4/3).size() == 0);
-            REQUIRE(triangle.convex_points(PI*2/3).size() == 3);
+            REQUIRE(triangle.concave_points().size() == 0);
+            REQUIRE(triangle.convex_points().size() == 3);
         }
     }
 
@@ -435,13 +435,11 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(31286371,461012)
         }));
         THEN("it has three convex vertices"){
-            REQUIRE(triangle.concave_points(PI*4/3).size() == 0);
-            REQUIRE(triangle.convex_points(PI*2/3).size() == 3);
+            REQUIRE(triangle.concave_points().size() == 0);
+            REQUIRE(triangle.convex_points().size() == 3);
         }
     }
-    GIVEN("A polygon with concave vertices with angles of specifically 4/3pi"){
-        // Two concave vertices of this polygon have angle = PI*4/3, so this test fails
-        // if epsilon is not used.
+    GIVEN("A polygon with mixed convex and concave vertices"){
         auto polygon = Slic3r::Polygon(std::vector<Point>({
             Point(60246458,14802768),Point(64477191,12360001),
             Point(63727343,11060995),Point(64086449,10853608),
@@ -453,9 +451,33 @@ SCENARIO("Polygon convex/concave detection", "[Geometry]"){
             Point(38092663,692699),Point(52100125,692699)
         }));
         THEN("the correct number of points are detected"){
-            REQUIRE(polygon.concave_points(PI*4/3).size() == 6);
-            REQUIRE(polygon.convex_points(PI*2/3).size() == 10);
+            REQUIRE(polygon.concave_points().size() == 6);
+            REQUIRE(polygon.convex_points().size() == 10);
         }
+    }
+}
+
+TEST_CASE("Polygon corner thresholds measure the change in direction", "[Geometry]"){
+    // The corner API takes the magnitude of the turn between consecutive edges,
+    // rather than the polygon's interior angle. A 3-4-5 triangle has turns of
+    // 90, approximately 126.87, and approximately 143.13 degrees.
+    const Polygon triangle{ { 0, 0 }, { 4, 0 }, { 0, 3 } };
+    for (const bool clockwise : { false, true }) {
+        CAPTURE(clockwise);
+        Polygon polygon = triangle;
+        if (clockwise)
+            polygon.make_clockwise();
+        const auto corners = [&polygon, clockwise](double threshold) {
+            return clockwise ? polygon.concave_points(threshold) : polygon.convex_points(threshold);
+        };
+        REQUIRE(corners(0.).size() == 3);
+        REQUIRE(corners(PI / 3.).size() == 3);
+        REQUIRE(corners(2. * PI / 3.).size() == 2);
+        const Points sharpest = corners(3. * PI / 4.);
+        REQUIRE(sharpest.size() == 1);
+        REQUIRE(sharpest.front() == Point(4, 0));
+        REQUIRE(corners(5. * PI / 6.).empty());
+        REQUIRE((clockwise ? polygon.convex_points() : polygon.concave_points()).empty());
     }
 }
 

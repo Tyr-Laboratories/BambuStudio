@@ -62,6 +62,8 @@ template <typename T>
 bool _equiv(const T& a, const T& b, double epsilon) { return abs(a - b) < epsilon; }
 
 Slic3r::Model model(const std::string& model_name, TriangleMesh&& _mesh);
+// Arrange slicing fixtures on the configured printable area, as the application does.
+void arrange_on_print_bed(Model &model, const DynamicPrintConfig &config);
 void init_print(std::vector<TriangleMesh> 		  &&meshes, Slic3r::Print &print, Slic3r::Model& model, const DynamicPrintConfig &config_in, bool comments = false);
 void init_print(std::initializer_list<TestMesh> 	meshes, Slic3r::Print &print, Slic3r::Model& model, const Slic3r::DynamicPrintConfig &config_in = Slic3r::DynamicPrintConfig::full_print_config(), bool comments = false);
 void init_print(std::initializer_list<TriangleMesh> meshes, Slic3r::Print &print, Slic3r::Model& model, const Slic3r::DynamicPrintConfig &config_in = Slic3r::DynamicPrintConfig::full_print_config(), bool comments = false);
