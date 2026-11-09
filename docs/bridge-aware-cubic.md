@@ -4,11 +4,14 @@ A sparse infill pattern: Cubic's lattice everywhere, plus lines under roofs, led
 too far over the sparse void, so that nothing above spans more than the Unsupported gap size (`bridge_aware_cubic_max_gap`,
 default 5 mm). It exists for single-wall parts at 3% infill whose first roof layer fails on ordinary Cubic.
 
-**Status (9 November 2026).** Being rewritten from `master` against the
+**Status (9 November 2026).** Rewritten from `master` against the
 [rewrite architecture](superpowers/specs/2026-11-08-bridge-aware-cubic-rewrite-design.md), which replaces the earlier
-constructive branch, following the [implementation plan](superpowers/plans/2026-11-08-bridge-aware-cubic-rewrite.md). The
-benchmark tooling (`scripts/bridge_aware_cubic_benchmark/`, [procedure](bridge-aware-cubic-benchmark.md)) and the acceptance
-scripts (`scripts/bridge_aware_cubic_acceptance/`, see its README) are in place.
+constructive branch, following the [implementation plan](superpowers/plans/2026-11-08-bridge-aware-cubic-rewrite.md): every
+stage is built, the whole-branch review's fix round is in (501020f91), the tests pass and the release gate passes. Not met: the
+Heimdall gates of stages 5a and 6 (K2's free ends on plates 1-5, hanging bridge ends) and the size budgets; they are below, with
+the decisions they need from the user. The benchmark tooling (`scripts/bridge_aware_cubic_benchmark/`,
+[procedure](bridge-aware-cubic-benchmark.md)) and the acceptance scripts (`scripts/bridge_aware_cubic_acceptance/`, see its
+README) are in place.
 
 | Stage (architecture 8) | State | Gate |
 | --- | --- | --- |
@@ -62,14 +65,18 @@ Known limitations (findings the construction does not yet meet, 9 November 2026;
 Release gate (`scripts/bridge_aware_cubic_benchmark/run_benchmark.py`, official 2.9.1.70 against this branch's app on X2's
 projects, slice instructions retired, a warm-up and five alternating pairs, 9 November 2026). The first complete run (app at
 5be6edb42) failed on the large cube; the sweep's boundary queries and a stock config copy per path were most of the cost, and
-ad1a10e16 cut them without changing a path:
+ad1a10e16 cut them without changing a path. The config copy was a shared file outside the hook list (2.3, 10.5), so the final
+review reverted it, and the final app (501020f91) passes without it:
 
-| Case | 5be6edb42: median, worst | ad1a10e16: median, worst | Build parity (fork Cubic over official) |
-| --- | --- | --- | --- |
-| small cube | 1.38, 1.39 | 1.17, 1.17 | 0.98 |
-| large cube | 2.94, 2.94 | 1.76, 1.76 | 0.98 |
-| rib | 1.11, 1.12 | 1.09, 1.09 | 0.98 |
-| modifier | 1.47, 1.48 | 1.26, 1.27 | 0.98 |
+| Case | 5be6edb42: median, worst | ad1a10e16: median, worst | 501020f91 (final): median, worst | Build parity (fork Cubic over official), final |
+| --- | --- | --- | --- | --- |
+| small cube | 1.38, 1.39 | 1.17, 1.17 | 1.21, 1.22 | 0.98 |
+| large cube | 2.94, 2.94 | 1.76, 1.76 | 1.95, 1.96 | 0.99 |
+| rib | 1.11, 1.12 | 1.09, 1.09 | 1.10, 1.11 | 0.99 |
+| modifier | 1.47, 1.48 | 1.26, 1.27 | 1.33, 1.33 | 0.99 |
+
+The large cube's margin under 2.0 is small (2 %); the config copy (`LayerRegion::simplify_path` and its two siblings copy the
+print config for every path) was worth about 0.19 of its ratio and is a candidate for the legacy branch, for every pattern.
 
 The gate needed one new reviewed exception: `flow_above_internal_bridges`, which the fork's master added after the baseline
 review, at exactly 100 % (neutral: `bridge_flow_mask` stays empty).
@@ -87,9 +94,12 @@ is the user's decision (R8):
 Cubic baselines for the acceptance: the 16 Heimdall plates sliced with master's build (0568b9dad, master with the two hunks
 fixed that it needed to compile): 4,255.4 g, 312.7 h estimated (308.0 h of model print time plus the printer's preparation time on
 each plate; the tables compare estimated times) (`$BAC_DATA/baselines/cubic/`). Hook 7 and the other shared changes leave Cubic
-alone on the user's parts: Heimdall plate 1 sliced as Cubic with the app at 3664d9ee8 equals the baseline move for move (2,921,978
-moves), and the baseline app reproduces its own output (also under another allocator); an earlier build of the branch (9 November,
-09:19) had differed by one outer-wall seam at z 214.2 mm.
+alone on the user's parts. Heimdall plate 1 sliced as Cubic: the app at 3664d9ee8 equals the baseline move for move (2,921,978
+moves); the final app (501020f91) and an earlier build (9 November, 09:19) differ from it in one Arachne outer-wall loop's seam at
+z 214.2 mm (22 lines, the start moved about 1 mm). That seam is the stock slicer's, not the branch's: master's own baseline app
+prints exactly the final app's moves (the same move stream, checksum for checksum) when macOS fills new or freed heap memory with a
+pattern (`MallocPreScribble=1`, `MallocScribble=1`), and the baseline otherwise, so some stock code on that path reads memory it has
+not initialised or has freed; which seam a build prints depends on its heap. A finding for master, outside the pattern.
 
 Heimdall acceptance runs (all 16 plates, `scripts/bridge_aware_cubic_acceptance/measure/measure.sh`; Cubic: 4,255.4 g, 312.7 h
 estimated, 492 k sparse paths, 0.99 M retractions; budgets of the architecture's 1.4):
@@ -101,19 +111,45 @@ estimated, 492 k sparse paths, 0.99 M retractions; budgets of the architecture's
 | 3 | + family change | 4,533.7 g (+6.5 %) | 365.7 h (+16.9 %) | 1.38 M (379 k) | 1.64 M | 1,825, 119 |
 | 4 | 06deb8b89 | 4,479.5 g (+5.3 %) | 360.2 h (+15.2 %) | 1.34 M (618 k, nearly all column pieces) | 1.62 M | 1,791, 59 |
 | 5 | ad1a10e16 | 4,479.9 g (+5.3 %) | 360.3 h (+15.2 %) | 1.34 M (618 k) | 1.62 M | 1,662, 59 |
+| 6 | 501020f91 (final) | 4,479.9 g (+5.3 %) | 360.3 h (+15.2 %) | 1.34 M (618 k) | 1.62 M | 1,662, 59 |
 
 The bridge check of runs 1 to 3 measured nothing: it read the internal bridge layers from the old branch's probe dumps. It now
 finds them in the G-code (a bridge path inside the outline of the layer below) and measures, as the export observer does, the
 free stretches and hanging ends over the sparse void below. On plate 4 (run 2's app): Cubic 3,120 free stretches over 5 mm
 (longest 79 mm), 7 hanging ends (longest hanging stretch 38 mm); the pattern 1 (7.0 mm), 11 hanging ends (longest 0.27 mm).
 
-Runs 4 and 5, all 16 plates: internal bridge stretches over 5 mm free over the void, Cubic 41,564 (longest 181 mm), the pattern 81
+Runs 4 to 6, all 16 plates: internal bridge stretches over 5 mm free over the void, Cubic 41,564 (longest 181 mm), the pattern 81
 (longest 36.6 mm on plate 10 at z 186.4, 34.4 mm on plate 13 at z 186.4, 29.9 mm on plate 12 at z 15.6, 26.2 mm on plate 2 at
-z 145.0); hanging bridge ends, Cubic 150 (longest 177 mm), the pattern 135 in run 5 (longest 5.1 mm, most under 0.3 mm). The 36.6 mm
-stretch is one bridge line that the stock generator ran across a sparse area to a distant anchor, holding nothing up (known
-limitations); the other long stretches are not yet examined.
+z 145.0); hanging bridge ends, Cubic 150 (longest 177 mm), the pattern 135 in runs 5 and 6 (longest 5.1 mm, most under 0.3 mm). The
+36.6 mm stretch is one bridge line that the stock generator ran across a sparse area to a distant anchor, holding nothing up (known
+limitations); the other long stretches are not yet examined. Run 6 (the final app; the fix round changes nothing at one line and
+gap 5, where the refinement never saturates) per plate against Cubic, as the architecture's 7.4 asks (instructions retired by the
+whole slice and export, measured while the batch slices the plates in parallel):
 
-K2 on plates 1 to 5, run 5: 1,662 free added ends and 59 free posts, by the geometry of the free piece (a local classification of
+| Plate | Instructions G | Ratio | Peak RSS MB | Hanging bridge ends | Longest hanging stretch mm | Within Cubic's |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 2,486 / 3,032 | 1.22 | 4,577 / 6,407 | 16 / 15 | 41.78 / 0.93 | yes |
+| 2 | 2,826 / 3,673 | 1.30 | 5,467 / 7,881 | 7 / 4 | 17.38 / 0.13 | yes |
+| 3 | 2,030 / 2,347 | 1.16 | 4,767 / 5,618 | 17 / 15 | 176.62 / 2.38 | yes |
+| 4 | 1,332 / 1,669 | 1.25 | 4,601 / 4,608 | 7 / 10 | 38.20 / 0.27 | yes |
+| 5 | 2,337 / 2,606 | 1.11 | 4,653 / 6,270 | 9 / 9 | 0.81 / 0.81 | yes |
+| 6 | 2,123 / 2,612 | 1.23 | 4,700 / 4,889 | 10 / 9 | 25.42 / 5.11 | yes |
+| 7 | 1,533 / 1,696 | 1.11 | 4,623 / 6,416 | 8 / 4 | 4.24 / 0.02 | yes |
+| 8 | 1,126 / 1,498 | 1.33 | 4,583 / 4,613 | 3 / 3 | 3.80 / 3.80 | yes |
+| 9 | 1,566 / 2,012 | 1.28 | 4,638 / 4,927 | 4 / 7 | 4.73 / 0.84 | yes |
+| 10 | 2,586 / 2,960 | 1.14 | 4,921 / 5,698 | 19 / 13 | 32.25 / 0.99 | yes |
+| 11 | 2,611 / 2,984 | 1.14 | 4,951 / 5,746 | 12 / 10 | 12.38 / 0.73 | yes |
+| 12 | 2,286 / 2,773 | 1.21 | 4,722 / 5,858 | 13 / 15 | 45.52 / 2.68 | yes |
+| 13 | 1,420 / 1,648 | 1.16 | 4,564 / 4,482 | 0 / 2 | 0.00 / 0.12 | no |
+| 14 | 1,063 / 1,251 | 1.18 | 4,528 / 4,568 | 10 / 7 | 9.31 / 0.37 | yes |
+| 15 | 3,720 / 4,458 | 1.20 | 6,037 / 7,467 | 0 / 1 | 0.00 / 0.08 | no |
+| 16 | 1,263 / 1,582 | 1.25 | 4,518 / 4,591 | 15 / 11 | 14.64 / 1.87 | yes |
+
+Each pair is Cubic / the pattern. The budget of 1.4 is zero hanging bridge ends over the pattern's void and a longest hanging
+stretch within Cubic's on every plate: the first is met on no plate (the pattern hangs 1 to 15 ends per plate, 135 in all, against Cubic's
+150), the second on 14 of 16 (plates 13 and 15, where Cubic hangs nothing, have stretches of 0.12 and 0.08 mm). Peak RSS rises to 7.9 GB (plate 2).
+
+K2 on plates 1 to 5, runs 5 and 6 (equal): 1,662 free added ends, 59 long added stretches and 59 free posts, by the geometry of the free piece (a local classification of
 the checker's report): 908 end in a connector hook along an island edge that faces same-layer material (a floating vertical
 shell, a bridge, a top surface, gap fill), the anchors the user accepted as Cubic's boundary behaviour, which the checker counts
 because Cubic has no hook on that line; 643 are lattice-direction ends beside a solid surface of the layer (hooks along edges
