@@ -20,6 +20,7 @@ struct ExportFixture {
     DynamicPrintConfig settings;     // on top of fixture_config(gap, pattern) with the fixture's own config function
     double             gap = 5.;
     DynamicPrintConfig (*base)(const char *) = nullptr;   // nullptr: fixture_config(gap, pattern)
+    double             direction = 45.;                   // the infill direction of the base config
 };
 
 DynamicPrintConfig settings_of(const ExportFixture &fixture, const char *pattern)
@@ -235,8 +236,8 @@ TEST_CASE("Bridge aware cubic bounds every opening and run under roofs with edge
 {
     Workspace workspace;
     check_k1(workspace, {
-        { "rib", rib, {}, 5., rib_config },
-        { "modifier", modifier, {}, 8., modifier_config },
+        { "rib", rib, {}, 5., rib_config, 17. },
+        { "modifier", modifier, {}, 8., modifier_config, 45. },
         { "partial roof", partial_roof, {}, 5. },
         { "partial roof, two internal bridge layers", partial_roof, with({}, {{"internal_bridge_layers", "2"}}), 5. },
         { "partial roof, three internal bridge layers", partial_roof, with({}, {{"internal_bridge_layers", "3"}}), 5. },
@@ -256,12 +257,74 @@ void check_k2(Workspace &workspace, const std::vector<ExportFixture> &fixtures)
         const std::vector<EmittedPath> control = exported_extrusions(workspace, fixture.model(), settings_of(fixture, "cubic"), fixture.name + "-k2-cubic.gcode");
         // The modifier fixture has two gaps: 3 mm on its right half (x from 24 mm of the part, placed at x = 80), 8 mm on the left.
         const double left_gap = fixture.gap;
-        const auto gap_b = [&fixture, left_gap](const Vec2d &at) { return (fixture.name == "modifier" && at.x() >= 80. + 24. ? 3. : left_gap) - 0.1; };
-        const K2Measure measure = measure_k2(paths, control, gap_b);
+        const auto gap_b = [&fixture, left_gap](const Vec2d &at, double) { return (fixture.name == "modifier" && at.x() >= 80. + 24. ? 3. : left_gap) - 0.1; };
+        const K2Measure measure = measure_k2(paths, control, gap_b, fixture.direction);
         INFO("added pieces " << measure.added_pieces << ", longest " << measure.longest << " mm, first place " << (measure.where.empty() ? Vec2d(0, 0) : measure.where.front()).transpose());
+        CHECK(measure.added_pieces > 0);
         CHECK(measure.free_ends == 0);
         CHECK(measure.long_stretches == 0);
-        CHECK(measure_k2(control, control, gap_b).added_pieces == 0);
+        CHECK(measure_k2(control, control, gap_b, fixture.direction).added_pieces == 0);
+        // The measure's own control: a hanging stub on a sparse line of the lowest plane and a two-segment stretch in the void,
+        // both added to the export, must come back as a free end and a long stretch.
+        {
+            const std::vector<PlaneMeasure> planes = measure_planes(paths, 0.4, fixture.gap);
+            REQUIRE_FALSE(planes.empty());
+            int lowest = planes.front().lower;
+            for (const PlaneMeasure &p : planes) lowest = std::min(lowest, p.lower);
+            const std::map<int, EmittedLayer> layers = emitted_layers(paths);
+            const EmittedLayer &layer = layers.at(lowest);
+            // The longest straight segment of a sparse path of that layer (every path may carry anchors, so no path is two points).
+            const EmittedPath *longest = nullptr;
+            Vec2d a = Vec2d::Zero(), b = Vec2d::Zero();
+            double longest_length = 0.;
+            for (const EmittedPath *path : layer)
+                if (path->role == erInternalInfill)
+                    for (size_t i = 1; i < path->path.points.size(); ++i) {
+                        const double length = (path->path.points[i] - path->path.points[i - 1]).cast<double>().norm();
+                        if (length > longest_length) {
+                            longest_length = length;
+                            longest = path;
+                            a = path->path.points[i - 1].cast<double>();
+                            b = path->path.points[i].cast<double>();
+                        }
+                    }
+            REQUIRE(longest != nullptr);
+            const Vec2d mid = 0.5 * (a + b), dir = (b - a).normalized(), perp(-dir.y(), dir.x());
+            const auto clear_of_all = [&](const Vec2d &point, double clearance_mm) {
+                for (const auto &[key, paths_of_layer] : layers) {
+                    if (key != lowest && key != std::prev(layers.find(lowest))->first) continue;
+                    for (const EmittedPath *path : paths_of_layer)
+                        for (size_t i = 1; i < path->path.points.size(); ++i)
+                            if (unscale<double>(Line(path->path.points[i - 1], path->path.points[i]).distance_to(Point(coord_t(point.x()), coord_t(point.y())))) < clearance_mm) return false;
+                }
+                return true;
+            };
+            std::vector<EmittedPath> injected = paths;
+            bool stub_added = false, stretch_added = false;
+            for (const double side : { 1., -1. }) {
+                const Vec2d stub_end = mid + side * perp * scale_(0.45);
+                if (!stub_added && clear_of_all(stub_end, 0.3)) {
+                    EmittedPath stub = *longest;
+                    stub.path = Polyline(Point(coord_t(mid.x()), coord_t(mid.y())), Point(coord_t(stub_end.x()), coord_t(stub_end.y())));
+                    injected.push_back(stub);
+                    stub_added = true;
+                }
+                for (double offset = 1.; offset <= 8. && !stretch_added; offset += 0.5) {
+                    const Vec2d s0 = mid + side * perp * scale_(offset), s1 = s0 + side * perp * scale_(3.) + dir * scale_(0.3), s2 = s0 + side * perp * scale_(6.);
+                    if (clear_of_all(s0, 0.6) && clear_of_all(s1, 0.6) && clear_of_all(s2, 0.6) && clear_of_all(0.5 * (s0 + s1), 0.6) && clear_of_all(0.5 * (s1 + s2), 0.6)) {
+                        EmittedPath stretch = *longest;
+                        stretch.path = Polyline(Points{ Point(coord_t(s0.x()), coord_t(s0.y())), Point(coord_t(s1.x()), coord_t(s1.y())), Point(coord_t(s2.x()), coord_t(s2.y())) });
+                        injected.push_back(stretch);
+                        stretch_added = true;
+                    }
+                }
+            }
+            if (stub_added || stretch_added) {
+                const K2Measure broken = measure_k2(injected, control, gap_b, fixture.direction);
+                if (stub_added) CHECK(broken.free_ends >= 1);
+                if (stretch_added && fixture.gap <= 6.) CHECK(broken.long_stretches >= 1);
+            }
+        }
         std::vector<EmittedPath> without;
         const std::vector<PlaneMeasure> planes = measure_planes(paths, 0.4, fixture.gap);
         REQUIRE_FALSE(planes.empty());
@@ -276,7 +339,7 @@ void check_k2(Workspace &workspace, const std::vector<ExportFixture> &fixtures)
             if (!(path.role == erInternalInfill && plane_key(path.z) == below))
                 without.push_back(path);
         // Without their holders the plane's lines hang: free ends, or, where an end is fused to another line, long stretches.
-        const K2Measure broken = measure_k2(without, control, gap_b);
+        const K2Measure broken = measure_k2(without, control, gap_b, fixture.direction);
         CHECK(broken.free_ends + broken.long_stretches > 0);
     }
 }
@@ -287,9 +350,12 @@ TEST_CASE("Bridge aware cubic holds every line it adds", "[BridgeAwareCubic][K2]
     check_k2(workspace, {
         { "small cube", small_cube, {}, 5. },
         { "large cube", large_cube, {}, 5. },
-        { "rib", rib, {}, 5., rib_config },
+        { "rib", rib, {}, 5., rib_config, 17. },
         { "box 40 at 3 %", [] { return single_part("Bridge aware cubic box 40", TriangleMesh(its_make_cube(40., 40., 40.))); },
           with({}, {{"sparse_infill_density", "3%"}}), 5. },
+        // Without anchors (no nub, no join) every end holds from below.
+        { "small cube, no anchor", small_cube, with({}, {{"sparse_infill_anchor", "0"}}), 5. },
+        { "small cube, no connections", small_cube, with({}, {{"sparse_infill_anchor_max", "0"}}), 5. },
     });
 }
 
@@ -299,7 +365,7 @@ TEST_CASE("Bridge aware cubic holds every line it adds", "[BridgeAwareCubic][K2]
 TEST_CASE("Bridge aware cubic holds every line it adds across a seam", "[BridgeAwareCubic][K2][K2seam]")
 {
     Workspace workspace;
-    check_k2(workspace, { { "modifier", modifier, {}, 8., modifier_config } });
+    check_k2(workspace, { { "modifier", modifier, {}, 8., modifier_config, 45. } });
 }
 
 // K1n: the nozzle-floor gap. At a gap of 0.4 mm (the nozzle diameter) the refinement saturates into solid columns under the roof,
@@ -318,7 +384,7 @@ TEST_CASE("Bridge aware cubic holds the contract at the nozzle-floor gap", "[Bri
         CHECK(plane.longest_run <= 0.4);
     }
     const std::vector<EmittedPath> control = exported_extrusions(workspace, small_cube(), with(fixture_config(0.4, "cubic"), {{"sparse_infill_density", "3%"}}), "k1n-cubic.gcode");
-    const K2Measure measure = measure_k2(paths, control, 0.3);
+    const K2Measure measure = measure_k2(paths, control, 0.3, 45.);
     CHECK(measure.free_ends == 0);
     CHECK(measure.long_stretches == 0);
 }

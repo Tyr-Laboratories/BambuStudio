@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """Independent K2 check on exported G-code, aligned to the hold rule R of the rewrite architecture's 3.7 (stage 5a).
 
-For every sparse-infill path (maximal run of extruding moves of ';FEATURE: Sparse infill' between travels) on layer n with bead
-width w, the parts of its centre line off the hold set of layer n - 1 are unsupported. The hold set reads rule R on the G-code:
+For every sparse-infill path (maximal run of extruding moves of ';FEATURE: Sparse infill' between travels, split where the line
+width changes) on layer n with bead width w, the parts of its centre line off the hold set of layer n - 1 are unsupported. The hold
+set reads rule R on the G-code:
   (i, ii) a sparse bead below whose centre line passes within w/2 of the point (round ends: a disc about every point of the lower
           centre line; a parallel bead merely touching, centre lines w apart, does not count), or
-  (iii)   a non-sparse bead below (walls, solid fill, bridges: a butt-ended rectangle of its ';LINE_WIDTH') whose footprint lies
-          within w/2 + tol of the point (tol = 0.01 mm, the touching measure).
-A path is measured in the parts between its vertices that lie on another bead of the layer (a junction: the pattern's line ended
-on existing material there and its anchor nub begins, or the connector joined two lines). An unsupported piece that reaches an
-end of a part is a free end, unless that end is fused alongside another bead of its own layer (centre lines within half the two
-widths and tol: an anchor along a perimeter, a nub along the line it meets, a junction). A piece between two held points longer
-than G_b = GAP - 0.1 mm is a long run (--exact-gap compares to GAP itself).
+  (iii)   a non-sparse model bead below (walls, solid fill, bridges, gap fill: its path grown by half its ';LINE_WIDTH', flat ends,
+          round joins) whose footprint lies within w/2 + tol of the point (tol = 0.01 mm, the touching measure).
+Rule (iv), the anchors: an end of a path, or an interior vertex of it, that lies ON another bead of its own layer (its centre within
+w_o/2 + tol of that bead's centre line, in the interior of that bead's path, at least w_o/2 + tol from the bead's own ends, and
+not on the path's own geometry within one bead's arc length) is fused to it. A path is measured in the parts between its fused
+vertices (junctions: the pattern's line ended on existing material and its nub begins). An unsupported piece that reaches an end
+of a part is a free end unless that end is fused; a piece between two held points longer than G_b = GAP - 0.1 mm is a long run
+(--exact-gap compares to GAP itself).
 
-Each piece is classified against a reference G-code (Cubic of the same plate): 'bulk' if every segment of it is collinear with a
-reference sparse segment on the same layer (angle < 0.5 deg, offset < 0.02 mm, overlapping it in projection); 'connection' if it
-runs outside the lattice directions (DIRS, infill_direction 0: 0, 60, 120 degrees) and every segment lies on the line of a
-reference segment (the connector's join along the island boundary, which Cubic's own lines get too: accepted boundary behaviour,
-reported but not a line of the pattern); otherwise 'added' (a line of the pattern), with 'post' when the whole path is no longer
-than 0.6 mm.
+Each piece is classified against a reference G-code (Cubic of the same plate): 'bulk' if every segment of it lies on the line of
+a reference sparse segment on the same layer (angle < 0.5 deg, offset < 0.02 mm; the two slices' islands differ where the bridge
+generator took sparse area, so the extents are not compared: a piece on a bulk line's line lies on that printed line);
+'connection' if it runs outside the three lattice directions (the G-code's '; infill_direction' + 0, 60, 120 degrees) and every
+segment lies on the line of a reference segment (the connector's join along the island boundary, which Cubic's own lines get too:
+accepted boundary behaviour, reported but not a line of the pattern); otherwise 'added' (a line of the pattern), with 'post' when
+the whole path is no longer than 0.6 mm.
 
 Usage: k2check.py GCODE REFERENCE_GCODE GAP OUT.tsv [--tol 0.01] [--exact-gap]
 """
@@ -32,24 +35,27 @@ import shapely
 from shapely import STRtree
 
 AX = re.compile(r'([XYE])(-?[0-9]*\.?[0-9]+)')
-# The lattice line directions of the project (infill_direction 0): 0, 60 and 120 degrees.
-DIRS = (0.0, 60.0, 120.0)
+MODEL_FEATURES = {'Outer wall', 'Inner wall', 'Overhang wall', 'Sparse infill', 'Internal solid infill', 'Top surface',
+                  'Bottom surface', 'Bridge', 'Internal Bridge', 'Gap infill', 'Floating vertical shell'}
 
 
 def parse(path):
-    """{z: (segments list [(x0,y0,x1,y1,w,feature)], sparse paths [list of (x,y) points with width])}"""
+    """{z: paths [(points, width, feature)]} for the model features, plus the infill direction (degrees) from the config block."""
     layers = {}
+    direction = 0.0
     z = None
     feat = ''
     width = 0.4
     x = y = 0.0
-    cur = None  # current sparse path points
+    relative_e = True
+    cur = None
     cur_w = 0.0
+    cur_f = ''
 
     def close():
         nonlocal cur
         if cur is not None and len(cur) >= 2 and z is not None:
-            layers[z][1].append((cur, cur_w))
+            layers[z].append((cur, cur_w, cur_f))
         cur = None
 
     with open(path, errors='replace') as f:
@@ -59,14 +65,25 @@ def parse(path):
                 if line.startswith('; Z_HEIGHT:'):
                     close()
                     z = round(float(line.split(':')[1]), 3)
-                    layers.setdefault(z, ([], []))
+                    layers.setdefault(z, [])
                 elif line.startswith('; FEATURE:'):
                     close()
                     feat = line[10:].strip()
                 elif line.startswith('; LINE_WIDTH:'):
-                    width = float(line.split(':')[1])
+                    w = float(line.split(':')[1])
+                    if w != width:
+                        close()
+                    width = w
+                elif line.startswith('; infill_direction = '):
+                    direction = float(line.split('=')[1])
                 continue
-            if not line.startswith(('G0 ', 'G1 ', 'G2 ', 'G3 ')):
+            if line.startswith('M82'):
+                relative_e = False
+                continue
+            if line.startswith('M83'):
+                relative_e = True
+                continue
+            if not line.startswith(('G0 ', 'G1 ', 'G2 ', 'G3 ', 'G92 ')):
                 continue
             nx, ny, e = x, y, None
             for a, v in AX.findall(line.split(';')[0]):
@@ -76,13 +93,20 @@ def parse(path):
                     ny = float(v)
                 elif a == 'E':
                     e = float(v)
+            if line.startswith('G92'):
+                close()
+                continue
+            if not relative_e:
+                sys.exit('k2check: absolute E distances are not supported (the acceptance exports with relative E)')
             moved = nx != x or ny != y
             if moved and e is not None and e > 0 and z is not None:
-                layers[z][0].append((x, y, nx, ny, width, feat))
-                if feat == 'Sparse infill':
+                if line.startswith(('G2 ', 'G3 ')):
+                    sys.exit('k2check: an extruding arc move; export with arc fitting off')
+                if feat in MODEL_FEATURES:
                     if cur is None:
                         cur = [(x, y)]
                         cur_w = width
+                        cur_f = feat
                     cur.append((nx, ny))
                 else:
                     close()
@@ -90,19 +114,19 @@ def parse(path):
                 close()
             x, y = nx, ny
     close()
-    return layers
+    return layers, direction
 
 
 def on_reference_line(ax, ay, bx, by, ref, ref_tree, overlap=True):
     """Whether the segment a-b is collinear with a reference segment (angle < 0.5 deg, midpoint offset < 0.02 mm), and, with
-    `overlap`, overlapping it in projection."""
+    `overlap`, overlapping it in projection within 0.2 mm."""
     dx, dy = bx - ax, by - ay
     lp = math.hypot(dx, dy)
     if lp < 1e-6:
         return True
     if ref_tree is None:
         return False
-    candidates = ref_tree.query(shapely.LineString([(ax, ay), (bx, by)]), predicate='dwithin', distance=0.02) if overlap else range(len(ref))
+    candidates = ref_tree.query(shapely.LineString([(ax, ay), (bx, by)]), predicate='dwithin', distance=0.25) if overlap else range(len(ref))
     for i in candidates:
         r = ref[i]
         rx, ry = r[2] - r[0], r[3] - r[1]
@@ -116,15 +140,10 @@ def on_reference_line(ax, ay, bx, by, ref, ref_tree, overlap=True):
             continue
         if not overlap:
             return True
-        t = ((mx - r[0]) * rx + (my - r[1]) * ry) / (lr * lr)
-        if -0.05 <= t <= 1.05:
+        t = ((mx - r[0]) * rx + (my - r[1]) * ry) / lr
+        if -0.2 <= t <= lr + 0.2:
             return True
     return False
-
-
-def along_lattice(ax, ay, bx, by):
-    ang = math.degrees(math.atan2(by - ay, bx - ax)) % 180.0
-    return any(min(abs(ang - d), 180.0 - abs(ang - d)) < 1.5 for d in DIRS)
 
 
 def main():
@@ -137,8 +156,14 @@ def main():
     ap.add_argument('--exact-gap', action='store_true', help='compare long runs to GAP itself rather than to G_b = GAP - 0.1')
     args = ap.parse_args()
     gap_b = args.gap if args.exact_gap else args.gap - 0.1
-    L = parse(args.gcode)
-    R = parse(args.reference)
+    L, direction = parse(args.gcode)
+    R, _ = parse(args.reference)
+    dirs = [(direction + k * 60.0) % 180.0 for k in range(3)]
+
+    def along_lattice(ax, ay, bx, by):
+        ang = math.degrees(math.atan2(by - ay, bx - ax)) % 180.0
+        return any(min(abs(ang - d), 180.0 - abs(ang - d)) < 1.5 for d in dirs)
+
     zs = sorted(L)
     counts = {'paths': 0, 'free_bulk': 0, 'free_added': 0, 'free_connection': 0, 'free_post': 0, 'long_bulk': 0, 'long_added': 0, 'long_connection': 0, 'fused_ends': 0}
     mm = {'free_bulk': 0.0, 'free_added': 0.0, 'free_connection': 0.0, 'free_post': 0.0}
@@ -148,69 +173,116 @@ def main():
     out.write('z\tkind\tlength\tx\ty\tpath_length\n')
     for k in range(1, len(zs)):
         z, zb = zs[k], zs[k - 1]
-        segs, paths = L[z]
-        if not paths:
+        paths = L[z]
+        sparse_paths = [(pts, w) for pts, w, f in paths if f == 'Sparse infill']
+        if not sparse_paths:
             continue
-        lower = L[zb][0]
+        lower = L[zb]
         if not lower:
             continue
-        low = np.array([s[:5] for s in lower], dtype=float)
-        sparse_below = np.array([s[5] == 'Sparse infill' for s in lower])
-        lower_lines = shapely.linestrings(np.stack([low[:, 0:2], low[:, 2:4]], axis=1))
-        # (iii): the footprints of the non-sparse beads below, butt-ended rectangles of their own widths.
-        other_rects = shapely.buffer(lower_lines[~sparse_below], low[~sparse_below, 4] / 2, cap_style='flat')
-        other_rects = other_rects[~shapely.is_empty(other_rects)]
-        other_footprint = shapely.union_all(other_rects) if len(other_rects) else None
-        sparse_lines = lower_lines[sparse_below]
+        # The hold set: (i, ii) the lower sparse centre lines grown by w/2 with round ends; (iii) the lower non-sparse footprints
+        # (flat ends, round joins) grown by w/2 + tol.
+        # The lower sparse paths: their segments along the lattice directions hold by their centre lines (rules i and ii); a
+        # segment off the lattice directions is a bead the pattern prints whole (a seam wall, a rail) or a connector's hook, and
+        # holds as material does, by its footprint (rule iii).
+        lower_sparse, lower_beads = [], []
+        for pts, w, f in lower:
+            if f != 'Sparse infill':
+                continue
+            for i in range(1, len(pts)):
+                seg = shapely.LineString([pts[i - 1], pts[i]])
+                if seg.length < 1e-6:
+                    continue
+                if along_lattice(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]):
+                    lower_sparse.append(seg)
+                else:
+                    lower_beads.append(seg.buffer(w / 2, cap_style='round'))
+        other_footprints = [shapely.LineString(pts).buffer(w / 2, cap_style='flat', join_style='round') for pts, w, f in lower if f != 'Sparse infill'] + lower_beads
+        other_footprint = shapely.union_all(other_footprints) if other_footprints else None
         # reference sparse segments on this layer
-        ref_segs = [s for s in R.get(z, ([], []))[0] if s[5] == 'Sparse infill']
-        ref = np.array([s[:4] for s in ref_segs], dtype=float) if ref_segs else np.zeros((0, 4))
+        ref_rows = []
+        for pts, w, f in R.get(z, []):
+            if f != 'Sparse infill':
+                continue
+            for i in range(1, len(pts)):
+                ref_rows.append((pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]))
+        ref = np.array(ref_rows, dtype=float) if ref_rows else np.zeros((0, 4))
         ref_tree = STRtree(shapely.linestrings(np.stack([ref[:, 0:2], ref[:, 2:4]], axis=1))) if len(ref) else None
-        # the layer's own beads, for the fused-end test
-        own = np.array([s[:5] for s in segs], dtype=float) if segs else np.zeros((0, 5))
-        own_lines = shapely.linestrings(np.stack([own[:, 0:2], own[:, 2:4]], axis=1)) if len(own) else None
-        own_tree = STRtree(own_lines) if own_lines is not None and len(own_lines) else None
-        max_w = float(own[:, 4].max()) if len(own) else 0.0
-        widths = sorted({round(p[1], 4) for p in paths})
+        # the layer's own beads, as paths, for the fused test
+        own_paths = [(shapely.LineString(pts), pts, w) for pts, w, f in paths]
+        own_tree = STRtree([p[0] for p in own_paths]) if own_paths else None
+        max_w = max((w for pts, w, f in paths), default=0.0)
+        widths = sorted({round(p[1], 4) for p in sparse_paths})
         holds = {}
         for w in widths:
             parts = []
-            if len(sparse_lines):
-                parts.append(shapely.union_all(shapely.buffer(sparse_lines, w / 2, cap_style='round')))
+            if lower_sparse:
+                parts.append(shapely.union_all([ls.buffer(w / 2, cap_style='round') for ls in lower_sparse]))
             if other_footprint is not None:
-                parts.append(shapely.buffer(other_footprint, w / 2 + args.tol, cap_style='round'))
+                parts.append(other_footprint.buffer(w / 2 + args.tol, cap_style='round'))
             holds[w] = shapely.union_all(parts) if parts else shapely.Polygon()
-        for pts, w in paths:
+        for pts, w in sparse_paths:
             counts['paths'] += 1
             plen = shapely.LineString(pts).length
             if plen <= 0:
                 continue
-            own_vertices = set(pts)
+            # The arc length from each vertex to the path's start, to exclude the path's own geometry near a vertex.
+            arc = [0.0]
+            for i in range(1, len(pts)):
+                arc.append(arc[-1] + math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]))
 
-            def fused(end):
-                """The end's bead overlaps another bead of its own layer: centre lines within half the two widths and tol."""
+            def fused(vi):
+                """Vertex vi lies on another bead of the layer: within w_o/2 + tol of its centre line, in the interior of that
+                bead's path (w_o/2 + tol from its ends); the path's own geometry within one bead's arc length does not count."""
                 if own_tree is None:
                     return False
-                ex, ey = end.x, end.y
-                for i in own_tree.query(end, predicate='dwithin', distance=(w + max_w) / 2 + args.tol):
-                    s = own[i]
-                    if (s[0], s[1]) in own_vertices and (s[2], s[3]) in own_vertices and ((s[0] == ex and s[1] == ey) or (s[2] == ex and s[3] == ey)):
-                        continue    # the end's own segment (another part of the same chain counts)
-                    if own_lines[i].distance(end) <= (w + s[4]) / 2 + args.tol:
-                        return True
+                v = shapely.Point(pts[vi])
+                for j in own_tree.query(v, predicate='dwithin', distance=max_w / 2 + args.tol):
+                    line, opts, ow = own_paths[j]
+                    if opts is pts:
+                        # Own path: only parts farther than one bead along the path.
+                        near = False
+                        for i in range(1, len(pts)):
+                            if min(abs(arc[i - 1] - arc[vi]), abs(arc[i] - arc[vi])) <= w + args.tol:
+                                continue
+                            seg = shapely.LineString([pts[i - 1], pts[i]])
+                            if seg.distance(v) <= ow / 2 + args.tol:
+                                near = True
+                                break
+                        if near:
+                            return True
+                        continue
+                    if line.distance(v) > ow / 2 + args.tol:
+                        continue
+                    # In the interior of the met path: not within w_o/2 + tol of its ends.
+                    foot = line.project(v)
+                    if foot < ow / 2 + args.tol or line.length - foot < ow / 2 + args.tol:
+                        continue
+                    return True
                 return False
 
+            def is_hook(i):
+                """The segment ending at vertex i is a connector hook along the island boundary: off the lattice directions, on
+                the line of a reference segment (Cubic's lines hook along the same boundary)."""
+                sg = (pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+                return not along_lattice(*sg) and on_reference_line(*sg, ref, ref_tree, overlap=False)
+
+            hooks = [False] + [is_hook(i) for i in range(1, len(pts))]
+            # A junction: a vertex fused to another bead, or the vertex where a lattice line turns into a connector hook along the
+            # boundary (Cubic's boundary behaviour, accepted by the user): the hook is measured as a connection piece of its own
+            # and the line's end at the junction is not free.
+            fused_vertex = [fused(i) or (0 < i < len(pts) - 1 and hooks[i] != hooks[i + 1]) for i in range(len(pts))]
             # The parts of the path between its junction vertices.
-            parts, part = [], [pts[0]]
+            parts, part, part_start = [], [pts[0]], 0
             for i in range(1, len(pts)):
                 part.append(pts[i])
-                if i + 1 < len(pts) and fused(shapely.Point(pts[i])):
-                    parts.append(part)
-                    part = [pts[i]]
+                if i + 1 < len(pts) and fused_vertex[i]:
+                    parts.append((part, part_start, i))
+                    part, part_start = [pts[i]], i
             if len(part) >= 2:
-                parts.append(part)
+                parts.append((part, part_start, len(pts) - 1))
             pieces = []
-            for part in parts:
+            for part, i0, i1 in parts:
                 line = shapely.LineString(part)
                 un = shapely.difference(line, holds[round(w, 4)])
                 if un.is_empty:
@@ -218,43 +290,41 @@ def main():
                 if hasattr(un, 'geoms'):
                     un = shapely.line_merge(un)
                 for piece in (list(un.geoms) if hasattr(un, 'geoms') else [un]):
-                    pieces.append((piece, shapely.Point(part[0]), shapely.Point(part[-1])))
+                    pieces.append((piece, shapely.Point(part[0]), fused_vertex[i0], shapely.Point(part[-1]), fused_vertex[i1]))
 
-            for piece, p0, p1 in pieces:
+            for piece, p0, fused0, p1, fused1 in pieces:
                 if piece.geom_type != 'LineString' or piece.length < 1e-4:
                     continue
                 a = shapely.Point(piece.coords[0])
                 b = shapely.Point(piece.coords[-1])
-                ends = [e for e in (p0, p1) if min(a.distance(e), b.distance(e)) < 1e-6]
-                at_end = any(not fused(e) for e in ends)
-                if ends and not at_end:
-                    counts['fused_ends'] += 1
+                free_at = None
+                for end, is_fused in ((p0, fused0), (p1, fused1)):
+                    if min(a.distance(end), b.distance(end)) < 1e-6:
+                        if is_fused:
+                            counts['fused_ends'] += 1
+                        elif free_at is None:
+                            free_at = end
                 coords = list(piece.coords)
                 segs_of_piece = [(coords[i][0], coords[i][1], coords[i + 1][0], coords[i + 1][1]) for i in range(len(coords) - 1)]
-                bulk = all(on_reference_line(*sg, ref, ref_tree) for sg in segs_of_piece)
+                bulk = all(on_reference_line(*sg, ref, ref_tree, overlap=False) for sg in segs_of_piece)
                 # The connector's join along the island boundary: off the lattice directions, on the line of a reference segment.
                 connection = not bulk and all(not along_lattice(*sg) and on_reference_line(*sg, ref, ref_tree, overlap=False) for sg in segs_of_piece)
-                (ax_, ay_), (bx_, by_) = coords[0], coords[-1]
-                lattice = along_lattice(ax_, ay_, bx_, by_)
-                if at_end:
+                if free_at is not None:
                     if bulk:
                         kind = 'free_bulk'
                     elif connection:
                         kind = 'free_connection'
                     elif plen <= 0.6:
                         kind = 'free_post'
-                    elif lattice:
-                        kind = 'free_added'
                     else:
-                        kind = 'free_connection'
+                        kind = 'free_added'
                     counts[kind] += 1
                     mm[kind] += piece.length
                     mx[kind] = max(mx[kind], piece.length)
                     if kind != 'free_bulk':
                         over[kind + '>0.25'] += piece.length > 0.25
                         over[kind + '>0.5'] += piece.length > 0.5
-                    end = a if min(a.distance(p0), a.distance(p1)) < 1e-6 else b
-                    out.write(f'{z:.3f}\t{kind}\t{piece.length:.3f}\t{end.x:.3f}\t{end.y:.3f}\t{plen:.3f}\n')
+                    out.write(f'{z:.3f}\t{kind}\t{piece.length:.3f}\t{free_at.x:.3f}\t{free_at.y:.3f}\t{plen:.3f}\n')
                 elif piece.length > gap_b:
                     kind = 'long_bulk' if bulk else ('long_connection' if connection else 'long_added')
                     counts[kind] += 1
@@ -262,7 +332,7 @@ def main():
                     m = piece.interpolate(0.5, normalized=True)
                     out.write(f'{z:.3f}\t{kind}\t{piece.length:.3f}\t{m.x:.3f}\t{m.y:.3f}\t{plen:.3f}\n')
     out.close()
-    print(args.gcode.split('/')[-3] if args.gcode.count('/') >= 2 else args.gcode, counts, {k: round(v, 2) for k, v in mm.items()}, {k: round(v, 3) for k, v in mx.items()}, over, 'gap_b', gap_b)
+    print(args.gcode.split('/')[-3] if args.gcode.count('/') >= 2 else args.gcode, counts, {k: round(v, 2) for k, v in mm.items()}, {k: round(v, 3) for k, v in mx.items()}, over, 'gap_b', gap_b, 'infill_direction', direction)
 
 
 if __name__ == '__main__':

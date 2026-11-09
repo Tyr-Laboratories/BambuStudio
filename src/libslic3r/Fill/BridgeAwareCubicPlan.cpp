@@ -88,6 +88,18 @@ Lines GroupPlan::strands_at(size_t layer, const BoundingBox &bbox) const
 // ---------------------------------------------------------------------------------------------------------------------------
 // ObjectPlan
 
+std::unique_ptr<ObjectPlan> ObjectPlan::build_for_verification(const PrintObject &object, const std::function<void()> &cancel)
+{
+    auto plan = std::make_unique<ObjectPlan>();
+    plan->collect_regions(object, true);
+    if (plan->m_groups.empty())
+        return plan;
+    cancel();
+    plan->collect_material(object, cancel);
+    plan->collect_planes(object, cancel);
+    return plan;
+}
+
 std::unique_ptr<ObjectPlan> ObjectPlan::build(const PrintObject &object, const std::function<void()> &cancel)
 {
     auto plan = std::make_unique<ObjectPlan>();
@@ -107,7 +119,7 @@ std::unique_ptr<ObjectPlan> ObjectPlan::build(const PrintObject &object, const s
     return plan;
 }
 
-void ObjectPlan::collect_regions(const PrintObject &object)
+void ObjectPlan::collect_regions(const PrintObject &object, bool any_sparse_pattern)
 {
     const Print &print = *object.print();
     const size_t region_count = object.num_printing_regions();
@@ -126,7 +138,8 @@ void ObjectPlan::collect_regions(const PrintObject &object)
         const Flow   solid            = region.flow(object, frSolidInfill, object.config().layer_height, false);
         const double bridge_bead      = nozzle_perimeter * std::sqrt(std::max(0.01, config.bridge_flow.value));
         m_bead_of_region[region_id]   = std::min({ double(perimeter.width()), double(external.width()), double(solid.width()), bridge_bead });
-        if (!prints_pattern(config))
+        const bool is_sparse = config.sparse_infill_density.value > 0. && config.sparse_infill_density.value < 100.;
+        if (!(any_sparse_pattern ? is_sparse : prints_pattern(config)))
             continue;
         const double nozzle_sparse = print.config().nozzle_diameter.get_at(region.extruder(frInfill) - 1);
         const ConfigOptionDef *gap_def = print_config_def.get("bridge_aware_cubic_max_gap");
@@ -171,6 +184,19 @@ void ObjectPlan::collect_regions(const PrintObject &object)
         m_overhang[i] = 0.5 * nozzle;
     }
     m_courses.assign(layers, std::vector<Polylines>(region_count));
+    m_boundary_courses.assign(layers, std::vector<Polylines>(region_count));
+    // Whether the connector anchors ends and the filler makes nubs: Fill.cpp's reading of the region's anchor settings.
+    for (GroupPlan &group : m_groups) {
+        const PrintRegionConfig &config = object.printing_region(group.m_regions.front()).config();
+        const double spacing = group.m_lattice.spacing;
+        double anchor = config.sparse_infill_anchor.value, anchor_max = config.sparse_infill_anchor_max.value;
+        if (config.sparse_infill_anchor.percent)
+            anchor *= 0.01 * spacing;
+        if (config.sparse_infill_anchor_max.percent)
+            anchor_max *= 0.01 * spacing;
+        anchor = std::min(anchor, anchor_max);
+        group.m_anchors = anchor_max >= 0.05 && anchor > 0.;
+    }
     for (GroupPlan &group : m_groups) {
         group.m_boundaries.resize(layers);
         group.m_strands.resize(layers);
@@ -276,7 +302,7 @@ void ObjectPlan::collect_boundaries(const PrintObject &object, const std::functi
             const PrintRegionConfig &config = object.printing_region(group.m_regions.front()).config();
             Polylines courses;
             for (const size_t region_id : group.m_regions)
-                append(courses, m_courses[i][region_id]);
+                append(courses, m_boundary_courses[i][region_id]);
             ExPolygons boundary;
             for (const SparseIsland &island : islands) {
                 bool of_group = false;
@@ -306,6 +332,13 @@ const Polylines& ObjectPlan::courses_at(size_t layer, size_t region_id) const
     if (layer >= m_courses.size() || region_id >= m_courses[layer].size())
         return m_no_courses;
     return m_courses[layer][region_id];
+}
+
+const Polylines& ObjectPlan::boundary_courses_at(size_t layer, size_t region_id) const
+{
+    if (layer >= m_boundary_courses.size() || region_id >= m_boundary_courses[layer].size())
+        return m_no_courses;
+    return m_boundary_courses[layer][region_id];
 }
 
 std::vector<PlaneSummary> ObjectPlan::planes() const
@@ -540,9 +573,12 @@ private:
                     t_lo = std::min(t_lo, tp);
                     t_hi = std::max(t_hi, tp);
                 }
-                const Point a = lattice.scaled(t.point(t_lo - 1.)), b = lattice.scaled(t.point(t_hi + 1.));
-                const double length = t_hi - t_lo + 2.;
-                const auto to_t = [&](double fraction) { return t_lo - 1. + fraction * length; };
+                // The probe reaches a margin plus the carry past the section, so that a carried end meets a true boundary crossing.
+                const double carry = std::min(2. * w, plane.gap - MU);
+                const double pad = 1. + carry;
+                const Point a = lattice.scaled(t.point(t_lo - pad)), b = lattice.scaled(t.point(t_hi + pad));
+                const double length = t_hi - t_lo + 2. * pad;
+                const auto to_t = [&](double fraction) { return t_lo - pad + fraction * length; };
                 // Inside the section, the footprint and the boundary, as parameter intervals.
                 const AreaIndex section_index(ExPolygons{ ExPolygon(section_polygon) });
                 std::vector<std::pair<double, double>> pieces;
@@ -558,6 +594,8 @@ private:
                     const double bl = to_t(in_boundary.first), bh = to_t(in_boundary.second);
                     if (bh - bl < w - 1e-4)
                         continue;    // a boundary interval shorter than a bead: the face is a gap
+                    // The interval's ends are boundary crossings unless they are the probe's own ends.
+                    const bool bl_crossing = in_boundary.first > 1e-9, bh_crossing = in_boundary.second < 1. - 1e-9;
                     for (const auto &piece : pieces) {
                         double lo = std::max(piece.first, bl), hi = std::min(piece.second, bh);
                         if (hi <= lo)
@@ -567,10 +605,9 @@ private:
                         // from the wall, on the edge of the material's reach, where rounding would decide whether the end is held;
                         // two beads along the trace reach the boundary from half a bead away at angles down to 15°. The carried
                         // part bridges to the wall's reach, so it is never longer than G_b.
-                        const double carry = std::min(2. * w, plane.gap - MU);
-                        if (lo - bl <= carry)
+                        if (bl_crossing && lo - bl <= carry)
                             lo = bl;
-                        if (bh - hi <= carry)
+                        if (bh_crossing && bh - hi <= carry)
                             hi = bh;
                         if (hi - lo < w - 1e-4) {
                             // Lengthen to a bead, centred, then shifted inside the boundary interval.
@@ -763,7 +800,7 @@ static void solid_column(GroupPlan &group, ObjectPlan &plan, const Cell &cell, c
             }
         }
         if (!courses.empty()) {
-            plan.add_courses(l, region_id, courses);
+            plan.add_courses(l, region_id, courses, false);
             group.mark_courses();
         }
     }

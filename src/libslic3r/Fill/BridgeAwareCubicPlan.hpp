@@ -89,6 +89,8 @@ public:
     const LatticeParams&        lattice() const { return m_lattice; }
     const std::vector<size_t>&  regions() const { return m_regions; }
     int                         bridge_layers() const { return m_bridge_layers; }
+    // Whether the regions' sparse infill anchor settings make the connector anchor line ends (and the filler add nubs).
+    bool                        anchors() const { return m_anchors; }
     const std::vector<Plane>&   planes() const { return m_planes; }
     const LayerBoundary&        boundary(size_t layer) const { return m_boundaries[layer]; }
     const std::vector<Strand>&  strands(size_t layer) const { return m_strands[layer]; }
@@ -113,6 +115,7 @@ private:
     LatticeParams                    m_lattice;
     std::vector<size_t>              m_regions;
     int                              m_bridge_layers = 1;
+    bool                             m_anchors = true;
     std::vector<Plane>               m_planes;          // ordered by (plane_layer, roof_layer)
     std::vector<LayerBoundary>       m_boundaries;      // by layer
     std::vector<std::vector<Strand>> m_strands;         // by layer
@@ -124,18 +127,30 @@ class ObjectPlan
 {
 public:
     static std::unique_ptr<ObjectPlan> build(const PrintObject &object, const std::function<void()> &cancel);
+    // The same plan for an object whose sparse infill is any pattern (its planes depend on the surfaces only): the verifier's
+    // oracle measures a Cubic object with the planes its surfaces define (test V1). Never used by the slice.
+    static std::unique_ptr<ObjectPlan> build_for_verification(const PrintObject &object, const std::function<void()> &cancel);
 
     // nullptr when the region does not print the pattern.
     const GroupPlan*          group_of_region(size_t region_id) const;
     // Seam walls, rails and solid-column courses of the region on the layer; empty when none.
     const Polylines&          courses_at(size_t layer, size_t region_id) const;
+    // The courses that cut the fill boundary (seam walls and rails, 3.5): a solid column's courses lie inside its faces and
+    // must not cut the lattice there (3.6c).
+    const Polylines&          boundary_courses_at(size_t layer, size_t region_id) const;
     std::vector<PlaneSummary> planes() const;
     // Z_l of 3.9a; empty without infill combination.
     ExPolygons                single_layer_zone(size_t layer) const;
     const PlanStatistics&     statistics() const { return m_statistics; }
     PlanStatistics&           statistics_mutable() { return m_statistics; }
-    // For the plan's own units: add courses of a region on a layer.
-    void                      add_courses(size_t layer, size_t region_id, const Polylines &courses) { append(m_courses[layer][region_id], courses); }
+    // For the plan's own units: add courses of a region on a layer; `cut_boundary` for seam walls and rails, not for the solid
+    // columns' courses.
+    void                      add_courses(size_t layer, size_t region_id, const Polylines &courses, bool cut_boundary)
+    {
+        append(m_courses[layer][region_id], courses);
+        if (cut_boundary)
+            append(m_boundary_courses[layer][region_id], courses);
+    }
     // G after the clamp to the nozzle diameter; 0 when the region does not print the pattern.
     double                    gap_of_region(size_t region_id) const;
 
@@ -158,7 +173,7 @@ private:
     friend void refine(GroupPlan &, ObjectPlan &, const std::function<void()> &);
     friend void sweep(GroupPlan &, ObjectPlan &, const std::function<void()> &);
 
-    void collect_regions(const PrintObject &object);
+    void collect_regions(const PrintObject &object, bool any_sparse_pattern = false);
     void collect_material(const PrintObject &object, const std::function<void()> &cancel);
     void collect_planes(const PrintObject &object, const std::function<void()> &cancel);
     void collect_boundaries(const PrintObject &object, const std::function<void()> &cancel);
@@ -172,6 +187,7 @@ private:
     std::vector<std::pair<double, double>>    m_layer_heights;      // (print_z, height) by layer
     std::vector<double>                       m_overhang;           // h_n by layer
     std::vector<std::vector<Polylines>>       m_courses;            // [layer][region]
+    std::vector<std::vector<Polylines>>       m_boundary_courses;   // [layer][region]: those that cut the fill boundary
     double                                    m_vertex_margin = 0., m_path_margin = 0.;
     PlanStatistics                            m_statistics;
     Polylines                                 m_no_courses;

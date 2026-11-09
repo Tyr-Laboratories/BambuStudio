@@ -47,45 +47,44 @@ Point carried_to_boundary(const Point &from, const Point &end, const BridgeAware
 }
 
 // Anchors the interior ends of the paths where they meet another path of the layer (a needed strand ends on the line of its
-// cell's face: a bulk line or a parent strand): a nub along the met path's centre line from the junction, `anchor_length`
-// long, clipped to the met segment, appended to the path. Ends within `reach` of the fill boundary are the connector's.
-void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach_scaled, double anchor_length_scaled)
+// cell's face: a bulk line or a parent strand): two ends that meet each other are joined into one path; an end that meets the
+// interior of another line gets a nub along that line's centre line from the junction, `anchor_length` long, clipped to the met
+// segment, appended to the path. Ends within `reach` of the fill boundary are the connector's. `join` is the longest link between
+// two meeting ends (a bead, or the planning gap when that is smaller).
+void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach_scaled, double anchor_length_scaled, double join_scaled)
 {
-    if (paths.size() < 2 || anchor_length_scaled < scale_(0.01))
+    if (paths.empty() || anchor_length_scaled < scale_(0.01))
         return;
-    struct Segment { size_t path; Point a, b; };
-    std::vector<Segment> segments;
-    for (size_t i = 0; i < paths.size(); ++i)
-        for (size_t k = 1; k < paths[i].points.size(); ++k)
-            if (paths[i].points[k - 1] != paths[i].points[k])
-                segments.push_back({ i, paths[i].points[k - 1], paths[i].points[k] });
-    // A uniform grid of the segments by the cells their boxes cover.
-    const coord_t cell = coord_t(scale_(2.));
-    const auto cell_of = [cell](coord_t v) { return int(std::floor(double(v) / double(cell))); };
-    std::map<std::pair<int, int>, std::vector<size_t>> grid;
-    for (size_t s = 0; s < segments.size(); ++s) {
-        const int x0 = cell_of(std::min(segments[s].a.x(), segments[s].b.x())), x1 = cell_of(std::max(segments[s].a.x(), segments[s].b.x()));
-        const int y0 = cell_of(std::min(segments[s].a.y(), segments[s].b.y())), y1 = cell_of(std::max(segments[s].a.y(), segments[s].b.y()));
-        for (int x = x0; x <= x1; ++x)
-            for (int y = y0; y <= y1; ++y)
-                grid[{ x, y }].push_back(s);
-    }
     EdgeGrid::Grid boundary_grid;
     boundary_grid.set_bbox(get_extents(boundary).inflated(coord_t(scale_(1.))));
     boundary_grid.create(boundary, coord_t(scale_(2.)));
     const auto on_boundary = [&boundary_grid, reach_scaled](const Point &p) { return boundary_grid.closest_point_signed_distance(p, coord_t(reach_scaled)).valid(); };
-    // Two ends that meet each other (within a bead of one another, both off the boundary) are joined into one path, as the
-    // connector joins two line ends on the boundary; a nub on each would print both pieces twice and fold the path back on itself.
+    // The interior ends: nothing to do without them (most islands away from the roofs).
+    struct End { size_t path; bool front; Point p; };
+    std::vector<End> ends;
+    for (size_t i = 0; i < paths.size(); ++i)
+        if (paths[i].points.size() >= 2)
+            for (const bool front : { true, false }) {
+                const Point p = front ? paths[i].points.front() : paths[i].points.back();
+                if (!on_boundary(p))
+                    ends.push_back({ i, front, p });
+            }
+    if (ends.empty())
+        return;
+    // The direction of a path's end segment, pointing into the path.
+    const auto end_direction = [&paths](size_t i, bool front) {
+        const Points &pts = paths[i].points;
+        const Point &a = front ? pts.front() : pts.back(), &b = front ? pts[1] : pts[pts.size() - 2];
+        Vec2d d = (b - a).cast<double>();
+        const double n = d.norm();
+        return n > 0. ? Vec2d(d / n) : Vec2d(1., 0.);
+    };
+    // 1. Two ends that meet each other (within `join_scaled`, both off the boundary, their lines not parallel: parallel neighbours
+    //    are the sub-lines of a band or two strands side by side, which do not meet) are joined into one path, as the connector
+    //    joins two line ends on the boundary; a nub on each would print both pieces twice and fold the path back on itself.
     {
-        struct End { size_t path; bool front; Point p; };
-        std::vector<End> ends;
-        for (size_t i = 0; i < paths.size(); ++i)
-            if (paths[i].points.size() >= 2)
-                for (const bool front : { true, false }) {
-                    const Point p = front ? paths[i].points.front() : paths[i].points.back();
-                    if (!on_boundary(p))
-                        ends.push_back({ i, front, p });
-                }
+        const coord_t cell = coord_t(scale_(2.));
+        const auto cell_of = [cell](coord_t v) { return int(std::floor(double(v) / double(cell))); };
         std::map<std::pair<int, int>, std::vector<size_t>> end_grid;
         for (size_t e = 0; e < ends.size(); ++e)
             end_grid[{ cell_of(ends[e].p.x()), cell_of(ends[e].p.y()) }].push_back(e);
@@ -96,8 +95,9 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
         for (size_t e = 0; e < ends.size(); ++e) {
             if (consumed[e])
                 continue;
+            const Vec2d de = end_direction(ends[e].path, ends[e].front);
             std::optional<size_t> mate;
-            double best = 2. * reach_scaled;
+            double best = join_scaled;
             const int cx = cell_of(ends[e].p.x()), cy = cell_of(ends[e].p.y());
             for (int x = cx - 1; x <= cx + 1; ++x)
                 for (int y = cy - 1; y <= cy + 1; ++y) {
@@ -108,23 +108,32 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
                         if (f == e || consumed[f] || root(ends[f].path) == root(ends[e].path))
                             continue;
                         const double d = (ends[f].p - ends[e].p).cast<double>().norm();
-                        if (d <= best) { best = d; mate = f; }
+                        if (d > best)
+                            continue;
+                        // Parallel lines meet only head on (the gap between them within half a bead).
+                        const Vec2d df = end_direction(ends[f].path, ends[f].front);
+                        if (std::abs(de.x() * df.y() - de.y() * df.x()) < std::sin(5. * M_PI / 180.)) {
+                            const Vec2d gap = (ends[f].p - ends[e].p).cast<double>();
+                            if (std::abs(gap.x() * de.y() - gap.y() * de.x()) > 0.5 * reach_scaled)
+                                continue;
+                        }
+                        best = d;
+                        mate = f;
                     }
                 }
             if (!mate)
                 continue;
-            // Join: path of e, oriented to end at e's end, then the path of the mate from its meeting end.
             Polyline &a = paths[root(ends[e].path)], &b = paths[root(ends[*mate].path)];
-            Points joined;
-            const bool a_ends_at_e = (ends[e].front ? a.points.front() : a.points.back()) == ends[e].p;
-            const bool b_starts_at_mate = (ends[*mate].front ? b.points.front() : b.points.back()) == ends[*mate].p;
-            if (!a_ends_at_e || !b_starts_at_mate)
+            // Orientation from the paths' actual ends (an earlier join may have reversed them).
+            const bool e_front = a.points.front() == ends[e].p, e_back = a.points.back() == ends[e].p;
+            const bool m_front = b.points.front() == ends[*mate].p, m_back = b.points.back() == ends[*mate].p;
+            if ((!e_front && !e_back) || (!m_front && !m_back))
                 continue;    // an end already moved by an earlier join
-            joined = a.points;
-            if (ends[e].front)
+            Points joined = a.points;
+            if (e_front && !e_back)
                 std::reverse(joined.begin(), joined.end());
             Points tail = b.points;
-            if (!ends[*mate].front)
+            if (m_back && !m_front)
                 std::reverse(tail.begin(), tail.end());
             if (tail.front() == joined.back())
                 tail.erase(tail.begin());
@@ -135,81 +144,82 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
             consumed[e] = consumed[*mate] = true;
         }
         paths.erase(std::remove_if(paths.begin(), paths.end(), [](const Polyline &pl) { return pl.points.size() < 2; }), paths.end());
-        // The segment index is rebuilt below from the joined paths.
-        segments.clear();
-        grid.clear();
-        for (size_t i = 0; i < paths.size(); ++i)
-            for (size_t k = 1; k < paths[i].points.size(); ++k)
-                if (paths[i].points[k - 1] != paths[i].points[k])
-                    segments.push_back({ i, paths[i].points[k - 1], paths[i].points[k] });
-        for (size_t s = 0; s < segments.size(); ++s) {
-            const int x0 = cell_of(std::min(segments[s].a.x(), segments[s].b.x())), x1 = cell_of(std::max(segments[s].a.x(), segments[s].b.x()));
-            const int y0 = cell_of(std::min(segments[s].a.y(), segments[s].b.y())), y1 = cell_of(std::max(segments[s].a.y(), segments[s].b.y()));
-            for (int x = x0; x <= x1; ++x)
-                for (int y = y0; y <= y1; ++y)
-                    grid[{ x, y }].push_back(s);
-        }
     }
+    // 2. The remaining interior ends: a nub along the line they meet. The paths are indexed by the cells their segments cross.
+    ends.clear();
+    for (size_t i = 0; i < paths.size(); ++i)
+        if (paths[i].points.size() >= 2)
+            for (const bool front : { true, false }) {
+                const Point p = front ? paths[i].points.front() : paths[i].points.back();
+                if (!on_boundary(p))
+                    ends.push_back({ i, front, p });
+            }
+    if (ends.empty())
+        return;
+    std::vector<Points> as_points;
+    as_points.reserve(paths.size());
+    for (const Polyline &pl : paths)
+        as_points.push_back(pl.points);
+    EdgeGrid::Grid grid;
+    BoundingBox all;
+    for (const Polyline &pl : paths)
+        all.merge(get_extents(pl));
+    grid.set_bbox(all.inflated(coord_t(scale_(1.))));
+    grid.create(as_points, coord_t(scale_(2.)), true);
     struct Nub { size_t path; bool front; Point q, e; };
     std::vector<Nub> nubs;
-    for (size_t i = 0; i < paths.size(); ++i) {
-        if (paths[i].points.size() < 2)
-            continue;
-        for (const bool front : { true, false }) {
-            const Point p = front ? paths[i].points.front() : paths[i].points.back();
-            if (on_boundary(p))
-                continue;
-            std::optional<size_t> best;
-            double best_distance = reach_scaled;
-            const int cx = cell_of(p.x()), cy = cell_of(p.y());
-            for (int x = cx - 1; x <= cx + 1; ++x)
-                for (int y = cy - 1; y <= cy + 1; ++y) {
-                    auto it = grid.find({ x, y });
-                    if (it == grid.end())
-                        continue;
-                    for (const size_t s : it->second) {
-                        // Another line, or another part of the same chain (the connector may have joined the met line into this
-                        // path along the boundary); never the end's own segment.
-                        if (segments[s].path == i && (segments[s].a == p || segments[s].b == p))
-                            continue;
-                        const double distance = Line(segments[s].a, segments[s].b).distance_to(p);
-                        if (distance <= best_distance) {
-                            best_distance = distance;
-                            best = s;
-                        }
-                    }
-                }
-            if (!best)
-                continue;
-            const Segment &met = segments[*best];
-            const Vec2d a = met.a.cast<double>(), d = (met.b - met.a).cast<double>();
-            const double length = d.norm();
-            if (length < 1.)
-                continue;
-            // A junction, not a crossing: the path stops at the met line. Its own last segment, extended, meets the line within
-            // the reach ahead of the end, or the end lies on the line; a path that runs on through the line has crossed it.
-            {
-                const Point &before = front ? paths[i].points[1] : paths[i].points[paths[i].points.size() - 2];
-                const Vec2d own = (p - before).cast<double>();
-                const double own_length = own.norm();
-                if (own_length >= 1.) {
-                    const Vec2d n(-d.y() / length, d.x() / length);                 // the met line's normal
-                    const double side_end = n.dot(p.cast<double>() - a), side_before = n.dot(before.cast<double>() - a);
-                    const bool crossed = side_end * side_before < 0. && std::abs(side_end) > scale_(0.01);
-                    if (crossed)
-                        continue;
+    for (const End &end : ends) {
+        const size_t i = end.path;
+        const Point &p = end.p;
+        const Point &before = end.front ? paths[i].points[1] : paths[i].points[paths[i].points.size() - 2];
+        // The candidate segments within reach: of another path, or of this chain beyond the end's own segment.
+        std::optional<Line> best;
+        double best_distance = reach_scaled;
+        const auto visitor = [&](coord_t row, coord_t col) {
+            const auto range = grid.cell_data_range(row, col);
+            for (auto it = range.first; it != range.second; ++it) {
+                const size_t path_index = it->first;
+                const EdgeGrid::Contour &contour = grid.contours()[path_index];
+                const Point &a = contour.segment_start(it->second), &b = contour.segment_end(it->second);
+                if (path_index == i && (a == p || b == p))
+                    continue;    // the end's own segment
+                const double distance = Line(a, b).distance_to(p);
+                if (distance <= best_distance) {
+                    best_distance = distance;
+                    best = Line(a, b);
                 }
             }
-            const double t = std::min(1., std::max(0., (p.cast<double>() - a).dot(d) / (length * length)));
-            const Vec2d q = a + t * d;
-            const double room_forward = (1. - t) * length, room_backward = t * length;
-            const double sign = room_forward >= room_backward ? 1. : -1.;
-            const double nub = std::min(anchor_length_scaled, sign > 0. ? room_forward : room_backward);
-            if (nub < scale_(0.01))
-                continue;
-            const Vec2d e = q + sign * nub / length * d;
-            nubs.push_back({ i, front, Point(coord_t(std::llround(q.x())), coord_t(std::llround(q.y()))), Point(coord_t(std::llround(e.x())), coord_t(std::llround(e.y()))) });
+            return true;
+        };
+        BoundingBox around;    // (a box from one point twice is undefined in this fork: merge, then offset)
+        around.merge(p);
+        around.offset(coord_t(reach_scaled) + 1);
+        grid.visit_cells_intersecting_box(around, visitor);
+        if (!best)
+            continue;
+        const Vec2d a = best->a.cast<double>(), d = (best->b - best->a).cast<double>();
+        const double length = d.norm();
+        if (length < 1.)
+            continue;
+        // A junction, not a crossing: the path stops at the met line (its own last segment lies on one side of it).
+        {
+            const Vec2d own = (p - before).cast<double>();
+            if (own.norm() >= 1.) {
+                const Vec2d n(-d.y() / length, d.x() / length);
+                const double side_end = n.dot(p.cast<double>() - a), side_before = n.dot(before.cast<double>() - a);
+                if (side_end * side_before < 0. && std::abs(side_end) > scale_(0.01))
+                    continue;
+            }
         }
+        const double t = std::min(1., std::max(0., (p.cast<double>() - a).dot(d) / (length * length)));
+        const Vec2d q = a + t * d;
+        const double room_forward = (1. - t) * length, room_backward = t * length;
+        const double sign = room_forward >= room_backward ? 1. : -1.;
+        const double nub = std::min(anchor_length_scaled, sign > 0. ? room_forward : room_backward);
+        if (nub < scale_(0.01))
+            continue;
+        const Vec2d e = q + sign * nub / length * d;
+        nubs.push_back({ i, end.front, Point(coord_t(std::llround(q.x())), coord_t(std::llround(q.y()))), Point(coord_t(std::llround(e.x())), coord_t(std::llround(e.y()))) });
     }
     for (const Nub &nub : nubs) {
         Points &points = paths[nub.path].points;
@@ -249,12 +259,15 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     const ExPolygon &island = surface->expolygon;
     const BoundingBox bbox = get_extents(island);
 
-    // The courses of the regions whose sparse fill this island holds: the group's regions.
-    Polylines courses;
-    for (const size_t region_id : group->regions())
+    // The courses of the regions whose sparse fill this island holds: the group's regions. Seam walls and rails cut the fill
+    // boundary; a solid column's courses lie inside its faces and do not.
+    Polylines courses, boundary_courses;
+    for (const size_t region_id : group->regions()) {
         append(courses, m_plan->courses_at(m_layer_index, region_id));
+        append(boundary_courses, m_plan->boundary_courses_at(m_layer_index, region_id));
+    }
     const PrintRegionConfig &config = m_layer->regions()[this->lock_region_id]->region().config();
-    const ExPolygons boundary = fill_boundary(island, courses, lattice.spacing, lattice.width, config.infill_wall_overlap.get_abs_value(100.));
+    const ExPolygons boundary = fill_boundary(island, boundary_courses, lattice.spacing, lattice.width, config.infill_wall_overlap.get_abs_value(100.));
 
     Polylines out;
     // 4. Courses of the layer, clipped to the island, printed whole (each clipped alone: Clipper splits open paths clipped together).
@@ -282,17 +295,37 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     //    strands), so that the connector anchors it to the perimeter.
     Polylines strands;
     const double gap_b = std::max(0., m_plan->gap_of_region(this->lock_region_id) - 0.1);    // G_b of the region (μ = 0.1 mm)
-    const double shortest = scale_(lattice.width - 1e-4), reach = scale_(0.5 * lattice.width), carry = scale_(std::min(2. * lattice.width, gap_b));
-    for (const Line &line : group->strands_at(m_layer_index, bbox))
+    // The carry of an end to the boundary exists so that the connector anchors it there like a bulk line's end; without anchors it
+    // would only lengthen the line into the void (the plan held the end where it was, not at the boundary).
+    const bool anchoring = !params.dont_connect() && params.anchor_length > 0.f;
+    const double shortest = scale_(lattice.width - 1e-4), reach = scale_(0.5 * lattice.width), carry = anchoring ? scale_(std::min(2. * lattice.width, gap_b)) : 0.;
+    const AreaIndex surface_index(ExPolygons{ island });
+    const double spacing_scaled = scale_(lattice.spacing);
+    for (const Line &line : group->strands_at(m_layer_index, bbox)) {
+        const double length = (line.b - line.a).cast<double>().norm();
+        const std::vector<std::pair<double, double>> on_surface = surface_index.segment_inside(line.a, line.b);
         for (const auto &interval : index.segment_inside(line.a, line.b)) {
             Point a = along(line, interval.first), b = along(line, interval.second);
             if ((b - a).cast<double>().norm() < shortest)
                 continue;
             const Point a0 = a, b0 = b;
-            a = carried_to_boundary(b0, a0, index, carry);
-            b = carried_to_boundary(a0, b0, index, carry);
+            if (carry > 0.) {
+                a = carried_to_boundary(b0, a0, index, carry);
+                b = carried_to_boundary(a0, b0, index, carry);
+            }
+            // Where the fill boundary cut a planned line (a surface laid after the plan took the sparse area there: the generator's
+            // ensuring strip one spacing wide along a bridge's edge, a thick base), the line runs on to the edge of the sparse
+            // surface, at most a spacing further, so that it meets what that surface prints instead of stopping half a spacing short
+            // of it. A line the plan itself ended at the boundary is left as it is.
+            for (const auto &s : on_surface) {
+                if (interval.first > 1e-6 && s.first < interval.first - 1e-9 && s.second >= interval.first - 1e-9 && (interval.first - s.first) * length <= spacing_scaled)
+                    a = along(line, s.first);
+                if (interval.second < 1. - 1e-6 && s.second > interval.second + 1e-9 && s.first <= interval.second + 1e-9 && (s.second - interval.second) * length <= spacing_scaled)
+                    b = along(line, s.second);
+            }
             strands.emplace_back(Points{ a, b });
         }
+    }
 
     // 5. Every line goes through the connector as Cubic's do (user decision, 9 November 2026: the pattern's lines are anchored
     //    like Cubic's, with the region's sparse infill anchor settings; the connector's behaviour at the boundary is accepted).
@@ -308,7 +341,7 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     } else
         connect_infill(std::move(lines), to_polygons(boundary), get_extents(island.contour), connected, this->spacing, params);
     if (!params.dont_connect() && params.anchor_length > 0.f)
-        anchor_junctions(connected, boundary, reach, scale_(double(params.anchor_length)));
+        anchor_junctions(connected, boundary, reach, scale_(double(params.anchor_length)), scale_(std::min(lattice.width, gap_b)));
     append(out, std::move(connected));
     return out;
 }

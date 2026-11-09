@@ -3,6 +3,7 @@
 #include "bridge_aware_cubic_fixtures.hpp"
 
 #include "libslic3r/BridgeAwareCubicMaterial.hpp"
+#include "libslic3r/BridgeAwareCubicVerify.hpp"
 #include "libslic3r/Fill/BridgeAwareCubicPlan.hpp"
 #include "libslic3r/PrintBase.hpp"
 
@@ -267,3 +268,44 @@ TEST_CASE("Bridge aware cubic plans demand planes under roofs only", "[BridgeAwa
     }
 }
 
+
+// V1: the development verifier measures K1 on the final paths. The small cube sliced as Cubic, measured with the planes its own
+// surfaces define, has a failing plane at gap 5 (its cell is 17.5 mm); the pattern's small cube passes on every plane, its plan has
+// nothing to warn about, and this build (the flag off) attaches no Bridge aware cubic warning to the slice.
+TEST_CASE("Bridge aware cubic verifier fails Cubic and passes the pattern", "[BridgeAwareCubic][V1]")
+{
+    using namespace Slic3r;
+    using namespace BACFixtures;
+    {
+        Print print;
+        Model model = small_cube();
+        slice(print, model, fixture_config(5., "cubic"));
+        const PrintObject &object = *print.get_object(size_t(0));
+        REQUIRE(object.bridge_aware_cubic_plan() == nullptr);
+        const auto plan = BridgeAwareCubic::ObjectPlan::build_for_verification(object, [] {});
+        REQUIRE_FALSE(plan->planes().empty());
+        const BridgeAwareCubic::VerificationReport report = BridgeAwareCubic::verify(object, *plan, [] {});
+        REQUIRE_FALSE(report.planes.empty());
+        CHECK_FALSE(report.passed());
+        CHECK(std::any_of(report.planes.begin(), report.planes.end(), [](const BridgeAwareCubic::PlaneReport &p) { return p.max_opening > 5.; }));
+    }
+    {
+        Print print;
+        Model model = small_cube();
+        slice(print, model, fixture_config(5., "bridgeawarecubic"));
+        const PrintObject &object = *print.get_object(size_t(0));
+        REQUIRE(object.bridge_aware_cubic_plan() != nullptr);
+        const BridgeAwareCubic::VerificationReport report = BridgeAwareCubic::verify(object, [] {});
+        REQUIRE(report.planes.size() >= 2);
+        for (const BridgeAwareCubic::PlaneReport &plane : report.planes) {
+            INFO("plane at " << plane.z << " mm: " << plane.failure);
+            CHECK(plane.passed);
+            CHECK(plane.max_opening <= 5.);
+            CHECK(plane.max_run <= 5.);
+            CHECK(plane.bridge_free_ends == 0);
+        }
+        CHECK(BridgeAwareCubic::plan_warnings(object).empty());
+        for (const auto &warning : object.step_state_with_warnings(posSimplifyInfill).warnings)
+            CHECK(warning.message.find("Bridge aware cubic") == std::string::npos);
+    }
+}

@@ -1,4 +1,5 @@
 #include "Fill/BridgeAwareCubicPlan.hpp"
+#include "BridgeAwareCubicVerify.hpp"
 #include "Exception.hpp"
 #include "Print.hpp"
 #include "BoundingBox.hpp"
@@ -1148,6 +1149,11 @@ void PrintObject::prepare_bridge_aware_cubic()
     std::unique_ptr<BridgeAwareCubic::ObjectPlan> plan = BridgeAwareCubic::ObjectPlan::build(*this, [this]() { m_print->throw_if_canceled(); });
     m_bridge_aware_cubic_plan = std::move(plan);
     BOOST_LOG_TRIVIAL(info) << "Bridge aware cubic plan - End" << log_memory_info();
+#if SLIC3R_BAC_DEVELOPMENT_CHECKS
+    // Development checks (architecture 5.2): warnings that change no path and stop no slice.
+    for (const std::string &message : BridgeAwareCubic::plan_warnings(*this))
+        this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, message);
+#endif
 }
 
 void PrintObject::infill()
@@ -1399,6 +1405,16 @@ void PrintObject::simplify_extrusion_path()
         );
         m_print->throw_if_canceled();
         BOOST_LOG_TRIVIAL(debug) << "Simplify infill extrusion path of object in parallel - end";
+#if SLIC3R_BAC_DEVELOPMENT_CHECKS
+        // Development check (architecture 5.1): the verifier on the paths as they are exported.
+        if (m_bridge_aware_cubic_plan != nullptr)
+            for (const BridgeAwareCubic::PlaneReport &plane : BridgeAwareCubic::verify(*this, [this]() { m_print->throw_if_canceled(); }).planes)
+                if (!plane.passed)
+                    this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                        "Bridge aware cubic, object \"" + this->model_object()->name + "\": " + plane.failure + " at (" + std::to_string(plane.where.x()) + ", " +
+                        std::to_string(plane.where.y()) + ") on the plane at " + std::to_string(plane.z) + " mm under the roof of the layer at " +
+                        std::to_string(this->layers()[plane.roof_layer]->print_z) + " mm");
+#endif
         this->set_done(posSimplifyInfill);
     }
 

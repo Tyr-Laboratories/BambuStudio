@@ -158,7 +158,7 @@ private:
     // c_N with the disc shrunk by a margin: the reach along a line from a crossing with a line of another family.
     double crossing_reach(double margin) const
     {
-        return std::max(1e-6, (0.5 * m_w - margin) / SIN_60 + (m_lattice.multiline - 1) * m_lattice.spacing / (2. * SIN_60));
+        return std::max(1e-6, (0.5 * m_w - margin) / SIN_60 + (m_lattice.multiline - 1) * m_lattice.spacing / (4. * SIN_60));
     }
 
     const LayerPrint& print_set(size_t l)
@@ -289,6 +289,8 @@ private:
     // the filler's nub and counts as a held point. The met line is itself held or bridging.
     bool anchored_end(const PlaneKey &K, double t, size_t m)
     {
+        if (!m_group.anchors())
+            return false;    // the region's anchor settings make no nub: ends hold only from below
         const LayerPrint &lp = print_set(m);
         const Trace tk = trace(m_lattice, K, lp.z);
         const Vec2d p = tk.point(t);
@@ -307,8 +309,9 @@ private:
                 const Trace tj = trace(m_lattice, plane, lp.z);
                 if (std::abs(n.dot(p - tj.origin)) > reach)
                     continue;
+                // In the interior of the met strand: a nub needs the met bead on both sides of the junction.
                 const double along = tj.parameter(p);
-                if (along >= interval.first - 1e-6 && along <= interval.second + 1e-6)
+                if (along >= interval.first + 0.5 * m_w - 1e-6 && along <= interval.second - 0.5 * m_w + 1e-6)
                     return true;
             }
         }
@@ -428,66 +431,69 @@ private:
             Intervals gaps = complement(h, item.t0, item.t1);
             if (gaps.empty())
                 return;
+            // The extension of a free end (step 3): along the trace inside the boundary at m to the first held point within G_b,
+            // when the whole run from the last held point to it is at most G_b. Returns the point reached.
+            const auto try_extend = [&](bool forward, double end, double last_held) -> std::optional<double> {
+                if (lp_m.boundary->index.empty())
+                    return std::nullopt;
+                const Trace t = trace(m_lattice, item.plane, lp_m.z);
+                const double far = forward ? end + gb : end - gb;
+                const Point a = m_lattice.scaled(t.point(std::min(end, far))), b = m_lattice.scaled(t.point(std::max(end, far)));
+                for (const Interval &i : lp_m.boundary->index.segment_inside(a, b)) {
+                    const double il = std::min(end, far) + i.first * gb, ih = std::min(end, far) + i.second * gb;
+                    if (il > end + 1e-6 || ih < end - 1e-6)
+                        continue;    // only the boundary interval that continues the strand's end
+                    const double lo = forward ? end : il, hi = forward ? ih : end;
+                    if (hi - lo < 1e-9)
+                        return std::nullopt;
+                    // The first held point beyond the end (the rules return every interval of the plane below, some behind it).
+                    std::optional<double> first_held;
+                    for (const Interval &h2 : held(item.plane, lo, hi, m)) {
+                        if (forward && h2.second >= end + 1e-9) {
+                            const double point = std::max(h2.first, end);
+                            if (!first_held || point < *first_held) first_held = point;
+                        } else if (!forward && h2.first <= end - 1e-9) {
+                            const double point = std::min(h2.second, end);
+                            if (!first_held || point > *first_held) first_held = point;
+                        }
+                    }
+                    if (first_held && std::abs(*first_held - last_held) <= gb && std::abs(*first_held - end) <= gb && std::abs(*first_held - end) > 1e-9)
+                        return first_held;
+                    return std::nullopt;
+                }
+                return std::nullopt;
+            };
             bool extended = false;
             for (const Interval &gap : gaps) {
-                const bool at_start = gap.first <= item.t0 + 1e-9, at_end = gap.second >= item.t1 - 1e-9;
-                if (!at_start && !at_end) {
+                // A gap reaches an end of the item when that end is not a held point (an end that an extension reached is held).
+                const bool at_start = gap.first <= item.t0 + 1e-9 && !covers(h, item.t0);
+                const bool at_end   = gap.second >= item.t1 - 1e-9 && !covers(h, item.t1);
+                // An end fused to another line of the layer is a held point too (rule iv).
+                const bool lo_held = !at_start || anchored_end(item.plane, item.t0, m);
+                const bool hi_held = !at_end || anchored_end(item.plane, item.t1, m);
+                if (lo_held && hi_held) {
                     if (gap.second - gap.first <= gb)
                         continue;    // a bridge between held points
                     place_holders(item, gap.first, gap.second, m, true, true);
                     continue;
                 }
-                const bool forward = at_end;
-                const double end = forward ? item.t1 : item.t0;
-                const double last_held = forward ? gap.first : gap.second;
-                // An end fused to another line of the layer is a held point (rule iv): the gap is a bridge or needs holders inside.
-                if (anchored_end(item.plane, end, m)) {
-                    if (gap.second - gap.first <= gb)
-                        continue;
-                    place_holders(item, gap.first, gap.second, m, true, true);
-                    continue;
-                }
-                // A free end: extend along the trace inside the boundary at m to the first held point within G_b.
-                std::optional<double> reach;
-                if (!lp_m.boundary->index.empty()) {
-                    const Trace t = trace(m_lattice, item.plane, lp_m.z);
-                    const double far = forward ? end + gb : end - gb;
-                    const Point a = m_lattice.scaled(t.point(std::min(end, far))), b = m_lattice.scaled(t.point(std::max(end, far)));
-                    Intervals in_boundary;
-                    for (const Interval &i : lp_m.boundary->index.segment_inside(a, b))
-                        in_boundary.emplace_back(std::min(end, far) + i.first * gb, std::min(end, far) + i.second * gb);
-                    // Only the boundary interval that continues the strand's end.
-                    for (const Interval &i : in_boundary)
-                        if (i.first <= end + 1e-6 && i.second >= end - 1e-6) {
-                            const double lo = forward ? end : i.first, hi = forward ? i.second : end;
-                            if (hi - lo < 1e-9)
-                                break;
-                            // The first held point beyond the end (the rules return every interval of the plane below, some of
-                            // them behind the end).
-                            std::optional<double> first_held;
-                            for (const Interval &h2 : held(item.plane, lo, hi, m)) {
-                                if (forward && h2.second >= end + 1e-9) {
-                                    const double point = std::max(h2.first, end);
-                                    if (!first_held || point < *first_held) first_held = point;
-                                } else if (!forward && h2.first <= end - 1e-9) {
-                                    const double point = std::min(h2.second, end);
-                                    if (!first_held || point > *first_held) first_held = point;
-                                }
-                            }
-                            if (first_held && std::abs(*first_held - last_held) <= gb && std::abs(*first_held - end) <= gb && std::abs(*first_held - end) > 1e-9)
-                                reach = *first_held;
-                            break;
-                        }
-                }
-                if (reach) {
-                    Strand ext{ item.plane, std::min(end, *reach), std::max(end, *reach), StrandKind::Extension, item.gap };
-                    add_strand(m, ext);
-                    item.t0 = std::min(item.t0, ext.t0);
-                    item.t1 = std::max(item.t1, ext.t1);
-                    extended = true;
-                    continue;
-                }
-                place_holders(item, gap.first, gap.second, m, !at_start, !at_end);
+                // A free end: an extension first; the item grows and the gaps are recomputed.
+                if (!lo_held)
+                    if (const std::optional<double> reach = try_extend(false, item.t0, gap.second)) {
+                        add_strand(m, Strand{ item.plane, *reach, item.t0, StrandKind::Extension, item.gap });
+                        item.t0 = *reach;
+                        extended = true;
+                        break;
+                    }
+                if (!hi_held)
+                    if (const std::optional<double> reach = try_extend(true, item.t1, gap.first)) {
+                        add_strand(m, Strand{ item.plane, item.t1, *reach, StrandKind::Extension, item.gap });
+                        item.t1 = *reach;
+                        extended = true;
+                        break;
+                    }
+                // Holders from each free end inward.
+                place_holders(item, gap.first, gap.second, m, lo_held, hi_held);
             }
             if (!extended)
                 return;
@@ -540,7 +546,7 @@ private:
                 const double point = std::min(covered + gb, g1);
                 if (!cover(item, point, m))
                     record_unheld(m, item.plane, point, "no admissible piece in the window");
-                covered = point + reach;
+                covered = point + crossing_reach(m_vertex_margin);    // a cover holds c either side of its crossing
                 continue;
             }
             add_strand(below, Strand{ item.plane, *y - half, *y + half, StrandKind::Column, item.gap });
@@ -605,6 +611,7 @@ private:
         if (complement(h, item.t0, item.t1).empty())
             return;    // lands, or rests on a planned interval of its own plane
         const double length = item.t1 - item.t0;
+        const double y = 0.5 * (item.t0 + item.t1);
         if (length > m_lambda + 1e-9) {
             // A joined interval continues narrowed by α at each end, until it is shorter than a piece.
             const double lo = item.t0 + a, hi = item.t1 - a;
@@ -613,30 +620,55 @@ private:
                     add_strand(below, Strand{ item.plane, lo, hi, StrandKind::Column, item.gap });
                     return;
                 }
+                // The narrowed interval does not fit inside the boundary: covers along the item, or the places are recorded.
+                const double c = crossing_reach(m_vertex_margin);
+                bool all = true;
+                for (double t = item.t0 + c; ; t += 2. * c) {
+                    const double point = std::min(t, item.t1 - c);
+                    if (!cover(item, point, m))
+                        all = false;
+                    if (point >= item.t1 - c - 1e-9)
+                        break;
+                }
+                if (!all)
+                    record_unheld(m, item.plane, y, "no room for the joined interval");
+                return;
             }
         }
-        const double y = 0.5 * (item.t0 + item.t1);
         // A single piece at y′ holds [y′ − λ/2 − α, y′ + λ/2 + α]: for an item of this length it may shift from the centre by at most
         // λ/2 + α − length/2 (zero slack when the item is as long as a piece plus two reaches).
         const double slack = std::max(0., half + a - 0.5 * length);
-        // Merge: a planned interval of the plane at m − 1 within λ joins the column.
+        // Merge: a planned interval of the plane at m − 1 within λ joins the column. The interval holds what it reaches; only the
+        // part of the piece's footprint it does not cover is added, as a piece of its own, and the column goes on from there.
         {
             const LayerPrint &lp = print_set(below);
             auto it = lp.strands_by_plane.find(item.plane);
             if (it != lp.strands_by_plane.end())
                 for (const Interval &i : it->second)
                     if (i.first <= y + m_lambda && i.second >= y - m_lambda) {
-                        const double lo = std::min(i.first, y - half + a), hi = std::max(i.second, y + half - a);
-                        if (inside_boundary_interval(item.plane, lo, hi, below)) {
-                            add_strand(below, Strand{ item.plane, lo, hi, StrandKind::Column, item.gap });
-                            return;
+                        const double need_lo = y - half + a, need_hi = y + half - a;    // what must print below to hold the piece
+                        Intervals uncovered = complement(Intervals{ i }, need_lo, need_hi);
+                        bool placed = true;
+                        for (const Interval &u : uncovered) {
+                            // A piece of λ at the uncovered part, abutting the interval, inside the boundary.
+                            double lo = u.first <= need_lo + 1e-9 ? u.second - m_lambda : u.first;
+                            double hi = lo + m_lambda;
+                            if (inside_boundary_interval(item.plane, lo, hi, below))
+                                add_strand(below, Strand{ item.plane, lo, hi, StrandKind::Column, item.gap });
+                            else
+                                placed = false;
                         }
+                        if (placed)
+                            return;
                     }
         }
-        // Continue: a new piece within α along the trace, steered toward the quickest landing.
-        const int direction = steering(item.plane, y, m);
+        // Continue: a new piece within α along the trace, steered onto the quickest landing. A piece lands only when a crossing
+        // covers it whole (c exceeds λ/2 by a few hundredths), so the next piece is aimed exactly at where the crossing will be
+        // one layer further down, as far as α allows; a fixed menu of shifts missed that window and the columns never landed.
+        const double target = steering_target(item.plane, y, m);
         const double step = std::min(a, slack);
-        const double preferences[5] = { double(direction) * step, double(direction) * 0.5 * step, 0., -double(direction) * 0.5 * step, -double(direction) * step };
+        const double move = std::max(-step, std::min(step, target - y));
+        const double preferences[5] = { move, 0.5 * move, 0., -0.5 * move, -move };
         for (const double shift : preferences) {
             const double candidate = y + shift;
             if (admissible(item.plane, candidate, below, half)) {
@@ -671,38 +703,43 @@ private:
         return inside_boundary(K, 0.5 * (lo + hi), l, 0.5 * (hi - lo));
     }
 
-    // The direction (−1, 0, +1 along the trace) of the landing that the fewest layers reach: an approaching crossing with a bulk
-    // line of another family that prints there, the nearest material along the trace within 20 mm, or the bed.
-    int steering(const PlaneKey &K, double y, size_t m)
+    // The centre of the next piece (at m − 1) that lands soonest: on a crossing with a bulk line of another family where that
+    // crossing will be at m − 2 (so that the piece lies whole within the crossing's reach c there), inside the material reach along
+    // the trace within 20 mm, or the current centre when nothing is in sight. The caller moves toward it by at most α a layer.
+    double steering_target(const PlaneKey &K, double y, size_t m)
     {
         const size_t below = m - 1;
         const double a = alpha(m), h = m_plan.layer_height(m);
         const LayerPrint &lp = print_set(below);
-        const Trace tk = trace(m_lattice, K, lp.z);
-        double best_k = double(m);     // the bed
-        int best_dir = 0;
+        // The piece we place lies on layer m − 1 and is held by the print set of m − 2: its crossings are those of K's trace at
+        // m − 1 with the bulk traces at m − 2 (as rule (ii) measures them for a piece and the layer below it).
+        const double z_k = lp.z, z_j = below >= 1 ? m_plan.print_z(below - 1) : lp.z - h;
+        const Trace tk = trace(m_lattice, K, z_k);
+        double best_k = double(m);     // layers to the bed
+        double target = y;
         for (int j = 0; j < 3; ++j) {
             if (j == K.family)
                 continue;
-            const PlaneKey j0{ j, 0, 0 }, j1{ j, 0, 1 };
-            const auto c0 = crossing(m_lattice, K, j0, lp.z), c1 = crossing(m_lattice, K, j1, lp.z);
-            if (!c0 || !c1 || std::abs(c1->t - c0->t) < 1e-9)
+            const Trace tj0 = trace(m_lattice, PlaneKey{ j, 0, 0 }, z_j), tj1 = trace(m_lattice, PlaneKey{ j, 0, 1 }, z_j);
+            const auto c0 = cross_parameter(tk, tj0), c1 = cross_parameter(tk, tj1);
+            if (!c0 || !c1 || std::abs(*c1 - *c0) < 1e-9)
                 continue;
-            const double step = c1->t - c0->t;
-            const double v = -c0->dt_dz * h;        // the crossing's drift per layer going down
+            const double step = *c1 - *c0;
+            // The crossings' drift per layer going down, for the count of layers to the landing.
+            const auto drift = crossing(m_lattice, K, PlaneKey{ j, 0, 0 }, z_k);
+            const double v = drift ? -drift->dt_dz * h : 0.;
             for (int side = -1; side <= 1; side += 2) {
-                // The nearest crossing on each side.
-                const double q = side > 0 ? std::ceil((y - c0->t) / step) : std::floor((y - c0->t) / step);
-                const double tc = c0->t + q * step;
+                const double q = side > 0 ? std::ceil((y - *c0) / step) : std::floor((y - *c0) / step);
+                const double tc = *c0 + q * step;
                 const double g = std::abs(tc - y);
                 const bool approaching = (tc - y) * v < 0.;
-                if (!approaching && std::abs(v) >= a)
-                    continue;
+                if (g > a && !approaching && std::abs(v) >= a)
+                    continue;    // it runs away faster than a column can follow
                 if (!lp.boundary->index.empty() && !lp.boundary->index.contains(m_lattice.scaled(tk.point(tc))))
                     continue;
-                const double closing = approaching ? std::abs(v) + a : a - std::abs(v);
-                const double k = std::max(1., std::ceil((g - (m_c - 0.5 * m_lambda)) / closing));
-                if (k < best_k) { best_k = k; best_dir = tc > y ? 1 : (tc < y ? -1 : 0); }
+                const double closing = approaching ? std::abs(v) + a : std::max(1e-6, a - std::abs(v));
+                const double k = g <= a ? 1. : 1. + std::ceil((g - a) / closing);
+                if (k < best_k) { best_k = k; target = tc; }
             }
         }
         if (!lp.material_reach->empty()) {
@@ -711,12 +748,13 @@ private:
                 const double lo = y - LOOK_ALONG + i.first * 2. * LOOK_ALONG, hi = y - LOOK_ALONG + i.second * 2. * LOOK_ALONG;
                 if (hi - lo < m_lambda)
                     continue;
-                const double g = lo > y ? lo - y : (hi < y ? y - hi : 0.);
-                const double k = std::max(1., std::ceil((g + 0.5 * m_lambda) / a));
-                if (k < best_k) { best_k = k; best_dir = lo > y ? 1 : (hi < y ? -1 : 0); }
+                const double inside = std::min(std::max(y, lo + 0.5 * m_lambda), hi - 0.5 * m_lambda);
+                const double g = std::abs(inside - y);
+                const double k = g <= a ? 1. : 1. + std::ceil((g - a) / a);
+                if (k < best_k) { best_k = k; target = inside; }
             }
         }
-        return best_dir;
+        return target;
     }
 
     GroupPlan                   &m_group;

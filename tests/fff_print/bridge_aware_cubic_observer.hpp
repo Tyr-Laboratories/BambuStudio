@@ -394,7 +394,8 @@ inline std::vector<Line> control_sparse_segments(const std::map<int, EmittedLaye
     return out;
 }
 
-// Whether a segment lies on one of the control's lines: collinear within 0.5° and 0.02 mm, overlapping it in projection.
+// Whether a segment lies on one of the control's lines: collinear within 0.5° and 0.02 mm. The extents are not compared: the two
+// slices' islands differ where the bridge generator took sparse area, and a piece on a bulk line's line lies on that printed line.
 inline bool on_control_line(const Point &pa, const Point &pb, const std::vector<Line> &control)
 {
     const Vec2d a = pa.cast<double>(), b = pb.cast<double>();
@@ -409,8 +410,7 @@ inline bool on_control_line(const Point &pa, const Point &pb, const std::vector<
         const Vec2d mid = 0.5 * (a + b);
         const double off = std::abs((mid.x() - seg.a.x()) * e.y() - (mid.y() - seg.a.y()) * e.x()) / el;
         if (off > scale_(.02)) continue;
-        const double t = (mid - seg.a.cast<double>()).dot(e) / (el * el);
-        if (t >= -0.05 && t <= 1.05) return true;
+        return true;
     }
     return false;
 }
@@ -462,7 +462,7 @@ struct K2Piece {
     double length = 0.;            // mm
     bool   at_end = false;
     size_t vertices = 0;           // of the path
-    double fused_at = 0.;          // mm: the distance from the free end to the nearest other path of its layer (−1 when none)
+    double fused_at = 0.;          // mm: the distance from the free end to the nearest bead it could be fused to (−999 when none)
     Polyline path;                 // the whole path, scaled
 };
 
@@ -540,11 +540,13 @@ inline bool boundary_join(const Polyline &piece, const std::vector<Line> &contro
     return true;
 }
 
-// `gap_b_at` gives G_b (mm) at a place on the bed (mm): the fixtures with two regions have two gaps.
+// `gap_b_at` gives G_b (mm) at a place on the bed (mm) and a height z (mm): the fixtures with two regions have two gaps. `infill_direction_deg` is the
+// region's infill direction: the three lattice directions are it and it + 60° and + 120°.
 inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control,
-                            const std::function<double(const Vec2d&)> &gap_b_at)
+                            const std::function<double(const Vec2d&, double)> &gap_b_at, double infill_direction_deg)
 {
     K2Measure result;
+    const std::vector<double> directions = { std::fmod(infill_direction_deg + 360., 180.), std::fmod(infill_direction_deg + 420., 180.), std::fmod(infill_direction_deg + 480., 180.) };
     const std::map<int, EmittedLayer> layers = emitted_layers(paths), control_layers = emitted_layers(control);
     for (auto it = layers.begin(); it != layers.end() && std::next(it) != layers.end(); ++it) {
         const EmittedLayer &lower = it->second, &upper = std::next(it)->second;
@@ -560,76 +562,119 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
             // Rule R holds a point whose centre lies within w/2 of any point of the lower centre line: the union over the centre
             // line's segments of each segment grown by the disc (round ends). Segment by segment, because Clipper's offset of a
             // whole polyline puts no cap where a path folds back on itself.
+            // A lower sparse segment off the lattice directions is a bead the pattern prints whole (a seam wall, a rail) or a
+            // connector's hook: material of its layer, which holds as the walls and solid fills do, by its footprint and the
+            // touching measure (rule iii), not by its centre line.
             for (const EmittedPath *path : lower_sparse)
                 for (size_t i = 1; i < path->path.points.size(); ++i)
-                    if (path->path.points[i - 1] != path->path.points[i])
-                        append(hold, offset(Polyline(path->path.points[i - 1], path->path.points[i]), float(scale_(.5 * w)), ClipperLib::jtRound, scale_(.001), ClipperLib::etOpenRound));
+                    if (path->path.points[i - 1] != path->path.points[i]) {
+                        const bool lattice = along_lattice(path->path.points[i - 1], path->path.points[i], directions);
+                        const double reach = lattice ? .5 * w : .5 * path->width + .5 * w + .01;
+                        append(hold, offset(Polyline(path->path.points[i - 1], path->path.points[i]), float(scale_(reach)), ClipperLib::jtRound, scale_(.001), ClipperLib::etOpenRound));
+                    }
             append(hold, to_polygons(offset_ex(footprint(lower_other), float(scale_(.5 * w + .01)), ClipperLib::jtRound, scale_(.001))));
             return holds.emplace(w, union_ex(hold)).first->second;
         };
         const std::vector<Line> control_segments = control_sparse_segments(control_layers, std::next(it)->first);
-        const std::vector<double> directions = lattice_directions(control_segments);
         // An end whose bead overlaps another bead of its own layer (an anchor along a perimeter or along the line it meets) is
         // fused to it, not hanging: the beads' centre lines are within half their widths and the touching measure.
         // The distance from the end's centre to the nearest other bead's edge on this layer (negative when the end lies inside
         // that bead), or nothing when no other path comes within 2 mm.
-        // Any bead of the layer counts, another part of the same chain included (the connector joins lines along the boundary into
-        // one path), but not the segments at the end itself.
-        const auto nearest_other = [&upper](const EmittedPath &own, const Point &end) -> std::optional<double> {
+        // Rule (iv) on the export: a vertex of a path is fused to another bead of its layer when it lies on that bead's centre line
+        // (within half the bead's width and the touching measure), in the interior of the bead's path (at least that far from its
+        // ends: a bead ending beside another does not hold it), the path's own geometry within one bead of arc length not counting
+        // (another part of the same chain does: the connector joins lines along the boundary into one path). Returns the distance
+        // from the vertex to the nearest such centre line, or nothing.
+        const auto arc_positions = [](const Polyline &path) {
+            std::vector<double> arc(path.points.size(), 0.);
+            for (size_t i = 1; i < path.points.size(); ++i) arc[i] = arc[i - 1] + unscale<double>((path.points[i] - path.points[i - 1]).cast<double>().norm());
+            return arc;
+        };
+        const auto fused_at = [&upper, &arc_positions](const EmittedPath &own, size_t vertex) -> std::optional<double> {
+            const Point &v = own.path.points[vertex];
+            const std::vector<double> own_arc = arc_positions(own.path);
             std::optional<double> best;
             for (const EmittedPath *other : upper) {
-                if (!get_extents(other->path).inflated(coord_t(scale_(2.))).contains(end)) continue;
+                if (!get_extents(other->path).inflated(coord_t(scale_(2.))).contains(v)) continue;
+                const double reach = .5 * other->width + .01;
+                const std::vector<double> arc = other == &own ? own_arc : arc_positions(other->path);
                 for (size_t i = 1; i < other->path.points.size(); ++i) {
-                    if (other == &own && (other->path.points[i - 1] == end || other->path.points[i] == end)) continue;
-                    const double d = unscale<double>(Line(other->path.points[i - 1], other->path.points[i]).distance_to(end)) - .5 * other->width;
+                    if (other == &own && std::min(std::abs(own_arc[i - 1] - own_arc[vertex]), std::abs(own_arc[i] - own_arc[vertex])) <= own.width + .01)
+                        continue;    // the path's own geometry within a bead of the vertex
+                    const Line seg(other->path.points[i - 1], other->path.points[i]);
+                    const double d = unscale<double>(seg.distance_to(v));
+                    if (d > reach) continue;
+                    // The foot's position along the met path: in the interior, a bead's half width from the ends.
+                    const Vec2d a = seg.a.cast<double>(), dvec = (seg.b - seg.a).cast<double>();
+                    const double l2 = dvec.squaredNorm();
+                    const double t = l2 > 0. ? std::min(1., std::max(0., (v.cast<double>() - a).dot(dvec) / l2)) : 0.;
+                    const double foot = arc[i - 1] + t * (arc[i] - arc[i - 1]);
+                    if (foot < reach || arc.back() - foot < reach) continue;
                     if (!best || d < *best) best = d;
                 }
             }
             return best;
         };
-        const auto fused = [&nearest_other](const EmittedPath &own, const Point &end) {
-            const std::optional<double> d = nearest_other(own, end);
-            return d && *d <= .5 * own.width + .01;
-        };
+        const auto fused = [&fused_at](const EmittedPath &own, size_t vertex) { return fused_at(own, vertex).has_value(); };
         for (const EmittedPath *path : sparse) {
             const ExPolygons &hold = hold_of(path->width);
             // A vertex of the path that lies on another bead of the layer is a junction where the pattern's line ended and its nub
             // along the met line begins (or where the connector joined two lines): the line landed on existing material there, so
             // the path is measured in the parts between such vertices, each part's end at a junction being fused, not free.
-            Polylines parts;
+            // A vertex where a lattice line turns into a connector hook along the island boundary (off the lattice directions, on
+            // the line of a control segment: Cubic's lines hook along the same boundary) is a junction too: the hook is measured
+            // as a connection piece of its own and the line's end at the junction is not free (Cubic's boundary behaviour, accepted
+            // by the user on 9 November 2026).
+            const auto is_hook = [&](const Point &a, const Point &b) { return !along_lattice(a, b, directions) && on_control_line(a, b, control_segments); };
+            const auto hook_junction = [&](const EmittedPath &own, size_t i) {
+                if (i == 0 || i + 1 >= own.path.points.size()) return false;
+                return is_hook(own.path.points[i - 1], own.path.points[i]) != is_hook(own.path.points[i], own.path.points[i + 1]);
+            };
+            std::vector<bool> fused_vertex(path->path.points.size(), false);
+            for (size_t i = 0; i < path->path.points.size(); ++i) fused_vertex[i] = fused(*path, i) || hook_junction(*path, i);
+            struct Part { Polyline line; bool start_fused, end_fused; };
+            std::vector<Part> parts;
             {
-                Polyline part;
+                Part part{ Polyline(), fused_vertex.front(), false };
                 for (size_t i = 0; i < path->path.points.size(); ++i) {
                     const Point &v = path->path.points[i];
-                    part.points.push_back(v);
-                    if (i > 0 && i + 1 < path->path.points.size() && fused(*path, v)) {
+                    part.line.points.push_back(v);
+                    if (i > 0 && i + 1 < path->path.points.size() && fused_vertex[i]) {
+                        part.end_fused = true;
                         parts.push_back(part);
-                        part = Polyline();
-                        part.points.push_back(v);
+                        part = Part{ Polyline(), true, false };
+                        part.line.points.push_back(v);
                     }
                 }
-                if (part.points.size() >= 2) parts.push_back(part);
+                part.end_fused = fused_vertex.back();
+                if (part.line.points.size() >= 2) parts.push_back(part);
             }
-            for (const Polyline &part : parts)
-            for (const Polyline &piece : diff_pl(Polylines{part}, hold)) {
+            for (const Part &part : parts)
+            for (const Polyline &piece : diff_pl(Polylines{part.line}, hold)) {
                 if (piece.length() < scale_(1e-4) || on_control_lines(piece, control_segments) || boundary_join(piece, control_segments, directions)) continue;
                 ++result.added_pieces;
-                const bool touches_start = piece.first_point() == part.first_point() || piece.last_point() == part.first_point();
-                const bool touches_end   = piece.first_point() == part.last_point() || piece.last_point() == part.last_point();
-                const bool at_end = (touches_start && !fused(*path, part.first_point())) || (touches_end && !fused(*path, part.last_point()));
+                const bool touches_start = piece.first_point() == part.line.first_point() || piece.last_point() == part.line.first_point();
+                const bool touches_end   = piece.first_point() == part.line.last_point() || piece.last_point() == part.line.last_point();
+                std::optional<Point> free_end;
+                if (touches_start && !part.start_fused) free_end = part.line.first_point();
+                else if (touches_end && !part.end_fused) free_end = part.line.last_point();
+                const bool at_end = free_end.has_value();
                 const double length = unscale<double>(piece.length());
-                const double gap_b = gap_b_at(unscale(piece.first_point()));
+                const double gap_b = gap_b_at(unscale(piece.first_point()), path->z);
                 const bool failing = at_end || length > gap_b;
                 if (at_end) {
                     ++result.free_ends;
-                    result.where.push_back(unscale(piece.first_point()));
+                    result.where.push_back(unscale(*free_end));
                 } else if (length > gap_b) {
                     ++result.long_stretches;
-                    result.where.push_back(unscale(piece.first_point()));
+                    result.where.push_back(unscale(piece.points[piece.points.size() / 2]));
                 }
                 if (failing && result.pieces.size() < 400) {
-                    const Point &end = touches_start ? part.first_point() : part.last_point();
-                    const std::optional<double> near = at_end ? nearest_other(*path, end) : std::nullopt;
+                    std::optional<double> near;
+                    if (at_end) {
+                        const size_t vertex = size_t(std::find(path->path.points.begin(), path->path.points.end(), *free_end) - path->path.points.begin());
+                        if (vertex < path->path.points.size()) near = fused_at(*path, vertex);
+                    }
                     result.pieces.push_back({ path->z, unscale(piece.first_point()), unscale(piece.last_point()), unscale(path->path.first_point()), unscale(path->path.last_point()), length, at_end,
                                               path->path.points.size(), near ? *near : -999., path->path });
                 }
@@ -640,9 +685,9 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
     return result;
 }
 
-inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control, double gap_b)
+inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control, double gap_b, double infill_direction_deg)
 {
-    return measure_k2(paths, control, [gap_b](const Vec2d &) { return gap_b; });
+    return measure_k2(paths, control, [gap_b](const Vec2d &, double) { return gap_b; }, infill_direction_deg);
 }
 
 } // namespace BACObserver
