@@ -3,13 +3,9 @@
 #include "bridge_aware_cubic_fixtures.hpp"
 
 #include "libslic3r/BridgeAwareCubicMaterial.hpp"
-#include "libslic3r/BridgeAwareCubicVerify.hpp"
-#include "libslic3r/Fill/BridgeAwareCubicPlan.hpp"
-#include "libslic3r/PrintBase.hpp"
 
 #include <algorithm>
 #include <random>
-#include <set>
 
 using namespace Slic3r;
 using namespace Slic3r::BridgeAwareCubic;
@@ -29,26 +25,6 @@ Model narrow_strip_block()
     modifier->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(100.));
     modifier->config.set_key_value("sparse_infill_pattern", new ConfigOptionEnum<InfillPattern>(ipRectilinear));
     return model;
-}
-
-// A prism whose cross-section is the trapezoid with the base [0, width] at z = 0 and the top [top_from, width] at z = height,
-// extruded over `length` in y: one side vertical, the other a slope that steps in by height / (top_from) per unit of height.
-Model sloped_block(double width, double length, double height, double top_from)
-{
-    indexed_triangle_set its;
-    its.vertices = {
-        { 0.f, 0.f, 0.f }, { float(width), 0.f, 0.f }, { float(width), float(length), 0.f }, { 0.f, float(length), 0.f },
-        { float(top_from), 0.f, float(height) }, { float(width), 0.f, float(height) }, { float(width), float(length), float(height) }, { float(top_from), float(length), float(height) }
-    };
-    its.indices = {
-        { 0, 2, 1 }, { 0, 3, 2 },   // bottom
-        { 4, 5, 6 }, { 4, 6, 7 },   // top
-        { 0, 1, 5 }, { 0, 5, 4 },   // front (y = 0)
-        { 1, 2, 6 }, { 1, 6, 5 },   // right (x = width), vertical
-        { 2, 3, 7 }, { 2, 7, 6 },   // back (y = length)
-        { 3, 0, 4 }, { 3, 4, 7 }    // left: the slope
-    };
-    return single_part("Bridge aware cubic sloped block", TriangleMesh(its));
 }
 
 // The regions that print the pattern, one group each (enough for the material of one object).
@@ -79,36 +55,12 @@ bool is_sparse(const LayerRegion &region, const Surface &surface)
     return surface.surface_type == stInternal && density > 0. && density < 100.;
 }
 
-// The lowest layer whose non-sparse fill lies over sparse fill of the layer below, from the final surfaces alone. Surfaces are
-// shrunk by 0.3 mm so that the one-spacing ensuring strips of the bridge generator do not count as roofs.
-size_t first_roof_layer(const PrintObject &object)
-{
-    const auto &layers = object.layers();
-    for (size_t n = 1; n < layers.size(); ++n) {
-        const ExPolygons sparse_below = surfaces_of(*layers[n - 1], is_sparse);
-        if (sparse_below.empty()) continue;
-        const ExPolygons roof = surfaces_of(*layers[n], [](const LayerRegion &region, const Surface &surface) { return !is_sparse(region, surface) && surface.surface_type != stInternalVoid; });
-        if (!intersection_ex(offset_ex(roof, -scale_(0.3)), sparse_below).empty())
-            return n;
-    }
-    return size_t(-1);
-}
-
-std::set<size_t> plane_layers_of(const std::vector<PlaneSummary> &planes, size_t roof)
-{
-    std::set<size_t> out;
-    for (const PlaneSummary &plane : planes)
-        if (plane.roof_layer == roof)
-            out.insert(plane.plane_layer);
-    return out;
-}
-
 } // namespace
 
 // M1: printed material, the rule applied to a sliced part's surfaces. A solid strip narrower than 1.1 spacings may print (roof
-// side) but surely does not (support side); the wall band is material on both sides; the void meets the sparse surfaces; a seam
-// wall separates two groups' voids; the fill boundary is FillCubic's inset, less the courses' beads kept at w/2 − 0.05 from their
-// centre lines; the area index agrees with the polygons.
+// side) but surely does not (support side); the wall band is material on both sides; the void meets the sparse surfaces; the fill
+// boundary is FillCubic's inset, less the courses' beads kept at w/2 − 0.05 from their centre lines; the area index agrees with
+// the polygons. (W1 reads the seam wall that separates two groups' voids on the export.)
 TEST_CASE("Bridge aware cubic material has one definition with two sides", "[BridgeAwareCubic][M1]")
 {
     SECTION("a narrow solid strip is a roof above and void below") {
@@ -132,39 +84,6 @@ TEST_CASE("Bridge aware cubic material has one definition with two sides", "[Bri
         CHECK(diff_ex(offset_ex(sparse, -scale_(0.001)), material.void_area).empty());
         REQUIRE(material.void_of_group.size() == 1);
         CHECK_FALSE(material.void_of_group.front().empty());
-    }
-
-    SECTION("a seam wall separates the voids of two groups, which meet without it") {
-        Print print;
-        Model model = modifier();
-        slice(print, model, modifier_config("bridgeawarecubic"));
-        const PrintObject &object = *print.get_object(size_t(0));
-        const std::vector<std::vector<size_t>> groups = pattern_groups(object);
-        REQUIRE(groups.size() == 2);
-        size_t layers_with_both = 0;
-        for (const Layer *layer : object.layers()) {
-            LayerMaterial material = printed_material(*layer, groups);
-            REQUIRE(material.void_of_group.size() == 2);
-            if (material.void_of_group[0].empty() || material.void_of_group[1].empty())
-                continue;
-            INFO("layer at z = " << layer->print_z);
-            CHECK_FALSE(intersection_ex(material.void_of_group[0], material.void_of_group[1]).empty());
-            // A bead of the lower-index region along the seam, half a bead less the overlap inside its surface (3.5a).
-            const auto sparse_of = [layer](size_t region_id) {
-                return get_extents(surfaces_of(*layer, [layer, region_id](const LayerRegion &region, const Surface &surface) {
-                    return &region == layer->regions()[region_id] && is_sparse(region, surface); }));
-            };
-            const BoundingBox lower = sparse_of(groups[0].front()), higher = sparse_of(groups[1].front());
-            const double w = layer->regions()[groups[0].front()]->flow(frInfill).width();
-            const coord_t inset = coord_t(scale_(0.5 * w - 0.05));
-            const coord_t x = lower.max.x() <= higher.min.x() + SCALED_EPSILON ? lower.max.x() - inset : lower.min.x() + inset;
-            const BoundingBox outline = get_extents(layer->lslices);
-            add_courses(material, { Polyline(Point(x, outline.min.y() - coord_t(scale_(1.))), Point(x, outline.max.y() + coord_t(scale_(1.)))) },
-                        w, *layer, groups);
-            CHECK(intersection_ex(material.void_of_group[0], material.void_of_group[1]).empty());
-            ++layers_with_both;
-        }
-        CHECK(layers_with_both >= 80);
     }
 
     SECTION("the fill boundary is the island inset by half a spacing, less the courses' beads") {
@@ -200,146 +119,5 @@ TEST_CASE("Bridge aware cubic material has one definition with two sides", "[Bri
         CHECK(-2. + intervals[1].first * 24. == Approx(10. + keep).margin(1e-5));
         CHECK(-2. + intervals[1].second * 24. == Approx(20. - inset).margin(1e-5));
         CHECK(index.segment_inside(Point::new_scale(-5., 10.), Point::new_scale(-3., 10.)).empty());
-    }
-}
-
-// P1: demand. The cubes have planes only under the roof, on B + 1 layers below it; a vertical wall and a steep slope create none;
-// a step wider than half the nozzle does; a solid block has none and slices; planes stop at layer 0; a cancel propagates.
-TEST_CASE("Bridge aware cubic plans demand planes under roofs only", "[BridgeAwareCubic][P1]")
-{
-    SECTION("the small cube has planes under its roof on B + 1 layers") {
-        // The roof from the surfaces of the one-bridge-layer slice: with more internal bridge layers the stock step projects the
-        // bridge down as thick bases after the plan, which the final surfaces then show as roofs too.
-        size_t roof = size_t(-1);
-        for (const int bridge_layers : {1, 3}) {
-            CAPTURE(bridge_layers);
-            Print print;
-            Model model = small_cube();
-            slice(print, model, with(fixture_config(5., "bridgeawarecubic"), {{"internal_bridge_layers", std::to_string(bridge_layers)}}));
-            const PrintObject &object = *print.get_object(size_t(0));
-            REQUIRE(object.bridge_aware_cubic_plan() != nullptr);
-            const std::vector<PlaneSummary> planes = object.bridge_aware_cubic_plan()->planes();
-            REQUIRE_FALSE(planes.empty());
-            if (bridge_layers == 1)
-                roof = first_roof_layer(object);
-            REQUIRE(roof != size_t(-1));
-            for (const PlaneSummary &plane : planes) {
-                CHECK(plane.roof_layer == roof);
-                CHECK(plane.gap == 5.);
-                CHECK(plane.footprint_area_mm2 > 100.);
-            }
-            std::set<size_t> expected;
-            for (int j = 0; j <= bridge_layers; ++j)
-                expected.insert(roof - 1 - j);
-            CHECK(plane_layers_of(planes, roof) == expected);
-            CHECK(planes.size() == size_t(bridge_layers + 1));
-        }
-    }
-
-    SECTION("a vertical wall, a steep slope and a 45 degree slope create no plane") {
-        struct Case { const char *name; Model model; } cases[] = {
-            { "thin plate of walls only", single_part("Bridge aware cubic plate", TriangleMesh(its_make_cube(20., 1.6, 20.))) },
-            { "slope steeper than 45 degrees", sloped_block(20., 20., 20., 10.) },
-            { "slope of 45 degrees", sloped_block(20., 20., 10., 10.) },
-        };
-        for (Case &c : cases) {
-            INFO(c.name);
-            Print print;
-            slice(print, c.model, with(fixture_config(5., "bridgeawarecubic"), {{"top_shell_layers", "0"}, {"bottom_shell_layers", "0"}}));
-            const PrintObject &object = *print.get_object(size_t(0));
-            if (object.bridge_aware_cubic_plan() != nullptr)
-                CHECK(object.bridge_aware_cubic_plan()->planes().empty());
-        }
-    }
-
-    SECTION("a roof that ends over sparse fill creates planes at that height and at the top") {
-        Print print;
-        Model model = partial_roof();
-        slice(print, model, fixture_config(5., "bridgeawarecubic"));
-        const PrintObject &object = *print.get_object(size_t(0));
-        REQUIRE(object.bridge_aware_cubic_plan() != nullptr);
-        std::set<size_t> roofs;
-        for (const PlaneSummary &plane : object.bridge_aware_cubic_plan()->planes())
-            roofs.insert(plane.roof_layer);
-        REQUIRE(roofs.size() >= 2);
-        // The left half's roof lies at 10 mm (its first solid layer at 9.4 mm with three top layers), the top at 14 mm.
-        CHECK(std::any_of(roofs.begin(), roofs.end(), [&](size_t n) { return std::abs(object.layers()[n]->print_z - 9.6) < 0.3; }));
-        CHECK(std::any_of(roofs.begin(), roofs.end(), [&](size_t n) { return std::abs(object.layers()[n]->print_z - 13.6) < 0.3; }));
-    }
-
-    SECTION("a solid block has no plane and slices") {
-        Print print;
-        Model model = single_part("Bridge aware cubic solid block", TriangleMesh(its_make_cube(10., 10., 1.)));    // five layers: three bottom and three top shells cover them all
-        REQUIRE_NOTHROW(slice(print, model, fixture_config(5., "bridgeawarecubic")));
-        const PrintObject &object = *print.get_object(size_t(0));
-        if (object.bridge_aware_cubic_plan() != nullptr)
-            CHECK(object.bridge_aware_cubic_plan()->planes().empty());
-    }
-
-    SECTION("planes stop at the first layer") {
-        Print print;
-        Model model = single_part("Bridge aware cubic low roof", TriangleMesh(its_make_cube(20., 20., 1.2)));
-        slice(print, model, with(fixture_config(5., "bridgeawarecubic"), {{"bottom_shell_layers", "0"}, {"internal_bridge_layers", "3"}}));
-        const PrintObject &object = *print.get_object(size_t(0));
-        REQUIRE(object.bridge_aware_cubic_plan() != nullptr);
-        const std::vector<PlaneSummary> planes = object.bridge_aware_cubic_plan()->planes();
-        REQUIRE_FALSE(planes.empty());
-        size_t lowest = size_t(-1);
-        for (const PlaneSummary &plane : planes)
-            lowest = std::min(lowest, plane.plane_layer);
-        CHECK(lowest == 0);
-        CHECK(planes.size() < 4);
-    }
-
-    SECTION("a cancel while the plan builds propagates") {
-        Print print;
-        Model model = small_cube();
-        slice(print, model, fixture_config(5., "bridgeawarecubic"));
-        const PrintObject &object = *print.get_object(size_t(0));
-        size_t calls = 0;
-        REQUIRE_THROWS_AS(ObjectPlan::build(object, [&calls]() { if (++calls == 1) throw CanceledException(); }), CanceledException);
-        REQUIRE_NOTHROW(ObjectPlan::build(object, []() {}));
-    }
-}
-
-
-// V1: the development verifier measures K1 on the final paths. The small cube sliced as Cubic, measured with the planes its own
-// surfaces define, has a failing plane at gap 5 (its cell is 17.5 mm); the pattern's small cube passes on every plane, its plan has
-// nothing to warn about, and this build (the flag off) attaches no Bridge aware cubic warning to the slice.
-TEST_CASE("Bridge aware cubic verifier fails Cubic and passes the pattern", "[BridgeAwareCubic][V1]")
-{
-    using namespace Slic3r;
-    using namespace BACFixtures;
-    {
-        Print print;
-        Model model = small_cube();
-        slice(print, model, fixture_config(5., "cubic"));
-        const PrintObject &object = *print.get_object(size_t(0));
-        REQUIRE(object.bridge_aware_cubic_plan() == nullptr);
-        const auto plan = BridgeAwareCubic::ObjectPlan::build_for_verification(object, [] {});
-        REQUIRE_FALSE(plan->planes().empty());
-        const BridgeAwareCubic::VerificationReport report = BridgeAwareCubic::verify(object, *plan, [] {});
-        REQUIRE_FALSE(report.planes.empty());
-        CHECK_FALSE(report.passed());
-        CHECK(std::any_of(report.planes.begin(), report.planes.end(), [](const BridgeAwareCubic::PlaneReport &p) { return p.max_opening > 5.; }));
-    }
-    {
-        Print print;
-        Model model = small_cube();
-        slice(print, model, fixture_config(5., "bridgeawarecubic"));
-        const PrintObject &object = *print.get_object(size_t(0));
-        REQUIRE(object.bridge_aware_cubic_plan() != nullptr);
-        const BridgeAwareCubic::VerificationReport report = BridgeAwareCubic::verify(object, [] {});
-        REQUIRE(report.planes.size() >= 2);
-        for (const BridgeAwareCubic::PlaneReport &plane : report.planes) {
-            INFO("plane at " << plane.z << " mm: " << plane.failure);
-            CHECK(plane.passed);
-            CHECK(plane.max_opening <= 5.);
-            CHECK(plane.max_run <= 5.);
-            CHECK(plane.bridge_free_ends == 0);
-        }
-        CHECK(BridgeAwareCubic::plan_warnings(object).empty());
-        for (const auto &warning : object.step_state_with_warnings(posSimplifyInfill).warnings)
-            CHECK(warning.message.find("Bridge aware cubic") == std::string::npos);
     }
 }

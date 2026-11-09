@@ -229,15 +229,6 @@ inline std::vector<std::vector<FillPath>> fill_paths(const Slic3r::Print &print,
     return layers;
 }
 
-// The layers on which two prints of one object differ in the paths that fill_paths took of them.
-inline size_t different_layers(const std::vector<std::vector<FillPath>> &a, const std::vector<std::vector<FillPath>> &b)
-{
-    size_t different = std::max(a.size(), b.size()) - std::min(a.size(), b.size());
-    for (size_t i = 0; i < std::min(a.size(), b.size()); ++i)
-        different += a[i] != b[i];
-    return different;
-}
-
 // The segments a layer's fills deposit, each with its path's role, cross-section and region.
 struct FillSegment {
     Slic3r::ExtrusionRole role;
@@ -317,37 +308,6 @@ inline bool same_fill_paths(const std::vector<std::vector<FillPath>> &a, const s
             if (!covered_by(s, sa, tolerance)) { message = "layer " + std::to_string(i) + ": uncovered in the first print: " + describe(s); return false; }
     }
     return true;
-}
-
-// Applies the small cube to `print` with `pattern` and one setting changed, `key` = `value`, set on the cube or on a parameter
-// modifier of a second cube beside it ("the object", "a modifier of a second object"). Returns the index of the object that
-// holds the value, which is the one that a validation error names.
-inline size_t apply_with_setting(Slic3r::Print &print, Slic3r::Model &model, const char *pattern, const std::string &key,
-                                 const std::string &value, const std::string &holder)
-{
-    using namespace Slic3r;
-    DynamicPrintConfig config = fixture_config(5., pattern);
-    DynamicPrintConfig changed;
-    changed.set_deserialize_strict({{key, value}});
-    size_t holding = 0;
-    if (holder == "the object")
-        config.apply(changed);
-    else {
-        ModelObject *second = model.add_object(*model.objects.front());
-        second->name = "Bridge aware cubic second cube";
-        second->instances.front()->set_offset(Vec3d(140., 80., 0.));
-        ModelVolume *modifier = second->add_volume(TriangleMesh(its_make_cube(16., 28., 18.)));
-        modifier->set_type(ModelVolumeType::PARAMETER_MODIFIER);
-        modifier->config.apply(changed);
-        holding = 1;
-    }
-    print.set_status_silent();
-    for (ModelObject *object : model.objects)
-        print.auto_assign_extruders(object);
-    print.apply(model, config);
-    // The print holds a copy of the model, whose objects keep their ids.
-    REQUIRE(print.get_object(holding)->model_object()->id() == model.objects[holding]->id());
-    return holding;
 }
 
 // A temporary data and temporary directory for the tests that save presets, projects or G-code.

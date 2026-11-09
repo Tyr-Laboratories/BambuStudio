@@ -495,24 +495,12 @@ inline std::vector<EmittedPath> without_added_sparse(const std::vector<EmittedPa
 // An unheld piece at an end of its path is a free end unless that end is fused alongside another bead of its own layer (the
 // anchors of 9 November 2026: a nub along a perimeter or along the line the strand meets). An added piece off the hold set
 // must be a stretch of at most `gap_b` between held points and must not reach an end of its path.
-struct K2Piece {
-    double z = 0.;                 // mm
-    Vec2d  a, b;                   // the piece, mm on the bed
-    Vec2d  path_a, path_b;         // its path's ends
-    double length = 0.;            // mm
-    bool   at_end = false;
-    size_t vertices = 0;           // of the path
-    double fused_at = 0.;          // mm: the distance from the free end to the nearest bead it could be fused to (−999 when none)
-    Polyline path;                 // the whole path, scaled
-};
-
 struct K2Measure {
     size_t added_pieces = 0;   // unheld pieces of added lines
     size_t free_ends = 0;      // those that reach an end of their path
     size_t long_stretches = 0; // those longer than gap_b between held points
     double longest = 0.;
     std::vector<Vec2d> where;  // mm: free ends and long stretches
-    std::vector<K2Piece> pieces;   // the first failing pieces, for diagnosis
 };
 
 // Whether every segment of a polyline lies on a control line.
@@ -521,25 +509,6 @@ inline bool on_control_lines(const Polyline &piece, const std::vector<Line> &con
     for (size_t i = 1; i < piece.points.size(); ++i)
         if (!on_control_line(piece.points[i - 1], piece.points[i], control)) return false;
     return true;
-}
-
-// The three lattice directions of a control layer (degrees in [0, 180)): the directions carrying the most sparse length.
-inline std::vector<double> lattice_directions(const std::vector<Line> &control)
-{
-    std::map<int, double> weight;
-    for (const Line &seg : control) {
-        const double length = seg.length();
-        if (length < scale_(1.)) continue;
-        const int bucket = int(std::lround(std::fmod(std::atan2(double(seg.b.y() - seg.a.y()), double(seg.b.x() - seg.a.x())) * 180. / M_PI + 360., 180.)));
-        weight[bucket % 180] += length;
-    }
-    std::vector<std::pair<double, int>> ranked;
-    for (const auto &[bucket, w] : weight) ranked.emplace_back(w, bucket);
-    std::sort(ranked.rbegin(), ranked.rend());
-    std::vector<double> out;
-    for (const auto &[w, bucket] : ranked)
-        if (out.size() < 3) out.push_back(bucket);
-    return out;
 }
 
 // Whether a segment runs in one of the lattice directions (within 1.5°).
@@ -740,9 +709,6 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
                 ++result.added_pieces;
                 ++result.free_ends;
                 result.where.push_back(unscale(path->path.first_point()));
-                if (result.pieces.size() < 400)
-                    result.pieces.push_back({ path->z, unscale(path->path.first_point()), unscale(path->path.last_point()), unscale(path->path.first_point()), unscale(path->path.last_point()),
-                                              unscale<double>(path->path.length()), true, path->path.points.size(), -999., path->path });
                 result.longest = std::max(result.longest, unscale<double>(path->path.length()));
                 continue;
             }
@@ -780,22 +746,12 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
                 const bool at_end = free_end.has_value();
                 const double length = unscale<double>(piece.length());
                 const double gap_b = gap_b_at(unscale(piece.first_point()), path->z);
-                const bool failing = at_end || length > gap_b;
                 if (at_end) {
                     ++result.free_ends;
                     result.where.push_back(unscale(*free_end));
                 } else if (length > gap_b) {
                     ++result.long_stretches;
                     result.where.push_back(unscale(piece.points[piece.points.size() / 2]));
-                }
-                if (failing && result.pieces.size() < 400) {
-                    std::optional<double> near;
-                    if (at_end) {
-                        const size_t vertex = size_t(std::find(path->path.points.begin(), path->path.points.end(), *free_end) - path->path.points.begin());
-                        if (vertex < path->path.points.size()) near = fused_at(*path, vertex);
-                    }
-                    result.pieces.push_back({ path->z, unscale(piece.first_point()), unscale(piece.last_point()), unscale(path->path.first_point()), unscale(path->path.last_point()), length, at_end,
-                                              path->path.points.size(), near ? *near : -999., path->path });
                 }
                 result.longest = std::max(result.longest, length);
             }

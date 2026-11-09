@@ -3,11 +3,8 @@
 #include "bridge_aware_cubic_fixtures.hpp"
 #include "bridge_aware_cubic_observer.hpp"
 
-#include "libslic3r/Fill/BridgeAwareCubicPlan.hpp"
-#include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Preset.hpp"
-#include "libslic3r/PresetBundle.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -42,91 +39,6 @@ TEST_CASE("Bridge aware cubic option is a scalar region option with default 5 in
     check_gap(config, 3.75);
     CHECK(config.validate().count("sparse_infill_pattern") == 0);
     CHECK(config.validate().count(gap_key) == 0);
-}
-
-TEST_CASE("Bridge aware cubic option round-trips through a preset, a 3MF and a project", "[BridgeAwareCubic][S1]")
-{
-    Workspace workspace;
-    DynamicPrintConfig config = with(region_defaults(), {{"sparse_infill_pattern", "bridgeawarecubic"}, {gap_key, "4.5"}});
-
-    SECTION("a saved process preset reloads the pattern and the gap") {
-        Preset preset(Preset::TYPE_PRINT, "Bridge aware cubic test");
-        preset.file = (workspace.path / "process.json").string();
-        preset.config = config;
-        REQUIRE(preset.save(nullptr));
-        Preset reopened(Preset::TYPE_PRINT, preset.name);
-        reopened.file = preset.file;
-        reopened.reload(Preset(Preset::TYPE_PRINT, "Default"));
-        check_gap(reopened.config, 4.5);
-        CHECK(reopened.config.opt_serialize("sparse_infill_pattern") == "bridgeawarecubic");
-    }
-
-    SECTION("a 3MF keeps the object, part and modifier overrides") {
-        Model model;
-        ModelObject *object = model.add_object();
-        ModelVolume *part = object->add_volume(TriangleMesh(its_make_cube(10., 10., 10.)));
-        ModelVolume *modifier = object->add_volume(TriangleMesh(its_make_cube(4., 4., 4.)));
-        modifier->set_type(ModelVolumeType::PARAMETER_MODIFIER);
-        object->add_instance();
-        object->config.set_key_value(gap_key, new ConfigOptionFloat(3.));
-        part->config.set_key_value(gap_key, new ConfigOptionFloat(2.));
-        modifier->config.set_key_value(gap_key, new ConfigOptionFloat(1.25));
-
-        const std::string filename = (workspace.path / "bridge-aware-cubic.3mf").string();
-        StoreParams params;
-        params.path = filename.c_str();
-        params.model = &model;
-        params.config = &config;
-        REQUIRE(store_bbs_3mf(params));
-        Model reopened;
-        DynamicPrintConfig reopened_config;
-        ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Disable);
-        bool is_bambu = false;
-        Semver version;
-        PlateDataPtrs plates;
-        std::vector<Preset *> presets;
-        const bool loaded = load_bbs_3mf(filename.c_str(), &reopened_config, &substitutions, &reopened, &plates, &presets, &is_bambu,
-                                         &version, nullptr, LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
-        for (auto *plate : plates) delete plate;
-        for (auto *saved : presets) delete saved;
-        REQUIRE(loaded);
-        CHECK(reopened_config.opt_serialize("sparse_infill_pattern") == "bridgeawarecubic");
-        check_gap(reopened_config, 4.5);
-        REQUIRE(reopened.objects.size() == 1);
-        const ModelObject *reopened_object = reopened.objects.front();
-        REQUIRE(reopened_object->volumes.size() == 2);
-        check_gap(reopened_object->config.get(), 3.);
-        check_gap(reopened_object->volumes.front()->config.get(), 2.);
-        REQUIRE(reopened_object->volumes.back()->is_modifier());
-        check_gap(reopened_object->volumes.back()->config.get(), 1.25);
-    }
-
-    SECTION("a project's process settings restore the gap, and an older project without it gets the default") {
-        PresetBundle bundle;
-        const auto profiles = boost::filesystem::path(TEST_DATA_DIR).parent_path().parent_path() / "resources" / "profiles";
-        bundle.load_vendor_configs_from_json(profiles.string(), "BBL", PresetBundle::LoadSystem, ForwardCompatibilitySubstitutionRule::Disable);
-        bundle.prints.update_user_presets_directory(workspace.path.string(), "process");
-        const std::string name = "0.20mm Standard @BBL H2S";
-        const Preset *base = bundle.prints.find_preset(name, false);
-        REQUIRE(base != nullptr);
-        check_gap(base->config, 5.);
-        DynamicPrintConfig saved = base->config;
-        saved.set_deserialize_strict({{"inherits", name}, {"sparse_infill_pattern", "bridgeawarecubic"}, {gap_key, "3.25"}});
-        bool legacy = false;
-        SECTION("with the gap") {}
-        SECTION("without the gap") {
-            legacy = true;
-            saved.erase(gap_key);
-            saved.set_deserialize_strict({{"sparse_infill_pattern", "cubic"}});
-        }
-        const auto restored = bundle.prints.load_external_preset("bridge-aware-cubic-test.3mf", "Bridge aware cubic project",
-            "Custom H2S bridge aware process", saved, {"sparse_infill_pattern", gap_key}, PresetCollection::LoadAndSelect::Always, Semver());
-        REQUIRE(restored.first != nullptr);
-        const DynamicPrintConfig &restored_config = bundle.prints.get_edited_preset().config;
-        check_gap(restored_config, legacy ? 5. : 3.25);
-        CHECK(restored_config.opt_serialize("sparse_infill_pattern") == (legacy ? "cubic" : "bridgeawarecubic"));
-        check_gap(bundle.prints.find_preset(name, false)->config, 5.);
-    }
 }
 
 TEST_CASE("Bridge aware cubic gap change invalidates prepare infill and modifier_ignore_infill restores it", "[BridgeAwareCubic][S1]")
@@ -230,23 +142,8 @@ TEST_CASE("Bridge aware cubic prints as Cubic where no roof needs refinement", "
     CHECK(at_full("bridgeawarecubic") == at_full("cubic"));
 }
 
-// S6: setting invariance. Choosing the pattern changes no other setting: the region configs after processing equal Cubic's but
-// for the pattern and the gap; arc fitting still fits arcs; an explicit bridge angle reaches every internal bridge; solid fills
-// merge as Cubic's away from the plan's layers.
-// A 40 x 20 x 10 mm tunnel: two legs 10 mm wide and a 4 mm slab whose underside spans the 20 mm between them over air (an external
-// bridge).
-Model tunnel()
-{
-    TriangleMesh body(its_make_cube(10., 20., 6.));
-    TriangleMesh right(its_make_cube(10., 20., 6.));
-    right.translate(30., 0., 0.);
-    TriangleMesh slab(its_make_cube(40., 20., 4.));
-    slab.translate(0., 0., 6.);
-    body.merge(right);
-    body.merge(slab);
-    return single_part("Bridge aware cubic tunnel", std::move(body));
-}
-
+// S6: setting invariance. Choosing the pattern changes no other setting: the print, object and region configs after processing
+// equal Cubic's but for the pattern and the gap, and arc fitting still fits arcs.
 TEST_CASE("Bridge aware cubic changes no other setting of the part", "[BridgeAwareCubic][S6]")
 {
     SECTION("the print, object and region configs equal Cubic's but for the pattern and the gap") {
@@ -291,70 +188,6 @@ TEST_CASE("Bridge aware cubic changes no other setting of the part", "[BridgeAwa
         CHECK(extruding_arcs("cubic", true, "s6-arcs-cubic.gcode") > 0);
         CHECK(extruding_arcs("bridgeawarecubic", false, "s6-no-arcs.gcode") == 0);
     }
-    SECTION("an explicit bridge angle reaches the external bridges as with Cubic") {
-        // The stock pipeline reads `bridge_angle` for the bridges over air (and overhang walls); an internal bridge takes the angle
-        // the generator derives from the anchors below, which spec 1.2 lets follow the pattern's lines.
-        const auto angles = [](const char *pattern) {
-            Print print;
-            Model model = tunnel();
-            slice(print, model, with(fixture_config(5., pattern), {{"bridge_angle", "30"}}));
-            std::vector<double> out;
-            for (const Layer *layer : print.get_object(0)->layers())
-                for (const LayerRegion *region : layer->regions())
-                    for (const Surface &surface : region->fill_surfaces.surfaces)
-                        if (surface.surface_type == stBottomBridge)
-                            out.push_back(surface.bridge_angle);
-            return out;
-        };
-        for (const char *pattern : { "bridgeawarecubic", "cubic" }) {
-            INFO(pattern);
-            const std::vector<double> found = angles(pattern);
-            CHECK_FALSE(found.empty());
-            for (const double angle : found)
-                CHECK(angle == Approx(Geometry::deg2rad(30.)).margin(1e-6));
-        }
-    }
-    SECTION("solid fills as Cubic's away from the layers next to its internal bridges") {
-        // Next to an internal bridge the stock pipeline answers the pattern's lines (the generator anchors on them, 1.2); elsewhere
-        // the solid surfaces of every layer equal Cubic's, area within the outline's length times the resolution.
-        Print bac, cubic;
-        Model model_bac = small_cube(), model_cubic = small_cube();
-        const DynamicPrintConfig settings = fixture_config(5., "bridgeawarecubic");
-        slice(bac, model_bac, settings);
-        slice(cubic, model_cubic, fixture_config(5., "cubic"));
-        const PrintObject &a = *bac.get_object(0), &b = *cubic.get_object(0);
-        REQUIRE(a.layers().size() == b.layers().size());
-        const double resolution = settings.opt_float("resolution");
-        const auto solid = [](const Layer &layer, SurfaceType type) {
-            double area = 0., outline = 0.;
-            for (const LayerRegion *region : layer.regions())
-                for (const Surface &surface : region->fill_surfaces.surfaces)
-                    if (surface.surface_type == type) {
-                        area += surface.expolygon.area() * SCALING_FACTOR * SCALING_FACTOR;
-                        for (const Polygon &polygon : to_polygons(surface.expolygon))
-                            outline += unscale<double>(polygon.length());
-                    }
-            return std::make_pair(area, outline);
-        };
-        std::set<size_t> near_bridges;
-        for (size_t l = 0; l < b.layers().size(); ++l)
-            if (solid(*b.layers()[l], stInternalBridge).first > 0.)
-                for (size_t k = l > 0 ? l - 1 : 0; k <= l + 1; ++k)
-                    near_bridges.insert(k);
-        REQUIRE_FALSE(near_bridges.empty());
-        size_t compared = 0;
-        for (size_t l = 0; l < a.layers().size(); ++l) {
-            if (near_bridges.count(l))
-                continue;
-            for (const SurfaceType type : { stInternalSolid, stTop, stBottom }) {
-                const auto mine = solid(*a.layers()[l], type), theirs = solid(*b.layers()[l], type);
-                INFO("layer " << l << " type " << int(type));
-                CHECK(std::abs(mine.first - theirs.first) <= std::max(mine.second, theirs.second) * resolution);
-                compared += theirs.first > 0.;
-            }
-        }
-        CHECK(compared > 3);
-    }
 }
 
 // A block 40 x 40 x 20 mm with a pocket 5 mm deep in its roof, a triangle with corners of 45, 90 and 45 degrees: the floor of the
@@ -383,16 +216,21 @@ Model blind_cavity()
     return single_part("Bridge aware cubic blind cavity", std::move(block));
 }
 
-// S7: stress settings. The slice completes, every sparse line stays inside the area the stock pipeline gives the infill, and where
-// the contract applies K1 holds: at the nozzle-floor gap K1 is a recorded limitation (docs/bridge-aware-cubic.md), under
-// combination S3 measures it on the unfolded paths, and arc fitting is read by S6. The control, on every row where Cubic's cells
-// are wider than the gap: Cubic on the same part and settings opens wider than the gap somewhere.
+// S7: stress settings. The slice completes, every sparse line stays inside the area the stock pipeline gives the infill (the
+// measure's control: a bead one bead past the export's rightmost sparse vertex leaves it), and where the contract applies K1 holds:
+// at the nozzle-floor gap K1 and K2 are a recorded limitation (docs/bridge-aware-cubic.md), under combination S3 measures K1 on the
+// unfolded paths, and S6 reads arc fitting. The control of K1, on every row where Cubic's cells are wider than the gap: Cubic on
+// the same part and settings opens wider than the gap somewhere.
 TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[BridgeAwareCubic][S7]")
 {
     Workspace workspace;
     struct Stress { const char *name; std::initializer_list<std::pair<const std::string, std::string>> settings; double gap; bool k1, control; };
     const std::vector<Stress> stresses = {
         { "gap at the nozzle", {}, 0.4, false, false },
+        // The refinement saturates into solid columns, whose cells reach past the island at the walls: on the user's walls (one
+        // Arachne wall the infill overlaps by 75 %) a line run on past the island leaves the part.
+        { "gap at the nozzle, the user's walls at 3 %", {{"wall_loops", "1"}, {"wall_generator", "arachne"}, {"infill_wall_overlap", "75%"},
+                                                         {"sparse_infill_density", "3%"}}, 0.4, false, false },
         { "60 %", {{"sparse_infill_density", "60%"}}, 5., true, false },
         { "0.003 %", {{"sparse_infill_density", "0.003%"}}, 5., true, true },
         { "gap 1000", {}, 1000., true, false },
@@ -414,8 +252,20 @@ TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[Brid
             REQUIRE_NOTHROW(paths = exported_extrusions(print, workspace, part.model(), settings, "s7.gcode"));
             CHECK_FALSE(paths.empty());
             const std::optional<Vec2d> outside = sparse_outside_fill_area(print, paths);
-            INFO("a sparse vertex outside the fill area at " << (outside ? *outside : Vec2d::Zero()).transpose());
+            INFO("a sparse path leaves the fill area at " << (outside ? *outside : Vec2d::Zero()).transpose());
             CHECK_FALSE(outside.has_value());
+            // The measure's control: a bead from the rightmost sparse vertex one bead further out leaves the fill area.
+            const EmittedPath *rightmost = nullptr;
+            for (const EmittedPath &path : paths)
+                if (path.role == erInternalInfill && (rightmost == nullptr || get_extents(path.path).max.x() > get_extents(rightmost->path).max.x()))
+                    rightmost = &path;
+            if (rightmost != nullptr) {
+                const Point far = *std::max_element(rightmost->path.points.begin(), rightmost->path.points.end(), [](const Point &a, const Point &b) { return a.x() < b.x(); });
+                std::vector<EmittedPath> injected = paths;
+                injected.push_back(*rightmost);
+                injected.back().path = Polyline(far, far + Point(coord_t(scale_(rightmost->width)), 0));
+                CHECK(sparse_outside_fill_area(print, injected).has_value());
+            }
             if (!stress.k1)
                 continue;
             const std::vector<PlaneMeasure> planes = measure_planes(paths, 0.4, stress.gap);
@@ -447,13 +297,5 @@ TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[Brid
             CHECK(plane.widest_opening <= 5.);
             CHECK(plane.longest_run <= 5.);
         }
-    }
-    SECTION("arc fitting") {
-        Print print;
-        Model model = small_cube();
-        REQUIRE_NOTHROW(slice(print, model, with(fixture_config(5., "bridgeawarecubic"), {{"enable_arc_fitting", "1"}})));
-        std::string filename;
-        REQUIRE_NOTHROW(filename = print.export_gcode((workspace.path / "s7-arcs.gcode").string(), nullptr));
-        CHECK(boost::filesystem::file_size(filename) > 0);
     }
 }

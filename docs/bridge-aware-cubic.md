@@ -7,9 +7,10 @@ default 5 mm). It exists for single-wall parts at 3% infill whose first roof lay
 **Status (9 November 2026).** Rewritten from `master` against the
 [rewrite architecture](superpowers/specs/2026-11-08-bridge-aware-cubic-rewrite-design.md), which replaces the earlier
 constructive branch, following the [implementation plan](superpowers/plans/2026-11-08-bridge-aware-cubic-rewrite.md): every
-stage is built, the whole-branch review's fix round is in (501020f91), the tests pass and the release gate passes. Not met: the
-Heimdall gates of stages 5a and 6 (K2's free ends on plates 1-5, hanging bridge ends) and the size budgets; they are below, with
-the decisions they need from the user. The benchmark tooling (`scripts/bridge_aware_cubic_benchmark/`,
+stage is built, the whole-branch review's fix round is in (501020f91), the tests pass and the release gate passes, and the branch
+is merged into master (the user's decisions of 9 November 2026: the source and shared-file budgets raised, the test budget held
+and the test set reduced to meet it, the shared-code changes approved). Not met: the Heimdall gates of stages 5a and 6 (K2's free
+ends on plates 1-5, hanging bridge ends), below; the next work waits for the user's review of the app. The benchmark tooling (`scripts/bridge_aware_cubic_benchmark/`,
 [procedure](bridge-aware-cubic-benchmark.md)) and the acceptance scripts (`scripts/bridge_aware_cubic_acceptance/`, see its
 README) are in place.
 
@@ -28,14 +29,14 @@ README) are in place.
 | 8b | done (Task 18) | S7 (nine stress settings on the small cube, a pocket block and a blind cavity, variable layer height, arc fitting); the hidden X1 (timing, information only) and X2 (the benchmark's fixture projects, carried over unchanged) |
 | 8c | done (Task 19) | S2 at 1 %, with conformal infill, on a raft, in spiral vase mode and at 100 % with and without combination (fills equal Cubic's); the 100 % configuration check says of the pattern what it says of Cubic; S1 was complete |
 | 9 | done (Task 20) | the release gate passes (below) after a construction fix of the plan's cost |
-| 10 | review done, one fix round (below) | the whole-branch review (Opus): one construction defect fixed (a saturated cell's lines printed past the island), the shared-file change outside the hook list reverted, five test gaps closed |
+| 10 | review done, one fix round (below); merged | the whole-branch review (Opus): one construction defect fixed (a saturated cell's lines printed past the island, and a band's at N ≥ 2), the shared-file change outside the hook list reverted, five test gaps closed; then the test set reduced to 18 cases within the held test budget (architecture 7.2) |
 
 Known limitations (findings the construction does not yet meet, 9 November 2026; the local debug dump `[BACDebug]` measures them):
 
 - Thick bases (`internal_bridge_layers` 2 and 3, this fork's feature; the default and the user's parts use 1): the stock generator's first pass makes the one-bead vertical-shell strips along the walls into bridge surfaces, and `add_internal_bridge_layers` re-anchors them as bases on a preview of the layer below from which the big base has already taken the sparse area; they grow up to a cell over the coarse lattice beside the roof, and their ends hang. K1 fails on the partial roof's planes at 9.0 and 9.4 mm (openings of 5.1 and 12.6 mm) and R1's overgrowth measure reads 67 and 91 mm² against 0.05 allowed.
 - The rib (vertical-shell thickening off, a stress fixture): the plane under the rib's first layer reads an opening of 7.6 mm from the void band between the body's top fill, which stops half a spacing short of its surface's edge, and the one-bead solid ring the stock pipeline lays under the rib's walls; the plan counts the top surface as printing to its edge (3.3) and sees no void there. A limitation of the measure on this fixture.
-- K1n (the nozzle-floor gap, 0.4 mm at 3 %): the part slices, the solid columns print and their lines stay inside the infill
-  area, which is what its test checks; K1 and K2 do not hold. The plane below z 17.4 mm reads an opening of 0.49 mm against the
+- The nozzle-floor gap (0.4 mm at 3 %, once K1n, now rows of S7): the part slices, the solid columns print and their lines stay
+  inside the infill area, which is what the test checks; K1 and K2 do not hold. The plane below z 17.4 mm reads an opening of 0.49 mm against the
   0.4 mm gap, and K2 reports 592 free ends and 191 stretches longer than G_b (0.3 mm there; 594 and 191 before the columns' lines
   were clipped to the fill boundary). Before Task 10 they were placed at the columns' lowest layers, where nubs fold
   back at face junctions; printing a face shorter than a bead (lengthened to one) moved the counts from 599 and 221 only.
@@ -47,23 +48,23 @@ Known limitations (findings the construction does not yet meet, 9 November 2026;
   course that a narrow surface laid after the plan cuts in its middle runs on from both sides and joins across it; the filler's
   carry of a strand end to the boundary may cross another line on the way; a bulk line's run-on into a rail's zone is undone
   only near walls, so with no walls at a steep angle (about 70 degrees or more at 0.12 mm layers) an end could land half a
-  spacing past the island (S7's no-walls row stays inside); W1 no longer pins the seam wall's sealing of a 0 % neighbour at
-  convex corners, a property of the plan's material with no consequence found on the export.
+  spacing past the island (S7's no-walls row stays inside). The reduced test set no longer checks the rails' and seam walls'
+  presence layer by layer, a 0 % neighbour beside a seam, or the plan's plane list; K1, K2, R1's bridge measures and W1's gaps
+  judge what those mechanisms are for.
 - R1 does not try a roof the candidate test rejects (one the generator fills with solid infill); rails are checked where bridges exist.
 - At the fuselage top's apex the generator bridges one layer above the roof the candidate test predicted: rails lie at 23.8 and
   24.0 mm under predicted bridges at 24.0 and 24.2 mm, the generator prints solid at 24.2 and bridges at 24.4 mm, whose inner edges
   have no rail; no bridge end hangs and nothing overgrows. The cause: with thick bridges (the user's setting) `bridge_over_infill`
   narrows the candidates to the sparse area deep enough for a thick bridge, less what its own thick bridges on the layers within
   that height already took; the second part is the generator's own output, which the plan, made before the generator (user
-  decision), cannot read. R1 therefore checks the fuselage's rails per fixture, every other fixture's per bridge layer, and
-  scans the fixtures whose roofs end at the walls for rail-like beads on every layer.
+  decision), cannot read. R1 judges the rails by the bridges' growth and hanging ends, which hold there.
 - The stock generator grows a bridge along its direction until both ends reach an anchor. Where the pattern's refined lines lie
   close it bridges less than over Cubic's coarse lattice, but a single bridge line can run on across a sparse area to a distant
   anchor: on Heimdall plate 10 at z 186.4 one 38 mm line, which holds nothing up (the area above it is sparse too). The bridge
   check counts such lines among its free stretches.
 
-Release gate (`scripts/bridge_aware_cubic_benchmark/run_benchmark.py`, official 2.9.1.70 against this branch's app on X2's
-projects, slice instructions retired, a warm-up and five alternating pairs, 9 November 2026). The first complete run (app at
+Release gate (`scripts/bridge_aware_cubic_benchmark/run_benchmark.py`, official 2.9.1.70 against this branch's app on the
+benchmark generator's projects, slice instructions retired, a warm-up and five alternating pairs, 9 November 2026). The first complete run (app at
 5be6edb42) failed on the large cube; the sweep's boundary queries and a stock config copy per path were most of the cost, and
 ad1a10e16 cut them without changing a path. The config copy was a shared file outside the hook list (2.3, 10.5), so the final
 review reverted it, and the final app (501020f91) passes without it:
@@ -81,15 +82,15 @@ print config for every path) was worth about 0.19 of its ratio and is a candidat
 The gate needed one new reviewed exception: `flow_above_internal_bridges`, which the fork's master added after the baseline
 review, at exactly 100 % (neutral: `bridge_flow_mask` stays empty).
 
-Budgets of the architecture's 1.4 (9 November 2026, after the final review's fix round), all over but the case count; raising them
-is the user's decision (R8):
+Budgets of the architecture's 1.4 at the merge (9 November 2026). The user raised the source and shared-file limits to these sizes
+and held the test limit; the less important cases were deleted to meet it (architecture 7.2):
 
 | Quantity | Limit | Now |
 | --- | --- | --- |
-| Source lines in the pattern's units (`Fill/BridgeAwareCubic*`, `Fill/FillBridgeAwareCubic*`, `BridgeAwareCubicMaterial`, `BridgeAwareCubicVerify`) | 4,000 | 4,833 |
-| Test lines (the five test files, the fixtures and the observer) | 2,500 | 3,901 |
-| Test cases | 40 | 25 (23 run by `[BridgeAwareCubic]`, and the hidden X1 and X2) |
-| Lines added in shared files, hook 7's moved candidate test (about 65 lines) apart | 150 | about 180 (245 added and 76 removed in all; 113 of the added outside `PrintObject.cpp`, 21 of them build registration) |
+| Source lines in the pattern's units (`Fill/BridgeAwareCubic*`, `Fill/FillBridgeAwareCubic*`, `BridgeAwareCubicMaterial`, `BridgeAwareCubicVerify`) | 4,833 (raised from 4,000) | 4,833 |
+| Test lines (the five test files, the fixtures and the observer) | 2,500 | 2,425 |
+| Test cases | 40 | 18, all run by `[BridgeAwareCubic]` (the benchmark's project generator, once the hidden X2, builds as its own executable `bridge_aware_cubic_benchmark_fixtures`) |
+| Lines added in shared files, hook 7's moved candidate test (about 65 lines) apart | about 185 (raised from 150) | about 185 (250 added and 76 removed in all; 118 of the added outside `PrintObject.cpp`, 26 of them build registration) |
 
 Cubic baselines for the acceptance: the 16 Heimdall plates sliced with master's build (0568b9dad, master with the two hunks
 fixed that it needed to compile): 4,255.4 g, 312.7 h estimated (308.0 h of model print time plus the printer's preparation time on

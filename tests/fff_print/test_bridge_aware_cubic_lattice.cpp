@@ -4,13 +4,11 @@
 #include "libslic3r/Fill/FillRectilinear.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Geometry.hpp"
-#include "libslic3r/Geometry/ConvexHull.hpp"
 #include "libslic3r/Surface.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <random>
 #include <set>
 #include <vector>
 
@@ -61,45 +59,6 @@ int family_of(const Oracle &oracle, const Line &line)
         if (dot > best_dot) { best_dot = dot; best = k; }
     }
     return best;
-}
-
-// A convex polygon (mm) clipped by the half plane n · p ≤ c.
-std::vector<Vec2d> clip(const std::vector<Vec2d> &polygon, const Vec2d &n, double c)
-{
-    std::vector<Vec2d> out;
-    for (size_t i = 0; i < polygon.size(); ++i) {
-        const Vec2d &p = polygon[i], &q = polygon[(i + 1) % polygon.size()];
-        const double dp = n.dot(p) - c, dq = n.dot(q) - c;
-        if (dp <= 0.) out.push_back(p);
-        if ((dp <= 0.) != (dq <= 0.)) out.push_back(p + (dp / (dp - dq)) * (q - p));
-    }
-    return out;
-}
-
-// The section of a cell at height z by brute force: a large square clipped by the six half planes i_k a ≤ u_k ≤ (i_k + 1) a.
-std::vector<Vec2d> brute_section(const Oracle &oracle, const Cell &cell, double z)
-{
-    const double a = oracle.a / double(int64_t(1) << cell.depth);
-    std::vector<Vec2d> polygon = { Vec2d(-1000., -1000.), Vec2d(1000., -1000.), Vec2d(1000., 1000.), Vec2d(-1000., 1000.) };
-    for (int k = 0; k < 3; ++k) {
-        const Vec2d n = oracle.normal(k);
-        const double scale = std::sqrt(2. / 3.), shift = oracle.sigma[k] * z / std::sqrt(3.);
-        polygon = clip(polygon, n, ((cell.index[k] + 1) * a - shift) / scale);
-        if (polygon.empty()) break;
-        polygon = clip(polygon, -n, -(cell.index[k] * a - shift) / scale);
-        if (polygon.empty()) break;
-    }
-    return polygon;
-}
-
-double polygon_area(const std::vector<Vec2d> &polygon)
-{
-    double twice = 0.;
-    for (size_t i = 0; i < polygon.size(); ++i) {
-        const Vec2d &p = polygon[i], &q = polygon[(i + 1) % polygon.size()];
-        twice += p.x() * q.y() - q.x() * p.y();
-    }
-    return std::abs(0.5 * twice);
 }
 
 } // namespace
@@ -201,144 +160,5 @@ TEST_CASE("Bridge aware cubic bulk lines equal FillCubic's point for point", "[B
                         CHECK(std::abs(gap - std::round(gap / pitch_mm) * pitch_mm) <= 2. * SCALING_FACTOR + 60. * 1e-6);
                 }
             }
-    }
-}
-
-// L2: cell sections, height ranges, traces, crossings, roots and the plane through a point agree with brute force from
-// FillCubic's definitions; refinement plane keys never alias a bulk plane or a face of their cell.
-TEST_CASE("Bridge aware cubic lattice geometry agrees with brute force", "[BridgeAwareCubic][L2]")
-{
-    std::mt19937 rng(20261108);
-    std::uniform_int_distribution<int> depth_of(0, 4), index_of(-6, 6), family_of_(0, 2);
-    std::uniform_real_distribution<double> unit(0., 1.);
-    const BoundingBox bbox(Point::new_scale(-32., -28.), Point::new_scale(32., 28.));
-    const double w = 0.4, c = w / std::sqrt(3.), tau = (c - 0.5 * w) * std::sin(M_PI / 3.) / 4.;
-    for (const float density : {0.05f, 0.03f}) {
-        const LatticeParams lattice = LatticeParams::make(45., density, 0.357, w, 1, bbox);
-        const Oracle oracle(45., unscale<double>(lattice.pitch));
-        for (int trial = 0; trial < 200; ++trial) {
-            Cell cell{ { index_of(rng), index_of(rng), index_of(rng) }, depth_of(rng) };
-            CAPTURE(trial, cell.index[0], cell.index[1], cell.index[2], cell.depth);
-            // Height range: the extreme heights of the eight corners, from z = Σ σ_k u_k / √3.
-            const double a = oracle.a / double(int64_t(1) << cell.depth);
-            double z_min = std::numeric_limits<double>::max(), z_max = std::numeric_limits<double>::lowest();
-            for (int corner = 0; corner < 8; ++corner) {
-                double z = 0.;
-                for (int k = 0; k < 3; ++k) z += oracle.sigma[k] * (cell.index[k] + ((corner >> k) & 1)) * a / std::sqrt(3.);
-                z_min = std::min(z_min, z);
-                z_max = std::max(z_max, z);
-            }
-            const auto range = height_range(lattice, cell);
-            CHECK(range.first == Approx(z_min).margin(1e-9));
-            CHECK(range.second == Approx(z_max).margin(1e-9));
-
-            // Section: the half-plane clipping against the unit's polygon.
-            const double z = z_min + (0.05 + 0.9 * unit(rng)) * (z_max - z_min);
-            const std::vector<Vec2d> brute = brute_section(oracle, cell, z);
-            const Polygon sect = section(lattice, cell, z);
-            REQUIRE(brute.size() >= 3);
-            REQUIRE(sect.points.size() >= 3);
-            CHECK(std::abs(sect.area() * SCALING_FACTOR * SCALING_FACTOR - polygon_area(brute)) <= 2. * SCALING_FACTOR * unscale<double>(sect.length()) + 1e-12);
-            for (const Point &vertex : sect.points) {
-                const Vec2d v = (vertex - lattice.center).cast<double>() * SCALING_FACTOR;
-                double nearest = std::numeric_limits<double>::max();
-                for (const Vec2d &b : brute) nearest = std::min(nearest, (v - b).norm());
-                CHECK(nearest <= 2. * SCALING_FACTOR);
-            }
-            for (const Vec2d &b : brute) {
-                double nearest = std::numeric_limits<double>::max();
-                for (const Point &vertex : sect.points) nearest = std::min(nearest, (b - (vertex - lattice.center).cast<double>() * SCALING_FACTOR).norm());
-                CHECK(nearest <= 2. * SCALING_FACTOR);
-            }
-            CHECK(section(lattice, cell, z_max + 1.).points.empty());
-
-            // Traces: points of the trace lie on the plane, by the oracle's cube coordinate.
-            const int k = family_of_(rng);
-            const PlaneKey plane{ k, cell.depth + 1, 2 * cell.index[k] + 1 };
-            const Trace trace_k = trace(lattice, plane, z);
-            const double a_plane = oracle.a / double(int64_t(1) << plane.depth);
-            for (const double t : {-7., 0., 11.})
-                CHECK(oracle.u(k, trace_k.point(t), z) == Approx(plane.numerator * a_plane).margin(1e-9));
-
-            // Crossings against a plane of another family: the brute-force intersection of the two traces, and its drift.
-            const int j = (k + 1 + (trial % 2)) % 3;
-            const PlaneKey other{ j, cell.depth, cell.index[j] };
-            const auto cross = crossing(lattice, plane, other, z);
-            REQUIRE(cross.has_value());
-            const Vec2d at = trace_k.point(cross->t);
-            CHECK(oracle.u(j, at, z) == Approx(other.numerator * a).margin(1e-9));
-            const auto cross_up = crossing(lattice, plane, other, z + 1e-4);
-            REQUIRE(cross_up.has_value());
-            CHECK(cross->dt_dz == Approx((cross_up->t - cross->t) / 1e-4).margin(1e-6));
-            CHECK(std::abs(cross->dt_dz) == Approx(std::sqrt(1.5)).margin(1e-9));
-
-            // Children cover the parent.
-            double lo = std::numeric_limits<double>::max(), hi = std::numeric_limits<double>::lowest();
-            for (const Cell &child : children(cell)) {
-                const auto child_range = height_range(lattice, child);
-                lo = std::min(lo, child_range.first);
-                hi = std::max(hi, child_range.second);
-            }
-            CHECK(lo == Approx(range.first).margin(1e-9));
-            CHECK(hi == Approx(range.second).margin(1e-9));
-        }
-
-        // Refinement planes never alias: 1,000 random cells; the split planes are odd one level down and lie midway between the
-        // cell's faces, whose canonical keys compare by the plane they name.
-        for (int trial = 0; trial < 1000; ++trial) {
-            Cell cell{ { index_of(rng), index_of(rng), index_of(rng) }, depth_of(rng) };
-            const double a_child = oracle.a / double(int64_t(1) << (cell.depth + 1));
-            for (const PlaneKey &split : split_planes(cell)) {
-                CHECK(split.depth == cell.depth + 1);
-                CHECK(split.numerator % 2 != 0);
-                const double u_split = split.numerator * a_child;
-                for (const bool upper : {false, true}) {
-                    const PlaneKey f = face(cell, split.family, upper);
-                    CHECK((f.depth == 0 || f.numerator % 2 != 0));    // canonical: a face of a coarser plane carries that plane's key
-                    const double u_face = f.numerator * oracle.a / double(int64_t(1) << f.depth);
-                    CHECK(std::abs(u_face - u_split) == Approx(a_child).margin(1e-9));
-                }
-            }
-        }
-
-        // Roots: every cell that a point of the box at height z lies in is a root.
-        for (const double z : {0.2, 7.3, 17.8}) {
-            const std::vector<Cell> found = roots(lattice, bbox, z);
-            std::set<std::tuple<int64_t, int64_t, int64_t>> root_set;
-            for (const Cell &cell : found) root_set.emplace(cell.index[0], cell.index[1], cell.index[2]);
-            for (int ix = 0; ix <= 20; ++ix)
-                for (int iy = 0; iy <= 20; ++iy) {
-                    const Vec2d p(-32. + 64. * ix / 20., -28. + 56. * iy / 20.);
-                    std::tuple<int64_t, int64_t, int64_t> cell{ int64_t(std::floor(oracle.u(0, p, z) / oracle.a)), int64_t(std::floor(oracle.u(1, p, z) / oracle.a)), int64_t(std::floor(oracle.u(2, p, z) / oracle.a)) };
-                    CHECK(root_set.count(cell) == 1);
-                }
-        }
-
-        // The plane through a point: the coarsest refinement plane of the family within τ, never a bulk plane; nothing when a
-        // bulk plane is the one within τ.
-        for (int trial = 0; trial < 200; ++trial) {
-            const Vec2d point(-20. + 40. * unit(rng), -15. + 30. * unit(rng));
-            const double z = 18. * unit(rng);
-            const int k = family_of_(rng);
-            const double u = oracle.u(k, point, z);
-            const auto found = plane_through(lattice, k, point, z, tau);
-            // The nearest plane of each level, coarsest first: the first within τ decides.
-            std::optional<std::pair<int, int64_t>> expected;
-            for (int depth = 0; depth <= 40 && !expected; ++depth) {
-                const double a_level = oracle.a / double(int64_t(1) << depth);
-                const int64_t q = int64_t(std::llround(u / a_level));
-                if (std::sqrt(1.5) * std::abs(u - q * a_level) <= tau) expected = std::make_pair(depth, q);
-            }
-            REQUIRE(expected.has_value());
-            if (expected->first == 0) {
-                CHECK_FALSE(found.has_value());
-            } else {
-                REQUIRE(found.has_value());
-                CHECK(found->family == k);
-                CHECK(found->depth == expected->first);
-                CHECK(found->numerator == expected->second);
-                CHECK(found->numerator % 2 != 0);
-            }
-        }
     }
 }

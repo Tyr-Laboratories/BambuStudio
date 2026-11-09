@@ -47,17 +47,17 @@ The configuration exceptions are specific to the recorded baseline and guarded f
 
 ## Generate fresh timing inputs
 
-The existing hidden C++ test `BACBenchmarkFixtures` in [test_bridge_aware_cubic_export.cpp](../tests/fff_print/test_bridge_aware_cubic_export.cpp) is the input authority. It writes eight native 3MF projects, JSON and INI snapshots of their completed configuration, and a manifest. It does not slice. Each pair has identical model geometry, placement, and common global/local settings; Cubic omits the unsupported BAC gap setting. It also completes the CLI inheritance and filament metadata vectors.
+The hidden C++ case `BACBenchmarkFixtures` in [bridge_aware_cubic_benchmark_fixtures.cpp](../tests/fff_print/bridge_aware_cubic_benchmark_fixtures.cpp), built as its own executable `bridge_aware_cubic_benchmark_fixtures` outside the pattern's test suite, is the input authority. It writes eight native 3MF projects, JSON and INI snapshots of their completed configuration, and a manifest. It does not slice. Each pair has identical model geometry, placement, and common global/local settings; Cubic omits the unsupported BAC gap setting. It also completes the CLI inheritance and filament metadata vectors.
 
 All four families use empty machine start and end scripts. The generator sets them after loading the family defaults and checks both values after configuration resolution on each side. This prevents a default startup Z move from preceding the slicer's absolute-coordinate and millimeter declarations. Keep the G-code mode and moving-extrusion checks enabled.
 
-Generate into a new absolute directory using the test binary built from the source under evaluation. For example, from the repository root, with the test executable path adjusted to the actual build:
+Generate into a new absolute directory using the generator built from the source under evaluation. For example, from the repository root, with the test executable path adjusted to the actual build:
 
 ```sh
 benchmark_root="$(pwd)/build/bridge-aware-cubic-benchmark"
 mkdir -p "$benchmark_root"
 BAC_BENCHMARK_FIXTURE_DIR="$benchmark_root/projects" \
-  build/wall-painting/tests/fff_print/bridge_aware_cubic_tests \
+  build/wall-painting/tests/fff_print/bridge_aware_cubic_benchmark_fixtures \
   '[BACBenchmarkFixtures]'
 ```
 
