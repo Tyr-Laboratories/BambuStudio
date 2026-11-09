@@ -20,7 +20,8 @@ scripts (`scripts/bridge_aware_cubic_acceptance/`, see its README) are in place.
 | 5b-6c | done (01fe19e87, 64ace2a9a, 38c1ee3b2, 8a66896e7) | the pass (3.8), seam walls (W1, M1), rails (R1), K1 on roofs with edges over the void and on the modifier, K2 across the seam; columns land |
 | 5c | done (Task 10) | the family change of 3.7 step 6, after Heimdall run 2 measured +19.1 % time; K2 unchanged on the fixtures |
 | 7a | done, corrected after review | S3 (infill combination): the surfaces combine as Cubic's; outside the single-layer zones a combined island prints the plan's lattice at the combined thickness, inside them the plan's lines print at layer height on every layer of the group, resting on lines of their own planes; S3 reads only the surfaces and the export |
-| 7b-10 | in progress | |
+| 7b | done (Task 16) | S4: at N = 2 the bands equal Cubic's away from the roof, and K1 and K2 hold with bands; at N = 1 the four fixtures' G-code is byte-identical |
+| 8-10 | in progress | |
 
 Known limitations (findings the construction does not yet meet, 9 November 2026; the local debug dump `[BACDebug]` measures them):
 

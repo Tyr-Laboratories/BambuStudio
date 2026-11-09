@@ -182,6 +182,64 @@ private:
     // crossing lies up to τ / sin 60° away along the item.
     double cover_reach() const { return std::max(1e-6, crossing_reach(m_vertex_margin) - m_tau / SIN_60); }
 
+    // The stretch of the line a + t u (u a unit vector) inside the capsule of radius r about the segment b0 b1: the discs about its
+    // ends and the band along it, whose union is that one stretch (the capsule is convex).
+    static std::optional<Interval> capsule_stretch(const Vec2d &a, const Vec2d &u, const Vec2d &b0, const Vec2d &b1, double r)
+    {
+        std::optional<Interval> out;
+        const auto add = [&out](double lo, double hi) {
+            if (lo <= hi)
+                out = out ? Interval{ std::min(out->first, lo), std::max(out->second, hi) } : Interval{ lo, hi };
+        };
+        for (const Vec2d &b : { b0, b1 }) {
+            const double tb = u.dot(b - a), d2 = (b - (a + tb * u)).squaredNorm();
+            if (d2 <= r * r)
+                add(tb - std::sqrt(r * r - d2), tb + std::sqrt(r * r - d2));
+        }
+        const double length = (b1 - b0).norm();
+        if (length > 1e-12) {
+            const Vec2d along = (b1 - b0) / length, across(-along.y(), along.x());
+            double lo = -std::numeric_limits<double>::infinity(), hi = std::numeric_limits<double>::infinity();
+            // v(t) = v0 + v1 t kept within [v_lo, v_hi].
+            const auto keep = [&lo, &hi](double v0, double v1, double v_lo, double v_hi) {
+                if (std::abs(v1) < 1e-12) {
+                    if (v0 < v_lo || v0 > v_hi)
+                        hi = -std::numeric_limits<double>::infinity();
+                    return;
+                }
+                const double ta = (v_lo - v0) / v1, tb = (v_hi - v0) / v1;
+                lo = std::max(lo, std::min(ta, tb));
+                hi = std::min(hi, std::max(ta, tb));
+            };
+            keep(across.dot(a - b0), across.dot(u), -r, r);
+            keep(along.dot(a - b0), along.dot(u), 0., length);
+            add(lo, hi);
+        }
+        return out;
+    }
+
+    // Rule (ii) for a band crossing a finite piece of a band of family j (3.9b): held where each of its sub-lines lies within r of
+    // one of the piece's sub-lines. For whole lines this is the reach c_N; near a piece's end the sub-lines part ways, and the
+    // reach about the bands' centre lines would claim a sub-line the piece does not reach.
+    Intervals band_hold(const Trace &tk, int k, const Trace &tj, int j, const Interval &piece, double r) const
+    {
+        const std::vector<double> offsets = m_lattice.subline_offsets();
+        const Vec2d nk = m_lattice.normal(k), nj = m_lattice.normal(j);
+        Intervals all;
+        bool first = true;
+        for (const double oi : offsets) {
+            Intervals any;
+            for (const double oj : offsets)
+                if (const std::optional<Interval> in = capsule_stretch(tk.origin + oi * nk, tk.dir, tj.point(piece.first) + oj * nj, tj.point(piece.second) + oj * nj, r))
+                    any.push_back(*in);
+            all = first ? merged(std::move(any)) : intersected(all, merged(std::move(any)));
+            first = false;
+            if (all.empty())
+                break;
+        }
+        return all;
+    }
+
     const LayerPrint& print_set(size_t l)
     {
         LayerPrint &lp = m_layers[l];
@@ -295,6 +353,10 @@ private:
                 // A finite piece: beyond its ends the reach along K is set by the disc about the end, not by the line. On the side
                 // of K that runs toward an end e away, the reach is c when e ≥ c cos 60°, else e cos 60° + √(r² − e² sin² 60°).
                 const double r = 0.5 * m_w - m_vertex_margin;
+                if (m_lattice.multiline > 1) {
+                    append(out, band_hold(tk, K.family, tj, j, interval, r));
+                    continue;
+                }
                 const auto reach_toward = [&](double e) {
                     if (e >= cN * 0.5)
                         return cN;
@@ -307,11 +369,21 @@ private:
                 out.emplace_back(*tc - reach_toward(e_minus), *tc + reach_toward(e_plus));
             }
         }
-        // (iii) material within w/2.
+        // (iii) material within w/2: of every sub-line of the band (3.9b; one sub-line at N = 1).
         if (!lp.material_reach->empty() && t1 > t0) {
-            const Point pa = m_lattice.scaled(tk.point(t0)), pb = m_lattice.scaled(tk.point(t1));
-            for (const Interval &i : lp.material_reach->segment_inside(pa, pb))
-                out.emplace_back(t0 + i.first * (t1 - t0), t0 + i.second * (t1 - t0));
+            const Vec2d normal = m_lattice.normal(K.family);
+            Intervals material;
+            bool first = true;
+            for (const double o : m_lattice.subline_offsets()) {
+                const Point pa = m_lattice.scaled(tk.point(t0) + o * normal), pb = m_lattice.scaled(tk.point(t1) + o * normal);
+                Intervals one;
+                for (const Interval &i : lp.material_reach->segment_inside(pa, pb))
+                    one.emplace_back(t0 + i.first * (t1 - t0), t0 + i.second * (t1 - t0));
+                one = merged(one);
+                material = first ? one : intersected(material, one);
+                first = false;
+            }
+            append(out, material);
         }
         return merged(out);
     }

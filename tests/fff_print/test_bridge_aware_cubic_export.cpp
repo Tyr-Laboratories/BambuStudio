@@ -75,12 +75,12 @@ Model phased_cube(double shift_mm)
 // P2: siblings stay coarse. On the plane layer under the half-open partial roof, outside the roof's footprint grown by the gap,
 // the sparse lines equal Cubic's but for the lattice's extreme lines (within one line width of the island's extent across each
 // family).
-TEST_CASE("Bridge aware cubic leaves the lattice coarse away from the roof", "[BridgeAwareCubic][P2]")
+// P2's comparison: on the plane layer, outside the roof's footprint grown by the gap, the pattern's lattice segments equal Cubic's
+// within 0.001 mm one for one, and the pattern adds none there.
+void check_coarse_away_from_roof(Workspace &workspace, const DynamicPrintConfig &settings, const DynamicPrintConfig &control_settings, const std::string &tag)
 {
-    Workspace workspace;
-    const DynamicPrintConfig settings = fixture_config(5., "bridgeawarecubic");
-    const std::vector<EmittedPath> bac = exported_extrusions(workspace, half_open_roof(), settings, "p2-bac.gcode");
-    const std::vector<EmittedPath> cubic = exported_extrusions(workspace, half_open_roof(), fixture_config(5., "cubic"), "p2-cubic.gcode");
+    const std::vector<EmittedPath> bac = exported_extrusions(workspace, half_open_roof(), settings, tag + "-bac.gcode");
+    const std::vector<EmittedPath> cubic = exported_extrusions(workspace, half_open_roof(), control_settings, tag + "-cubic.gcode");
     // The plane under the roof, from the Cubic control: the first plane whose roof layer prints solid fill of some extent (a wall
     // seam makes the oracle report slivers of demand on lower layers too). The roof footprint is that solid fill, not the walls,
     // which run round the whole island; the region outside it grown by the gap is where the lattice must stay coarse.
@@ -163,6 +163,12 @@ TEST_CASE("Bridge aware cubic leaves the lattice coarse away from the roof", "[B
         }
     INFO("the pattern's segments without a Cubic counterpart:" << extra.str());
     CHECK(mine.size() == theirs.size());
+}
+
+TEST_CASE("Bridge aware cubic leaves the lattice coarse away from the roof", "[BridgeAwareCubic][P2]")
+{
+    Workspace workspace;
+    check_coarse_away_from_roof(workspace, fixture_config(5., "bridgeawarecubic"), fixture_config(5., "cubic"), "p2");
 }
 
 // K1: the roof contract on the exported G-code. On every plane where non-sparse material lies over the pattern's void, every
@@ -540,4 +546,17 @@ TEST_CASE("Bridge aware cubic honours infill combination through single-layer zo
         CHECK(measure.free_ends == 0);
         CHECK(measure.long_stretches == 0);
     }
+}
+
+// S4: fill multiline (3.9b). At N = 2 every lattice line is a band of two sub-lines: away from the roof the bands equal Cubic's at
+// N = 2 (P2's comparison), and K1 and K2 hold with the bands (K2's hold set is the sub-lines' centre lines, the control Cubic's bands).
+// The pitch grows with N (FillCubic: N s_f / density per family), so the comparison runs at 10 %, P2's pitch at N = 1 and 5 %: at
+// 5 % no band crosses the region away from the half-open roof.
+TEST_CASE("Bridge aware cubic honours fill multiline as bands", "[BridgeAwareCubic][S4]")
+{
+    Workspace workspace;
+    check_coarse_away_from_roof(workspace, with(fixture_config(5., "bridgeawarecubic"), {{"fill_multiline", "2"}, {"sparse_infill_density", "10%"}}),
+                                with(fixture_config(5., "cubic"), {{"fill_multiline", "2"}, {"sparse_infill_density", "10%"}}), "s4");
+    check_k1(workspace, { { "small cube, two lines", small_cube, with({}, {{"fill_multiline", "2"}}), 5. } });
+    check_k2(workspace, { { "small cube, two lines", small_cube, with({}, {{"fill_multiline", "2"}}), 5. } });
 }

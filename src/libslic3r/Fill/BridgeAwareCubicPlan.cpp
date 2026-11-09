@@ -473,18 +473,24 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
             Polylines  rails;
             ExPolygons band;
             for (auto &[key, entry] : edges_by_distance) {
-                const double     d_r       = entry.first;
-                const Polygons   near_edge = offset(entry.second, float(scale_(d_r + 0.01)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
-                const ExPolygons grown     = offset_ex(roof_material, float(scale_(d_r)), ClipperLib::jtRound, ARC_TOLERANCE);
-                Polylines rail = intersection_pl(to_polylines(grown), near_edge);
-                if (rail.empty())
-                    continue;
-                rail = intersection_pl(rail, boundary_m);
-                join_end_to_end(rail);    // a closed contour comes back split at its start vertex
-                for (Polyline &piece : rail)
-                    if (piece.length() >= scale_(w - 1e-4))
-                        rails.push_back(std::move(piece));
-                append(band, intersection_ex(diff_ex(grown, upper.may_print), near_edge));
+                // N offset curves at d_r + i·s_f (3.9b): a rail is a band of N beads like every line of the lattice; the demand
+                // band reaches the outer curve. One curve at N = 1.
+                const int N = group.m_lattice.multiline;
+                for (int i = 0; i < N; ++i) {
+                    const double     d_i       = entry.first + i * group.m_lattice.spacing;
+                    const Polygons   near_edge = offset(entry.second, float(scale_(d_i + 0.01)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
+                    const ExPolygons grown     = offset_ex(roof_material, float(scale_(d_i)), ClipperLib::jtRound, ARC_TOLERANCE);
+                    Polylines rail = intersection_pl(to_polylines(grown), near_edge);
+                    if (!rail.empty()) {
+                        rail = intersection_pl(rail, boundary_m);
+                        join_end_to_end(rail);    // a closed contour comes back split at its start vertex
+                        for (Polyline &piece : rail)
+                            if (piece.length() >= scale_(w - 1e-4))
+                                rails.push_back(std::move(piece));
+                    }
+                    if (i + 1 == N)
+                        append(band, intersection_ex(diff_ex(grown, upper.may_print), near_edge));
+                }
             }
             if (rails.empty())
                 continue;
