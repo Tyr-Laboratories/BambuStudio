@@ -1,19 +1,23 @@
 #include <catch2/catch.hpp>
 
 #include "bridge_aware_cubic_fixtures.hpp"
+#include "bridge_aware_cubic_observer.hpp"
 
 #include "libslic3r/Fill/BridgeAwareCubicPlan.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/MeshBoolean.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <set>
 #include <fstream>
 #include <string>
 
 using namespace Slic3r;
 using namespace BACFixtures;
+using namespace BACObserver;
 
 // S1: option plumbing. The gap is a scalar region option with default 5 in the print options; the pattern is a value of
 // sparse_infill_pattern and not of the top surface patterns (which is what refuses it at 100% density, as Cubic is refused).
@@ -327,6 +331,94 @@ TEST_CASE("Bridge aware cubic changes no other setting of the part", "[BridgeAwa
             }
         }
         CHECK(compared > 3);
+    }
+}
+
+// A block 40 x 40 x 20 mm with a pocket 5 mm deep in its roof, a triangle with corners of 45, 90 and 45 degrees: the floor of the
+// pocket is a top surface, whose solid layers below poke the 45 degree corners into the sparse fill.
+Model pocket_block()
+{
+    TriangleMesh block(its_make_cube(40., 40., 20.));
+    indexed_triangle_set prism;
+    const std::vector<Vec2d> triangle { { 13., 6. }, { 27., 20. }, { 13., 34. } };
+    for (const double z : { 15., 21. })
+        for (const Vec2d &corner : triangle)
+            prism.vertices.emplace_back(float(corner.x()), float(corner.y()), float(z));
+    prism.indices = { { 0, 2, 1 }, { 3, 4, 5 }, { 0, 1, 4 }, { 0, 4, 3 }, { 1, 2, 5 }, { 1, 5, 4 }, { 2, 0, 3 }, { 2, 3, 5 } };
+    MeshBoolean::cgal::minus(block, TriangleMesh(std::move(prism)));
+    return single_part("Bridge aware cubic pocket block", std::move(block));
+}
+
+// A block 40 x 40 x 20 mm with a blind pocket 16 x 16 mm, 6 mm deep, in its roof: a roof at 14 mm under the pocket and a roof at
+// 20 mm round it.
+Model blind_cavity()
+{
+    TriangleMesh block(its_make_cube(40., 40., 20.));
+    TriangleMesh pocket(its_make_cube(16., 16., 7.));
+    pocket.translate(12., 12., 14.);
+    MeshBoolean::cgal::minus(block, pocket);
+    return single_part("Bridge aware cubic blind cavity", std::move(block));
+}
+
+// S7: stress settings. The slice completes, and where the contract applies K1 holds: at the nozzle-floor gap K1 is a recorded
+// limitation (docs/bridge-aware-cubic.md), under combination S3 measures it on the unfolded paths, and arc fitting is read by S6.
+TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[BridgeAwareCubic][S7]")
+{
+    Workspace workspace;
+    struct Stress { const char *name; std::initializer_list<std::pair<const std::string, std::string>> settings; double gap; bool k1; };
+    const std::vector<Stress> stresses = {
+        { "gap at the nozzle", {}, 0.4, false },
+        { "60 %", {{"sparse_infill_density", "60%"}}, 5., true },
+        { "0.003 %", {{"sparse_infill_density", "0.003%"}}, 5., true },
+        { "gap 1000", {}, 1000., true },
+        { "raft", {{"raft_layers", "3"}}, 5., true },
+        { "the user's walls and bridges", {{"wall_loops", "1"}, {"wall_generator", "arachne"}, {"infill_wall_overlap", "75%"},
+                                          {"detect_narrow_internal_solid_infill", "1"}, {"thick_bridges", "1"}}, 5., true },
+        { "no walls", {{"wall_loops", "0"}}, 5., true },
+        { "combination", {{"infill_combination", "1"}}, 5., false },
+        { "a 0.6 mm sparse bead", {{"sparse_infill_line_width", "0.6"}}, 5., true },
+    };
+    struct Part { const char *name; Model (*model)(); };
+    const Part parts[] = { { "small cube", small_cube }, { "pocket block", pocket_block }, { "blind cavity", blind_cavity } };
+    for (const Part &part : parts)
+        for (const Stress &stress : stresses) {
+            INFO(part.name << ", " << stress.name);
+            const DynamicPrintConfig settings = with(fixture_config(stress.gap, "bridgeawarecubic"), stress.settings);
+            std::vector<EmittedPath> paths;
+            REQUIRE_NOTHROW(paths = exported_extrusions(workspace, part.model(), settings, "s7.gcode"));
+            CHECK_FALSE(paths.empty());
+            if (!stress.k1)
+                continue;
+            for (const PlaneMeasure &plane : measure_planes(paths, 0.4, stress.gap)) {
+                INFO("plane below z = " << plane.lower / 1000. << " mm");
+                CHECK(plane.widest_opening <= stress.gap);
+                CHECK(plane.longest_run <= stress.gap);
+            }
+        }
+    SECTION("variable layer height") {
+        Model model = small_cube();
+        model.objects.front()->layer_height_profile.set(std::vector<coordf_t>{ 0., .2, 3., .2, 5., .12, 12., .12, 18., .24 });
+        std::vector<EmittedPath> paths;
+        REQUIRE_NOTHROW(paths = exported_extrusions(workspace, std::move(model), fixture_config(5., "bridgeawarecubic"), "s7-variable.gcode"));
+        std::set<int> heights;
+        for (const EmittedPath &path : paths)
+            heights.insert(int(std::lround(path.height * 1000.)));
+        CHECK(heights.size() >= 3);
+        const std::vector<PlaneMeasure> planes = measure_planes(paths, 0.4, 5.);
+        REQUIRE_FALSE(planes.empty());
+        for (const PlaneMeasure &plane : planes) {
+            INFO("plane below z = " << plane.lower / 1000. << " mm");
+            CHECK(plane.widest_opening <= 5.);
+            CHECK(plane.longest_run <= 5.);
+        }
+    }
+    SECTION("arc fitting") {
+        Print print;
+        Model model = small_cube();
+        REQUIRE_NOTHROW(slice(print, model, with(fixture_config(5., "bridgeawarecubic"), {{"enable_arc_fitting", "1"}})));
+        std::string filename;
+        REQUIRE_NOTHROW(filename = print.export_gcode((workspace.path / "s7-arcs.gcode").string(), nullptr));
+        CHECK(boost::filesystem::file_size(filename) > 0);
     }
 }
 
