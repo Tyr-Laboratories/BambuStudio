@@ -488,17 +488,19 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     const AreaIndex surface_index(ExPolygons{ island });
     const double spacing_scaled = scale_(lattice.spacing);
     // Where the fill boundary cut a line (a surface laid after the plan took the sparse area there: the generator's ensuring strip
-    // one spacing wide along a bridge's edge, a bridge's front above a rail, a thick base), the line runs on to the edge of the
-    // sparse surface, at most a spacing further, so that it meets what that surface prints instead of stopping half a spacing
-    // short of it. `on_surface` are the line's intervals inside the island, `interval` the piece inside the fill boundary; the
-    // ends to carry are chosen by the caller (a strand's both; a bulk line's inside the zone of a course of the layer below).
+    // one spacing wide along a bridge's edge, a bridge's front above a rail, a thick base), the line runs on past the edge of the
+    // sparse surface into the outer bead of what the other surface prints there, half a spacing beyond the edge (a spacing from
+    // the cut), so that its end lies on that bead and is fused to it (3.8, rule iv) instead of stopping beside it. `on_surface` are
+    // the line's intervals inside the island, `interval` the piece inside the fill boundary; the ends to carry are chosen by the
+    // caller (a strand's both; a bulk line's inside the zone of a course of the layer below).
     const auto run_on_to_surface = [spacing_scaled](const Line &line, double length, const std::vector<std::pair<double, double>> &on_surface,
                                                    const std::pair<double, double> &interval, Point &a, Point &b, bool at_a, bool at_b) {
+        const double into = 0.5 * spacing_scaled / length;
         for (const auto &s : on_surface) {
             if (at_a && interval.first > 1e-6 && s.first < interval.first - 1e-9 && s.second >= interval.first - 1e-9 && (interval.first - s.first) * length <= spacing_scaled)
-                a = along(line, s.first);
+                a = along(line, std::max(0., s.first - into));
             if (at_b && interval.second < 1. - 1e-6 && s.second > interval.second + 1e-9 && s.first <= interval.second + 1e-9 && (s.second - interval.second) * length <= spacing_scaled)
-                b = along(line, s.second);
+                b = along(line, std::min(1., s.second + into));
         }
     };
 
