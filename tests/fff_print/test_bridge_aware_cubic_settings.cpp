@@ -161,6 +161,17 @@ TEST_CASE("Bridge aware cubic gap change invalidates prepare infill and modifier
     }
 }
 
+// The modifier fixture with the modifier changing the gap only: one lattice key, two gaps, so one group and no seam. (The
+// two-lattice modifier carries a seam wall on every layer where the lattices meet, roof or none, by 3.5a; W1 covers it.)
+static Model gap_only_modifier()
+{
+    Model model = modifier();
+    ModelVolume *right = model.objects.front()->volumes.back();
+    right->config.erase("sparse_infill_density");
+    right->config.erase("infill_direction");
+    return model;
+}
+
 // S2 (open top): where nothing needs refinement, the pattern's fills equal Cubic's as deposited segments within 0.001 mm. A
 // part without top shells has no roof over its sparse fill, so the plan has nothing and the group prints as Cubic. The enum's
 // position reorders the fill groups and moves their shared edges by Clipper's safety offset, nothing more.
@@ -171,7 +182,8 @@ TEST_CASE("Bridge aware cubic prints as Cubic where no roof needs refinement", "
         { "open-top small cube", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"top_shell_layers", "0"}}); } },
         // Not the rib itself: the vertical shells under its ribs are roofs over sparse fill, so its plan has content.
         { "open-top cube with the rib's settings", small_cube, [](const char *p) { return with(rib_config(p), {{"top_shell_layers", "0"}}); } },
-        { "open-top modifier", modifier, [](const char *p) { return with(modifier_config(p), {{"top_shell_layers", "0"}}); } },
+        // Not the two-lattice modifier: two lattices meet through a seam wall on every layer (3.5a), roof or none.
+        { "open-top modifier changing the gap only", gap_only_modifier, [](const char *p) { return with(modifier_config(p), {{"top_shell_layers", "0"}}); } },
         { "open-top small cube, two lines", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"top_shell_layers", "0"}, {"fill_multiline", "2"}}); } },
     };
     for (const Fixture &fixture : fixtures) {

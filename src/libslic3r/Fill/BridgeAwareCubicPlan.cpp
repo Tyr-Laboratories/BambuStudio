@@ -188,15 +188,20 @@ void ObjectPlan::collect_regions(const PrintObject &object, bool any_sparse_patt
     m_boundary_courses.assign(layers, std::vector<Polylines>(region_count));
     // Whether the connector anchors ends and the filler makes nubs: Fill.cpp's reading of the region's anchor settings.
     for (GroupPlan &group : m_groups) {
-        const PrintRegionConfig &config = object.printing_region(group.m_regions.front()).config();
-        const double spacing = group.m_lattice.spacing;
-        double anchor = config.sparse_infill_anchor.value, anchor_max = config.sparse_infill_anchor_max.value;
-        if (config.sparse_infill_anchor.percent)
-            anchor *= 0.01 * spacing;
-        if (config.sparse_infill_anchor_max.percent)
-            anchor_max *= 0.01 * spacing;
-        anchor = std::min(anchor, anchor_max);
-        group.m_anchors = anchor_max >= 0.05 && anchor > 0.;
+        // Every region of the group must anchor (the anchor settings are not part of the group key).
+        group.m_anchors = true;
+        for (const size_t region_id : group.m_regions) {
+            const PrintRegionConfig &config = object.printing_region(region_id).config();
+            const double spacing = group.m_lattice.spacing;
+            double anchor = config.sparse_infill_anchor.value, anchor_max = config.sparse_infill_anchor_max.value;
+            if (config.sparse_infill_anchor.percent)
+                anchor *= 0.01 * spacing;
+            if (config.sparse_infill_anchor_max.percent)
+                anchor_max *= 0.01 * spacing;
+            anchor = std::min(anchor, anchor_max);
+            if (!(anchor_max >= 0.05 && anchor > 0.))
+                group.m_anchors = false;
+        }
     }
     for (GroupPlan &group : m_groups) {
         group.m_boundaries.resize(layers);
@@ -262,8 +267,20 @@ void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::functi
         }
         if (groups_present.empty())
             continue;
-        // A layer whose sparse fill is all of one group, each region with walls and none at 0 %, has no seam.
-        if (groups_present.size() == 1 && !other_lattice && !void_region && all_walled)
+        // The air outside the part: the parts of each region's sparse boundary within δ_s of the outside of the outline. Tested
+        // on every region (one clip each): a region with walls can still touch air where wall painting leaves zero-wall spans.
+        std::vector<Polylines> open_air(region_count);
+        bool any_air = false;
+        for (size_t r = 0; r < region_count; ++r) {
+            if (kind[r] != 'b' || m_group_of_region[r] < 0)
+                continue;
+            open_air[r] = diff_pl(to_polylines(sparse[r]), offset_ex(layer.lslices, -float(scale_(DELTA_S))));
+            open_air[r].erase(std::remove_if(open_air[r].begin(), open_air[r].end(), [](const Polyline &p) { return p.length() < scale_(0.05); }), open_air[r].end());
+            any_air = any_air || !open_air[r].empty();
+        }
+        (void)all_walled;
+        // A layer whose sparse fill is all of one group, no region at 0 % and no sparse boundary at the air, has no seam.
+        if (groups_present.size() == 1 && !other_lattice && !void_region && !any_air)
             continue;
         for (size_t r = 0; r < region_count; ++r) {
             if (kind[r] != 'b' || m_group_of_region[r] < 0)
@@ -287,11 +304,13 @@ void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::functi
             Polylines open_beads, open_void;
             if (!bead_neighbours.empty())
                 open_beads = intersection_pl(boundary, offset(bead_neighbours, float(scale_(DELTA_S))));
+            // A 0 % neighbour is void, but the wall is inset as beside beads: at a convex corner of the region the bead's round
+            // join otherwise leaves a pocket that joins the 0 % void to the region's surface (review, 9 November 2026). The 0.05 mm
+            // overlap into a region that prints nothing there is harmless.
             if (!void_neighbours.empty())
-                open_void = intersection_pl(boundary, offset(void_neighbours, float(scale_(DELTA_S))));
-            // The air outside a part without walls: the boundary within δ_s of the outside of the outline.
-            if (!all_walled)
-                append(open_void, diff_pl(boundary, offset_ex(layer.lslices, -float(scale_(DELTA_S)))));
+                append(open_beads, intersection_pl(boundary, offset(void_neighbours, float(scale_(DELTA_S)))));
+            // The air outside the part keeps the bead inside the outline.
+            open_void = std::move(open_air[r]);
             Polylines walls;
             const auto lay = [&](const Polylines &open, double inset) {
                 if (open.empty())
@@ -336,21 +355,27 @@ void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::functi
             lay(open_void, 0.5 * w);
             if (walls.empty())
                 continue;
+#if SLIC3R_BAC_DEVELOPMENT_CHECKS
             // A lowest course over another pattern's void, a 0 % region or air, beyond h_n of the material below, cannot be bounded
-            // by the refinement: it prints as planned and a development build warns (5.2). Over the group's own void the plane
-            // beneath it holds it (3.4).
+            // by the refinement: it prints as planned and a development build warns (5.2). Over the void of any of the pattern's
+            // groups the plane beneath it holds it (3.4).
             if (n > 0) {
                 const LayerMaterial &below = m_materials[n - 1];
                 const Polygons supported = offset(below.surely_prints, float(scale_(m_overhang[n])), ClipperLib::jtRound, ARC_TOLERANCE);
-                for (const Polyline &hanging : diff_pl(walls, supported)) {
-                    if (hanging.points.size() < 2)
+                ExPolygons own_void;
+                for (const ExPolygons &v : below.void_of_group)
+                    append(own_void, v);
+                Polylines hanging = diff_pl(walls, supported);
+                if (!own_void.empty())
+                    hanging = diff_pl(hanging, union_ex(own_void));
+                for (const Polyline &piece : hanging) {
+                    if (piece.points.size() < 2 || piece.length() < scale_(w))
                         continue;
-                    if (g < below.void_of_group.size() && !intersection_pl(Polylines{ hanging }, below.void_of_group[g]).empty())
-                        continue;
-                    const Point mid = hanging.points[hanging.points.size() / 2];
+                    const Point mid = piece.points[piece.points.size() / 2];
                     m_statistics.courses_over_other_void.push_back(Place{ n, Vec2d(unscale<double>(mid.x()), unscale<double>(mid.y())), "seam wall" });
                 }
             }
+#endif
             add_courses(n, r, walls, true);
             group.mark_courses();
             BridgeAwareCubic::add_courses(m_materials[n], walls, w, layer, m_groups_regions);

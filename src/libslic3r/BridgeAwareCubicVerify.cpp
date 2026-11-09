@@ -90,6 +90,7 @@ Polygons footprint_of_layer(const Layer &layer)
     Polygons out;
     for (const LayerRegion *region : layer.regions()) {
         region->perimeters.polygons_covered_by_width(out, 0.f);
+        region->thin_fills.polygons_covered_by_width(out, 0.f);
         region->fills.polygons_covered_by_width(out, 0.f);
     }
     return out;

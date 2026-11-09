@@ -163,6 +163,9 @@ private:
     {
         return std::max(1e-6, (0.5 * m_w - margin) / SIN_60 + (m_lattice.multiline - 1) * m_lattice.spacing / (4. * SIN_60));
     }
+    // What a cover piece surely holds either side of the point it was aimed at: its plane is found within τ of the point, so its
+    // crossing lies up to τ / sin 60° away along the item.
+    double cover_reach() const { return std::max(1e-6, crossing_reach(m_vertex_margin) - m_tau / SIN_60); }
 
     const LayerPrint& print_set(size_t l)
     {
@@ -251,8 +254,19 @@ private:
                         const double tc = *c0 + q * step;
                         if (tc < t0 - cN_path || tc > t1 + cN_path)
                             continue;
-                        if (!lp.boundary->index.empty() && lp.boundary->index.contains(m_lattice.scaled(tk.point(tc))))
-                            out.emplace_back(tc - cN_path, tc + cN_path);
+                        if (lp.boundary->index.empty())
+                            continue;
+                        const Vec2d crossing_point = tk.point(tc);
+                        if (!lp.boundary->index.contains(m_lattice.scaled(crossing_point)))
+                            continue;
+                        // The simplifier moves a path's vertices, not the interior of a straight segment: where the bulk line runs
+                        // straight through the boundary a bead either side of the crossing, only the rounding margin applies.
+                        const Trace tj = trace(m_lattice, PlaneKey{ j, 0, q }, lp.z);
+                        const double uj = tj.parameter(crossing_point);
+                        const Intervals straight = lp.boundary->index.segment_inside(m_lattice.scaled(tj.point(uj - m_w)), m_lattice.scaled(tj.point(uj + m_w)));
+                        const bool interior = straight.size() == 1 && straight.front().first <= 1e-9 && straight.front().second >= 1. - 1e-9;
+                        const double reach = interior ? cN : cN_path;
+                        out.emplace_back(tc - reach, tc + reach);
                     }
             }
             for (const auto &[plane, interval] : lp.strands_of_family[j]) {
@@ -449,9 +463,15 @@ private:
                         if (!plane)
                             continue;
                         const double y = trace(m_lattice, *plane, m_plan.print_z(below)).parameter(p), half = 0.5 * m_lambda;
-                        if (!admissible(*plane, y, below, half))
+                        // Centred on the end, or shifted along the trace as far as the piece still covers the end's projection.
+                        std::optional<double> centre;
+                        if (admissible(*plane, y, below, half))
+                            centre = y;
+                        else if (const std::optional<double> shifted = nearest_inside(*plane, y, below, half - m_vertex_margin, half); shifted && admissible(*plane, *shifted, below, half))
+                            centre = shifted;
+                        if (!centre)
                             continue;
-                        add_strand(below, Strand{ *plane, y - half, y + half, StrandKind::Column, gap });
+                        add_strand(below, Strand{ *plane, *centre - half, *centre + half, StrandKind::Column, gap });
                         placed = true;
                     }
                     if (!placed)
@@ -613,7 +633,7 @@ private:
                 const double point = std::min(covered + gb, g1);
                 if (!cover(item, point, m))
                     record_unheld(m, item.plane, point, "no admissible piece in the window");
-                covered = point + crossing_reach(m_vertex_margin);    // a cover holds c either side of its crossing
+                covered = point + cover_reach();    // a cover holds c either side of its crossing, less the plane search drift
                 continue;
             }
             add_strand(below, Strand{ item.plane, *y - half, *y + half, StrandKind::Column, item.gap });
@@ -688,7 +708,7 @@ private:
                     return;
                 }
                 // The narrowed interval does not fit inside the boundary: covers along the item, or the places are recorded.
-                const double c = crossing_reach(m_vertex_margin);
+                const double c = cover_reach();
                 bool all = true;
                 for (double t = item.t0 + c; ; t += 2. * c) {
                     const double point = std::min(t, item.t1 - c);
@@ -713,7 +733,7 @@ private:
             if (it != lp.strands_by_plane.end())
                 for (const Interval &i : it->second)
                     if (i.first <= y + m_lambda && i.second >= y - m_lambda) {
-                        const double need_lo = y - half + a, need_hi = y + half - a;    // what must print below to hold the piece
+                        const double need_lo = item.t0 + a, need_hi = item.t1 - a;    // what must print below to hold the whole item
                         Intervals uncovered = complement(Intervals{ i }, need_lo, need_hi);
                         bool placed = true;
                         for (const Interval &u : uncovered) {
@@ -735,7 +755,11 @@ private:
         const double target = steering_target(item.plane, y, m);
         const double step = std::min(a, slack);
         const double move = std::max(-step, std::min(step, target - y));
-        const double preferences[5] = { move, 0.5 * move, 0., -0.5 * move, -move };
+        // The exact move first, then the positions within the window ordered by their distance to the target (a target already
+        // reached, or none in sight, must still leave the admissible shifts in play).
+        std::vector<double> preferences = { move, step, -step, 0.5 * step, -0.5 * step, 0. };
+        std::stable_sort(preferences.begin(), preferences.end(), [&](double p, double q) { return std::abs(y + p - target) < std::abs(y + q - target); });
+        preferences.erase(std::unique(preferences.begin(), preferences.end(), [](double p, double q) { return std::abs(p - q) < 1e-9; }), preferences.end());
         for (const double shift : preferences) {
             const double candidate = y + shift;
             if (admissible(item.plane, candidate, below, half)) {
@@ -747,7 +771,7 @@ private:
         // another family, each holding the item within the crossing reach c of its crossing (step 6's trapped case, among the
         // three lattice directions only); an item longer than 2c takes several, c apart from each end.
         {
-            const double c = crossing_reach(m_vertex_margin);
+            const double c = cover_reach();
             bool all = true;
             if (length <= 2. * c - 1e-9)
                 all = cover(item, y, m);
@@ -779,7 +803,9 @@ private:
         const double a = alpha(m), h = m_plan.layer_height(m);
         const LayerPrint &lp = print_set(below);
         // The piece we place lies on layer m − 1 and is held by the print set of m − 2: its crossings are those of K's trace at
-        // m − 1 with the bulk traces at m − 2 (as rule (ii) measures them for a piece and the layer below it).
+        // m − 1 with the bulk traces at m − 2 (as rule (ii) measures them for a piece and the layer below it), and the boundary
+        // and material that hold it are those of m − 2.
+        const LayerPrint &lp2 = below >= 1 ? print_set(below - 1) : lp;
         const double z_k = lp.z, z_j = below >= 1 ? m_plan.print_z(below - 1) : lp.z - h;
         const Trace tk = trace(m_lattice, K, z_k);
         double best_k = double(m);     // layers to the bed
@@ -802,16 +828,16 @@ private:
                 const bool approaching = (tc - y) * v < 0.;
                 if (g > a && !approaching && std::abs(v) >= a)
                     continue;    // it runs away faster than a column can follow
-                if (!lp.boundary->index.empty() && !lp.boundary->index.contains(m_lattice.scaled(tk.point(tc))))
+                if (!lp2.boundary->index.empty() && !lp2.boundary->index.contains(m_lattice.scaled(tk.point(tc))))
                     continue;
                 const double closing = approaching ? std::abs(v) + a : std::max(1e-6, a - std::abs(v));
                 const double k = g <= a ? 1. : 1. + std::ceil((g - a) / closing);
                 if (k < best_k) { best_k = k; target = tc; }
             }
         }
-        if (!lp.material_reach->empty()) {
+        if (!lp2.material_reach->empty()) {
             const Point pa = m_lattice.scaled(tk.point(y - LOOK_ALONG)), pb = m_lattice.scaled(tk.point(y + LOOK_ALONG));
-            for (const Interval &i : lp.material_reach->segment_inside(pa, pb)) {
+            for (const Interval &i : lp2.material_reach->segment_inside(pa, pb)) {
                 const double lo = y - LOOK_ALONG + i.first * 2. * LOOK_ALONG, hi = y - LOOK_ALONG + i.second * 2. * LOOK_ALONG;
                 if (hi - lo < m_lambda)
                     continue;

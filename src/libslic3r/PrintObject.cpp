@@ -3021,7 +3021,7 @@ std::vector<PrintObject::BridgeCandidate> PrintObject::internal_bridge_candidate
                 }
                 worth_bridging = intersection(closing(worth_bridging, float(SCALED_EPSILON)), s->expolygon);
                 // 对应哪个region下的那个surface需要生成桥接
-                out.push_back(BridgeCandidate{ s, lidx, worth_bridging, region });
+                out.push_back(BridgeCandidate{ s, lidx, std::move(worth_bridging), region });
 
 #ifdef DEBUG_BRIDGE_OVER_INFILL
                 debug_draw(std::to_string(lidx) + "_candidate_surface_" + std::to_string(area(s->expolygon)),

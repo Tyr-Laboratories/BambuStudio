@@ -185,6 +185,15 @@ def main():
         # The lower sparse paths: their segments along the lattice directions hold by their centre lines (rules i and ii); a
         # segment off the lattice directions is a bead the pattern prints whole (a seam wall, a rail) or a connector's hook, and
         # holds as material does, by its footprint (rule iii).
+        # The reference's sparse segments on the lower layer, for the hooks along the island boundary.
+        ref_lower_rows = []
+        for pts, w, f in R.get(zb, []):
+            if f != 'Sparse infill':
+                continue
+            for i in range(1, len(pts)):
+                ref_lower_rows.append((pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]))
+        ref_lower = np.array(ref_lower_rows, dtype=float) if ref_lower_rows else np.zeros((0, 4))
+        ref_lower_tree = STRtree(shapely.linestrings(np.stack([ref_lower[:, 0:2], ref_lower[:, 2:4]], axis=1))) if len(ref_lower) else None
         lower_sparse, lower_beads = [], []
         for pts, w, f in lower:
             if f != 'Sparse infill':
@@ -193,10 +202,13 @@ def main():
                 seg = shapely.LineString([pts[i - 1], pts[i]])
                 if seg.length < 1e-6:
                     continue
-                if along_lattice(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]):
-                    lower_sparse.append(seg)
-                else:
+                sg = (pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+                # Off the lattice directions and at least a bead long, or on a reference line: a course or a hook, held by its
+                # footprint; a short off-lattice hop (a nub's step, a join link) holds by its centre line.
+                if not along_lattice(*sg) and (seg.length >= w - 1e-4 or on_reference_line(*sg, ref_lower, ref_lower_tree, overlap=False)):
                     lower_beads.append(seg.buffer(w / 2, cap_style='round'))
+                else:
+                    lower_sparse.append(seg)
         other_footprints = [shapely.LineString(pts).buffer(w / 2, cap_style='flat', join_style='round') for pts, w, f in lower if f != 'Sparse infill'] + lower_beads
         other_footprint = shapely.union_all(other_footprints) if other_footprints else None
         # reference sparse segments on this layer
@@ -240,15 +252,17 @@ def main():
                 for j in own_tree.query(v, predicate='dwithin', distance=max_w / 2 + args.tol):
                     line, opts, ow = own_paths[j]
                     if opts is pts:
-                        # Own path: only parts farther than one bead along the path.
+                        # Own path: only parts farther than one bead along the path, and in the interior of that part.
                         near = False
                         for i in range(1, len(pts)):
                             if min(abs(arc[i - 1] - arc[vi]), abs(arc[i] - arc[vi])) <= w + args.tol:
                                 continue
                             seg = shapely.LineString([pts[i - 1], pts[i]])
                             if seg.distance(v) <= ow / 2 + args.tol:
-                                near = True
-                                break
+                                foot = arc[i - 1] + seg.project(v)
+                                if foot >= ow / 2 + args.tol and arc[-1] - foot >= ow / 2 + args.tol:
+                                    near = True
+                                    break
                         if near:
                             return True
                         continue

@@ -202,16 +202,9 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
         const double length = d.norm();
         if (length < 1.)
             continue;
-        // A junction, not a crossing: the path stops at the met line (its own last segment lies on one side of it).
-        {
-            const Vec2d own = (p - before).cast<double>();
-            if (own.norm() >= 1.) {
-                const Vec2d n(-d.y() / length, d.x() / length);
-                const double side_end = n.dot(p.cast<double>() - a), side_before = n.dot(before.cast<double>() - a);
-                if (side_end * side_before < 0. && std::abs(side_end) > scale_(0.01))
-                    continue;
-            }
-        }
+        // An end within half a bead of the met line is a junction whether it stops short of the line or overshoots it by up to
+        // that much (the beads overlap either way, and the sweep's rule (iv) counts both as fused).
+        (void)before;
         const double t = std::min(1., std::max(0., (p.cast<double>() - a).dot(d) / (length * length)));
         const Vec2d q = a + t * d;
         const double room_forward = (1. - t) * length, room_backward = t * length;
@@ -374,16 +367,23 @@ void print_uncovered(Layer &layer)
             anything = true;
     if (!anything)
         return;
-    // The islands the fillers were handed (the final surfaces), and the footprint of everything the layer prints.
+    // The islands the fillers were handed (the final surfaces). The footprint of everything the layer prints is built only when a
+    // line turns out uncovered, which is rare.
     const std::vector<SparseIsland> islands = sparse_islands(layer);
-    Polygons printed;
-    for (const LayerRegion *region : layer.regions()) {
-        region->perimeters.polygons_covered_by_width(printed, 0.f);
-        region->thin_fills.polygons_covered_by_width(printed, 0.f);
-        region->fills.polygons_covered_by_width(printed, 0.f);
-    }
-    const ExPolygons printed_ex = union_ex(printed);
     const BoundingBox bbox = get_extents(layer.lslices);
+    std::optional<ExPolygons> printed_ex;
+    const auto printed = [&]() -> const ExPolygons& {
+        if (!printed_ex) {
+            Polygons footprint;
+            for (const LayerRegion *region : layer.regions()) {
+                region->perimeters.polygons_covered_by_width(footprint, 0.f);
+                region->thin_fills.polygons_covered_by_width(footprint, 0.f);
+                region->fills.polygons_covered_by_width(footprint, 0.f);
+            }
+            printed_ex = union_ex(footprint);
+        }
+        return *printed_ex;
+    };
     for (size_t g = 0; g < plan->groups().size(); ++g) {
         const GroupPlan &group = plan->groups()[g];
         if (layer_index >= group.layer_count() || group.regions().empty())
@@ -397,8 +397,8 @@ void print_uncovered(Layer &layer)
                     append(handed, to_polygons(island.island));
                     break;
                 }
-        // The plan's lines of the layer: strands clipped to the plan's own fill boundary, and the courses.
-        Polylines planned;
+        // The plan's strands of the layer, clipped to the plan's own fill boundary.
+        Polylines strands;
         const LayerBoundary &boundary = group.boundary(layer_index);
         for (const Line &line : group.strands_at(layer_index, bbox))
             for (const auto &interval : boundary.index.segment_inside(line.a, line.b)) {
@@ -406,40 +406,52 @@ void print_uncovered(Layer &layer)
                 const Point pa(coord_t(std::llround(a.x() + interval.first * d.x())), coord_t(std::llround(a.y() + interval.first * d.y())));
                 const Point pb(coord_t(std::llround(a.x() + interval.second * d.x())), coord_t(std::llround(a.y() + interval.second * d.y())));
                 if (pa != pb)
-                    planned.emplace_back(Points{ pa, pb });
+                    strands.emplace_back(Points{ pa, pb });
             }
-        for (const size_t region_id : group.regions())
-            append(planned, plan->courses_at(layer_index, region_id));
-        if (planned.empty())
-            continue;
-        Polylines uncovered = handed.empty() ? planned : diff_pl(planned, handed);
-        if (uncovered.empty())
-            continue;
-        if (!printed_ex.empty())
-            uncovered = diff_pl(uncovered, printed_ex);
-        Polylines kept;
-        for (Polyline &piece : uncovered)
-            if (piece.length() >= scale_(w - 1e-4))
-                kept.push_back(std::move(piece));
-        if (kept.empty())
-            continue;
-        // Sparse infill of the group's first region on the layer, at the sparse flow, one collection per island of the outline.
-        size_t region_id = group.regions().front();
-        for (const size_t r : group.regions())
-            if (r < layer.regions().size() && !layer.regions()[r]->slices.empty()) { region_id = r; break; }
-        if (region_id >= layer.regions().size())
-            continue;
-        LayerRegion &layerm = *layer.regions()[region_id];
-        const Flow flow = layerm.flow(frInfill);
-        for (const ExPolygon &outline : layer.lslices) {
-            Polylines inside = intersection_pl(kept, outline);
-            inside.erase(std::remove_if(inside.begin(), inside.end(), [w](const Polyline &p) { return p.length() < scale_(w - 1e-4); }), inside.end());
-            if (inside.empty())
+        // Uncovered: outside the islands the fillers were handed. Each region keeps its own courses.
+        const Polylines uncovered_strands = strands.empty() ? Polylines() : (handed.empty() ? strands : diff_pl(strands, handed));
+        std::vector<Polylines> uncovered_courses(group.regions().size());
+        bool any_course = false;
+        for (size_t k = 0; k < group.regions().size(); ++k) {
+            const Polylines &courses = plan->courses_at(layer_index, group.regions()[k]);
+            if (courses.empty())
                 continue;
-            ExtrusionEntityCollection *collection = new ExtrusionEntityCollection();
-            collection->no_sort = false;
-            extrusion_entities_append_paths(collection->entities, std::move(inside), erInternalInfill, flow.mm3_per_mm(), float(flow.width()), float(flow.height()));
-            layerm.fills.entities.push_back(collection);
+            uncovered_courses[k] = handed.empty() ? courses : diff_pl(courses, handed);
+            any_course = any_course || !uncovered_courses[k].empty();
+        }
+        if (uncovered_strands.empty() && !any_course)
+            continue;
+        // Each region prints its own courses and the strands over its slices, as its sparse infill at the sparse flow, one
+        // collection per island of the outline (the group key ignores the extruder and the speeds, which are the region's).
+        for (size_t k = 0; k < group.regions().size(); ++k) {
+            const size_t region_id = group.regions()[k];
+            if (region_id >= layer.regions().size())
+                continue;
+            LayerRegion &layerm = *layer.regions()[region_id];
+            Polylines lines = uncovered_courses[k];
+            if (!uncovered_strands.empty() && !layerm.slices.empty())
+                append(lines, intersection_pl(uncovered_strands, to_polygons(layerm.slices.surfaces)));
+            if (lines.empty())
+                continue;
+            if (!printed().empty())
+                lines = diff_pl(lines, printed());
+            Polylines kept;
+            for (Polyline &piece : lines)
+                if (piece.length() >= scale_(w - 1e-4))
+                    kept.push_back(std::move(piece));
+            if (kept.empty())
+                continue;
+            const Flow flow = layerm.flow(frInfill);
+            for (const ExPolygon &outline : layer.lslices) {
+                Polylines inside = intersection_pl(kept, outline);
+                inside.erase(std::remove_if(inside.begin(), inside.end(), [w](const Polyline &p) { return p.length() < scale_(w - 1e-4); }), inside.end());
+                if (inside.empty())
+                    continue;
+                ExtrusionEntityCollection *collection = new ExtrusionEntityCollection();
+                collection->no_sort = false;
+                extrusion_entities_append_paths(collection->entities, std::move(inside), erInternalInfill, flow.mm3_per_mm(), float(flow.width()), float(flow.height()));
+                layerm.fills.entities.push_back(collection);
+            }
         }
     }
 }

@@ -554,6 +554,8 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
         for (const EmittedPath *path : lower) (path->role == erInternalInfill ? lower_sparse : lower_other).push_back(path);
         for (const EmittedPath *path : upper) if (path->role == erInternalInfill) sparse.push_back(path);
         if (sparse.empty()) continue;
+        const std::vector<Line> control_segments = control_sparse_segments(control_layers, std::next(it)->first);
+        const std::vector<Line> lower_control = control_sparse_segments(control_layers, it->first);
         std::map<double, ExPolygons> holds;    // by the upper bead's width
         const auto hold_of = [&](double w) -> const ExPolygons& {
             auto found = holds.find(w);
@@ -562,20 +564,22 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
             // Rule R holds a point whose centre lies within w/2 of any point of the lower centre line: the union over the centre
             // line's segments of each segment grown by the disc (round ends). Segment by segment, because Clipper's offset of a
             // whole polyline puts no cap where a path folds back on itself.
-            // A lower sparse segment off the lattice directions is a bead the pattern prints whole (a seam wall, a rail) or a
-            // connector's hook: material of its layer, which holds as the walls and solid fills do, by its footprint and the
-            // touching measure (rule iii), not by its centre line.
+            // A lower sparse segment off the lattice directions that is at least a bead long, or lies on a control line, is a
+            // bead the pattern prints whole (a seam wall, a rail) or a connector's hook: material of its layer, which holds as the
+            // walls and solid fills do, by its footprint and the touching measure (rule iii), not by its centre line. A short
+            // off-lattice hop (a nub's step to its line, a join link) holds by its centre line like any sparse line.
             for (const EmittedPath *path : lower_sparse)
                 for (size_t i = 1; i < path->path.points.size(); ++i)
                     if (path->path.points[i - 1] != path->path.points[i]) {
-                        const bool lattice = along_lattice(path->path.points[i - 1], path->path.points[i], directions);
-                        const double reach = lattice ? .5 * w : .5 * path->width + .5 * w + .01;
+                        const Point &pa = path->path.points[i - 1], &pb = path->path.points[i];
+                        const bool lattice = along_lattice(pa, pb, directions);
+                        const bool bead = !lattice && (unscale<double>((pb - pa).cast<double>().norm()) >= path->width - 1e-4 || on_control_line(pa, pb, lower_control));
+                        const double reach = bead ? .5 * path->width + .5 * w + .01 : .5 * w;
                         append(hold, offset(Polyline(path->path.points[i - 1], path->path.points[i]), float(scale_(reach)), ClipperLib::jtRound, scale_(.001), ClipperLib::etOpenRound));
                     }
             append(hold, to_polygons(offset_ex(footprint(lower_other), float(scale_(.5 * w + .01)), ClipperLib::jtRound, scale_(.001))));
             return holds.emplace(w, union_ex(hold)).first->second;
         };
-        const std::vector<Line> control_segments = control_sparse_segments(control_layers, std::next(it)->first);
         // An end whose bead overlaps another bead of its own layer (an anchor along a perimeter or along the line it meets) is
         // fused to it, not hanging: the beads' centre lines are within half their widths and the touching measure.
         // The distance from the end's centre to the nearest other bead's edge on this layer (negative when the end lies inside

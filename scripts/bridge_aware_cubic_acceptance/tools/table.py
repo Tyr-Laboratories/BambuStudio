@@ -45,7 +45,8 @@ print(f"| Estimated time | {tot[('c','total_time_s')]/3600:.1f} h | {tot[('a','t
 print(f"| Sparse paths | {int(tot[('c','sparse_paths')]):,} | {int(tot[('a','sparse_paths')]):,} | {int(tot[('b','sparse_paths')]):,} |")
 print(f"| of them 0.6 mm or shorter | | {int(tot[('a','short_sparse_paths')]):,} | {int(tot[('b','short_sparse_paths')]):,} |")
 print(f"| Retractions | {int(tot[('c','retractions')]):,} | {int(tot[('a','retractions')]):,} | {int(tot[('b','retractions')]):,} |")
-print(f"| Instructions retired | | {tot[('a','instructions')]/1e9:,.0f} G | {tot[('b','instructions')]/1e9:,.0f} G (x{tot[('b','instructions')]/tot[('a','instructions')]:.3f} vs fix 2) |")
+ratio = f"x{tot[('b','instructions')]/tot[('a','instructions')]:.3f} vs fix 2" if tot[('a','instructions')] else "no fix 2 column"
+print(f"| Instructions retired | | {tot[('a','instructions')]/1e9:,.0f} G | {tot[('b','instructions')]/1e9:,.0f} G ({ratio}) |")
 roles = sorted({k for d in list(bx.values()) + list(cubic.values()) for k in d if k[0].isupper()})
 print()
 print('Per role, all plates, grams (Cubic / fix 2 / BX-fix, and BX-fix - Cubic):')

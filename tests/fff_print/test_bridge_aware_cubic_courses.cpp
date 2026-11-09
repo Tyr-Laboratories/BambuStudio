@@ -244,7 +244,7 @@ TEST_CASE("Bridge aware cubic lays one seam wall where two lattices meet", "[Bri
         CHECK(measure.long_stretches == 0);
     }
 
-    SECTION("a 0 % neighbour gets a wall at half a bead and stays empty") {
+    SECTION("a 0 % neighbour gets a wall at half a bead less the overlap and stays empty") {
         Sliced sliced;
         slice_and_export(sliced, workspace, right_half_modifier({{"sparse_infill_density", "0%"}}), modifier_config("bridgeawarecubic"), "w1-empty.gcode");
         const PrintObject &object = sliced.object();
@@ -252,7 +252,9 @@ TEST_CASE("Bridge aware cubic lays one seam wall where two lattices meet", "[Bri
         REQUIRE(plan != nullptr);
         const double w = sparse_width(sliced.paths);
         REQUIRE(w > 0.3);
-        const double x_wall = SEAM_X - 0.5 * w;
+        // Inset as beside beads (w/2 - 0.05): at a convex corner the round join of a bead at w/2 leaves a pocket joining the 0 %
+        // void to the region's surface; the 0.05 mm overlap into a region that prints nothing there is harmless.
+        const double x_wall = SEAM_X - (0.5 * w - 0.05);
         size_t layers_checked = 0;
         for (const auto &[key, layer] : emitted_layers(sliced.paths)) {
             const int l = layer_of_key(object, key);
@@ -272,6 +274,25 @@ TEST_CASE("Bridge aware cubic lays one seam wall where two lattices meet", "[Bri
         }
         CHECK(layers_checked >= 80);
         CHECK(sparse_max_x(sliced.paths) <= SEAM_X + 0.01);
+        // The 0 % region's surfaces never meet the pattern's void: the wall seals the seam at the corners too.
+        const int zero_region = object.printing_region(0).config().sparse_infill_density.value <= 0. ? 0 : 1;
+        size_t sealed_layers = 0;
+        for (size_t l = 0; l < object.layers().size(); ++l) {
+            const Layer &layer = *object.layers()[l];
+            if (size_t(zero_region) >= layer.regions().size())
+                continue;
+            ExPolygons zero;
+            for (const Surface &surface : layer.regions()[zero_region]->fill_surfaces.surfaces)
+                if (surface.surface_type == stInternal)
+                    zero.push_back(surface.expolygon);
+            if (zero.empty())
+                continue;
+            INFO("layer " << l << " at z = " << layer.print_z);
+            for (const ExPolygons &group_void : plan->material(l).void_of_group)
+                CHECK(intersection_ex(group_void, zero).empty());
+            ++sealed_layers;
+        }
+        CHECK(sealed_layers >= 80);
     }
 
     SECTION("no wall against material or between regions of one group") {
