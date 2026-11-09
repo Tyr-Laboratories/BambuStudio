@@ -19,4 +19,5 @@ bash "$TOOLING/acc/analyse2.sh" "$V" >> "$V/log.txt" 2>&1
 echo "$(date '+%F %T') analyses done" >> "$V/log.txt"
 "$BAC_PYTHON" "$TOOLING/tools/table.py" "$V/summary.txt" > "$V/table.md" 2>&1
 rm -f "$V"/p*/output/*.gcode
+rm -f "$TOOLING"/cache/"$(echo "$V" | tr / _)"_p*.pkl    # the reader's parse cache of the deleted G-code
 echo "$(date '+%F %T') done" >> "$V/log.txt"
