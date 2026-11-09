@@ -21,7 +21,8 @@ scripts (`scripts/bridge_aware_cubic_acceptance/`, see its README) are in place.
 | 5c | done (Task 10) | the family change of 3.7 step 6, after Heimdall run 2 measured +19.1 % time; K2 unchanged on the fixtures |
 | 7a | done, corrected after review | S3 (infill combination): the surfaces combine as Cubic's; outside the single-layer zones a combined island prints the plan's lattice at the combined thickness, inside them the plan's lines print at layer height on every layer of the group, resting on lines of their own planes; S3 reads only the surfaces and the export |
 | 7b | done (Task 16) | S4: at N = 2 the bands equal Cubic's away from the roof, and K1 and K2 hold with bands; at N = 1 the four fixtures' G-code is byte-identical |
-| 8-10 | in progress | |
+| 8a | done (Task 17) | S5 (instances, a shared object and its plan), S6 (settings unchanged but for the pattern and the gap; bridge angles as Cubic's), D1 (byte-identical exports, reslices as fresh slices) |
+| 8b-10 | in progress | |
 
 Known limitations (findings the construction does not yet meet, 9 November 2026; the local debug dump `[BACDebug]` measures them):
 
@@ -53,11 +54,17 @@ estimated, 492 k sparse paths, 0.99 M retractions; budgets of the architecture's
 | 1 | 8a66896e7 | 15 plates (plate 4 crashed, fixed in f2e2dc288): +5.9 % | +18 % on 15 plates | 473 k on 15 plates | 1.65 M on 15 plates | 1,387, 169 |
 | 2 | 6e823809f | 4,522.9 g (+6.3 %) | 372.4 h (+19.1 %) | 1.44 M (533 k) | 1.79 M | 1,791, 187 |
 | 3 | + family change | 4,533.7 g (+6.5 %) | 365.7 h (+16.9 %) | 1.38 M (379 k) | 1.64 M | 1,825, 119 |
+| 4 | 06deb8b89 | 4,479.5 g (+5.3 %) | 360.2 h (+15.2 %) | 1.34 M (618 k, nearly all column pieces) | 1.62 M | 1,791, 59 |
 
 The bridge check of runs 1 to 3 measured nothing: it read the internal bridge layers from the old branch's probe dumps. It now
 finds them in the G-code (a bridge path inside the outline of the layer below) and measures, as the export observer does, the
 free stretches and hanging ends over the sparse void below. On plate 4 (run 2's app): Cubic 3,120 free stretches over 5 mm
 (longest 79 mm), 7 hanging ends (longest hanging stretch 38 mm); the pattern 1 (7.0 mm), 11 hanging ends (longest 0.27 mm).
+
+Run 4, all 16 plates: internal bridge stretches over 5 mm free over the void, Cubic 41,564 (longest 181 mm), the pattern 81
+(longest 36.6 mm on plate 10 at z 186.4, 34.4 mm on plate 13 at z 186.4, 29.9 mm on plate 12 at z 15.6, 26.2 mm on plate 2 at
+z 145.0); hanging bridge ends, Cubic 150 (longest 177 mm), the pattern 137 (longest 5.1 mm, most under 0.3 mm). The long free
+stretches and the hanging ends over 1 mm are under investigation.
 
 What a released build will do: plan once per object before the bridge generator, from the sliced surfaces; print Cubic's lines plus
 the plan's strands and courses through the ordinary fill machinery; run no check. What a development build adds: the verifier and

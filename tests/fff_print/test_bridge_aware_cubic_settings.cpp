@@ -2,11 +2,14 @@
 
 #include "bridge_aware_cubic_fixtures.hpp"
 
+#include "libslic3r/Fill/BridgeAwareCubicPlan.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
 
 #include <algorithm>
+#include <set>
+#include <fstream>
 #include <string>
 
 using namespace Slic3r;
@@ -199,3 +202,104 @@ TEST_CASE("Bridge aware cubic prints as Cubic where no roof needs refinement", "
         CHECK(same);
     }
 }
+
+// S6: setting invariance. Choosing the pattern changes no other setting: the region configs after processing equal Cubic's but
+// for the pattern and the gap; arc fitting still fits arcs; an explicit bridge angle reaches every internal bridge; solid fills
+// merge as Cubic's away from the plan's layers.
+TEST_CASE("Bridge aware cubic changes no other setting of the part", "[BridgeAwareCubic][S6]")
+{
+    SECTION("the region configs equal Cubic's but for the pattern and the gap") {
+        Print bac, cubic;
+        Model model_bac = modifier(), model_cubic = modifier();
+        slice(bac, model_bac, modifier_config("bridgeawarecubic"));
+        slice(cubic, model_cubic, modifier_config("cubic"));
+        const PrintObject &a = *bac.get_object(0), &b = *cubic.get_object(0);
+        REQUIRE(a.num_printing_regions() == b.num_printing_regions());
+        for (size_t r = 0; r < a.num_printing_regions(); ++r) {
+            const PrintRegionConfig &ca = a.printing_region(r).config(), &cb = b.printing_region(r).config();
+            for (const std::string &key : ca.keys()) {
+                if (key == "sparse_infill_pattern" || key == gap_key)
+                    continue;
+                INFO("region " << r << ": " << key);
+                const ConfigOption *oa = ca.option(key), *ob = cb.option(key);
+                CHECK((oa == nullptr) == (ob == nullptr));
+                if (oa != nullptr && ob != nullptr)
+                    CHECK(*oa == *ob);
+            }
+        }
+    }
+    SECTION("arc fitting fits arcs") {
+        Print print;
+        Model model = small_cube();
+        slice(print, model, with(fixture_config(5., "bridgeawarecubic"), {{"enable_arc_fitting", "1"}}));
+        Workspace workspace;
+        const std::string filename = print.export_gcode((workspace.path / "s6-arcs.gcode").string(), nullptr);
+        std::ifstream file(filename);
+        std::string line;
+        size_t arcs = 0;
+        while (std::getline(file, line))
+            if (line.rfind("G2 ", 0) == 0 || line.rfind("G3 ", 0) == 0)
+                ++arcs;
+        CHECK(arcs > 0);
+    }
+    SECTION("an explicit bridge angle reaches the internal bridges as with Cubic") {
+        // The stock pipeline gives a bridge the explicit angle, except a thick base over a required roof, whose angle it derives
+        // from the lines below (Cubic's too; the small cube's one internal bridge is such a base): per layer the internal bridges'
+        // angles equal Cubic's.
+        const auto angles = [](const Print &print) {
+            std::vector<std::set<long>> out;
+            for (const Layer *layer : print.get_object(0)->layers()) {
+                std::set<long> here;
+                for (const LayerRegion *region : layer->regions())
+                    for (const Surface &surface : region->fill_surfaces.surfaces)
+                        if (surface.surface_type == stInternalBridge)
+                            here.insert(std::lround(surface.bridge_angle * 1e6));
+                out.push_back(std::move(here));
+            }
+            return out;
+        };
+        Print bac, cubic;
+        Model model_bac = small_cube(), model_cubic = small_cube();
+        slice(bac, model_bac, with(fixture_config(5., "bridgeawarecubic"), {{"bridge_angle", "30"}}));
+        slice(cubic, model_cubic, with(fixture_config(5., "cubic"), {{"bridge_angle", "30"}}));
+        const std::vector<std::set<long>> a = angles(bac), b = angles(cubic);
+        REQUIRE(a.size() == b.size());
+        size_t bridged = 0;
+        for (size_t l = 0; l < a.size(); ++l) {
+            INFO("layer " << l);
+            CHECK(a[l] == b[l]);
+            bridged += !a[l].empty();
+        }
+        CHECK(bridged > 0);
+    }
+    SECTION("solid fills merge as Cubic's away from the plan's layers") {
+        Print bac, cubic;
+        Model model_bac = small_cube(), model_cubic = small_cube();
+        slice(bac, model_bac, fixture_config(5., "bridgeawarecubic"));
+        slice(cubic, model_cubic, fixture_config(5., "cubic"));
+        const PrintObject &a = *bac.get_object(0), &b = *cubic.get_object(0);
+        REQUIRE(a.layers().size() == b.layers().size());
+        const BridgeAwareCubic::ObjectPlan *plan = a.bridge_aware_cubic_plan();
+        REQUIRE(plan != nullptr);
+        std::set<size_t> plan_layers;
+        for (const BridgeAwareCubic::PlaneSummary &plane : plan->planes()) {
+            plan_layers.insert(plane.plane_layer);
+            plan_layers.insert(plane.roof_layer);
+        }
+        const auto solid_count = [](const Layer &layer) {
+            size_t n = 0;
+            for (const LayerRegion *region : layer.regions())
+                for (const Surface &surface : region->fill_surfaces.surfaces)
+                    if (surface.surface_type == stInternalSolid)
+                        ++n;
+            return n;
+        };
+        for (size_t l = 0; l < a.layers().size(); ++l) {
+            if (plan_layers.count(l) || plan_layers.count(l + 1) || (l > 0 && plan_layers.count(l - 1)))
+                continue;
+            INFO("layer " << l);
+            CHECK(solid_count(*a.layers()[l]) == solid_count(*b.layers()[l]));
+        }
+    }
+}
+
