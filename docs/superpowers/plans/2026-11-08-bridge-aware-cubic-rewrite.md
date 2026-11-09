@@ -1,0 +1,468 @@
+# Bridge aware cubic rewrite: implementation plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build the sparse infill pattern "Bridge aware cubic" (`ipBridgeAwareCubic`, key `bridgeawarecubic`, option `bridge_aware_cubic_max_gap`) from `master`, so that nothing above the pattern's void spans more than the gap (K1), every line the pattern adds is held or bridged (K2), and no other setting of the part changes.
+
+**Architecture:** One plan per `PrintObject`, built from the sliced surfaces once, after `clip_fill_surfaces` and immediately before `bridge_over_infill`. It refines Cubic's lattice under roofs (open cells, needed strands, solid columns), holds the added lines with a greedy support sweep, lays courses (seam walls, rails) outside the lattice directions, and stores strands and courses by layer. A filler derived from `FillCubic` prints Cubic's lines plus the plan's lines through the stock fill machinery, and one pass after every filler prints what a later stock step took where nothing else prints. Development builds add a verifier and plan checks that warn and stop nothing.
+
+**Tech Stack:** C++17 (libslic3r: Clipper, EdgeGrid, TBB), Catch2 v2 tests in `tests/fff_print`, Python 3 (shapely 2, numpy) for the acceptance scripts, Ninja build tree `build/wall-painting` (RelWithDebInfo, arm64, `SLIC3R_BUILD_TESTS=ON`).
+
+**Spec:** `docs/superpowers/specs/2026-11-08-bridge-aware-cubic-rewrite-design.md` (sections are cited as §n.m). The spec's line citations are at commit 28aed7650; this plan cites the current base ff7ba443a (master dbf8c36be plus the first branch commit). The old branch head ef9c17704 is unreachable by branch but still in the object store: `git show ef9c17704:<path>` retrieves the test helpers §7.2 carries over verbatim. No source unit of the old branch is read or reused (§0, §10.3).
+
+## Global Constraints
+
+- Budgets (§1.4): pattern source units ≤ 4,000 lines; tests ≤ 2,500 lines and ≤ 40 cases (fixtures included); changed lines in shared files ≤ 150; slicing cost ≤ 2.0 × official 2.9.1.70 Cubic in instructions retired (median and worst of five alternating pairs after a warm-up pair, per fixture); print time on the 16 Heimdall plates ≤ +17.8 % over Cubic (≤ 367.5 h against 312.0 h); hanging internal bridge ends over the pattern's void on the 16 plates: 0 (an end overlapping a wall is anchored); unheld pattern pieces on plates 1–5 by the K2 checker ≤ 86 at stage 5a, target 0, every piece listed with its cause.
+- Release behaviour (§1.2): no check runs in a release build; nothing stops, truncates, falls back or repairs; never add `SlicingError`, a fallback or a repair pass for a pattern condition; when a limit is reached the pattern generates anyway.
+- Settings (§1.2): choosing the pattern changes no other setting; nothing is refused, overridden or ignored because the pattern is chosen; no special case in shared slicer logic beyond the hooks of §2.3; `combine_infill`, `Print::validate`, `PrintConfig::validate()`, `bridge_over_infill`'s logic, `connect_infill`, the G-code writer and processor, `LayerRegion` are not touched.
+- Tests (§7.1): assert the contract on the output, or closed-form geometry against a brute-force oracle; no test reads internal state (no strand coordinates, counts, kinds, statistics, digests); no `[!mayfail]`, no guard values, no pinned failures; a test that would need re-pinning after a contract-preserving change is deleted; no test hooks in production code (no `allow_*`, `emit_*`, statistics that exist only for a test).
+- Constants (§4): G = clamp(option, nozzle diameter of the sparse extruder, option max); G_b = G − 0.1 mm; μ = 0.1 mm; option min 0.01 mm, max 1000 mm, default 5; s_f = `Flow::spacing()` of the sparse flow at the object's `layer_height`; L_N = `coord_t(scale_(s_f) · N / (d / 3))`; a_0 = L_N · √(2/3); θ_k = `infill_direction` + π/2 + k·π/3; σ = (+1, −1, +1); s_m = h_m/√2; α_m = √((w/2)² − s_m²); c = w/√3; c_N = c + (N − 1) s_f / (2√3); λ = w; τ = (c − w/2) · sin 60° / 4; r_sw = (λ − c)/2; k_min = 6, gain = 1; look-ahead 3 layers; material look-along 20 mm; plane levels 1 to 16; ε = 0.01 mm; δ_s = 0.01 mm; seam inset w/2 − 0.05 mm beside beads, w/2 beside 0 % or air; corner follow w; d_r = s_b + w/2 + 0.05 mm; solid rule opening by 0.55 · s_role; h_n = half the nozzle diameter; r = nozzle · √(bridge_flow) under a bridge candidate, else the narrowest wall or solid bead; round joins (`ClipperLib::jtRound`) with arc tolerance 0.001 mm for every offset of material; sliver: pieces < w − 1e−4 dropped, needed strands lengthened to w; visit warning 1,000,000 cells per group; cancel period 1024 visits; solid column course clip W_N/2 − w/4.
+- Measurement (§1.4, memory): instructions retired, never wall time; `/usr/bin/time -l` for CLI runs; grams, the slicer's time estimate, path and retraction counts and peak RSS are clock-independent. The 16-plate acceptance, the K2 checker and the release gate are the controller's scripted steps, never inside an implementer task.
+- Process (§8, memory): every reviewer subagent runs on Opus (`model: "opus"`); tasks are about an hour; critical and important review findings are fixed in the task, minor ones wait for the final review; commit after each task.
+
+## Review Focus
+
+Input classes the spec implies but no listed case exercises directly, most likely to bite first; each line names the task whose tests pin it.
+
+1. **An object with no sparse surface at all** (every layer solid, or a 100 % region only): `ObjectPlan::build` must produce a plan with no groups and the filler must fall through to `FillCubic` with no plan bound. Pinned in Task 4 (P1: a solid block creates no plane and slices) and Task 19 (S2 100 %).
+2. **A plane whose layer index would be negative** (a roof on layer 1 or 2 with B = 3, m = n − 1 − j < 0): planes are clamped to m ≥ 0 and the sweep stops at layer 0. Pinned in Task 4 (P1: a 3-layer-high roof over sparse fill with `internal_bridge_layers` 3 creates planes only down to layer 0).
+3. **A strand whose trace meets the fill boundary in several intervals** (an island with a hole, or two islands on one trace): clipping along the trace must return every interval, each ≥ w, and the sweep's admissibility must read the right interval. Pinned in Task 9 (K2 on the perforated roof and the cylinder fixtures, which have holes).
+4. **Cancellation while the plan builds** (the cancel hook throws `CanceledException` inside the descent run in parallel): the exception must propagate and leave no partially written plan behind on the object. Pinned in Task 4 (P1's cancel case: a hook that throws on its first call leaves `bridge_aware_cubic_plan()` null and a second `process()` completes).
+5. **A gap larger than the part** (option at 1000 mm) and **an infill direction outside [0, 360)** (e.g. 405°, which the GUI allows through presets): no plane fails, output equals Cubic's; the lattice reduces θ modulo 2π exactly as `FillCubic` does (it does not reduce; neither does the pattern). Pinned in Task 2 (L1 at direction 405° and −30°) and Task 19 (S7: gap 1000).
+
+---
+
+## File structure
+
+Create (namespace `Slic3r::BridgeAwareCubic` unless noted):
+
+| File | Responsibility |
+| --- | --- |
+| `src/libslic3r/Fill/BridgeAwareCubicLattice.{hpp,cpp}` | Cubic's lattice in closed form: `LatticeParams`, `PlaneKey`, `Cell`, `Trace`, `trace()`, `section()`, `height_range()`, `crossing()`, `bulk_lines()`, `roots()`, `children()`, `split_planes()`, `face()`, `plane_through()`, sub-line offsets |
+| `src/libslic3r/BridgeAwareCubicMaterial.{hpp,cpp}` | Per layer: `LayerMaterial` (walls, M⁺, M⁻, V, S^G), `printed_material()`, `add_courses()`, `sparse_islands()` (through the shared-code wrapper of hook 8a), `fill_boundary()`, `AreaIndex` |
+| `src/libslic3r/Fill/BridgeAwareCubicPlan.{hpp,cpp}` | `ObjectPlan::build()`, regions and groups, seam walls, roofs and planes, rails, `GroupPlan::refine()`, solid columns, storage by layer, the public queries, the statistics of §5.2 |
+| `src/libslic3r/Fill/BridgeAwareCubicSweep.{hpp,cpp}` | The hold rule, items per layer, extensions, holders, cover pieces, columns with steering and family change, course ends, the unheld list |
+| `src/libslic3r/Fill/FillBridgeAwareCubic.{hpp,cpp}` | `class FillBridgeAwareCubic : public FillCubic`: `bind()`, `fill_surface()`; free function `print_uncovered(Layer&)` |
+| `src/libslic3r/BridgeAwareCubicVerify.{hpp,cpp}` | `verify()` (§5.1), `plan_warnings()` (§5.2), message formatting |
+| `tests/fff_print/bridge_aware_cubic_fixtures.hpp` | Carried-over fixtures and helpers: `with`, `fixture_config`, geometry, `paths`, `slice`, `sparse_length`, `roof_gaps`, `bridge_ends`, the export observer (`ExportWorkspace`, `export_config`, `observed`, the decimal readers, `read_extrusions`, `footprint`, `emitted_layers`, `count_bridge_ends`, `count_free_sparse_ends`, `exported_gcode`), `fill_paths`, `different_layers`, `apply_with_setting`, `deposited_segments`, `combined_infill_paths`, the bridge-surface snapshots, the config helpers, and the new `measure_planes` |
+| `tests/fff_print/test_bridge_aware_cubic_lattice.cpp` | L1, L2 |
+| `tests/fff_print/test_bridge_aware_cubic_plan.cpp` | M1, P1, V1 |
+| `tests/fff_print/test_bridge_aware_cubic_export.cpp` | P2, K1, K1n, K2, R1, W1, S3, S4, S5, D1, X1 (hidden), X2 (hidden) |
+| `tests/fff_print/test_bridge_aware_cubic_settings.cpp` | S1, S2, S6, S7 |
+
+Modify (the complete list of shared-code hooks, §2.3): `src/libslic3r/PrintConfig.hpp`, `PrintConfig.cpp`, `Preset.cpp`, `src/slic3r/GUI/Tab.cpp`, `GUI_Factories.cpp`, `ConfigManipulation.cpp`, `src/libslic3r/Fill/FillBase.cpp`, `Fill/Fill.cpp`, `Fill/Fill.hpp`, `Print.hpp`, `Print.cpp`, `PrintObject.cpp`, `Layer.cpp`, `src/libslic3r/CMakeLists.txt`, `tests/fff_print/CMakeLists.txt`, top-level `CMakeLists.txt`.
+
+## Interfaces (the contract between tasks)
+
+```cpp
+// Fill/BridgeAwareCubicLattice.hpp
+struct LatticeParams {
+    double  spacing;            // s_f, mm
+    double  width;              // w, mm: the sparse bead width
+    int     multiline;          // N
+    coord_t pitch;              // L_N, scaled; clamped to std::numeric_limits<coord_t>::max() / 2
+    double  a0;                 // cube edge, mm = unscale(pitch) * sqrt(2./3.)
+    double  theta[3];           // infill_direction (rad) + pi/2 + k*pi/3
+    int     sigma[3] = {+1, -1, +1};
+    Point   center;             // the reference point: the object's bounding box centre, scaled
+    static LatticeParams make(double infill_direction_deg, double density_fraction, double spacing_mm,
+                              double width_mm, int multiline, const BoundingBox &object_bbox);
+    Vec2d   normal(int k) const;             // (cos θ_k, sin θ_k)
+    Vec2d   direction(int k) const;          // d_k = (−sin θ_k, cos θ_k)
+    double  band_width() const;              // W_N = (N − 1) s_f + w
+    std::vector<double> subline_offsets() const;   // o_i = (i − (N − 1)/2) s_f
+};
+struct PlaneKey { int family; int depth; int64_t numerator; };      // u_k = numerator * a0 / 2^depth; depth 0 = bulk
+struct Cell     { int64_t index[3]; int depth; };                   // u_k in [index_k * a_depth, (index_k + 1) * a_depth]
+struct Trace    { Vec2d origin; Vec2d dir; };                       // mm, relative to center; point(t) = origin + t * dir
+struct Crossing { double t; double dt_dz; };                        // along the first plane's trace
+Trace                    trace(const LatticeParams&, const PlaneKey&, double z);
+std::pair<double,double> height_range(const LatticeParams&, const Cell&);
+Polygon                  section(const LatticeParams&, const Cell&, double z);       // scaled, absolute; empty outside the height range
+std::optional<Crossing>  crossing(const LatticeParams&, const PlaneKey &K, const PlaneKey &J, double z);
+Lines                    bulk_lines(const LatticeParams&, double z, const BoundingBox &bbox);   // FillCubic's lines, extremes included
+std::vector<Cell>        roots(const LatticeParams&, const BoundingBox &bbox, double z);
+std::array<Cell, 8>      children(const Cell&);
+std::array<PlaneKey, 3>  split_planes(const Cell&);                 // odd numerators at depth + 1
+PlaneKey                 face(const Cell&, int family, bool upper);
+std::optional<PlaneKey>  plane_through(const LatticeParams&, int family, const Vec2d &point, double z, double tolerance); // finest of levels 1..16 within tolerance, never bulk
+
+// BridgeAwareCubicMaterial.hpp
+struct LayerMaterial {
+    ExPolygons walls;               // lslices − ∪ fill_no_overlap_expolygons
+    ExPolygons may_print;           // M⁺
+    ExPolygons surely_prints;       // M⁻
+    ExPolygons void_area;           // V = lslices − M⁻
+    std::vector<ExPolygons> void_of_group;   // S^G per group index
+};
+LayerMaterial printed_material(const Layer&, const std::vector<std::vector<size_t>> &groups_regions);  // §3.3
+void          add_courses(LayerMaterial&, const Polylines &courses, double width_mm, const std::vector<std::vector<size_t>> &groups_regions, const Layer&);
+struct SparseIsland { std::vector<size_t> region_ids; ExPolygon island; ExPolygons no_overlap; };
+std::vector<SparseIsland> sparse_islands(const Layer&);              // the pattern's sparse islands as make_fills will see them (hook 8a)
+ExPolygons    fill_boundary(const ExPolygon &island, const Polylines &courses, double spacing_mm, double width_mm, double infill_wall_overlap_percent);
+class AreaIndex {                                                   // an EdgeGrid over ExPolygons
+public:
+    explicit AreaIndex(const ExPolygons&, coord_t resolution = scale_(1.));
+    bool contains(const Point&) const;
+    std::vector<std::pair<double,double>> segment_inside(const Line&, double t0, double t1) const;   // parameter intervals inside
+    const ExPolygons& polygons() const;
+    const BoundingBox& bbox() const;
+};
+
+// Fill/BridgeAwareCubicPlan.hpp
+enum class StrandKind : uint8_t { Needed, Extension, Column, Cover, SolidFace };
+struct PlaneSummary { size_t roof_layer, plane_layer; double gap; double footprint_area_mm2; };
+struct PlanStatistics { /* §5.2: unheld places, lowest courses over other void, visit counts, thick layers, rail misses */ };
+class GroupPlan {
+public:
+    bool  has_content() const;
+    Lines strands_at(size_t layer, const BoundingBox&) const;        // scaled segments, sub-lines expanded
+    const LatticeParams& lattice() const;
+};
+class ObjectPlan {
+public:
+    static std::unique_ptr<ObjectPlan> build(const PrintObject&, const std::function<void()> &cancel);
+    const GroupPlan* group_of_region(size_t region_id) const;        // nullptr when the region does not print the pattern
+    const Polylines& courses_at(size_t layer, size_t region_id) const;
+    std::vector<PlaneSummary> planes() const;
+    ExPolygons single_layer_zone(size_t layer) const;                // §3.9a; empty without combination
+    const PlanStatistics& statistics() const;
+    double gap_of_region(size_t region_id) const;                    // G after the clamp
+};
+
+// Fill/FillBridgeAwareCubic.hpp
+class FillBridgeAwareCubic : public FillCubic {
+public:
+    Fill* clone() const override;
+    void bind(const ObjectPlan&, const Layer&);
+    Polylines fill_surface(const Surface*, const FillParams&) override;
+};
+void print_uncovered(Layer&);                                        // §3.8, once per layer at the end of make_fills
+
+// BridgeAwareCubicVerify.hpp
+struct PlaneReport { size_t roof_layer, plane_layer; double z, gap, bead; double max_opening, max_run; size_t bridge_free_ends, other_free_ends; bool passed; std::string failure; };
+struct VerificationReport { std::vector<PlaneReport> planes; bool passed() const; };
+VerificationReport verify(const PrintObject&, const std::function<void()> &cancel);
+std::vector<std::string> plan_warnings(const PrintObject&);
+
+// PrintObject (Print.hpp)
+const BridgeAwareCubic::ObjectPlan* bridge_aware_cubic_plan() const;  // a shared object returns its source's
+```
+
+Test oracles (tests only, `tests/fff_print/bridge_aware_cubic_fixtures.hpp`), beyond the carried-over helpers:
+
+```cpp
+struct PlaneMeasure { int lower, upper; double gap; double widest_opening, longest_run; size_t bridge_free_ends, other_free_ends; size_t openings, runs; };
+// Every pair of consecutive emitted planes where non-sparse material of the upper lies over the sparse void of the lower beyond
+// half the nozzle from what the lower prints: openings (components of opening(void, r/2) ∩ offset(roof, r/2)), runs (roof paths
+// clipped to void − offset_round(printed, h_n + ε)), free ends by role. Reads only the G-code (§5.1 applied to the export).
+std::vector<PlaneMeasure> measure_planes(const std::vector<EmittedPath>&, double nozzle_mm, double gap_mm);
+```
+
+## Build and verification commands
+
+- Configure once (already done): `build/wall-painting` (Ninja). Build: `ninja -C build/wall-painting bridge_aware_cubic_tests` and `ninja -C build/wall-painting BambuStudio`. Run at `nice -n 10`; a header edit in `PrintConfig.hpp` rebuilds most of the project (only Task 1 edits it).
+- Tests: `build/wall-painting/tests/fff_print/bridge_aware_cubic_tests '[BridgeAwareCubic]'`; a tag group in one bracket is AND, a comma is OR; hidden cases need their tag explicitly.
+- CLI slice of a fixture project (byte-identity gate, Task 1): `build/wall-painting/src/BambuStudio.app/Contents/MacOS/BambuStudio --datadir D --outputdir O --arrange 0 --orient 0 --debug 1 --slice 1 PROJECT.3mf` (the benchmark runner's invocation; never run the binary without `--slice`).
+- Heimdall acceptance (controller, between stages): `scripts/bridge_aware_cubic_acceptance/measure/measure.sh LABEL build/wall-painting/src/BambuStudio.app` with `BAC_DATA=/Users/jforbes/Documents/Development.nosync/BambuStudio-bac-data` and `BAC_PYTHON` a Python with shapely 2 and numpy.
+- Release gate (Task 20): `scripts/bridge_aware_cubic_benchmark/run_benchmark.py` per `docs/bridge-aware-cubic-benchmark.md` against `/private/tmp/bridge-aware-official-baseline/2.9.1.70/BambuStudio.app`.
+
+---
+
+### Task 0: Stage-0 gate and master baselines
+
+**Files:** none changed.
+
+- [ ] **Step 1: Verify the stage-0 gate.** Run `python3 -m pytest tests/benchmarking -q` (or `python3 -m unittest discover tests/benchmarking`); expected: all pass. Check the baseline app exists: `ls /private/tmp/bridge-aware-official-baseline/2.9.1.70/BambuStudio.app/Contents/MacOS/BambuStudio`.
+- [ ] **Step 2: Build master's slicer.** `ninja -C build/wall-painting BambuStudio` at ff7ba443a (no source change since master). Expected: exit 0.
+- [ ] **Step 3: Capture master's Cubic fixture G-code.** For each of `small-cubic`, `large-cubic`, `rib-cubic`, `modifier-cubic` in `tests/data/bridge_aware_cubic_benchmark/projects/`, run the CLI slice command into `$BAC_DATA/baselines/master-fixtures/<name>/`. Keep the G-code. Expected: four `plate_1.gcode` files, exit 0 each.
+- [ ] **Step 4: Regenerate the 16-plate Cubic baselines** with this build: `BAC_DATA=... scripts/bridge_aware_cubic_acceptance/acc/batch.sh VARIANT` on a variant dir holding this app and the Cubic project, then copy the `pN` dirs to `$BAC_DATA/baselines/cubic/`. Runs in the background through Task 1; the result is needed first at Task 7's Heimdall run 0. Expected: 16 `plate_N.gcode` and a `summary.txt`.
+
+### Task 1: Stage 1 — option, enum, GUI, filler stub, test executable, parity gate
+
+**Files:**
+- Modify: `src/libslic3r/PrintConfig.hpp:88-94` (enum), `:1127` (region config, after `sparse_infill_pattern`)
+- Modify: `src/libslic3r/PrintConfig.cpp:243` (keys map), `:3234-3283` (`sparse_infill_pattern` enum values and labels), option definition after the `sparse_infill_pattern` block
+- Modify: `src/libslic3r/Preset.cpp:1042`, `src/slic3r/GUI/Tab.cpp:3340`, `src/slic3r/GUI/GUI_Factories.cpp:61,109,148`, `src/slic3r/GUI/ConfigManipulation.cpp:944-948`
+- Modify: `src/libslic3r/Fill/FillBase.cpp:65` (factory case), `src/libslic3r/Fill/Fill.cpp:297` (multiline list), `:1031` (preview switch case), `src/libslic3r/Layer.cpp:624`, `src/libslic3r/PrintObject.cpp:1708` (invalidation), `:3958` (`s_modifier_ignored_infill_keys`)
+- Create: `src/libslic3r/Fill/FillBridgeAwareCubic.hpp`, `.cpp`; add to `src/libslic3r/CMakeLists.txt` after `Fill/FillRectilinear.hpp`
+- Create: `tests/fff_print/bridge_aware_cubic_fixtures.hpp`, `tests/fff_print/test_bridge_aware_cubic_settings.cpp`; add `bridge_aware_cubic_tests` to `tests/fff_print/CMakeLists.txt` (pattern: `bridge_controls_tests`, with `target_include_directories(... ${CMAKE_SOURCE_DIR}/src/libslic3r)`)
+
+**Interfaces:** Produces `ipBridgeAwareCubic` (last value before `ipCount`), key `"bridgeawarecubic"`, label `"Bridge aware cubic"`; `PrintRegionConfig::bridge_aware_cubic_max_gap` (`ConfigOptionFloat`, label "Unsupported gap size", category Strength, sidetext mm, min 0.01, max 1000, default 5, mode `comAdvanced`, tooltip stating that values below the nozzle diameter are raised to it); `FillBridgeAwareCubic` deriving from `FillCubic` whose `fill_surface` returns `FillCubic::fill_surface` until Task 7.
+
+- [ ] **Step 1: Write the failing S1 config tests** in `test_bridge_aware_cubic_settings.cpp` (carry the config helpers from `git show ef9c17704:tests/fff_print/test_bridge_aware_cubic_config.cpp` lines 17-53 into the fixtures header; adapt the old file's cases, which read the option through the config API only):
+
+```cpp
+TEST_CASE("Bridge aware cubic option is a scalar region option with default 5 in the print options", "[BridgeAwareCubic][S1]")
+// region defaults: option exists, coFloat, 5.0; print_config_def min 0.01, max 1000; "bridge_aware_cubic_max_gap" is in Preset::print_options();
+// the sparse_infill_pattern definition lists "bridgeawarecubic"; the top_surface_pattern definition does not.
+TEST_CASE("Bridge aware cubic option round-trips through a preset, a 3MF and a project", "[BridgeAwareCubic][S1]")
+// save a DynamicPrintConfig with gap 7.5 and pattern bridgeawarecubic to ini and back; store a Model with a modifier gap 3 as 3MF
+// (store_bbs_3mf) and load it (load_bbs_3mf); both read back 7.5 and 3.
+TEST_CASE("Bridge aware cubic gap change invalidates prepare infill and modifier_ignore_infill restores it", "[BridgeAwareCubic][S1]")
+// Print::apply with gap 5 then 6 -> PrintObject step posPrepareInfill invalidated (print.get_object(0)->is_step_done(posPrepareInfill) false
+// after a processed print); a modifier with gap 3 and modifier_ignore_infill true -> the region config of the modifier's region reads 5.
+```
+
+Also write the stage gate case (temporary until Task 7 folds it into S2):
+
+```cpp
+TEST_CASE("Bridge aware cubic fills equal Cubic's on the four fixtures while no plan exists", "[BridgeAwareCubic][Stage1]")
+// for small_cube, large_cube, rib (rib_config), modifier (modifier_config): fill_paths(bac) vs fill_paths(cubic) with every point within
+// 0.001 mm (scale_(0.001) units) of its counterpart, same count, same roles.
+```
+
+- [ ] **Step 2: Build the test target and run; expected: compile failure** (`bridgeawarecubic` unknown, option missing).
+- [ ] **Step 3: Implement hooks 1–5 and 10, the invalidation key and the modifier key**, each as the existing pattern beside it (see Files); in `ConfigManipulation.cpp` add `toggle_line("bridge_aware_cubic_max_gap", have_infill && pattern == ipBridgeAwareCubic && density < 100)` after the multiline toggle and add the pattern to `support_multiline_infill` in both `ConfigManipulation.cpp` and `Fill.cpp`.
+- [ ] **Step 4: Implement `FillBridgeAwareCubic`**: `class FillBridgeAwareCubic : public FillCubic { Fill* clone() const override; void bind(const BridgeAwareCubic::ObjectPlan&, const Layer&) {} ; Polylines fill_surface(const Surface*, const FillParams&) override { return FillCubic::fill_surface(surface, params); } }`; `is_self_crossing()` and `_layer_angle` inherit.
+- [ ] **Step 5: Create the fixtures header** from `git show ef9c17704:tests/fff_print/bridge_aware_cubic_fixtures.hpp`: keep `with`, `fixture_config`, `single_part`, `small_cube`, `large_cube`, `partial_roof`, `rib`, `rib_config`, `modifier_between`, `modifier`, `floating_modifier`, `modifier_config`, `paths`, `slice`, `sparse_length`, `roof_gaps`, `bridge_ends`; drop `plan_details_kept`, `Digest`, `at_bed_origin`, `pattern_warnings`, `holds_demand`, `ReportCounts`, `report_counts`, `plane_log` and the includes of the old units. Add `fill_paths`, `different_layers`, `apply_with_setting` from `git show ef9c17704:tests/fff_print/test_bridge_aware_cubic.cpp` lines 33-95.
+- [ ] **Step 6: Build everything** (`ninja -C build/wall-painting bridge_aware_cubic_tests BambuStudio`, background; the enum edit rebuilds most of the tree). Run `bridge_aware_cubic_tests '[BridgeAwareCubic]'`. Expected: all pass.
+- [ ] **Step 7: Byte-identity gate.** Slice the four Cubic fixture projects with the new app (Task 0 step 3's command) and `cmp` each `plate_1.gcode` with master's. Expected: identical. If a header line differs only by a build identifier, record the line and compare the rest; any other difference is a defect of this task.
+- [ ] **Step 8: Legacy tests.** `ctest --test-dir build/wall-painting --output-on-failure -j 4` (exclude benchmark executables). Expected: green, or a failure list identical to master's (record it).
+- [ ] **Step 9: Commit** `feat(bac): add the Bridge aware cubic pattern option and a filler that prints Cubic`.
+
+### Task 2: Stage 2 — the lattice unit (L1, L2)
+
+**Files:**
+- Create: `src/libslic3r/Fill/BridgeAwareCubicLattice.hpp`, `.cpp` (CMake entries)
+- Create: `tests/fff_print/test_bridge_aware_cubic_lattice.cpp` (add to the test target)
+
+**Interfaces:** Produces the `LatticeParams`, `PlaneKey`, `Cell`, `Trace`, `Crossing` types and the free functions of the Interfaces section. Formulas (§3.2, Appendix A): cube coordinates u_k = √(2/3)(n_k·p) + σ_k z/√3 with p in mm relative to `center`; z = Σ_k σ_k u_k/√3; the trace of (k, δ, q) at z is n_k·p = q·a_δ·√(3/2) − σ_k z/√2 with a_δ = a_0/2^δ; `bulk_lines` reproduces `make_fill_lines` as called by `FillCubic::fill_surface` and `fill_surface_by_multilines` (`src/libslic3r/Fill/FillRectilinear.cpp:3002-3081, 3163-3173`): per sweep k and sub-line i, `line_width = coord_t(scale_(s_f))`, `line_spacing = pitch`, `total_offset = coord_t(i * line_spacing) + coord_t((i - (N - 1) / 2.0f) * line_width)`, `pattern_shift = coord_t(scale_(double(float(σ_k * sqrt(0.5) * z)) + unscale_(total_offset)))`, `shift = pattern_shift % line_spacing`, lines at `n_k·p = n_k·center − (shift >= 0 ? shift : line_spacing + shift) + m·line_spacing` for every m whose line crosses `bbox`; extreme lines are kept (R5). `plane_through` returns the finest refinement plane (depth 1..16, odd numerator) whose trace at z passes within `tolerance` of `point`, or `nullopt`.
+
+- [ ] **Step 1: Write L1** (`[BridgeAwareCubic][L1]`): for N in {1, 2, 3}, directions {0, 45, 17, 405, −30} degrees, densities {5 %, 12 %, 3 %}, heights z in {0.2, 3.4, 17.8}: a rectangle 60 × 44 mm (an `ExPolygon` offset by −s_f/2 with `jtMiter` as `ExPolygonWithOffset` does) centred in a bounding box 64 × 56; `FillCubic` with `spacing = s_f`, `angle = deg2rad(direction)`, `z`, `layer_id = 0`, bounding box set, `FillParams{density, multiline = N, anchor_length_max = 0}` (so `dont_connect()` holds) on `Surface(stInternal, rectangle)`; `bulk_lines` clipped to the same offset rectangle with `intersection_pl`. Compare as sorted segment sets after dropping every segment within one `line_width` of the rotated bounding box's extremes on either side: equal count, endpoints within `scale_(1e-6)`.
+- [ ] **Step 2: Write L2** (`[BridgeAwareCubic][L2]`): 200 random cells (depth 0..4, indices in ±6) at 5 % and 3 %: `section()` equals the convex hull of the plane's intersections with the cube's 12 edges computed by brute force from the 8 corners (area and vertex set within 1e-6 mm); `height_range()` equals the min/max z of the corners; `trace()` of a random plane passes through brute-force points satisfying the plane equation; `crossing()` equals the brute-force intersection of two traces and its `dt_dz` equals the finite difference over Δz = 1e-4 within 1e-6, and |dt_dz| ≈ √(3/2) for every family pair; `split_planes()` of 1,000 random cells never equals a bulk plane key nor any face key of the cell; `children()` cover the parent (union of height ranges = parent's).
+- [ ] **Step 3: Run; expected: compile failure.**
+- [ ] **Step 4: Implement the unit** (signatures above). `section`: corners from cube coordinates through the inverse map (solve p from any two n_k·p equations), interpolate on the 12 edges, `Geometry::convex_hull`, scale and add `center`. `roots`: for the bbox corners at z compute cube coordinates, take the integer range per axis, keep cells whose height range contains z and whose section's bbox meets `bbox`. Clamp `pitch` at `std::numeric_limits<coord_t>::max() / 2`.
+- [ ] **Step 5: Run L1, L2; expected: pass.** Also `bridge_aware_cubic_tests '[BridgeAwareCubic]'` all pass.
+- [ ] **Step 6: Commit** `feat(bac): add the lattice unit in closed form, pinned against FillCubic`.
+
+### Task 3: Stage 3a — material, fill boundary, area index (M1 without the seam assertion)
+
+**Files:**
+- Create: `src/libslic3r/BridgeAwareCubicMaterial.hpp`, `.cpp` (CMake)
+- Modify: `src/libslic3r/Fill/Fill.hpp` (declare the wrapper), `src/libslic3r/Fill/Fill.cpp` (hook 8a: `std::vector<BridgeAwareCubic::SparseIsland> bridge_aware_cubic_sparse_islands(const Layer&)`, ≈12 lines: `group_fills` on the layer, the `stInternal` fills whose `params.pattern == ipBridgeAwareCubic`, each expolygon with the fill's `region_id_group` and `no_overlap_expolygons`)
+- Create: `tests/fff_print/test_bridge_aware_cubic_plan.cpp` (M1)
+
+**Interfaces:** Produces `LayerMaterial`, `printed_material`, `add_courses`, `sparse_islands`, `fill_boundary`, `AreaIndex`. Rules (§3.3): walls = lslices − ∪ `fill_no_overlap_expolygons`; A = `stInternalSolid`, `stTop`, `stBottom`, `stBottomBridge`, and `stInternal` of a region at 100 %; printing(A) = `opening_ex(A, scale_(0.55 · s_role), jtRound, scale_(0.001))` with s_role the spacing of `LayerRegion::flow(frSolidInfill | frTopSolidInfill)` or `bridging_flow(frSolidInfill, thick)` for `stBottomBridge`; M⁺ = walls ∪ A ∪ courses; M⁻ = walls ∪ printing(A) ∪ courses; V = lslices − M⁻; S^G = components of V meeting the `stInternal` surfaces of G's regions. `fill_boundary` = `offset_ex(island, −scale_(s_f/2))` (miter, as `ExPolygonWithOffset`) minus `offset(courses, scale_((1 − overlap%)(w/2 + s_f/2)), jtRound)`: the lattice stops (1 − overlap)(w/2 + s_f/2) from a course's centre line, as a perimeter leaves it `inset − infill_peri_overlap` from the wall's (`PerimeterGenerator.cpp:1525-1528`). `AreaIndex::segment_inside` walks the EdgeGrid cells along the line, collects edge intersections as parameters, sorts, and classifies each interval by `contains` at its midpoint.
+
+- [ ] **Step 1: Write M1** (without its seam-wall assertion, which Task 13 adds): slice a 40 × 30 × 12 block with a 0.3 mm wide solid strip modifier through its sparse layers (a `ModelVolume` modifier 0.3 × 30 × 12 at x = 20 with `sparse_infill_density` 100 %) at `fixture_config(5, "bridgeawarecubic")`: on a mid layer, `printed_material` reports the strip inside `may_print` and outside `surely_prints` (strip width 0.3 < 1.1 · s_solid); the wall band (lslices − fill_no_overlap) is inside both; `void_area` meets the sparse surfaces. On the small cube: `fill_boundary(island, {}, s_f, w, 15)` equals `offset_ex(island, −s_f/2)`; with one course across the island the boundary excludes a band of width 2·(1 − 0.15)(w/2 + s_f/2) around it; `AreaIndex` on that boundary: `contains` agrees with `ExPolygon::contains` on 1,000 random points, and `segment_inside` of a line crossing the course band returns two intervals whose ends are within 1e-5 mm of the band's edges.
+- [ ] **Step 2: Run; expected: compile failure.**
+- [ ] **Step 3: Implement the unit and the wrapper.**
+- [ ] **Step 4: Run M1; expected: pass.**
+- [ ] **Step 5: Commit** `feat(bac): add the material unit: one definition of printed material and void`.
+
+### Task 4: Stage 3b — plan skeleton, roofs and planes, object hooks (P1)
+
+**Files:**
+- Create: `src/libslic3r/Fill/BridgeAwareCubicPlan.hpp`, `.cpp` (CMake)
+- Modify: `src/libslic3r/Print.hpp:688-700` (member `std::unique_ptr<BridgeAwareCubic::ObjectPlan> m_bridge_aware_cubic_plan;`, accessor, private `void prepare_bridge_aware_cubic();`; forward declaration `namespace BridgeAwareCubic { class ObjectPlan; }`), `src/libslic3r/PrintObject.cpp:1009` (call before `bridge_over_infill()`), `src/libslic3r/Print.cpp:5423` (reset beside `m_lightning_generator.reset()`), `src/libslic3r/Fill/Fill.cpp:840` and `:1044` (hook 8b: `if (surface_fill.params.pattern == ipBridgeAwareCubic) if (const auto *plan = this->object()->bridge_aware_cubic_plan()) static_cast<FillBridgeAwareCubic*>(f.get())->bind(*plan, *this);`)
+- Modify: `tests/fff_print/test_bridge_aware_cubic_plan.cpp` (P1)
+
+**Interfaces:** Produces `ObjectPlan::build`, `group_of_region`, `planes`, `gap_of_region`, `statistics` (empty for now), `courses_at` (empty), `single_layer_zone` (empty); `GroupPlan` with `lattice()`, `has_content()` false, `strands_at()` empty. `prepare_bridge_aware_cubic()` builds the plan when any region prints the pattern (0 < density < 100), else leaves it null; a shared object (`get_shared_object() != nullptr`) builds nothing and `bridge_aware_cubic_plan()` returns the source's. Rules: §3.1 (group key (pitch, `infill_direction`, s_f, N); G per region; B per group), §3.4 (h_n; D_n = (M⁺_n − offset_round(M⁻_{n−1}, h_n)) ∩ S^G_{n−1}, pieces over no group's void dropped; gap of a piece from the nearest `stInternal` surface of n−1, split by regions' surfaces grown by s_f where gaps differ; planes m = n−1−j, j = 0..B, clamped to m ≥ 0). The plan stores per group the planes (D, z_m, G, S^G_m, roof layer n, plane layer m) and per layer the `LayerMaterial`, the sparse islands and their boundaries (`fill_boundary` with no courses yet) with an `AreaIndex` each.
+
+- [ ] **Step 1: Write P1** (`[BridgeAwareCubic][P1]`): (a) small cube at B = 1: `planes()` non-empty, every plane's `roof_layer` is the first roof layer (print_z 15.2 + 0.2·k for the first solid layer over sparse fill: compute it from the surfaces: the lowest layer whose region has an `stInternalSolid` or `stTop` surface over the `stInternal` of the layer below) and `plane_layer = roof_layer − 1`; with `internal_bridge_layers` 3, plane layers are roof−1, roof−2, roof−3 and the total count triples; (b) a 20 × 20 × 20 block with a vertical wall only (no roof over sparse: top solid layers rest on solid) and a 45° chamfered block (its_make_cube with a chamfer built from a merged wedge, every layer stepping in by ≤ h_n): zero planes; (c) a stepped cavity: a block whose roof steps by 1 mm on one side (wider than h_n = 0.2): planes exist on the step layer; (d) a solid 10 × 10 × 2 block (every layer solid): `bridge_aware_cubic_plan()` non-null or null, `planes()` empty, slice succeeds; (e) a 3-layer-high roof over sparse (block 20 × 20 × 1.2 with `bottom_shell_layers` 0 and `internal_bridge_layers` 3): no `plane_layer` below 0; (f) cancellation: `ObjectPlan::build(object, [&]{ if (++calls == 1) throw CanceledException(); })` throws, and a following full `process()` completes.
+- [ ] **Step 2: Run; expected: compile failure.**
+- [ ] **Step 3: Implement the plan skeleton and hooks.** `build()` runs steps 1, 2, 4 of §3.0 (no courses yet), reads only `Layer`/`LayerRegion` surfaces and configs (§2.2), calls `cancel()` per layer, and is wrapped in `prepare_bridge_aware_cubic()` so that an exception leaves `m_bridge_aware_cubic_plan` null (build into a local, move on success).
+- [ ] **Step 4: Run P1; expected: pass.** Run the Stage1 parity case and S1: still pass.
+- [ ] **Step 5: Commit** `feat(bac): build the object plan: regions, groups, material and demand planes`.
+
+### Task 5: Stage 4a — refinement descent and needed strands (§3.6a, b)
+
+**Files:**
+- Modify: `src/libslic3r/Fill/BridgeAwareCubicPlan.hpp`, `.cpp` (`GroupPlan::refine()`, strand storage)
+
+**Interfaces:** Produces `GroupPlan::refine(const std::function<void()> &cancel)` run by `build()` after the planes (step 6 of §3.0), roots descended with `tbb::parallel_for` and joined in root order; storage `std::vector<std::vector<Strand>> m_strands_by_layer` with `struct Strand { PlaneKey plane; double t0, t1; StrandKind kind; }`; `strands_at(layer, bbox)` expands sub-lines. The visit rule is §3.6's pseudocode verbatim: for each candidate plane with z strictly inside the cell's height range: P = `section`; quick pass when P lies inside the fill boundary at that layer (`AreaIndex` box classification then `contains` of P's vertices and no boundary edge crossing P) and diam(P) − W_N ≤ G − μ; skip when P misses D; Q = `opening(shrink of P by W_N/2 along its printed faces ∩ S, r/2)`; F = Q ∩ offset(D, r/2); fail when any component C has max(diam(hull C), L(C)) > G − μ with L(C) = per/2 − 4·area/per; saturation d·2^(depth+1) ≥ 1 → Task 6; else split and recurse with the failing planes only. A printed face is an edge of P lying inside the boundary along ≥ w (`segment_inside` interval ≥ w). Needed strands: for each split cell and failing plane (D⁺, m), each of `split_planes(cell)`'s trace at z_m ∩ D⁺ ∩ boundary at m, pieces shorter than w − 1e−4 lengthened to w inside their boundary interval (centred, then shifted inside), dropped when the interval is shorter than w. One atomic visit counter; `cancel()` every 1024 visits; count > 1,000,000 recorded in the statistics.
+
+- [ ] **Step 1: No new test case.** The contract case for this task is K1's openings part (Task 7), which needs the filler. Write a temporary assertion into P1 (b): after `refine()`, the large cube's `planes()` are unchanged and `has_content()` is true for its group; the chamfered block's group `has_content()` is false. (Reading `has_content()` is a public query, not internal state.)
+- [ ] **Step 2: Run; expected: `has_content()` false on the large cube.**
+- [ ] **Step 3: Implement `refine()` and the strands.**
+- [ ] **Step 4: Run P1; expected: pass.** Record the large cube's visit count at 5 % from the statistics in the status document (information; spec expects ≈ 3,300).
+- [ ] **Step 5: Commit** `feat(bac): refine the lattice under roofs with needed strands`.
+
+### Task 6: Stage 4b — solid columns (§3.6c)
+
+**Files:**
+- Modify: `src/libslic3r/Fill/BridgeAwareCubicPlan.hpp`, `.cpp`
+
+**Interfaces:** A cell that fails with d·2^(depth+1) ≥ 1 becomes a solid column: its refinement faces print on every layer of the window as `StrandKind::SolidFace` strands along the section's edges; on each window layer, parallel courses of one face family (alternating between two families layer by layer) divide the face distance into ⌈face spacing / s_f⌉ equal parts, none on a face, each clipped to the section shrunk by W_N/2 − w/4, stored as courses of the region whose sparse fill holds the cell (`courses_at`); the window opens at the layer at or just below the height where the section first grows past G_b and closes at the highest failing plane; a lowest course over another group's or pattern's void is recorded in the statistics.
+
+- [ ] **Step 1: Write K1n's slicing half** (`[BridgeAwareCubic][K1n]`, completed in Task 9): the small cube at gap 0.4 (the nozzle floor at 3 %: `sparse_infill_density` 3 %) slices with `REQUIRE_NOTHROW(process())` and the group has content.
+- [ ] **Step 2: Run; expected: the slice completes but no course exists** (check `courses_at` non-empty on some layer; temporary assertion, removed in Task 9 when the observer measures it).
+- [ ] **Step 3: Implement solid columns.**
+- [ ] **Step 4: Run; expected: pass.**
+- [ ] **Step 5: Commit** `feat(bac): fill saturated cells with solid columns`.
+
+### Task 7: Stage 4c — the filler (steps 1, 2, 3, 5 of §3.8), P2, K1 (openings and runs), S2 (open top)
+
+**Files:**
+- Modify: `src/libslic3r/Fill/FillBridgeAwareCubic.hpp`, `.cpp`
+- Modify: `tests/fff_print/bridge_aware_cubic_fixtures.hpp` (the export observer carried over from `git show ef9c17704:tests/fff_print/test_bridge_aware_cubic_export.cpp` lines 40-342, 454-465, 1277-1392, 1438-1498, dropping the plan and verifier calls in `exported_gcode`'s `measure` branch; new `measure_planes`)
+- Create: `tests/fff_print/test_bridge_aware_cubic_export.cpp` (P2, K1); modify `test_bridge_aware_cubic_settings.cpp` (S2 open top replaces the Stage1 case)
+
+**Interfaces:** `fill_surface(surface, params)`: (1) without a bound plan, or when `group_of_region(lock_region_id)` is null or its `has_content()` is false, return `FillCubic::fill_surface`; (2) bulk: `bulk_lines(lattice, z, bbox of surface)` clipped to `fill_boundary(island, courses of the group's regions at this layer, s_f, w, infill_wall_overlap)` with `intersection_pl`; (3) `strands_at(layer, bbox)` each clipped along its trace by the boundary's `AreaIndex::segment_inside`, pieces < w − 1e−4 dropped; (4) courses of the group's regions clipped to the island, whole; (5) bulk lines through `Fill::connect_infill(std::move(bulk), boundary polygons, bbox, out, spacing, params)` as `fill_surface_by_multilines` does, then strands and courses appended unconnected. `layer_id`/`z`/`lock_region_id` come from `make_fills` as for every filler. Observer `measure_planes` per the Interfaces section, nozzle from the config, G per fixture.
+
+- [ ] **Step 1: Write P2** (`[BridgeAwareCubic][P2]`): large cube, BAC against the Cubic control: on the roof's plane layer, the sparse paths outside the roof footprint grown by G equal Cubic's (segment set, within 0.001 mm) except segments within one line width of the lattice's extremes.
+- [ ] **Step 2: Write K1 (openings and runs)** (`[BridgeAwareCubic][K1]`): for the four fixtures (their configs), the partial roof with `internal_bridge_layers` 1, 2, 3 and `thick_bridges` 0 and 1, six lattice-phase boxes (the small cube shifted by k · a_0/6 in x, k = 0..5, through the instance offset), the stepped cavity, variable layer height (`layer_height` 0.2 with a `ModelObject` layer-height profile 0.12–0.28 via `layer_config_ranges`), densities 3 % and 10 %, gaps 3, 5, 8, and a second instance at offset (x + 0.37 a_0, y): `measure_planes(read_extrusions(exported_gcode(...)))` has at least one plane, every `widest_opening ≤ G` and `longest_run ≤ G`. Controls: the Cubic export of the same fixture has a plane with `widest_opening > G` (except at gap 8 on the small cube, where the control is the large cube), and removing every `erInternalInfill` path of the plane below from the emitted paths makes the measure exceed G. Bridge ends are not asserted yet (Task 14).
+- [ ] **Step 3: Write S2 (open top)**: an open-top box (40 × 30 × 20, wall 2 mm, no roof: `top_shell_layers` 0 and a hollow built from a cube minus a cube): `fill_paths(bac) == fill_paths(cubic)` within 0.001 mm; delete the Stage1 case.
+- [ ] **Step 4: Run; expected: P2 and K1 fail (fills equal Cubic's).**
+- [ ] **Step 5: Implement the filler.**
+- [ ] **Step 6: Run P2, K1, S2, S1, M1, P1, L1, L2; expected: pass.** Indicative cost: `[BACTiming]`-style instruction counts are Task 20's; here record `time -l` instructions of the large cube BAC vs Cubic from the CLI (information).
+- [ ] **Step 7: Commit** `feat(bac): print the plan: bulk lattice, needed strands and solid columns`.
+- [ ] **Step 8 (controller, after the commit): Heimdall run 0.** `measure.sh run0 build/wall-painting/src/BambuStudio.app`: all 16 plates slice; grams per role and estimated time against Cubic in the status document. A plate that fails to slice is a defect fixed before Task 8.
+
+### Task 8: Stage 5a-1 — the sweep: hold rule, items, extensions, holders (§3.7 steps 1–4, without cover)
+
+**Files:**
+- Create: `src/libslic3r/Fill/BridgeAwareCubicSweep.hpp`, `.cpp` (CMake)
+- Modify: `src/libslic3r/Fill/BridgeAwareCubicPlan.cpp` (step 7 of §3.0 calls `sweep()` per group after refinement)
+
+**Interfaces:** Produces `void sweep(GroupPlan&, const ObjectPlan&, const std::function<void()> &cancel)` which appends strands of kinds `Extension` and `Column` to the group's layers and unheld places to the statistics. Per layer pair (m, m−1): s_m = h_m/√2, α_m = √((w/2)² − s_m²) (s_m ≥ w/2 recorded once per object), c = w/√3, λ = w. Print set of m−1: bulk lines inside the fill boundary at m−1 (closed form: `bulk_lines` clipped by `segment_inside`), the strands at m−1 of every kind, M⁻_{m−1}. Hold rule R for position x on plane K: (i) a printed interval of K at m−1 contains t with |x − t| ≤ α_m; (ii) a printed line of another family at m−1 crosses K's trace at t_c with |x − t_c| ≤ c; (iii) `offset_round(M⁻_{m−1}, w/2)` contains the point (an `AreaIndex` per layer). Items at m: needed strands at m, extensions, and column pieces placed at m. Steps: H = held part as intervals; a gap with held points both sides and length ≤ G_b is a bridge; a free-end gap of a needed strand extends along its trace inside the boundary at m to the first held point within G_b when the run from the last held point is ≤ G_b (kind `Extension`); otherwise holders at m−1: pieces [y − λ/2, y + λ/2] on K, admissible when whole inside the boundary at m−1 and a chain within α continues through the boundaries of the three layers below or lands sooner; greedy from each free end inward (first within λ/2 + α of the end, then as far as keeps every stretch ≤ G_b); no admissible position in a window → the stretch is recorded unheld and placement resumes past it.
+
+- [ ] **Step 1: Write K2's first half** (`[BridgeAwareCubic][K2]`): small and large cube, rib, modifier, a 40 mm box at 3 %: on the export, every sparse path piece that is not a bulk line (not collinear within 0.5° and 0.02 mm with a sparse segment of the Cubic control's same layer) and lies off the hold set of the plane below is ≤ G_b long between held points and does not reach an end of its path. Hold set of the plane below on the G-code: `offset(lower sparse centre lines, w/2)` ∪ `offset_ex(lower non-sparse footprints, w/2 + 0.01, jtRound)` (rule R read on the export: (i) and (ii) are both "the centre line lies within w/2 of a lower sparse bead's centre line"). Control: the Cubic export has free ends of added-line class 0 (it has no added lines), and removing the lower plane's sparse paths makes the count positive.
+- [ ] **Step 2: Run; expected: K2 fails on free ends of needed strands.**
+- [ ] **Step 3: Implement the sweep unit through step 4 without the cover piece** (no admissible piece on K → recorded unheld for now).
+- [ ] **Step 4: Run K2; expected: free ends 0 on the cubes; unheld stretches possibly > 0 on rib/modifier** (allowed until Task 9 adds cover pieces; do not weaken the test: leave it failing on those fixtures only if cover pieces are the cause, confirmed by the recorded reasons, and finish them in Task 9 before committing the test as passing). If K2 passes on all five, fine.
+- [ ] **Step 5: Commit** `feat(bac): hold the plan's strands with extensions and lattice columns`.
+
+### Task 9: Stage 5a-2 — cover pieces, columns continuing and landing, course ends; K2 checker aligned; K2, K1n
+
+**Files:**
+- Modify: `src/libslic3r/Fill/BridgeAwareCubicSweep.cpp` (steps 4's cover, 5, 7)
+- Modify: `scripts/bridge_aware_cubic_acceptance/k2/k2check.py` (hold rule R)
+- Modify: `tests/fff_print/test_bridge_aware_cubic_export.cpp` (K2 complete, K1n)
+
+**Interfaces:** Cover: when no admissible piece on K reaches a gap, a piece of length λ on `plane_through(lattice, k' ≠ k, point, z_{m−1}, τ)` centred on the crossing, kind `Cover`; none → unheld, recorded. Columns: each piece placed at m−1 is an item at the next step; it lands when held whole at m−2 by (ii) or (iii), merges with a planned interval of its plane at m−2 within λ, else continues with a piece at m−2 within α along its trace steered to the position in [y − α, y + α] minimising the estimated layers to a landing: the first approaching crossing with a bulk line of another family that prints there, k = max(1, ⌈(g − (c − λ/2)) / (|v| + α)⌉) with v = dt_dz · h, the nearest material edge along the trace within 20 mm, or the bed; a merged interval longer than λ continues narrowed by α at each end until shorter than λ. Course ends (added in Task 12/13 as items): an end not within w/2 of material below gets a holder through the end point. Termination at layer 0. `k2check.py`: replace the single footprint buffer with the hold set above (sparse centre lines buffered by w_up/2; other roles' rectangles buffered by w_up/2 + tol); keep its classification of pieces against the Cubic reference and its output columns.
+
+- [ ] **Step 1: Complete K2** (unheld stretches and free ends both zero on the five fixtures) **and K1n** (small cube at gap 0.4, 3 %: `measure_planes` openings and runs ≤ G where G = 0.4 after the clamp, and K2's measure holds).
+- [ ] **Step 2: Run; expected: fail where cover pieces or landings are missing.**
+- [ ] **Step 3: Implement cover, columns, ends; align `k2check.py`** and check it on one exported fixture G-code against the suite's count (same free-end and long-run counts on the small cube).
+- [ ] **Step 4: Run K2, K1n and the whole `[BridgeAwareCubic]` set; expected: pass.**
+- [ ] **Step 5: Commit** `feat(bac): complete the support sweep and align the K2 checker to the hold rule`.
+- [ ] **Step 6 (controller): Heimdall run 1.** Mass and time within §1.4; `k2check.py` on plates 1–5: unheld pieces ≤ 86 with causes; no free end of a needed strand. Record in the status document. Decide stage 5c: built only if estimated time > +12 % over Cubic.
+
+### Task 10 (conditional, stage 5c): family change (§3.7 step 6)
+
+**Files:** `src/libslic3r/Fill/BridgeAwareCubicSweep.cpp`.
+
+**Interfaces:** A single-piece column at m on plane K (family k), not landed, evaluates a change when k_stay ≥ k_min = 6 or staying has no admissible piece: for k' ≠ k, K' = `plane_through(k', centre, z_{m−1}, τ)` (none → skip), x' = crossing position along K', window [x' − r_sw, x' + r_sw], y = the admissible point nearest the steering target, k_sw = 1 + estimate from (K', y, m−1); change when some k_sw ≤ k_stay − 1 (gain 1) or trapped, taking the smallest k_sw, then material over bulk over bed, then the lower family index; the switched piece goes on K' at m−1 under the column's id. No test case: K2 (unchanged) must still pass; the gate is Heimdall's count and time.
+
+- [ ] **Step 1: Implement.** **Step 2: Run K2, K1n; expected: pass.** **Step 3: Commit** `feat(bac): let columns change family among the lattice directions`. **Step 4 (controller): Heimdall run 1b**: fewer pieces and less time, no new unheld place.
+
+### Task 11: Stage 5b — verifier, plan checks, build flag (V1)
+
+**Files:**
+- Create: `src/libslic3r/BridgeAwareCubicVerify.hpp`, `.cpp` (CMake)
+- Modify: top-level `CMakeLists.txt` (`option(SLIC3R_BAC_DEVELOPMENT_CHECKS "Bridge aware cubic development checks" OFF)`), `src/libslic3r/CMakeLists.txt` (`target_compile_definitions(libslic3r PUBLIC SLIC3R_BAC_DEVELOPMENT_CHECKS=1)` when on), `src/libslic3r/PrintObject.cpp` (under `#if SLIC3R_BAC_DEVELOPMENT_CHECKS`: `plan_warnings` after the plan in `prepare_bridge_aware_cubic`, `verify` at the end of `simplify_extrusion_path`, each message through `active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, message)`); the release recipes `BuildMac.sh` and `scripts/build_tyr_macos_runtime.sh` are checked to pass nothing that turns it on
+- Modify: `tests/fff_print/test_bridge_aware_cubic_plan.cpp` (V1)
+
+**Interfaces:** `verify(object, cancel)` per §5.1 on the final extrusions: for each plane (D, m, G) of `planes()` (and the roof's deeper planes), F = footprints by nominal width of every extrusion of layer m except ironing; openings = components of `opening(lslices_m − F, r/2) ∩ offset(D, r/2)` meeting the void: diam(hull) ≤ G and L ≤ G; runs of the roof layer's paths meeting D (loops closed, multipaths joined, courses, `erBridgeInfill`) clipped to lslices_m − offset_round(F, h_n + ε) − other regions' voids: each ≤ G; free ends in the region's void off the support and outside the wall overlap by role (`erBridgeInfill` fails). `plan_warnings(object)` formats `statistics()` per §5.2. Messages name the object, the region (density, gap), roof and plane heights, the value and the place; line types by the slicer's names.
+
+- [ ] **Step 1: Write V1**: the small cube sliced as Cubic then measured by `verify` at gap 5 has a failing plane (the verifier runs on any object; it reads the planes of a plan built on the side: `ObjectPlan::build` on the Cubic object is allowed for the oracle since the planes depend on surfaces only; expose `verify(object, plan, cancel)` as the overload for this); the pattern's small cube passes; `object.step_state_with_warnings(posSimplifyInfill).warnings` holds no "Bridge aware cubic" message in this build (the flag is off).
+- [ ] **Step 2: Run; expected: compile failure.** **Step 3: Implement.** **Step 4: Run V1 and all; expected: pass.** Build once with `-DSLIC3R_BAC_DEVELOPMENT_CHECKS=ON` in a scratch configure of the test target only if disk allows; otherwise compile the unit's `#if` branches by inspection and note it.
+- [ ] **Step 5: Commit** `feat(bac): add the development verifier and plan checks behind a build flag`.
+
+### Task 12: Stage 6a — seam walls (§3.5a), W1
+
+**Files:**
+- Modify: `src/libslic3r/Fill/BridgeAwareCubicPlan.cpp` (step 3 of §3.0; `courses_at` filled), `BridgeAwareCubicSweep.cpp` (course ends as items)
+- Modify: `tests/fff_print/test_bridge_aware_cubic_export.cpp` (W1), `test_bridge_aware_cubic_plan.cpp` (M1's seam-wall assertion)
+
+**Interfaces:** For region r at layer n: open_r(n) = parts of the boundary of r's `stInternal` surfaces within δ_s of sparse fill of another lattice, a 0 % region, or air outside a part without walls (open by what lies next to it, never by what is missing); a layer whose sparse fill is all one group with walls and no 0 % region is skipped. Wall = boundary of `offset(S_r, −i)` within i + δ_s of open_r(n), i = w/2 − 0.05 beside beads, w/2 beside 0 % or air, following the inset contour round each corner for one bead width. One wall per seam: the lower-index region between two groups; the pattern's region against another pattern, 0 % or air; on every layer with the open boundary. Walls join M⁺ and M⁻ of their layer before the roofs are computed (so the lowest course raises demand on the plane beneath), and separate V so that S^G never spans two groups. A course over another pattern's void beyond h_n of material is recorded (§5.2).
+
+- [ ] **Step 1: Write W1**: modifier (gaps 8 and 3): on the export the seam carries one sparse bead of the lower-index region at every sparse layer, inset as 3.5a (distance from the seam plane between w/2 − 0.06 and w/2 − 0.04); `measure_planes` at each half's gap passes; the floating modifier's first course layer is a plane (its layer below has strands under the seam: K2 holds); the 0 % half fixture (right half modifier at 0 %) has a wall at w/2 and the 0 % half has no sparse path; no wall exists against solid material or between same-group regions (a modifier that changes only `wall_loops`). Add M1's assertion: with the modifier, `void_of_group` of the two groups are disjoint on every layer.
+- [ ] **Step 2: Run; expected: fail.** **Step 3: Implement.** **Step 4: Run W1, M1, K1, K2 and all; expected: pass.**
+- [ ] **Step 5: Commit** `feat(bac): lay seam walls where two lattices, a void region or air meet`.
+
+### Task 13: Stage 6b — the candidate test extracted (hook 7) and rails (§3.5b), R1
+
+**Files:**
+- Modify: `src/libslic3r/PrintObject.cpp:2923-3034` (move the candidate loop body into `std::vector<BridgeCandidate> PrintObject::internal_bridge_candidates(const Layer&) const` declared in `Print.hpp` with `struct BridgeCandidate { const Surface *surface; int layer_index; Polygons worth_bridging; const LayerRegion *region; };`; `bridge_over_infill` calls it per layer and builds its `CandidateSurface`s from the result; behaviour unchanged)
+- Modify: `src/libslic3r/Fill/BridgeAwareCubicPlan.cpp` (step 5 of §3.0; D⁺)
+- Modify: `tests/fff_print/test_bridge_aware_cubic_export.cpp` (R1)
+
+**Interfaces:** For each candidate polygon of layer n (from `internal_bridge_candidates`), m_r = n − 1 − (B − 1); E = parts of the boundary of M⁺_n within s_b of the candidate over S^G_{m_r} bordering G's sparse fill at n within δ_s; rail R = boundary of `offset_round(M⁺_n, d_r)` kept within d_r + 0.01 of E, clipped to G's fill boundary at m_r, stretches < w − 1e−4 dropped, d_r = s_b + w/2 + 0.05 with s_b the bridge flow's spacing; one rail per roof component on plane j = B − 1; D⁺_n = D_n ∪ ((offset_round(M⁺_n, d_r) − M⁺_n) ∩ offset(E, d_r + 0.01) ∩ S^G_m) at every plane of the roof; the rail is material of m_r on both sides; no rail along walls, over another group's void or air, or for a surface the candidate test does not return. Rail ends are sweep items. Rails stored as courses of the roof's region at m_r.
+
+- [ ] **Step 1: Write the refactor's pin**: slice the four fixtures as Cubic before and after the extraction (same build, since the refactor is behaviour-preserving, this is `fill_paths` of Cubic equal to the Task 1 Cubic paths captured at the start of the task in a temporary file; alternatively the byte-identity CLI check of Task 1 step 7 repeated).
+- [ ] **Step 2: Write R1**: partial roof (B = 1, 2, 3), steps (a 3-step staircase roof), fuselage top (a half cylinder 40 mm long, radius 15, on a 10 mm base), and the eight fixtures of the old preview case (`git show ef9c17704:tests/fff_print/test_bridge_aware_cubic_preview.cpp`, geometry only): `count_bridge_ends` counts an end inside the wall overlap (within `bridge_line_travel_extend`'s reach of an external or internal perimeter footprint of the layer) as anchored; hanging = 0; on the partial roof the bridge reaches at most d_r + w_b + 0.05 past the roof's inner edge over the void (measure: bridge footprint − offset(solid roof footprint of the layer, d_r + w_b + 0.05) meets no sparse void of the plane below); from the final surfaces: every `stInternalBridge` surface of the roof had a rail course at m_r (read `courses_at` is internal? No: read the export: a sparse bead at m_r within d_r + 0.01 of the bridge edge); no rail where no bridge is predicted (the open-top box has no course at all).
+- [ ] **Step 3: Run; expected: fail.** **Step 4: Implement the extraction, then the rails.** **Step 5: Run R1, W1, K1, K2 and all; expected: pass; the Cubic refactor pin passes.**
+- [ ] **Step 6: Commit** `feat(bac): extract the stock bridge candidate test and lay rails along roof edges`.
+
+### Task 14: Stage 6c — the uncovered-lines pass (§3.8, hook 8d), K1 bridge ends
+
+**Files:**
+- Modify: `src/libslic3r/Fill/FillBridgeAwareCubic.cpp` (`print_uncovered`), `src/libslic3r/Fill/Fill.cpp:979` (one call after the fill loop: `BridgeAwareCubic::print_uncovered(*this);`)
+- Modify: `tests/fff_print/test_bridge_aware_cubic_export.cpp` (K1's bridge-end assertion)
+
+**Interfaces:** `print_uncovered(layer)`: for each region with a plan group, the planned lines of the layer (strands and courses, and under combination the bulk lines of the zone) not printed by the pattern's fillers (outside the islands handed to them; the islands are those of `sparse_islands` recomputed on the final surfaces), kept outside the printing footprint of every extrusion of the layer (perimeters and fills by nominal width), pieces < w − 1e−4 dropped, bulk lines connected with `connect_infill` against the zone's boundary, printed as sparse infill of the region at the sparse flow, one `ExtrusionEntityCollection` per island of `lslices`, appended to `layerm->fills`.
+
+- [ ] **Step 1: Add to K1**: `count_bridge_ends(...).hanging == 0` (wall-overlap ends anchored) on every K1 fixture and `measure_planes` `bridge_free_ends == 0`; the Cubic control has hanging > 0 on the partial roof.
+- [ ] **Step 2: Run; expected: fail where ensuring strips or growth took planned lines.** **Step 3: Implement the pass.** **Step 4: Run K1, R1, K2, W1 and all; expected: pass.**
+- [ ] **Step 5: Commit** `feat(bac): print planned lines that later stock steps uncovered`.
+- [ ] **Step 6 (controller): Heimdall run 2.** Zero hanging bridge ends over the pattern's void on all 16 plates; longest hanging stretch ≤ Cubic's per plate; mass and time within §1.4. Record.
+
+### Task 15: Stage 7a — infill combination (§3.9a), S3
+
+**Files:** `src/libslic3r/Fill/BridgeAwareCubicPlan.cpp` (`single_layer_zone`), `FillBridgeAwareCubic.cpp` (combined surfaces: print outside Z at the combined thickness, nothing inside; the pass prints inside Z at layer height on every layer of the group), `test_bridge_aware_cubic_export.cpp` (S3).
+
+**Interfaces:** Z_l = offset(footprints at l and l+1 of the plan's strands, courses and solid-column sections, c + w) ∪ offset(D⁺ of the planes on l, w); for a combined group a..b, Z = ∪ Z_l; `single_layer_zone(layer)` returns Z for the group of that layer, empty without combination.
+
+- [ ] **Step 1: Write S3**: small and large cube with `infill_combination` on: the final surfaces (`stInternalVoid` count and area per layer, thick `stInternal` thickness_layers) equal Cubic's; on the export, inside the zone every sparse path's height equals the layer height, outside it the combined height appears on the top layer of each group; K1 and K2 measures hold.
+- [ ] **Step 2: Run; expected: fail.** **Step 3: Implement.** **Step 4: Run S3 and all; expected: pass. Heimdall unchanged (combination off): no run needed; the stage-6 export of the four fixtures must be byte-identical to before this task (keep the G-code from Task 14 in the scratchpad and `cmp`).**
+- [ ] **Step 5: Commit** `feat(bac): honour infill combination through single-layer zones`.
+
+### Task 16: Stage 7b — fill multiline (§3.9b), S4
+
+**Files:** `BridgeAwareCubicPlan.cpp`, `BridgeAwareCubicSweep.cpp`, `FillBridgeAwareCubic.cpp`, `test_bridge_aware_cubic_export.cpp` (S4).
+
+**Interfaces:** Every lattice line and strand is a band of N sub-lines at offsets o_i; measures use W_N; hold: α unchanged, c_N = c + (N − 1) s_f/(2√3), material within w/2 for every sub-line; cover and switched pieces have length λ + (N − 1) s_f / sin 60°, window r_sw unchanged; rails as N offset curves at d_r + i·s_f with D⁺ to the outer curve; seam walls one bead; solid-column clip W_N/2 − w/4; the depth bound uses W_N.
+
+- [ ] **Step 1: Write S4**: small cube at `fill_multiline` 2: bulk bands equal Cubic's at N = 2 (P2's comparison on the plane layer outside the footprint grown by G); K1 and K2 hold with band widths (K2's hold set uses the band's sub-line centre lines).
+- [ ] **Step 2: Run; expected: fail.** **Step 3: Implement.** **Step 4: Run S4 and all; expected: pass; the four fixtures' G-code at N = 1 byte-identical to Task 15's.**
+- [ ] **Step 5: Commit** `feat(bac): honour fill multiline as bands`.
+
+### Task 17: Stage 8a — S5, S6, D1
+
+**Files:** `test_bridge_aware_cubic_export.cpp` (S5, D1), `test_bridge_aware_cubic_settings.cpp` (S6).
+
+- [ ] **Step 1: Write S5**: two instances of the small cube (second at +70 mm x): `measure_planes` per instance region of the bed gives equal counts and equal widest/longest within 1e-6; a shared object (`set_shared_object`) returns its source's plan (`bridge_aware_cubic_plan()` pointer equality) and slices.
+- [ ] **Step 2: Write S6**: the applied `PrintRegionConfig` after `process()` equals Cubic's but for `sparse_infill_pattern` and `bridge_aware_cubic_max_gap` (diff of serialised options); arc fitting on → the export contains `G2`/`G3`; an explicit `bridge_angle` 30 → every `stInternalBridge` surface has that angle (snapshot helper from `git show ef9c17704:tests/fff_print/test_bridge_aware_cubic_modifiers.cpp` 38-129) and the bridge surface domains equal Cubic's on the modifier; solid fills merge as Cubic's (`stInternalSolid` surface count per layer equals Cubic's outside the planes' layers).
+- [ ] **Step 3: Write D1**: large cube, partial roof under 3 layers, modifier: two exports byte-identical (`exported_gcode` twice); a reslice after gap 5 → 6 → 5, density 5 → 7 → 5 and direction 45 → 60 → 45 (through `Print::apply` on the same `Print`) gives `fill_paths` equal to a fresh slice's.
+- [ ] **Step 4: Run; fix any defect found; expected: pass.** **Step 5: Commit** `test(bac): pin instances, setting invariance and determinism`.
+
+### Task 18: Stage 8b — S7 stress and X1, X2 hidden cases
+
+**Files:** `test_bridge_aware_cubic_settings.cpp` (S7), `test_bridge_aware_cubic_export.cpp` (X1 `[.][BACTiming]`, X2 `[.][BACBenchmarkFixtures]` carried over from `git show ef9c17704:tests/fff_print/test_bridge_aware_cubic_export.cpp`, the X2 writer at its lines ≈ 1100-1275 and X1's instruction reader at `test_bridge_aware_cubic.cpp`'s `libproc` block, trimmed to §7.2's description).
+
+- [ ] **Step 1: Write S7**: `REQUIRE_NOTHROW(process())` and `measure_planes` K1 on: gap at the nozzle (0.4), 60 %, 0.003 %, gap 1000, raft (`raft_layers` 3), Arachne with `detect_narrow_internal_solid_infill` on and `thick_bridges` on (the user's settings), variable layer height, `wall_loops` 0, combination, a 0.6 mm sparse bead (`sparse_infill_line_width`), arc fitting, a blind cavity (a pocket block with a 6 mm deep blind pocket in its roof), on the small cube, the pocket block and the blind cavity.
+- [ ] **Step 2: Carry over X1 and X2** (hidden; X2 writes to `BAC_BENCHMARK_FIXTURE_DIR`, refuses to overwrite).
+- [ ] **Step 3: Run S7 and the whole suite; expected: pass. Check the budgets**: `wc -l` of the pattern's units ≤ 4,000, of the test files ≤ 2,500, case count ≤ 40 (`--list-tests`), `git diff --stat master -- <shared files>` ≤ 150 changed lines (moved lines of hook 7 excluded, listed separately).
+- [ ] **Step 4: Fill the status document** `docs/bridge-aware-cubic.md` (stages, the Heimdall runs' tables, budgets) and `ctest` green (as Task 1 step 8). **Step 5: Commit** `test(bac): stress settings, hidden timing and fixture writer; fill the status document`.
+
+### Task 19: Stage 8c — S1 completion and S2 completion
+
+**Files:** `test_bridge_aware_cubic_settings.cpp`.
+
+- [ ] **Step 1: Complete S2**: 100 % (validation message equals Cubic's for `sparse_infill_pattern` at 100 % through `PrintConfig::validate`, and a modifier region at 100 % loaded from a 3MF fills as `FillCubic` does, with and without combination); density under the stock limit (`sparse_infill_density` 1 % at `minimum_sparse_infill_area`'s default); spiral vase (`spiral_mode` 1): `fill_paths` equal Cubic's; Conformal on and off: equal; a raft moves nothing but z (fill paths equal after subtracting the raft height).
+- [ ] **Step 2: Complete S1**: project restore of the pattern through `load_bbs_3mf` of a project saved with the pattern selected; `modifier_ignore_infill` case if not yet in Task 1.
+- [ ] **Step 3: Run all; expected: pass.** **Step 4: Commit** `test(bac): complete the settings and parity cases`.
+
+### Task 20: Stage 9 — release gate and documents
+
+- [ ] **Step 1: Generate the benchmark fixtures** with X2 (`BAC_BENCHMARK_FIXTURE_DIR=build/bridge-aware-cubic-benchmark/projects`).
+- [ ] **Step 2: Run the release gate** with no other slicing job running: `run_benchmark.py` per `docs/bridge-aware-cubic-benchmark.md` with the official app and the branch's app, warm-up plus five iterations, all four cases. Expected: median and worst pair ratio ≤ 2.0 per case. If a case fails, the finding goes to the status document and a construction fix task is added before Task 21 (never a cache or a limit, per the constraints).
+- [ ] **Step 3: Update `docs/bridge-aware-cubic.md` and `docs/bridge-aware-cubic-benchmark.md`** tables with the measured figures. The release tracker is not posted without asking the user.
+- [ ] **Step 4: Commit** `docs(bac): record the release gate results`.
+
+### Task 21: Stage 10 — whole-branch review and finish
+
+- [ ] **Step 1: Whole-branch review** by an Opus subagent against the spec (K1, K2, settings, budgets, hooks list, §7.1 rules), with the diff `master..HEAD`.
+- [ ] **Step 2: One fix round** for critical and important findings; minor ones recorded.
+- [ ] **Step 3: `superpowers:finishing-a-development-branch`.**
+
+---
+
+## Self-review notes
+
+- Spec coverage: §1 contract → K1, K2 (Tasks 7, 8, 9, 14), settings (Tasks 1, 17, 19), release behaviour (Task 11's flag, constraints); §2.3 hooks 1–5, 10 (Task 1), 6 (Task 4), 7 (Task 13), 8a (Task 3), 8b (Task 4), 8c (Task 1), 8d (Task 14), 9 (Tasks 1, 2, 3, 4, 8, 11); §3.1–3.2 (Tasks 2, 4), §3.3 (Task 3), §3.4 (Task 4), §3.5a (Task 12), §3.5b (Task 13), §3.6 (Tasks 5, 6), §3.7 (Tasks 8, 9, 10), §3.8 (Tasks 7, 14), §3.9a (Task 15), §3.9b (Task 16), §3.9c–e (Tasks 7's variable layer height case, 19's raft, 12's modifiers); §5 (Task 11, K2 checker Task 9); §7.2's 21 cases plus X1, X2 all placed; §7.4 runs after Tasks 7, 9, 10, 14; §7.5 Task 20; §8 stages 0–10 → Tasks 0–21.
+- Type consistency: `ObjectPlan`/`GroupPlan` queries, `LatticeParams` fields, `AreaIndex` methods and `measure_planes` are named once in the Interfaces section and used by those names in every task.
+- Proportion: the plan decides interfaces, rules' exact values and tests; bodies are left to the implementer except where the spec pins an algorithm (the visit rule, the hold rule, the bulk-line arithmetic).
