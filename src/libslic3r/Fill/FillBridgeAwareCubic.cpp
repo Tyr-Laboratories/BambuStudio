@@ -323,21 +323,25 @@ void anchor_junctions(Polylines &paths, const ExPolygons &boundary, double reach
     }
 }
 
-// Trims from each path's ends the segments that run off the lattice directions inside a zone the connector could not see as
-// material (the band beside a course of the layer or of the layer below), unless they run along the
-// island's own boundary (both ends within half a bead of it: a hook along the wall, Cubic's) or along a course of the layer (the
-// course itself, or a nub along it): the connector's boundary excludes those zones, so no line end lies on their edges, but a hook
-// from an end on the wall can turn the corner onto such an edge and hang over the void. Nothing on a lattice line is touched; a
-// path left with one point is dropped.
+// Cuts out of the paths every run of segments that follows the edge of a zone the connector could not see as material (the band
+// beside a course of the layer or of the layer below, a combined island's single-layer zone): the connector's boundary leaves
+// those zones out, so its hooks and joins can run along their edges, and there they hang over the void. A segment follows an edge
+// when its ends and its middle lie within `margin` of the zones' contour (the connector copies the contour's vertices); one that
+// lies the same way on the island's own boundary (a hook along the wall, Cubic's) or on a course of the layer (the course itself,
+// or a nub along it) is kept. A path is split where a run is cut out of its middle; pieces left with one point are dropped.
 void trim_virtual_hooks(Polylines &paths, const ExPolygons &zones, const ExPolygons &island_boundary, const Polylines &courses,
-                        const BridgeAwareCubic::LatticeParams &lattice, double reach_scaled)
+                        double margin_scaled)
 {
-    if (zones.empty() || paths.empty() || island_boundary.empty())
+    if (zones.empty() || paths.empty())
         return;
-    const BridgeAwareCubic::AreaIndex zone_index(zones);
+    EdgeGrid::Grid zone_grid;
+    zone_grid.set_bbox(get_extents(zones).inflated(coord_t(scale_(1.))));
+    zone_grid.create(zones, coord_t(scale_(2.)));
     EdgeGrid::Grid wall_grid;
-    wall_grid.set_bbox(get_extents(island_boundary).inflated(coord_t(scale_(1.))));
-    wall_grid.create(island_boundary, coord_t(scale_(2.)));
+    if (!island_boundary.empty()) {
+        wall_grid.set_bbox(get_extents(island_boundary).inflated(coord_t(scale_(1.))));
+        wall_grid.create(island_boundary, coord_t(scale_(2.)));
+    }
     EdgeGrid::Grid course_grid;
     std::vector<Points> course_points;
     for (const Polyline &course : courses)
@@ -351,32 +355,38 @@ void trim_virtual_hooks(Polylines &paths, const ExPolygons &zones, const ExPolyg
         course_grid.set_bbox(all.inflated(coord_t(scale_(1.))));
         course_grid.create(course_points, coord_t(scale_(2.)), true);
     }
-    const auto near_wall   = [&](const Point &p) { return wall_grid.closest_point_signed_distance(p, coord_t(reach_scaled)).valid(); };
-    const auto near_course = [&](const Point &p) { return !course_points.empty() && course_grid.closest_point_signed_distance(p, coord_t(reach_scaled)).valid(); };
-    const double cos_tolerance = std::cos(2. * M_PI / 180.);
+    const coord_t margin = std::max<coord_t>(1, coord_t(margin_scaled));
+    const auto on_edge   = [&](const Point &p) { return zone_grid.closest_point_signed_distance(p, margin).valid(); };
+    const auto on_wall   = [&](const Point &p) { return !island_boundary.empty() && wall_grid.closest_point_signed_distance(p, margin).valid(); };
+    const auto on_course = [&](const Point &p) { return !course_points.empty() && course_grid.closest_point_signed_distance(p, margin).valid(); };
     const auto virtual_segment = [&](const Point &a, const Point &b) {
-        const Vec2d d = (b - a).cast<double>();
-        const double n = d.norm();
-        if (n <= 0.)
-            return true;
-        for (int k = 0; k < 3; ++k)
-            if (std::abs(d.dot(lattice.direction(k))) >= n * cos_tolerance)
-                return false;    // on a lattice direction: a line or a nub along one
         const Point mid((a.x() + b.x()) / 2, (a.y() + b.y()) / 2);
-        if (!zone_index.contains(mid))
+        if (!(on_edge(a) && on_edge(b) && on_edge(mid)))
             return false;
-        if (near_course(a) && near_course(b))
+        if (on_course(a) && on_course(b) && on_course(mid))
             return false;    // a course, or a nub along it
-        return !(near_wall(a) && near_wall(b));    // along the wall: Cubic's hook, kept; a turn off the wall is not
+        return !(on_wall(a) && on_wall(b) && on_wall(mid));    // along the wall: Cubic's hook, kept
     };
+    Polylines out;
+    out.reserve(paths.size());
     for (Polyline &pl : paths) {
-        Points &pts = pl.points;
-        while (pts.size() >= 2 && virtual_segment(pts[0], pts[1]))
-            pts.erase(pts.begin());
-        while (pts.size() >= 2 && virtual_segment(pts[pts.size() - 2], pts.back()))
-            pts.pop_back();
+        const Points &pts = pl.points;
+        Polyline piece;
+        for (size_t i = 0; i + 1 < pts.size(); ++i) {
+            if (virtual_segment(pts[i], pts[i + 1])) {
+                if (piece.points.size() >= 2)
+                    out.push_back(std::move(piece));
+                piece.points.clear();
+                continue;
+            }
+            if (piece.points.empty())
+                piece.points.push_back(pts[i]);
+            piece.points.push_back(pts[i + 1]);
+        }
+        if (piece.points.size() >= 2)
+            out.push_back(std::move(piece));
     }
-    paths.erase(std::remove_if(paths.begin(), paths.end(), [](const Polyline &pl) { return pl.points.size() < 2; }), paths.end());
+    paths = std::move(out);
 }
 
 } // namespace
@@ -401,40 +411,22 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     const ExPolygon &island = surface->expolygon;
     const BoundingBox bbox = get_extents(island);
 
-    // 6. A combined island (3.9a): ordinary combined Cubic outside the single-layer zone of its group of layers, nothing inside
-    //    it; the pass prints the plan's lines there at layer height on every layer of the group. Stock make_fills gives a combined
-    //    surface the flow of the combined height, whose smaller spacing makes Cubic's combined lattice finer than the plan's
-    //    single-layer one, so outside the zone it is FillCubic's own output, clipped to leave the zone out (each path alone:
-    //    Clipper splits paths clipped together where they cross); a piece the cut left shorter than a bead is dropped. The fill
-    //    group carries the combined thickness in millimetres (make_fills copies `thickness`, not `thickness_layers`); the layer
-    //    count comes from the region's final surfaces.
-    if (surface->thickness > m_layer->height + 1e-6 || surface->thickness_layers > 1) {
+    // 6. A combined island (3.9a): the plan's lattice at the combined thickness outside the single-layer zone of its group of
+    //    layers, and nothing inside it (the pass prints the plan's lines there at layer height on every layer of the group). The
+    //    lattice outside is the plan's, so that a zone line on the group's lowest layer rests on the thick line of the group below
+    //    as on its own line one layer below (rule i). The zone's edge is not material: no hook runs along it (a virtual zone).
+    //    The island's beads stand on the layer below the group's lowest layer, so the zone from below is that layer's. The fill
+    //    group carries the combined thickness in millimetres; the layer count comes from the region's final surfaces.
+    ExPolygons combined;
+    size_t     lowest = m_layer_index;    // the lowest layer this island's beads fill
+    if (surface->thickness > m_layer->height + EPSILON || surface->thickness_layers > 1) {
         const auto [top, count] = BridgeAwareCubic::combined_group_of(*m_layer, m_layer_index, this->lock_region_id);
         if (count > 1) {
-            Polylines cubic = FillCubic::fill_surface(surface, params);
-            const ExPolygons zone = combined_zone(*m_plan, top, count);
-            if (zone.empty() || cubic.empty())
-                return cubic;
-            const Polygons zone_polygons = to_polygons(zone);
-            const BoundingBox zone_box = get_extents(zone);
-            Polylines out;
-            for (Polyline &path : cubic) {
-                if (!zone_box.overlap(get_extents(path))) {
-                    out.push_back(std::move(path));
-                    continue;
-                }
-                Polylines pieces = diff_pl(Polylines{ path }, zone_polygons);
-                if (pieces.size() == 1 && pieces.front().points == path.points) {
-                    out.push_back(std::move(pieces.front()));
-                    continue;
-                }
-                for (Polyline &piece : pieces)
-                    if (piece.length() >= scale_(lattice.width - 1e-4))
-                        out.push_back(std::move(piece));
-            }
-            return out;
+            combined = combined_zone(*m_plan, top, count);
+            lowest   = top + 1 >= count ? top + 1 - count : 0;
         }
     }
+    const bool is_combined = lowest != m_layer_index || !combined.empty();
 
     // The courses of the regions whose sparse fill this island holds: the group's regions. Seam walls and rails cut the fill
     // boundary; a solid column's courses lie inside its faces and do not.
@@ -442,8 +434,8 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     for (const size_t region_id : group->regions()) {
         append(courses, m_plan->courses_at(m_layer_index, region_id));
         append(boundary_courses, m_plan->boundary_courses_at(m_layer_index, region_id));
-        if (m_layer_index > 0)
-            append(courses_below, m_plan->boundary_courses_at(m_layer_index - 1, region_id));
+        if (lowest > 0)
+            append(courses_below, m_plan->boundary_courses_at(lowest - 1, region_id));
     }
     // A course of the layer below that this layer repeats (a seam wall, laid on every layer of its seam) is this layer's own
     // business; only the courses this layer does not have (rails) make a zone from below.
@@ -451,7 +443,7 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
         courses_below = diff_pl(courses_below, offset(boundary_courses, float(scale_(lattice.width)), ClipperLib::jtRound, float(scale_(0.001))));
     const PrintRegionConfig &config = m_layer->regions()[this->lock_region_id]->region().config();
     const double overlap_percent = config.infill_wall_overlap.get_abs_value(100.);
-    const ExPolygons boundary = fill_boundary(island, boundary_courses, lattice.spacing, lattice.width, overlap_percent);
+    ExPolygons boundary = fill_boundary(island, boundary_courses, lattice.spacing, lattice.width, overlap_percent);
     // The connector's boundary: the island's inset without the courses' cut, less a zone around each boundary course of the layer
     // and of the layer below, wide enough that the line ends there lie well inside it. At a course of the layer those ends are
     // junctions with the course (a nub along it, like any line met), not the connector's (a hook along a band beside the course,
@@ -465,6 +457,11 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     ExPolygons virtual_zones;    // what the connector's boundary leaves out: no hook may run along their edges (below)
     if (!zone_courses.empty())
         virtual_zones = union_ex(offset(zone_courses, float(scale_(zone)), ClipperLib::jtRound, float(scale_(0.001))));
+    if (!combined.empty()) {
+        boundary = diff_ex(boundary, combined);
+        append(virtual_zones, combined);
+        virtual_zones = union_ex(virtual_zones);
+    }
     const ExPolygons connector_boundary = virtual_zones.empty() ? boundary : diff_ex(plain_boundary, virtual_zones);
     const AreaIndex below_zone(courses_below.empty() ? ExPolygons()
         : union_ex(offset(courses_below, float(scale_(zone)), ClipperLib::jtRound, float(scale_(0.001)))));
@@ -477,7 +474,7 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     //    it runs on along the course across a one-spacing strip and a bead beyond it, so that its end stays on the material the plan
     //    ended it on.
     Polylines course_pieces;
-    {
+    if (!is_combined) {
         const AreaIndex island_index(ExPolygons{ island });
         const double run_on = scale_(lattice.spacing + lattice.width);
         for (const Polyline &course : courses)
@@ -544,7 +541,7 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     // The ends carried on to the boundary, with where the plan ended them: a carry the connector did not anchor is undone after it
     // (the carried stretch would hang over the void; the plan held the end where it was).
     std::map<std::pair<coord_t, coord_t>, Point> carried_from;
-    for (const Line &line : group->strands_at(m_layer_index, bbox)) {
+    for (const Line &line : is_combined ? Lines() : group->strands_at(m_layer_index, bbox)) {
         const double length = (line.b - line.a).cast<double>().norm();
         const std::vector<std::pair<double, double>> on_surface = surface_index.segment_inside(line.a, line.b);
         for (const auto &interval : index.segment_inside(line.a, line.b)) {
@@ -586,7 +583,7 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     if (!params.dont_connect() && params.anchor_length > 0.f)
         anchor_junctions(connected, connector_boundary, reach, scale_(double(params.anchor_length)), scale_(std::min(lattice.width, gap_b)));
     if (!virtual_zones.empty() && !params.dont_connect())
-        trim_virtual_hooks(connected, virtual_zones, plain_boundary, courses, lattice, reach);
+        trim_virtual_hooks(connected, virtual_zones, plain_boundary, courses, scale_(m_plan->path_margin()));
     if (!carried_from.empty())
         for (Polyline &path : connected) {
             if (path.points.size() < 2)
@@ -630,12 +627,19 @@ std::pair<size_t, size_t> combined_group_of(const Layer &layer, size_t layer_ind
     }
     if (!has_void)
         return { 0, 0 };
-    for (size_t b = layer_index + 1; b < object.layers().size() && b - layer_index < 32; ++b) {
+    // Upward to the group's top: every layer of a group below its top carries a void surface.
+    for (size_t b = layer_index + 1; b < object.layers().size(); ++b) {
         if (region_id >= object.layers()[b]->regions().size())
             break;
-        for (const Surface &surface : surfaces_of(b))
+        bool void_here = false;
+        for (const Surface &surface : surfaces_of(b)) {
             if (surface.surface_type == stInternal && surface.thickness_layers > 1 && b + 1 >= layer_index + size_t(surface.thickness_layers))
                 return { b, size_t(surface.thickness_layers) };
+            if (surface.surface_type == stInternalVoid)
+                void_here = true;
+        }
+        if (!void_here)
+            break;
     }
     return { 0, 0 };
 }
@@ -655,13 +659,27 @@ void print_uncovered(Layer &layer)
     const size_t layer_index = layer.id() - object->layers().front()->id();
     if (layer_index >= plan->layer_count())
         return;
-    // Anything planned on this layer?
+    // Under infill combination (3.9a), the single-layer zone of a region's group of layers (per region: regions combine apart).
+    std::map<std::pair<size_t, size_t>, ExPolygons> zones;
+    const auto zone_of_region = [&](size_t region_id) -> const ExPolygons* {
+        if (region_id >= layer.regions().size() || plan->group_of_region(region_id) == nullptr)
+            return nullptr;
+        const std::pair<size_t, size_t> key = combined_group_of(layer, layer_index, region_id);
+        if (key.second < 2)
+            return nullptr;
+        auto it = zones.find(key);
+        if (it == zones.end())
+            it = zones.emplace(key, combined_zone(*plan, key.first, key.second)).first;
+        return it->second.empty() ? nullptr : &it->second;
+    };
+    // Anything planned on this layer? A zone counts: it holds the plan's lines of every layer of its group, including the layers
+    // that plan nothing of their own.
     bool anything = false;
     for (const GroupPlan &group : plan->groups())
         if (layer_index < group.layer_count() && !group.strands(layer_index).empty())
             anything = true;
     for (size_t r = 0; r < layer.regions().size() && !anything; ++r)
-        if (!plan->courses_at(layer_index, r).empty())
+        if (!plan->courses_at(layer_index, r).empty() || zone_of_region(r) != nullptr)
             anything = true;
     if (!anything)
         return;
@@ -717,48 +735,90 @@ void print_uncovered(Layer &layer)
             uncovered_courses[k] = handed.empty() ? courses : diff_pl(courses, handed);
             any_course = any_course || !uncovered_courses[k].empty();
         }
-        // Under infill combination (3.9a) the fillers skipped the single-layer zone of the group of layers this layer belongs
-        // to: the plan's lines of this layer inside it (the bulk lines, and the strands and courses the islands covered) print at
-        // layer height, clipped to the zone. The bulk lines are chained, not connected: a hook along the zone's edge would hang
-        // over the void, since the edge is not material. Inside the zone each is held along its length by the same lattice line
-        // one layer below (rule i), every layer of the group printing the zone alike; outside it the combined surface prints
-        // Cubic's combined lattice, which is finer than the plan's, so nothing meets the lines' ends there.
-        Polylines zone_lines;
-        {
-            size_t top = 0, count = 0;
-            for (const size_t region_id : group.regions())
-                if (region_id < layer.regions().size()) {
-                    std::tie(top, count) = combined_group_of(layer, layer_index, region_id);
-                    if (count > 1)
-                        break;
+        // Under infill combination (3.9a) the fillers skipped the single-layer zone of each region's group of layers: the plan's
+        // lines of this layer inside it (the bulk lines, and the strands and courses the islands covered) print at layer height,
+        // clipped to the zone. Inside the zone each bulk line is held along its length by the same lattice line one layer below
+        // (rule i): the zone's lines on the group's other layers, or, under its lowest layer, the thick line of the group below,
+        // which is the plan's lattice too. No hook runs along the zone's edge, which is not material; where a line ends on another
+        // line of the zone, it gets a nub along it (or the two ends join), with the region's sparse infill anchor settings.
+        // A lattice line's trace drifts from layer to layer, so the same zone cuts it at different places on the group's layers;
+        // where the zone's edge runs at a slant to the line, a zone line of a higher layer would end beyond the one below it. Each
+        // family's lines are therefore cut by the zone as seen from this layer and from every layer above it in the group (the
+        // zone shifted by the family's drift), so that a zone line rests on the zone line below it, and on the group's top layer
+        // the thick line takes over exactly where the zone line ends.
+        const auto zone_lines_of = [&](const ExPolygons &zone, size_t region_id, size_t top) {
+            Polylines lines;
+            const LatticeParams &lattice = group.lattice();
+            const double z = plan->print_z(layer_index);
+            ExPolygons seen_by_any;    // the zone as every family sees it: the connector's boundary and the trim's virtual zone
+            for (int k = 0; k < 3; ++k) {
+                ExPolygons seen = zone;
+                const Point here = lattice.scaled(trace(lattice, PlaneKey{ k, 0, 0 }, z).origin);
+                for (size_t above = layer_index + 1; above <= top && above < plan->layer_count(); ++above) {
+                    const Point there = lattice.scaled(trace(lattice, PlaneKey{ k, 0, 0 }, plan->print_z(above)).origin);
+                    ExPolygons shifted = zone;
+                    for (ExPolygon &part : shifted)
+                        part.translate(here - there);
+                    append(seen, std::move(shifted));
                 }
-            if (count > 1) {
-                const ExPolygons zone = combined_zone(*plan, top, count);
-                const ExPolygons zone_boundary = zone.empty() ? ExPolygons() : intersection_ex(zone, boundary.boundary);
-                if (!zone_boundary.empty()) {
-                    const AreaIndex zone_index(zone_boundary);
-                    Polylines bulk;
-                    for (const Line &line : bulk_lines(group.lattice(), plan->print_z(layer_index), bbox))
-                        for (const auto &interval : zone_index.segment_inside(line.a, line.b)) {
-                            const Vec2d a = line.a.cast<double>(), d = (line.b - line.a).cast<double>();
-                            const Point pa(coord_t(std::llround(a.x() + interval.first * d.x())), coord_t(std::llround(a.y() + interval.first * d.y())));
-                            const Point pb(coord_t(std::llround(a.x() + interval.second * d.x())), coord_t(std::llround(a.y() + interval.second * d.y())));
-                            if (pa != pb)
-                                bulk.emplace_back(Points{ pa, pb });
-                        }
-                    if (!handed.empty()) {
-                        Polylines covered = intersection_pl(strands, handed);
-                        for (const size_t region_id : group.regions())
-                            append(covered, intersection_pl(plan->courses_at(layer_index, region_id), handed));
-                        append(bulk, intersection_pl(covered, zone));
+                seen = union_ex(seen);
+                append(seen_by_any, seen);
+                const ExPolygons zone_boundary = intersection_ex(seen, boundary.boundary);
+                if (zone_boundary.empty())
+                    continue;
+                const AreaIndex zone_index(zone_boundary);
+                const Vec2d direction = lattice.direction(k);
+                for (const Line &line : bulk_lines(lattice, z, bbox)) {
+                    const Vec2d d = (line.b - line.a).cast<double>();
+                    if (std::abs(d.normalized().dot(direction)) < 0.999)
+                        continue;    // another family's line
+                    for (const auto &interval : zone_index.segment_inside(line.a, line.b)) {
+                        const Vec2d a = line.a.cast<double>();
+                        const Point pa(coord_t(std::llround(a.x() + interval.first * d.x())), coord_t(std::llround(a.y() + interval.first * d.y())));
+                        const Point pb(coord_t(std::llround(a.x() + interval.second * d.x())), coord_t(std::llround(a.y() + interval.second * d.y())));
+                        if (pa != pb)
+                            lines.emplace_back(Points{ pa, pb });
                     }
-                    if (bulk.size() > 1)
-                        bulk = chain_polylines(std::move(bulk));
-                    zone_lines = std::move(bulk);
                 }
             }
-        }
-        if (uncovered_strands.empty() && !any_course && zone_lines.empty())
+            seen_by_any = union_ex(seen_by_any);
+            const ExPolygons zone_boundary = intersection_ex(seen_by_any, boundary.boundary);
+            if (!handed.empty()) {
+                Polylines covered = intersection_pl(strands, handed);
+                append(covered, intersection_pl(plan->courses_at(layer_index, region_id), handed));
+                for (Polyline &piece : covered)
+                    append(lines, intersection_pl(Polylines{ piece }, zone));
+            }
+            if (lines.empty() || zone_boundary.empty())
+                return lines;
+            // Connected as the filler connects its lines (3.8 step 5), with the region's anchor settings: the connector's hooks
+            // and joins along the walls bound the zone's corners as they bound the island's; those along the zone's own edge,
+            // which is not material, are cut out; an end that meets another line gets a nub.
+            const PrintRegionConfig &config = layer.regions()[region_id]->region().config();
+            const double spacing = group.lattice().spacing;
+            FillParams params;
+            params.density           = float(0.01 * config.sparse_infill_density.value);
+            params.anchor_length     = float(config.sparse_infill_anchor.percent ? 0.01 * config.sparse_infill_anchor.value * spacing : config.sparse_infill_anchor.value);
+            params.anchor_length_max = float(config.sparse_infill_anchor_max.percent ? 0.01 * config.sparse_infill_anchor_max.value * spacing : config.sparse_infill_anchor_max.value);
+            params.anchor_length     = std::min(params.anchor_length, params.anchor_length_max);
+            if (params.dont_connect() || lines.size() <= 1)
+                return lines;
+            Polylines connected;
+            Fill::connect_infill(std::move(lines), to_polygons(zone_boundary), get_extents(zone_boundary), connected, spacing, params);
+            const double gap_b = std::max(0., plan->gap_of_region(region_id) - 0.1);
+            if (params.anchor_length > 0.f)
+                anchor_junctions(connected, zone_boundary, scale_(0.5 * w), scale_(double(params.anchor_length)), scale_(std::min(w, gap_b)));
+            trim_virtual_hooks(connected, seen_by_any, boundary.boundary, plan->courses_at(layer_index, region_id), scale_(plan->path_margin()));
+            return connected;
+        };
+        std::vector<Polylines> zone_lines(group.regions().size());
+        bool any_zone = false;
+        for (size_t k = 0; k < group.regions().size(); ++k)
+            if (const ExPolygons *zone = zone_of_region(group.regions()[k])) {
+                zone_lines[k] = zone_lines_of(*zone, group.regions()[k], combined_group_of(layer, layer_index, group.regions()[k]).first);
+                any_zone = any_zone || !zone_lines[k].empty();
+            }
+        if (uncovered_strands.empty() && !any_course && !any_zone)
             continue;
         // Each region prints its own courses and the strands over its slices, as its sparse infill at the sparse flow, one
         // collection per island of the outline (the group key ignores the extruder and the speeds, which are the region's).
@@ -770,8 +830,8 @@ void print_uncovered(Layer &layer)
             Polylines lines = uncovered_courses[k];
             if (!uncovered_strands.empty() && !layerm.slices.empty())
                 append(lines, intersection_pl(uncovered_strands, to_polygons(layerm.slices.surfaces)));
-            if (!zone_lines.empty() && !layerm.slices.empty())
-                append(lines, intersection_pl(zone_lines, to_polygons(layerm.slices.surfaces)));
+            if (!zone_lines[k].empty() && !layerm.slices.empty())
+                append(lines, intersection_pl(zone_lines[k], to_polygons(layerm.slices.surfaces)));
             if (lines.empty())
                 continue;
             if (!printed().empty())

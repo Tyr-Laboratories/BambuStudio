@@ -244,9 +244,16 @@ def main():
             for i in range(1, len(pts)):
                 arc.append(arc[-1] + math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]))
 
+            closed = len(pts) > 2 and pts[0] == pts[-1]   # a course laid as a loop has no ends: arc distances go round
+
+            def own_distance(a, b):
+                d = abs(a - b)
+                return min(d, arc[-1] - d) if closed else d
+
             def fused(vi):
                 """Vertex vi lies on another bead of the layer: within w_o/2 + tol of its centre line, in the interior of that
-                bead's path (w_o/2 + tol from its ends); the path's own geometry within one bead's arc length does not count."""
+                bead's path (w_o/2 + tol from its ends; a loop has none); the path's own geometry within one bead's arc length does
+                not count."""
                 if own_tree is None:
                     return False
                 v = shapely.Point(pts[vi])
@@ -256,12 +263,12 @@ def main():
                         # Own path: only parts farther than one bead along the path, and in the interior of that part.
                         near = False
                         for i in range(1, len(pts)):
-                            if min(abs(arc[i - 1] - arc[vi]), abs(arc[i] - arc[vi])) <= w + args.tol:
+                            if min(own_distance(arc[i - 1], arc[vi]), own_distance(arc[i], arc[vi])) <= w + args.tol:
                                 continue
                             seg = shapely.LineString([pts[i - 1], pts[i]])
                             if seg.distance(v) <= ow / 2 + args.tol:
                                 foot = arc[i - 1] + seg.project(v)
-                                if foot >= ow / 2 + args.tol and arc[-1] - foot >= ow / 2 + args.tol:
+                                if closed or (foot >= ow / 2 + args.tol and arc[-1] - foot >= ow / 2 + args.tol):
                                     near = True
                                     break
                         if near:
@@ -269,9 +276,10 @@ def main():
                         continue
                     if line.distance(v) > ow / 2 + args.tol:
                         continue
-                    # In the interior of the met path: not within w_o/2 + tol of its ends.
+                    # In the interior of the met path: not within w_o/2 + tol of its ends (a loop has none).
                     foot = line.project(v)
-                    if foot < ow / 2 + args.tol or line.length - foot < ow / 2 + args.tol:
+                    other_closed = len(opts) > 2 and opts[0] == opts[-1]
+                    if not other_closed and (foot < ow / 2 + args.tol or line.length - foot < ow / 2 + args.tol):
                         continue
                     return True
                 return False
@@ -282,26 +290,53 @@ def main():
                 sg = (pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
                 return not along_lattice(*sg) and on_reference_line(*sg, ref, ref_tree, overlap=False)
 
-            closed = len(pts) > 2 and pts[0] == pts[-1]   # a course laid as a loop has no ends
+            inserted = None   # a pivot inside a segment: the measure's first and last point, not a vertex of the path
             if closed:
-                # Measured from a vertex that is held (over the hold set) or fused, round to itself, so that a stretch through the
-                # start point is one stretch; without such a vertex the whole loop is one piece whose length is a stretch.
+                # Measured from the first point where the loop is held (where it enters the hold set: a vertex or a point inside a
+                # segment) or a fused vertex, round to itself, so that a stretch through the start point is one stretch; that point
+                # counts as fused at both ends. A loop with no held and no fused point is held nowhere: one free piece.
                 hold_w = holds[round(w, 4)]
-                pivot = 0
-                for i in range(len(pts) - 1):
+                ring = len(pts) - 1
+                entry = None
+                for i in range(ring):
                     if hold_w.covers(shapely.Point(pts[i])) or fused(i):
-                        pivot = i
+                        entry = (i, tuple(pts[i]))
                         break
-                if pivot > 0:
-                    pts = pts[pivot:-1] + pts[:pivot + 1]
-                    arc = [0.0]
-                    for i in range(1, len(pts)):
-                        arc.append(arc[-1] + math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]))
+                    inside = shapely.intersection(shapely.LineString([pts[i], pts[i + 1]]), hold_w)
+                    if not inside.is_empty:
+                        q = min((c for g in (getattr(inside, 'geoms', None) or [inside]) for c in g.coords),
+                                key=lambda c: math.hypot(c[0] - pts[i][0], c[1] - pts[i][1]), default=None)
+                        if q is not None:
+                            entry = (i, (q[0], q[1]))
+                            break
+                if entry is None:
+                    coords = [(x, y) for x, y in pts]
+                    segs_of_loop = [(coords[i][0], coords[i][1], coords[i + 1][0], coords[i + 1][1]) for i in range(len(coords) - 1)]
+                    if not all(on_reference_line(*sg, ref, ref_tree, overlap=False) for sg in segs_of_loop):
+                        kind = 'free_post' if plen <= 0.6 else 'free_added'
+                        counts[kind] += 1
+                        mm[kind] += plen
+                        mx[kind] = max(mx[kind], plen)
+                        over[kind + '>0.25'] += plen > 0.25
+                        over[kind + '>0.5'] += plen > 0.5
+                        out.write(f'{z:.3f}\t{kind}\t{plen:.3f}\t{pts[0][0]:.3f}\t{pts[0][1]:.3f}\t{plen:.3f}\n')
+                    continue
+                i, q = entry
+                rotated = [q] + [tuple(pts[(i + j) % ring]) for j in range(1, ring + 1)]
+                if q != tuple(pts[i]):
+                    rotated.append(q)
+                    inserted = q
+                pts = rotated
+                arc = [0.0]
+                for k in range(1, len(pts)):
+                    arc.append(arc[-1] + math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]))
             hooks = [False] + [is_hook(i) for i in range(1, len(pts))]
+            if closed:
+                hooks[0] = hooks[-1]   # the segment into the start point is the loop's last
             # A junction: a vertex fused to another bead, or the vertex where a lattice line turns into a connector hook along the
             # boundary (Cubic's boundary behaviour, accepted by the user): the hook is measured as a connection piece of its own
             # and the line's end at the junction is not free.
-            fused_vertex = [fused(i) or (0 < i < len(pts) - 1 and hooks[i] != hooks[i + 1]) or (closed and (i == 0 or i == len(pts) - 1)) for i in range(len(pts))]
+            fused_vertex = [(closed and (i == 0 or i == len(pts) - 1)) or fused(i) or (0 < i < len(pts) - 1 and hooks[i] != hooks[i + 1]) for i in range(len(pts))]
             # The parts of the path between its junction vertices.
             parts, part, part_start = [], [pts[0]], 0
             for i in range(1, len(pts)):

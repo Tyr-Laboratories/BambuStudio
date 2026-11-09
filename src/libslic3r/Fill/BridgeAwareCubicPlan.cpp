@@ -1127,8 +1127,16 @@ static void solid_column(GroupPlan &group, ObjectPlan &plan, const Cell &cell, c
                         hi = std::max(hi, tv);
                     }
                 }
-                if (hi - lo >= w - 1e-4)
+                // An edge shorter than a bead is lengthened to one about its middle, as a needed strand is (3.6b): the courses
+                // end on every face, short ones included. An edge no longer than the vertex margin is a vertex.
+                if (hi - lo > plan.vertex_margin()) {
+                    if (hi - lo < w) {
+                        const double mid = 0.5 * (lo + hi);
+                        lo = mid - 0.5 * w;
+                        hi = mid + 0.5 * w;
+                    }
                     group.add_strand(l, Strand{ f, lo, hi, StrandKind::SolidFace, smallest_gap });
+                }
             }
         // The courses: one family per layer, alternating.
         const int k = int(l % 2);

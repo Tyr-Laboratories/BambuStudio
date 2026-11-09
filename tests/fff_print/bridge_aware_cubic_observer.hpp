@@ -545,13 +545,16 @@ inline bool boundary_join(const Polyline &piece, const std::vector<Line> &contro
     return true;
 }
 
-// `gap_b_at` gives G_b (mm) at a place on the bed (mm) and a height z (mm): the fixtures with two regions have two gaps. `infill_direction_deg` is the
-// region's infill direction: the three lattice directions are it and it + 60° and + 120°.
+// `gap_b_at` gives G_b (mm) at a place on the bed (mm) and a height z (mm): the fixtures with two regions have two gaps.
+// `infill_directions_deg` are the regions' infill directions: the lattice directions of each are it and it + 60° and + 120°.
 inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control,
-                            const std::function<double(const Vec2d&, double)> &gap_b_at, double infill_direction_deg)
+                            const std::function<double(const Vec2d&, double)> &gap_b_at, const std::vector<double> &infill_directions_deg)
 {
     K2Measure result;
-    const std::vector<double> directions = { std::fmod(infill_direction_deg + 360., 180.), std::fmod(infill_direction_deg + 420., 180.), std::fmod(infill_direction_deg + 480., 180.) };
+    std::vector<double> directions;
+    for (const double direction : infill_directions_deg)
+        for (int k = 0; k < 3; ++k)
+            directions.push_back(std::fmod(direction + 60. * k + 360., 180.));
     const std::map<int, EmittedLayer> layers = emitted_layers(paths), control_layers = emitted_layers(control);
     for (auto it = layers.begin(); it != layers.end() && std::next(it) != layers.end(); ++it) {
         const EmittedLayer &lower = it->second, &upper = std::next(it)->second;
@@ -599,16 +602,21 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
             for (size_t i = 1; i < path.points.size(); ++i) arc[i] = arc[i - 1] + unscale<double>((path.points[i] - path.points[i - 1]).cast<double>().norm());
             return arc;
         };
-        const auto fused_at = [&upper, &arc_positions](const EmittedPath &own, size_t vertex) -> std::optional<double> {
+        // A closed path (a course laid as a loop) has no ends: arc distances along it go round, and nothing lies at its ends.
+        const auto is_closed = [](const Polyline &path) { return path.points.size() > 2 && path.first_point() == path.last_point(); };
+        const auto fused_at = [&upper, &arc_positions, &is_closed](const EmittedPath &own, size_t vertex) -> std::optional<double> {
             const Point &v = own.path.points[vertex];
             const std::vector<double> own_arc = arc_positions(own.path);
+            const bool own_closed = is_closed(own.path);
+            const auto own_distance = [&](double a, double b) { const double d = std::abs(a - b); return own_closed ? std::min(d, own_arc.back() - d) : d; };
             std::optional<double> best;
             for (const EmittedPath *other : upper) {
                 if (!get_extents(other->path).inflated(coord_t(scale_(2.))).contains(v)) continue;
                 const double reach = .5 * other->width + .01;
                 const std::vector<double> arc = other == &own ? own_arc : arc_positions(other->path);
+                const bool other_closed = other == &own ? own_closed : is_closed(other->path);
                 for (size_t i = 1; i < other->path.points.size(); ++i) {
-                    if (other == &own && std::min(std::abs(own_arc[i - 1] - own_arc[vertex]), std::abs(own_arc[i] - own_arc[vertex])) <= own.width + .01)
+                    if (other == &own && std::min(own_distance(own_arc[i - 1], own_arc[vertex]), own_distance(own_arc[i], own_arc[vertex])) <= own.width + .01)
                         continue;    // the path's own geometry within a bead of the vertex
                     const Line seg(other->path.points[i - 1], other->path.points[i]);
                     const double d = unscale<double>(seg.distance_to(v));
@@ -618,7 +626,7 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
                     const double l2 = dvec.squaredNorm();
                     const double t = l2 > 0. ? std::min(1., std::max(0., (v.cast<double>() - a).dot(dvec) / l2)) : 0.;
                     const double foot = arc[i - 1] + t * (arc[i] - arc[i - 1]);
-                    if (foot < reach || arc.back() - foot < reach) continue;
+                    if (!other_closed && (foot < reach || arc.back() - foot < reach)) continue;
                     if (!best || d < *best) best = d;
                 }
             }
@@ -636,37 +644,78 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
             // by the user on 9 November 2026).
             const auto is_hook = [&](const Point &a, const Point &b) { return !along_lattice(a, b, directions) && on_control_line(a, b, control_segments); };
             const auto hook_junction = [&](const EmittedPath &own, size_t i) {
-                if (i == 0 || i + 1 >= own.path.points.size()) return false;
-                return is_hook(own.path.points[i - 1], own.path.points[i]) != is_hook(own.path.points[i], own.path.points[i + 1]);
+                const Points &pts = own.path.points;
+                if (is_closed(own.path)) {
+                    const size_t ring = pts.size() - 1, k = i % ring;
+                    return is_hook(pts[(k + ring - 1) % ring], pts[k]) != is_hook(pts[k], pts[(k + 1) % ring]);
+                }
+                if (i == 0 || i + 1 >= pts.size()) return false;
+                return is_hook(pts[i - 1], pts[i]) != is_hook(pts[i], pts[i + 1]);
             };
-            // A closed path (a course laid as a loop) has no ends. It is measured from a vertex that is held (over the hold set)
-            // or fused, round to itself, so that a stretch through its start point is one stretch; without such a vertex the whole
-            // loop is one piece whose length is a stretch. Its first and last vertices count as fused (a loop has no free end).
-            const bool closed = path->path.points.size() > 2 && path->path.first_point() == path->path.last_point();
+            // A closed path (a course laid as a loop) has no ends. It is measured from the first point where it is held (where it
+            // enters the hold set, a vertex or a point inside a segment) or a fused vertex, round to itself, so that a stretch
+            // through its start point is one stretch; that point counts as fused at both ends of the measure. A loop with no held
+            // and no fused point is not held anywhere: it is one free piece.
+            const bool closed = is_closed(path->path);
+            constexpr size_t inserted = size_t(-1);
             Polyline measured = path->path;
             std::vector<size_t> orig(measured.points.size());
             std::iota(orig.begin(), orig.end(), 0);
+            bool loop_held = !closed;
             if (closed) {
-                const size_t ring = path->path.points.size() - 1;
-                size_t pivot = 0;
-                for (size_t i = 0; i < ring; ++i) {
-                    const Point &v = path->path.points[i];
-                    if (std::any_of(hold.begin(), hold.end(), [&v](const ExPolygon &e) { return e.contains(v); }) || fused(*path, i)) {
-                        pivot = i;
-                        break;
+                const Points &pts = path->path.points;
+                const size_t ring = pts.size() - 1;
+                const auto held_point = [&hold](const Point &v) { return std::any_of(hold.begin(), hold.end(), [&v](const ExPolygon &e) { return e.contains(v); }); };
+                for (size_t i = 0; i < ring && !loop_held; ++i) {
+                    std::optional<Point> entry;
+                    size_t from = i;
+                    if (held_point(pts[i]) || fused(*path, i))
+                        entry = pts[i];
+                    else {
+                        // The segment's first point inside the hold set.
+                        Polylines inside = intersection_pl(Polylines{ Polyline(pts[i], pts[i + 1]) }, hold);
+                        for (const Polyline &piece : inside)
+                            for (const Point &q : { piece.first_point(), piece.last_point() })
+                                if (!entry || (q - pts[i]).cast<double>().norm() < (*entry - pts[i]).cast<double>().norm())
+                                    entry = q;
+                    }
+                    if (!entry)
+                        continue;
+                    loop_held = true;
+                    measured.points.clear();
+                    orig.clear();
+                    measured.points.push_back(*entry);
+                    orig.push_back(*entry == pts[i] ? i : inserted);
+                    for (size_t j = 1; j <= ring; ++j) {
+                        const size_t k = (from + j) % ring;
+                        measured.points.push_back(pts[k]);
+                        orig.push_back(k);
+                    }
+                    if (*entry != pts[i]) {
+                        measured.points.push_back(*entry);
+                        orig.push_back(inserted);
+                    } else {
+                        orig.back() = i;
                     }
                 }
-                if (pivot > 0) {
-                    measured.points.assign(path->path.points.begin() + pivot, path->path.points.begin() + ring);
-                    measured.points.insert(measured.points.end(), path->path.points.begin(), path->path.points.begin() + pivot + 1);
-                    for (size_t i = 0; i < measured.points.size(); ++i)
-                        orig[i] = (pivot + i) % ring;
-                }
+            }
+            if (!loop_held) {
+                if (on_control_lines(path->path, control_segments) || boundary_join(path->path, control_segments, directions))
+                    continue;    // a loop of Cubic's own lines or joins
+                ++result.added_pieces;
+                ++result.free_ends;
+                result.where.push_back(unscale(path->path.first_point()));
+                if (result.pieces.size() < 400)
+                    result.pieces.push_back({ path->z, unscale(path->path.first_point()), unscale(path->path.last_point()), unscale(path->path.first_point()), unscale(path->path.last_point()),
+                                              unscale<double>(path->path.length()), true, path->path.points.size(), -999., path->path });
+                result.longest = std::max(result.longest, unscale<double>(path->path.length()));
+                continue;
             }
             const size_t n_pts = measured.points.size();
             std::vector<bool> fused_vertex(n_pts, false);
             for (size_t i = 0; i < n_pts; ++i)
-                fused_vertex[i] = fused(*path, orig[i]) || hook_junction(*path, orig[i]) || (closed && (i == 0 || i + 1 == n_pts));
+                fused_vertex[i] = (closed && (i == 0 || i + 1 == n_pts)) ||
+                                  (orig[i] != inserted && (fused(*path, orig[i]) || hook_junction(*path, orig[i])));
             struct Part { Polyline line; bool start_fused, end_fused; };
             std::vector<Part> parts;
             {
@@ -718,6 +767,17 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
         }
     }
     return result;
+}
+
+inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control,
+                            const std::function<double(const Vec2d&, double)> &gap_b_at, double infill_direction_deg)
+{
+    return measure_k2(paths, control, gap_b_at, std::vector<double>{ infill_direction_deg });
+}
+
+inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control, double gap_b, const std::vector<double> &infill_directions_deg)
+{
+    return measure_k2(paths, control, [gap_b](const Vec2d &, double) { return gap_b; }, infill_directions_deg);
 }
 
 inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control, double gap_b, double infill_direction_deg)

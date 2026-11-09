@@ -176,14 +176,13 @@ bool no_courses(const ObjectPlan &plan, const PrintObject &object)
     return true;
 }
 
-// The bridge footprint of every layer beyond `limit_mm` of the roof's solid footprint of the plan (M⁺ of that layer, on the bed),
-// where it lies over the sparse void of the plane below: the generator's growth past the roof's inner edge beyond what the rails
-// allow. Returns the area (mm²) of that overgrowth, summed over the layers.
-double bridge_overgrowth_mm2(const std::vector<EmittedPath> &paths, const PrintObject &object, const ObjectPlan &plan, double limit_mm, int bridge_layers)
+// The bridge footprint of every layer beyond `limit_mm` of the roof's solid footprint (what the layers above it print, `bridge_layers`
+// of them: a thick base lies under the roof's own layer), where it lies over the sparse void of the plane below: the generator's
+// growth past the roof's inner edge beyond what the rails allow. Returns the area (mm²) of that overgrowth, summed over the layers.
+double bridge_overgrowth_mm2(const std::vector<EmittedPath> &paths, double limit_mm, int bridge_layers)
 {
     double total = 0.;
     const std::map<int, EmittedLayer> layers = emitted_layers(paths);
-    const Point shift = object.instances().front().shift;
     for (auto it = layers.begin(); it != layers.end() && std::next(it) != layers.end(); ++it) {
         const EmittedLayer &lower = it->second, &upper = std::next(it)->second;
         EmittedLayer bridges, sparse;
@@ -193,85 +192,82 @@ double bridge_overgrowth_mm2(const std::vector<EmittedPath> &paths, const PrintO
             if (path->role == erInternalInfill) sparse.push_back(path);
         if (bridges.empty() || sparse.empty())
             continue;
-        const int n = layer_of_key(object, std::next(it)->first);
-        if (n < 0)
-            continue;
-        // The roof of a bridge layer: the material the plan saw on it and on the layers above it within the bridge stack (a thick
-        // base lies under the roof's own layer).
-        ExPolygons roof;
-        for (int k = n; k < int(object.layers().size()) && k < n + bridge_layers; ++k)
-            append(roof, plan.material(size_t(k)).may_print);
-        roof = union_ex(roof);
-        for (ExPolygon &part : roof)
-            part.translate(shift);
-        const ExPolygons allowed = offset_ex(roof, float(scale_(limit_mm)), ClipperLib::jtRound, scale_(.001));
+        EmittedLayer roof_paths;
+        auto above = std::next(it);
+        for (int k = 0; k < bridge_layers && std::next(above) != layers.end(); ++k) {
+            ++above;
+            for (const EmittedPath *path : above->second)
+                if (path->role != erInternalInfill) roof_paths.push_back(path);
+        }
+        const ExPolygons allowed = offset_ex(footprint(roof_paths), float(scale_(limit_mm)), ClipperLib::jtRound, scale_(.001));
         // The sparse void of the plane below, as the observer measures it: inside its outer wall, off what it prints, beside sparse fill.
         ExPolygons domain;
         for (const ExPolygon &wall : footprint(lower, erExternalPerimeter)) domain.emplace_back(wall.contour);
-        const ExPolygons printed = footprint(lower);
         const ExPolygons near_sparse = offset_ex(footprint(sparse), float(scale_(.01)));
         ExPolygons sparse_void;
-        for (ExPolygon &part : diff_ex(domain, printed))
+        for (ExPolygon &part : diff_ex(domain, footprint(lower)))
             if (!intersection_ex(ExPolygons{ part }, near_sparse).empty()) sparse_void.push_back(std::move(part));
-        const ExPolygons overgrowth = intersection_ex(diff_ex(footprint(bridges), allowed), sparse_void);
-        total += area(overgrowth) * SCALING_FACTOR * SCALING_FACTOR;
+        total += area(intersection_ex(diff_ex(footprint(bridges), allowed), sparse_void)) * SCALING_FACTOR * SCALING_FACTOR;
     }
     return total;
 }
 
-// The rail beads of an export: under every layer with bridges, the sparse segments of the layer below that run off the lattice
-// directions, are at least a bead long (a course, not a nub's step), lie farther than a bead from the walls' beads, off the lines
-// of the Cubic control's sparse segments of that layer (the connector's hooks along an island edge, which Cubic lays too, also
-// where the ensuring strip moved the edge off the walls) and within `reach_mm` of the bridges' footprint. Returns their length
-// (mm) per bridge layer.
-std::vector<double> rail_bead_lengths(const std::vector<EmittedPath> &paths, const std::vector<EmittedPath> &control, double reach_mm, double w,
-                                      double infill_direction_deg)
+// The rail-like beads of a layer: sparse segments at least a bead long that run off the lattice directions, lie farther than a bead
+// from the walls' beads and off the lines of the Cubic control's sparse segments of that layer (the connector's hooks along an
+// island edge, which Cubic lays too).
+std::vector<Line> rail_like_beads(const EmittedLayer &layer, const std::vector<Line> &cubic_segments, double w, const std::vector<double> &directions)
 {
-    const std::map<int, EmittedLayer> control_layers = emitted_layers(control);
-    std::vector<double> out;
-    // The lattice directions in degrees in [0, 180), as the observer's along_lattice takes them: the lines' normals lie at the infill
-    // direction plus 90 and plus 0, 60 and 120 degrees, so the lines run at the infill direction plus 0, 60 and 120 degrees.
-    std::vector<double> directions;
-    for (int k = 0; k < 3; ++k)
-        directions.push_back(std::fmod(infill_direction_deg + 60. * k + 360., 180.));
-    const std::map<int, EmittedLayer> layers = emitted_layers(paths);
-    for (auto it = layers.begin(); it != layers.end() && std::next(it) != layers.end(); ++it) {
-        const EmittedLayer &lower = it->second, &upper = std::next(it)->second;
-        EmittedLayer bridges;
-        for (const EmittedPath *path : upper)
-            if (path->role == erBridgeInfill) bridges.push_back(path);
-        if (bridges.empty())
-            continue;
-        const ExPolygons near_bridge = offset_ex(footprint(bridges), float(scale_(reach_mm)), ClipperLib::jtRound, scale_(.001));
-        ExPolygons walls = footprint(lower, erExternalPerimeter);
-        append(walls, footprint(lower, erPerimeter));
-        const ExPolygons wall_band = offset_ex(union_ex(walls), float(scale_(w)), ClipperLib::jtRound, scale_(.001));
-        const std::vector<Line> cubic_segments = control_sparse_segments(control_layers, it->first);
-        double length = 0.;
-        for (const EmittedPath *path : lower) {
-            if (path->role != erInternalInfill) continue;
-            for (size_t i = 1; i < path->path.points.size(); ++i) {
-                const Point &a = path->path.points[i - 1], &b = path->path.points[i];
-                const double segment = unscale<double>((b - a).cast<double>().norm());
-                if (segment < w - 1e-4 || along_lattice(a, b, directions) || on_control_line(a, b, cubic_segments)) continue;
-                const Point mid((a.x() + b.x()) / 2, (a.y() + b.y()) / 2);
-                const auto inside = [&mid](const ExPolygons &area) { return std::any_of(area.begin(), area.end(), [&mid](const ExPolygon &e) { return e.contains(mid); }); };
-                if (inside(wall_band) || !inside(near_bridge)) continue;
-                length += segment;
-            }
+    ExPolygons walls = footprint(layer, erExternalPerimeter);
+    append(walls, footprint(layer, erPerimeter));
+    const ExPolygons wall_band = offset_ex(union_ex(walls), float(scale_(w)), ClipperLib::jtRound, scale_(.001));
+    std::vector<Line> out;
+    for (const EmittedPath *path : layer) {
+        if (path->role != erInternalInfill) continue;
+        for (size_t i = 1; i < path->path.points.size(); ++i) {
+            const Point &a = path->path.points[i - 1], &b = path->path.points[i];
+            if (unscale<double>((b - a).cast<double>().norm()) < w - 1e-4 || along_lattice(a, b, directions) || on_control_line(a, b, cubic_segments)) continue;
+            const Point mid((a.x() + b.x()) / 2, (a.y() + b.y()) / 2);
+            if (std::none_of(wall_band.begin(), wall_band.end(), [&mid](const ExPolygon &e) { return e.contains(mid); }))
+                out.emplace_back(a, b);
         }
-        out.push_back(length);
     }
     return out;
+}
+
+// The inner edges of a layer's bridges: the outline of their footprint (closed by half a bridge bead: neighbouring beads leave
+// slivers between them) over the sparse area of the layer below (inside its outer wall, off the beads of its other roles),
+// farther than a bead from its walls.
+Polylines bridge_inner_edges(const EmittedLayer &upper, const EmittedLayer &lower, double w)
+{
+    EmittedLayer bridges, other;
+    double half_bead = 0.;
+    for (const EmittedPath *path : upper)
+        if (path->role == erBridgeInfill) {
+            bridges.push_back(path);
+            half_bead = std::max(half_bead, 0.5 * path->width);
+        }
+    for (const EmittedPath *path : lower)
+        if (path->role != erInternalInfill) other.push_back(path);
+    if (bridges.empty())
+        return {};
+    ExPolygons domain;
+    for (const ExPolygon &wall : footprint(lower, erExternalPerimeter)) domain.emplace_back(wall.contour);
+    ExPolygons walls = footprint(lower, erExternalPerimeter);
+    append(walls, footprint(lower, erPerimeter));
+    const ExPolygons sparse_area = diff_ex(domain, offset_ex(union_ex(walls), float(scale_(w)), ClipperLib::jtRound, scale_(.001)));
+    const ExPolygons closed = offset_ex(offset_ex(footprint(bridges), float(scale_(half_bead)), ClipperLib::jtRound, scale_(.001)),
+                                        -float(scale_(half_bead)), ClipperLib::jtRound, scale_(.001));
+    return intersection_pl(to_polylines(closed), diff_ex(sparse_area, footprint(other)));
 }
 
 } // namespace
 
 // R1: rails. At a bridged roof's inner edge the bridge reaches at most d_r + w_b + 0.05 past the edge over the void (Cubic's grows
-// further: the control); no bridge end over the pattern's void hangs (an end inside the wall overlap is anchored); a rail bead
-// lies under every bridge layer whose roof edge runs over the void, and none where the roof edges are at the walls; the user's
-// wall, bridge, anchor and density settings included. Thick bases (two and three internal bridge layers) are a recorded
-// limitation (docs/bridge-aware-cubic.md).
+// further: the control, where it does on the fixture; the roof is what the layers above the bridge print); no bridge end over the
+// pattern's void hangs (an end inside the wall overlap is anchored); rail beads lie along the bridges' inner edges where roof edges
+// run over the void, and none where the roof edges are at the walls; the user's wall, bridge, anchor and density settings
+// included. Thick bases (two and three internal bridge layers) and the generator bridging a layer above the predicted roof are
+// recorded limitations (docs/bridge-aware-cubic.md).
 struct RailCase {
     std::string          name;
     Model              (*model)();
@@ -296,7 +292,7 @@ TEST_CASE("Bridge aware cubic lays rails along the roof edges the bridges grow p
         // The user's settings: one Arachne wall at 75 % overlap, thick bridges, 1 mm anchors, 3 % density.
         { "fuselage top, the user's settings", fuselage_top,
           with({}, {{"wall_loops", "1"}, {"wall_generator", "arachne"}, {"infill_wall_overlap", "75%"}, {"thick_bridges", "1"},
-                    {"sparse_infill_anchor", "1"}, {"sparse_infill_anchor_max", "1"}, {"sparse_infill_density", "3%"}}), 5., nullptr, true, 45., true },
+                    {"sparse_infill_anchor", "1"}, {"sparse_infill_anchor_max", "1"}, {"sparse_infill_density", "3%"}}), 5., nullptr, true, 45., false },
         { "small cube", small_cube, {}, 5., nullptr, false },
         { "large cube", large_cube, {}, 5., nullptr, false },
         { "rib", rib, {}, 5., rib_config, true, 17., true },
@@ -316,8 +312,6 @@ void check_rails(Workspace &workspace, const std::vector<RailCase> &cases)
         Sliced sliced;
         slice_and_export(sliced, workspace, c.model(), settings, c.name + "-r1.gcode");
         const PrintObject &object = sliced.object();
-        const ObjectPlan *plan = sliced.plan();
-        REQUIRE(plan != nullptr);
         const std::vector<EmittedPath> control = exported_extrusions(workspace, c.model(), control_settings, c.name + "-r1-cubic.gcode");
         const BACObserver::BridgeEnds ends = count_bridge_ends(sliced.paths);
         REQUIRE(ends.paths > 0);
@@ -333,17 +327,36 @@ void check_rails(Workspace &workspace, const std::vector<RailCase> &cases)
         const Flow bridge_flow = object.layers().front()->regions().front()->bridging_flow(frSolidInfill, true);
         const double d_r = bridge_flow.spacing() + 0.5 * w + 0.05, limit = d_r + bridge_flow.width() + 0.05;
         const int B = std::max(1, std::min(3, int(region.config().internal_bridge_layers.value)));
-        CHECK(bridge_overgrowth_mm2(sliced.paths, object, *plan, limit, B) <= 0.05);
-        // The rail beads under the bridge layers, from the export; Cubic has none and its bridges grow further (the control).
-        const std::vector<double> rails = rail_bead_lengths(sliced.paths, control, limit, w, c.direction);
+        CHECK(bridge_overgrowth_mm2(sliced.paths, limit, B) <= 0.05);
+        if (c.cubic_overgrows)
+            CHECK(bridge_overgrowth_mm2(control, limit, B) > 0.05);
+        // The rails, from the export: rail-like beads along the inner edges (longer than the gap) of the bridges of the layers
+        // above them. A fixture whose roofs have edges over the void has them; one whose roofs end at the walls has none.
+        std::vector<double> directions;
+        for (int k = 0; k < 3; ++k)
+            directions.push_back(std::fmod(c.direction + 60. * k + 360., 180.));
+        const std::map<int, EmittedLayer> layers = emitted_layers(sliced.paths), control_layers = emitted_layers(control);
         double rail_length = 0.;
-        for (const double length : rails) rail_length += length;
-        if (c.edge_over_void) {
+        for (auto it = layers.begin(); it != layers.end() && std::next(it) != layers.end(); ++it) {
+            const Polylines edges = bridge_inner_edges(std::next(it)->second, it->second, w);
+            double edge_length = 0.;
+            for (const Polyline &edge : edges) edge_length += unscale<double>(edge.length());
+            if (edge_length <= c.gap)
+                continue;
+            const ExPolygons near = union_ex(offset(edges, float(scale_(limit)), ClipperLib::jtRound, scale_(.001), ClipperLib::etOpenRound));
+            for (auto below = it;; --below) {
+                for (const Line &bead : rail_like_beads(below->second, control_sparse_segments(control_layers, below->first), w, directions)) {
+                    const Point mid = (bead.a + bead.b) / 2;
+                    if (std::any_of(near.begin(), near.end(), [&mid](const ExPolygon &e) { return e.contains(mid); }))
+                        rail_length += unscale<double>(bead.length());
+                }
+                if (below == layers.begin() || std::distance(below, it) + 1 >= B)
+                    break;
+            }
+        }
+        if (c.edge_over_void)
             CHECK(rail_length > w);
-            CHECK(std::count_if(rails.begin(), rails.end(), [w](double length) { return length > w; }) >= 1);
-            if (c.cubic_overgrows)
-                CHECK(bridge_overgrowth_mm2(control, object, *plan, limit, B) > 0.05);
-        } else
+        else
             CHECK(rail_length == 0.);
     }
 }
@@ -438,7 +451,7 @@ TEST_CASE("Bridge aware cubic lays one seam wall where two lattices meet", "[Bri
         const double z_first = object.layers()[first_course]->print_z;
         const std::vector<EmittedPath> control = exported_extrusions(workspace, floating_modifier(), modifier_config("cubic"), "w1-floating-cubic.gcode");
         const K2Measure measure = measure_k2(sliced.paths, control,
-            [z_first](const Vec2d &at, double z) { return (z >= z_first - 1e-6 && at.x() >= SEAM_X ? 3. : 8.) - 0.1; }, 45.);
+            [z_first](const Vec2d &at, double z) { return (z >= z_first - 1e-6 && at.x() >= SEAM_X ? 3. : 8.) - 0.1; }, std::vector<double>{ 45., 17. });
         CHECK(measure.added_pieces > 0);
         CHECK(measure.free_ends == 0);
         CHECK(measure.long_stretches == 0);

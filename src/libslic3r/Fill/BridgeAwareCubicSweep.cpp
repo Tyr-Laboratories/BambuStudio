@@ -551,7 +551,14 @@ private:
                             } else
                                 in_unheld = true;
                         }
-                        if (in_unheld)    // an open course ends over the void; a closed course had no held station at all
+                        const bool any_held = std::find(held_at.begin(), held_at.end(), char(1)) != held_at.end();
+                        if (closed && !any_held) {
+                            // A loop with no held station: n holders round it, station 0 among them, so that no stretch exceeds
+                            // G_b (one holder for a loop no longer than G_b).
+                            const int n = std::max(1, int(std::ceil(length / gb)));
+                            for (int k = 0; k < n; ++k)
+                                to_hold.push_back(point_at_arc_length(course, length * double(k) / double(n)));
+                        } else if (in_unheld)    // an open course ends over the void
                             place_along(last_held, closed ? stations[start] + length : length);
                     }
                 }
