@@ -22,6 +22,7 @@ namespace {
 constexpr double MU            = 0.1;      // the planning margin: G_b = G − μ
 constexpr double EPSILON_MM    = 0.01;     // the touching measure of the checker and the verifier
 constexpr int    LOOK_AHEAD    = 3;        // layers below a holder in which a column must have room
+constexpr double K_MIN         = 6.;       // step 6: a column that would stay this many layers or more evaluates a family change
 constexpr double LOOK_ALONG    = 20.;      // mm along its trace in which a column looks for material
 constexpr int    PLANE_LEVELS  = 16;       // the plane through a point: levels 1 to 16 (plane_through)
 constexpr double SIN_60        = 0.86602540378443864676;
@@ -29,6 +30,20 @@ constexpr float  ARC_TOLERANCE = float(scale_(0.001));
 
 using Interval  = std::pair<double, double>;
 using Intervals = std::vector<Interval>;
+
+// The intersection of two sorted, merged interval lists.
+Intervals intersected(const Intervals &a, const Intervals &b)
+{
+    Intervals out;
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        const double lo = std::max(a[i].first, b[j].first), hi = std::min(a[i].second, b[j].second);
+        if (lo < hi)
+            out.emplace_back(lo, hi);
+        if (a[i].second < b[j].second) ++i; else ++j;
+    }
+    return out;
+}
 
 // The union of intervals, sorted and merged.
 Intervals merged(Intervals intervals)
@@ -401,13 +416,14 @@ private:
     }
 
     // A piece [y − λ/2, y + λ/2] on K at layer l is admissible when it lies whole inside the fill boundary at l and a chain of
-    // pieces within α of each other continues through the boundaries of the three layers below it, or lands sooner.
-    bool admissible(const PlaneKey &K, double y, size_t l, double half_length)
+    // pieces within α of each other continues through the boundaries of the three layers below it (`look_ahead` layers), or
+    // lands sooner.
+    bool admissible(const PlaneKey &K, double y, size_t l, double half_length, int look_ahead = LOOK_AHEAD)
     {
         if (!inside_boundary(K, y, l, half_length))
             return false;
         double pos = y;
-        for (int step = 1; step <= LOOK_AHEAD; ++step) {
+        for (int step = 1; step <= look_ahead; ++step) {
             if (l < size_t(step))
                 return true;    // the bed
             const size_t layer = l - step + 1;      // the piece at `layer` is held by the print set of layer − 1
@@ -854,24 +870,19 @@ private:
         // Continue: a new piece within α along the trace, steered onto the quickest landing. A piece lands only when a crossing
         // covers it whole (c exceeds λ/2 by a few hundredths), so the next piece is aimed exactly at where the crossing will be
         // one layer further down, as far as α allows; a fixed menu of shifts missed that window and the columns never landed.
-        const double target = steering_target(item.plane, y, m);
-        const double step = std::min(a, slack);
-        const double move = std::max(-step, std::min(step, target - y));
-        // The exact move first, then the positions within the window ordered by their distance to the target (a target already
-        // reached, or none in sight, must still leave the admissible shifts in play).
-        std::vector<double> preferences = { move, step, -step, 0.5 * step, -0.5 * step, 0. };
-        std::stable_sort(preferences.begin(), preferences.end(), [&](double p, double q) { return std::abs(y + p - target) < std::abs(y + q - target); });
-        preferences.erase(std::unique(preferences.begin(), preferences.end(), [](double p, double q) { return std::abs(p - q) < 1e-9; }), preferences.end());
-        for (const double shift : preferences) {
-            const double candidate = y + shift;
-            if (admissible(item.plane, candidate, below, half)) {
-                add_strand(below, Strand{ item.plane, candidate - half, candidate + half, StrandKind::Column, item.gap });
-                return;
-            }
+        const Steering stay = steering(item.plane, y, m);
+        const std::optional<double> staying = nearest_admissible(item.plane, y, std::min(a, slack), stay.target, below, half);
+        // Step 6: a single piece that would stay long, or is trapped, moves to another family when that lands sooner.
+        if (length <= m_lambda + 1e-9 && (!staying || stay.layers >= K_MIN) &&
+            change_family(item, y, m, staying ? stay.layers : std::numeric_limits<double>::infinity()))
+            return;
+        if (staying) {
+            add_strand(below, Strand{ item.plane, *staying - half, *staying + half, StrandKind::Column, item.gap });
+            return;
         }
-        // Trapped (its trace runs into the boundary, typically at a wall): the column changes family through cover pieces of
-        // another family, each holding the item within the crossing reach c of its crossing (step 6's trapped case, among the
-        // three lattice directions only); an item longer than 2c takes several, c apart from each end.
+        // Trapped (its trace runs into the boundary, typically at a wall) and too long to change family as one piece: cover pieces
+        // of another family, each holding the item within the crossing reach c of its crossing (among the three lattice directions
+        // only); an item longer than 2c takes several, c apart from each end.
         {
             const double c = cover_reach();
             bool all = true;
@@ -896,10 +907,79 @@ private:
         return inside_boundary(K, 0.5 * (lo + hi), l, 0.5 * (hi - lo));
     }
 
+    // The admissible centre for a piece at layer l within `step` of y, nearest the target: the exact move toward it first, then the
+    // positions of the window ordered by their distance to the target (a target already reached, or none in sight, must still
+    // leave the admissible shifts in play).
+    std::optional<double> nearest_admissible(const PlaneKey &K, double y, double step, double target, size_t l, double half)
+    {
+        const double move = std::max(-step, std::min(step, target - y));
+        std::vector<double> preferences = { move, step, -step, 0.5 * step, -0.5 * step, 0. };
+        std::stable_sort(preferences.begin(), preferences.end(), [&](double p, double q) { return std::abs(y + p - target) < std::abs(y + q - target); });
+        preferences.erase(std::unique(preferences.begin(), preferences.end(), [](double p, double q) { return std::abs(p - q) < 1e-9; }), preferences.end());
+        for (const double shift : preferences)
+            if (admissible(K, y + shift, l, half))
+                return y + shift;
+        return std::nullopt;
+    }
+
+    // Step 6, the family change: the single piece at m centred at x on K goes on, at m − 1, on the plane of another family through
+    // its centre (the plane search of step 4; never a bulk plane, which would have landed it), at the admissible point nearest that
+    // plane's steering target within r_sw = (λ − c)/2 of the crossing, where the crossing holds the piece above whole by (ii). It
+    // changes when the estimate there, k_sw = 1 + the layers to land from the new piece, is at most k_stay − 1 (always when trapped,
+    // k_stay infinite): the smallest k_sw, then material over bulk over bed, then the lower family index.
+    bool change_family(const Item &item, double x, size_t m, double k_stay)
+    {
+        const size_t below = m - 1;
+        const double half = 0.5 * m_lambda, r_sw = std::max(0., 0.5 * (m_lambda - crossing_reach(m_vertex_margin)));
+        const Trace tk = trace(m_lattice, item.plane, m_plan.print_z(m));
+        const Vec2d centre = tk.point(x);
+        struct Candidate { PlaneKey plane; double y, layers; int landing; };
+        std::optional<Candidate> best;
+        for (int j = 0; j < 3; ++j) {
+            if (j == item.plane.family)
+                continue;
+            const std::optional<PlaneKey> plane = plane_through(m_lattice, j, centre, m_plan.print_z(below), m_tau);
+            if (!plane)
+                continue;
+            const Trace tj = trace(m_lattice, *plane, m_plan.print_z(below));
+            const auto tc = cross_parameter(tk, tj);
+            if (!tc)
+                continue;
+            const double xj = tj.parameter(tk.point(*tc));
+            const std::optional<double> y = nearest_admissible(*plane, xj, r_sw, steering(*plane, xj, m).target, below, half);
+            if (!y)
+                continue;
+            Candidate candidate{ *plane, *y, 1., 0 };    // a piece held whole at m − 2 lands at once
+            if (below >= 1 && !held_whole(*plane, *y - half, *y + half, below)) {
+                const Steering from = steering(*plane, *y, below);
+                candidate.layers  = 1. + from.layers;
+                candidate.landing = from.landing;
+                // A change by choice must leave the column room for the descent it promises: a plane whose trace drifts into the
+                // boundary within those layers traps the column there (a change out of a trap needs only the usual room).
+                if (std::isfinite(k_stay) && candidate.layers > LOOK_AHEAD + 1 &&
+                    !admissible(*plane, *y, below, half, int(std::min(candidate.layers, double(below)))))
+                    continue;
+            }
+            if (!best || candidate.layers < best->layers || (candidate.layers == best->layers && candidate.landing < best->landing))
+                best = candidate;
+        }
+        if (!best || best->layers > k_stay - 1.)
+            return false;
+        add_strand(below, Strand{ best->plane, best->y - half, best->y + half, StrandKind::Column, item.gap });
+        return true;
+    }
+
+    // Where a column steers, and the estimated layers to its landing there (step 5's closed form), by what it lands on: material,
+    // a bulk line, or the bed (the preference order of step 6's ties).
+    struct Steering { double target, layers; int landing; };
+    enum Landing { OnMaterial = 0, OnBulk = 1, OnBed = 2 };
+
     // The centre of the next piece (at m − 1) that lands soonest: on a crossing with a bulk line of another family where that
     // crossing will be at m − 2 (so that the piece lies whole within the crossing's reach c there), inside the material reach along
-    // the trace within 20 mm, or the current centre when nothing is in sight. The caller moves toward it by at most α a layer.
-    double steering_target(const PlaneKey &K, double y, size_t m)
+    // the trace within 20 mm, or the current centre when nothing is in sight; a target counts only where the piece fits inside the
+    // fill boundary of its own layer (beside a wall the material's reach and the boundary overlap by less than a piece, and a
+    // column steered at the wall rode along it). The caller moves toward it by at most α a layer.
+    Steering steering(const PlaneKey &K, double y, size_t m)
     {
         const size_t below = m - 1;
         const double a = alpha(m), h = m_plan.layer_height(m);
@@ -912,6 +992,7 @@ private:
         const Trace tk = trace(m_lattice, K, z_k);
         double best_k = double(m);     // layers to the bed
         double target = y;
+        int    landing = OnBed;
         for (int j = 0; j < 3; ++j) {
             if (j == K.family)
                 continue;
@@ -932,24 +1013,26 @@ private:
                     continue;    // it runs away faster than a column can follow
                 if (!lp2.boundary->index.empty() && !lp2.boundary->index.contains(m_lattice.scaled(tk.point(tc))))
                     continue;
+                if (!inside_boundary(K, tc, below, 0.5 * m_lambda))
+                    continue;
                 const double closing = approaching ? std::abs(v) + a : std::max(1e-6, a - std::abs(v));
                 const double k = g <= a ? 1. : 1. + std::ceil((g - a) / closing);
-                if (k < best_k) { best_k = k; target = tc; }
+                if (k < best_k) { best_k = k; target = tc; landing = OnBulk; }
             }
         }
-        if (!lp2.material_reach->empty()) {
+        if (!lp2.material_reach->empty() && !lp.boundary->index.empty()) {
             const Point pa = m_lattice.scaled(tk.point(y - LOOK_ALONG)), pb = m_lattice.scaled(tk.point(y + LOOK_ALONG));
-            for (const Interval &i : lp2.material_reach->segment_inside(pa, pb)) {
+            for (const Interval &i : intersected(merged(lp2.material_reach->segment_inside(pa, pb)), merged(lp.boundary->index.segment_inside(pa, pb)))) {
                 const double lo = y - LOOK_ALONG + i.first * 2. * LOOK_ALONG, hi = y - LOOK_ALONG + i.second * 2. * LOOK_ALONG;
                 if (hi - lo < m_lambda)
                     continue;
                 const double inside = std::min(std::max(y, lo + 0.5 * m_lambda), hi - 0.5 * m_lambda);
                 const double g = std::abs(inside - y);
                 const double k = g <= a ? 1. : 1. + std::ceil((g - a) / a);
-                if (k < best_k) { best_k = k; target = inside; }
+                if (k < best_k) { best_k = k; target = inside; landing = OnMaterial; }
             }
         }
-        return target;
+        return Steering{ target, best_k, landing };
     }
 
     GroupPlan                   &m_group;
