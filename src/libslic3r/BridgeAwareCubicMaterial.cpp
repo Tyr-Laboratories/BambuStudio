@@ -182,20 +182,65 @@ AreaIndex::AreaIndex(ExPolygons polygons, coord_t resolution) : m_polygons(std::
     grid_bbox.offset(2 * resolution);
     m_grid = std::make_unique<EdgeGrid::Grid>(grid_bbox);
     m_grid->create(m_polygons, resolution);
+    // Whether each cell's centre lies inside, by the ray cast of contains() (+x, an edge counted where exactly one of its ends lies
+    // above the ray), one row at a time: the x where the edges cross the row's centre line, and the count of those right of each
+    // centre. A query then starts from the centre of its own cell.
+    const BoundingBox &g = m_grid->bbox();
+    const coord_t res = m_grid->resolution();
+    const size_t rows = m_grid->rows(), cols = m_grid->cols();
+    std::vector<std::vector<double>> row_crossings(rows);
+    for (const EdgeGrid::Contour &contour : m_grid->contours())
+        for (size_t i = 0; i < contour.num_segments(); ++i) {
+            const Point &s = contour.segment_start(i), &e = contour.segment_end(i);
+            if (s.y() == e.y())
+                continue;
+            const coord_t lo = std::min(s.y(), e.y()), hi = std::max(s.y(), e.y());
+            // The rows whose centre y_c satisfies lo <= y_c < hi.
+            const int64_t first = std::max<int64_t>(0, (int64_t(lo) - g.min.y() - res / 2 + res - 1) / res);
+            for (int64_t r = first; r < int64_t(rows); ++r) {
+                const coord_t y_c = g.min.y() + coord_t(r) * res + res / 2;
+                if (y_c < lo)
+                    continue;
+                if (y_c >= hi)
+                    break;
+                row_crossings[size_t(r)].push_back(double(s.x()) + double(y_c - s.y()) * double(e.x() - s.x()) / double(e.y() - s.y()));
+            }
+        }
+    m_centre_inside.assign(rows * cols, 0);
+    for (size_t r = 0; r < rows; ++r) {
+        std::vector<double> &xs = row_crossings[r];
+        std::sort(xs.begin(), xs.end());
+        for (size_t c = 0; c < cols; ++c) {
+            const double x_c = double(g.min.x() + coord_t(c) * res + res / 2);
+            const size_t right = size_t(xs.end() - std::upper_bound(xs.begin(), xs.end(), x_c));
+            m_centre_inside[r * cols + c] = uint8_t(right & 1);
+        }
+    }
 }
 
 std::vector<double> AreaIndex::crossings(const Point &a, const Point &b) const
 {
     std::vector<double> out;
+    crossings(a, b, out);
+    return out;
+}
+
+void AreaIndex::crossings(const Point &a, const Point &b, std::vector<double> &out) const
+{
+    const size_t first = out.size();
     if (!m_grid || a == b)
-        return out;
-    std::set<std::pair<size_t, size_t>> seen;
+        return;
+    // The edges met so far: an edge spans several cells and counts once. A flat buffer reused by the thread (a query meets a few
+    // edges), not a node per edge.
+    thread_local std::vector<std::pair<size_t, size_t>> seen;
+    seen.clear();
     const Vec2crd d = b - a;
     const auto visitor_fn = [&](coord_t row, coord_t col) {
         const auto range = m_grid->cell_data_range(row, col);
         for (auto it = range.first; it != range.second; ++it) {
-            if (!seen.insert(*it).second)
+            if (std::find(seen.begin(), seen.end(), *it) != seen.end())
                 continue;
+            seen.push_back(*it);
             const EdgeGrid::Contour &contour = m_grid->contours()[it->first];
             const Point &s = contour.segment_start(it->second), &e = contour.segment_end(it->second);
             // Segment a→b against edge s→e: a + t d = s + u (e − s).
@@ -214,37 +259,42 @@ std::vector<double> AreaIndex::crossings(const Point &a, const Point &b) const
     };
     struct Visitor { const decltype(visitor_fn) &fn; bool operator()(coord_t row, coord_t col) { return fn(row, col); } } visitor{ visitor_fn };
     m_grid->visit_cells_intersecting_line(a, b, visitor);
-    std::sort(out.begin(), out.end());
-    return out;
+    std::sort(out.begin() + first, out.end());
 }
 
 bool AreaIndex::contains(const Point &point) const
 {
     if (!m_grid || !m_bbox.contains(point))
         return false;
-    // Ray casting along +x to just past the polygons' bounding box, counting proper crossings of the edges.
-    const Point far(m_bbox.max.x() + m_grid->resolution(), point.y());
-    std::set<std::pair<size_t, size_t>> seen;
-    size_t crossings_count = 0;
-    const auto visitor_fn = [&](coord_t row, coord_t col) {
-        const auto range = m_grid->cell_data_range(row, col);
-        for (auto it = range.first; it != range.second; ++it) {
-            if (!seen.insert(*it).second)
-                continue;
-            const EdgeGrid::Contour &contour = m_grid->contours()[it->first];
-            const Point &s = contour.segment_start(it->second), &e = contour.segment_end(it->second);
-            if ((s.y() > point.y()) == (e.y() > point.y()))
-                continue;
-            // x of the edge at the ray's height, compared to the point's x: (x − s.x) (e.y − s.y) = (p.y − s.y) (e.x − s.x)
+    // From the centre of the point's own cell: the state there, flipped by every edge that the path from the point along y = p.y to
+    // the centre's x and then along that x to the centre crosses. Every such edge passes through the cell, so the cell's own edges
+    // decide; each leg counts an edge on the ray cast's half-open rule.
+    const BoundingBox &g = m_grid->bbox();
+    const coord_t res = m_grid->resolution();
+    const size_t col = size_t((point.x() - g.min.x()) / res), row = size_t((point.y() - g.min.y()) / res);
+    const Point centre(g.min.x() + coord_t(col) * res + res / 2, g.min.y() + coord_t(row) * res + res / 2);
+    bool inside = m_centre_inside[row * m_grid->cols() + col] != 0;
+    const double x_lo = double(std::min(point.x(), centre.x())), x_hi = double(std::max(point.x(), centre.x()));
+    const coord_t y_lo = std::min(point.y(), centre.y()), y_hi = std::max(point.y(), centre.y());
+    const auto range = m_grid->cell_data_range(coord_t(row), coord_t(col));
+    for (auto it = range.first; it != range.second; ++it) {
+        const EdgeGrid::Contour &contour = m_grid->contours()[it->first];
+        const Point &s = contour.segment_start(it->second), &e = contour.segment_end(it->second);
+        // The leg along y = p.y: the edges whose crossing of that line lies in (x_lo, x_hi], where the ray casts from the point and
+        // from (centre.x, p.y) differ.
+        if ((s.y() > point.y()) != (e.y() > point.y())) {
             const double x = double(s.x()) + double(point.y() - s.y()) * double(e.x() - s.x()) / double(e.y() - s.y());
-            if (x > double(point.x()))
-                ++crossings_count;
+            if (x > x_lo && x <= x_hi)
+                inside = !inside;
         }
-        return true;
-    };
-    struct Visitor { const decltype(visitor_fn) &fn; bool operator()(coord_t row, coord_t col) { return fn(row, col); } } visitor{ visitor_fn };
-    m_grid->visit_cells_intersecting_line(point, far, visitor);
-    return (crossings_count & 1) == 1;
+        // The leg along x = centre.x: the edges crossing that line at a y in [y_lo, y_hi), where the state along it changes.
+        if ((s.x() > centre.x()) != (e.x() > centre.x())) {
+            const double y = double(s.y()) + double(centre.x() - s.x()) * double(e.y() - s.y()) / double(e.x() - s.x());
+            if (y >= double(y_lo) && y < double(y_hi))
+                inside = !inside;
+        }
+    }
+    return inside;
 }
 
 std::vector<std::pair<double, double>> AreaIndex::segment_inside(const Point &a, const Point &b) const
@@ -261,11 +311,14 @@ std::vector<std::pair<double, double>> AreaIndex::segment_inside(const Point &a,
         return out;
     const Vec2d da = a.cast<double>(), dd = (b - a).cast<double>();
     const auto at = [&](double t) { return Point(coord_t(std::llround(da.x() + t * dd.x())), coord_t(std::llround(da.y() + t * dd.y()))); };
-    std::vector<double> cuts = crossings(at(t0), at(t1));
+    // The clipped segment's ends and its crossings between them, in a buffer the thread reuses.
+    thread_local std::vector<double> cuts;
+    cuts.clear();
+    cuts.push_back(t0);
+    crossings(at(t0), at(t1), cuts);
     // The crossings came back as parameters of the clipped segment; map them to a→b.
-    for (double &t : cuts)
-        t = t0 + t * (t1 - t0);
-    cuts.insert(cuts.begin(), t0);
+    for (size_t i = 1; i < cuts.size(); ++i)
+        cuts[i] = t0 + cuts[i] * (t1 - t0);
     cuts.push_back(t1);
     for (size_t i = 1; i < cuts.size(); ++i) {
         if (cuts[i] - cuts[i - 1] <= 0.)
@@ -278,6 +331,44 @@ std::vector<std::pair<double, double>> AreaIndex::segment_inside(const Point &a,
         }
     }
     return out;
+}
+
+bool AreaIndex::segment_inside_whole(const Point &a, const Point &b) const
+{
+    if (!m_grid)
+        return false;
+    if (a == b)
+        return false;    // segment_inside gives the degenerate interval [0, 0]
+    double t0, t1;
+    if (!clip_to_box(a, b, m_bbox, t0, t1))
+        return false;
+    const Vec2d da = a.cast<double>(), dd = (b - a).cast<double>();
+    const auto at = [&](double t) { return Point(coord_t(std::llround(da.x() + t * dd.x())), coord_t(std::llround(da.y() + t * dd.y()))); };
+    thread_local std::vector<double> cuts;
+    cuts.clear();
+    cuts.push_back(t0);
+    crossings(at(t0), at(t1), cuts);
+    for (size_t i = 1; i < cuts.size(); ++i)
+        cuts[i] = t0 + cuts[i] * (t1 - t0);
+    cuts.push_back(t1);
+    // segment_inside's intervals, merged as it merges them, counted rather than stored.
+    size_t count = 0;
+    double first = 0., last = 0.;
+    for (size_t i = 1; i < cuts.size(); ++i) {
+        if (cuts[i] - cuts[i - 1] <= 0.)
+            continue;
+        if (contains(at(0.5 * (cuts[i - 1] + cuts[i])))) {
+            if (count > 0 && std::abs(last - cuts[i - 1]) < 1e-12)
+                last = cuts[i];
+            else {
+                if (++count > 1)
+                    return false;
+                first = cuts[i - 1];
+                last  = cuts[i];
+            }
+        }
+    }
+    return count == 1 && first <= 1e-9 && last >= 1. - 1e-9;
 }
 
 bool AreaIndex::segment_crosses_edge(const Point &a, const Point &b) const

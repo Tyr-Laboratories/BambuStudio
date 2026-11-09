@@ -66,12 +66,14 @@ public:
     // Copies rebuild the grid (a copy happens only when a plan's containers reallocate, with empty boundaries).
     AreaIndex(const AreaIndex &other) : AreaIndex(other.m_polygons, other.m_grid ? other.m_grid->resolution() : coord_t(scale_(1.))) {}
     AreaIndex &operator=(const AreaIndex &other) { *this = AreaIndex(other); return *this; }
-    AreaIndex(AreaIndex &&other) noexcept : m_polygons(std::move(other.m_polygons)), m_bbox(other.m_bbox), m_grid(std::move(other.m_grid)) {}
+    AreaIndex(AreaIndex &&other) noexcept
+        : m_polygons(std::move(other.m_polygons)), m_bbox(other.m_bbox), m_grid(std::move(other.m_grid)), m_centre_inside(std::move(other.m_centre_inside)) {}
     AreaIndex &operator=(AreaIndex &&other) noexcept
     {
-        m_polygons = std::move(other.m_polygons);
-        m_bbox     = other.m_bbox;
-        m_grid     = std::move(other.m_grid);
+        m_polygons      = std::move(other.m_polygons);
+        m_bbox          = other.m_bbox;
+        m_grid          = std::move(other.m_grid);
+        m_centre_inside = std::move(other.m_centre_inside);
         return *this;
     }
 
@@ -81,16 +83,20 @@ public:
     bool               contains(const Point &point) const;
     // The parameter intervals of the segment a + t (b − a), t in [0, 1], that lie inside the area, in increasing order.
     std::vector<std::pair<double, double>> segment_inside(const Point &a, const Point &b) const;
+    // Whether segment_inside(a, b) is the one interval [0, 1] (within 1e-9), without building it.
+    bool               segment_inside_whole(const Point &a, const Point &b) const;
     // Whether the segment crosses or touches any edge of the area.
     bool               segment_crosses_edge(const Point &a, const Point &b) const;
 
 private:
-    // The parameters along a→b where the segment crosses an edge.
+    // The parameters along a→b where the segment crosses an edge, sorted; the second form appends them to `out`.
     std::vector<double> crossings(const Point &a, const Point &b) const;
+    void                crossings(const Point &a, const Point &b, std::vector<double> &out) const;
 
     ExPolygons                       m_polygons;
     BoundingBox                      m_bbox;      // of the polygons
     std::unique_ptr<EdgeGrid::Grid>  m_grid;      // over a bbox inflated by two cells, so that clipped queries stay inside it
+    std::vector<uint8_t>             m_centre_inside;    // per grid cell (row-major): whether its centre lies inside
 };
 
 } // namespace BridgeAwareCubic

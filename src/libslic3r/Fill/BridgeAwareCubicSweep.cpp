@@ -120,6 +120,7 @@ public:
         m_cN    = m_c + (m_lattice.multiline - 1) * m_lattice.spacing / (2. * std::sqrt(3.));
         m_lambda = m_w;
         m_tau   = (m_c - 0.5 * m_w) * SIN_60 / 4.;
+        m_offsets = m_lattice.subline_offsets();
         // Taken off the reaches (ObjectPlan::vertex_margin, path_margin): a point held at exactly α, c or w/2 in the plan would read
         // as free on the export after path simplification and coordinate rounding. The material reach w/2 gets the path margin
         // less the checker's touching measure ε, which the checker grants material.
@@ -223,7 +224,7 @@ private:
     // reach about the bands' centre lines would claim a sub-line the piece does not reach.
     Intervals band_hold(const Trace &tk, int k, const Trace &tj, int j, const Interval &piece, double r) const
     {
-        const std::vector<double> offsets = m_lattice.subline_offsets();
+        const std::vector<double> &offsets = m_offsets;
         const Vec2d nk = m_lattice.normal(k), nj = m_lattice.normal(j);
         Intervals all;
         bool first = true;
@@ -336,8 +337,7 @@ private:
                         // straight through the boundary a bead either side of the crossing, only the rounding margin applies.
                         const Trace tj = trace(m_lattice, PlaneKey{ j, 0, q }, lp.z);
                         const double uj = tj.parameter(crossing_point);
-                        const Intervals straight = lp.boundary->index.segment_inside(m_lattice.scaled(tj.point(uj - m_w)), m_lattice.scaled(tj.point(uj + m_w)));
-                        const bool interior = straight.size() == 1 && straight.front().first <= 1e-9 && straight.front().second >= 1. - 1e-9;
+                        const bool interior = lp.boundary->index.segment_inside_whole(m_lattice.scaled(tj.point(uj - m_w)), m_lattice.scaled(tj.point(uj + m_w)));
                         const double reach = interior ? cN : cN_path;
                         out.emplace_back(tc - reach, tc + reach);
                     }
@@ -374,7 +374,7 @@ private:
             const Vec2d normal = m_lattice.normal(K.family);
             Intervals material;
             bool first = true;
-            for (const double o : m_lattice.subline_offsets()) {
+            for (const double o : m_offsets) {
                 const Point pa = m_lattice.scaled(tk.point(t0) + o * normal), pb = m_lattice.scaled(tk.point(t1) + o * normal);
                 Intervals one;
                 for (const Interval &i : lp.material_reach->segment_inside(pa, pb))
@@ -400,7 +400,7 @@ private:
         const Vec2d p = tk.point(t);
         const double reach = 0.5 * m_w - m_vertex_margin;
         const double pitch = unscale<double>(m_lattice.pitch);
-        const std::vector<double> offsets = m_lattice.subline_offsets();
+        const std::vector<double> &offsets = m_offsets;
         for (int j = 0; j < 3; ++j) {
             if (j == K.family)
                 continue;
@@ -473,12 +473,9 @@ private:
             return false;
         const Trace t = trace(m_lattice, K, lp.z);
         const Vec2d normal = m_lattice.normal(K.family);
-        for (const double o : m_lattice.subline_offsets()) {
-            const Point a = m_lattice.scaled(t.point(y - half_length) + o * normal), b = m_lattice.scaled(t.point(y + half_length) + o * normal);
-            const Intervals in = lp.boundary->index.segment_inside(a, b);
-            if (!(in.size() == 1 && in.front().first <= 1e-9 && in.front().second >= 1. - 1e-9))
+        for (const double o : m_offsets)
+            if (!lp.boundary->index.segment_inside_whole(m_lattice.scaled(t.point(y - half_length) + o * normal), m_lattice.scaled(t.point(y + half_length) + o * normal)))
                 return false;
-        }
         return true;
     }
 
@@ -496,7 +493,7 @@ private:
         const Vec2d normal = m_lattice.normal(K.family);
         Intervals inside;
         bool first = true;
-        for (const double o : m_lattice.subline_offsets()) {
+        for (const double o : m_offsets) {
             const Point a = m_lattice.scaled(t.point(lo) + o * normal), b = m_lattice.scaled(t.point(hi) + o * normal);
             Intervals one;
             for (const Interval &i : lp.boundary->index.segment_inside(a, b))
@@ -1152,6 +1149,7 @@ private:
     const LatticeParams         &m_lattice;
     std::vector<LayerPrint>      m_layers;
     double m_w = 0., m_c = 0., m_cN = 0., m_lambda = 0., m_tau = 0.;
+    std::vector<double> m_offsets;    // the band's sub-line offsets (3.9b; one, 0, at N = 1)
     double m_vertex_margin = 0., m_path_margin = 0., m_material_margin = 0.;
 };
 
