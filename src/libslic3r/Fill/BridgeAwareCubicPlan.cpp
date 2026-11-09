@@ -17,6 +17,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <set>
 #include <tuple>
 
 namespace Slic3r {
@@ -108,7 +109,7 @@ std::unique_ptr<ObjectPlan> ObjectPlan::build(const PrintObject &object, const s
         return plan;
     cancel();
     plan->collect_material(object, cancel);
-    // Seam walls (3.5a) join the material here; built in a later stage.
+    plan->collect_seam_walls(object, cancel);
     plan->collect_planes(object, cancel);
     // Rails (3.5b) widen the footprints here; built in a later stage.
     plan->collect_boundaries(object, cancel);
@@ -213,6 +214,147 @@ void ObjectPlan::collect_material(const PrintObject &object, const std::function
     for (size_t i = 0; i < layers; ++i) {
         cancel();
         m_materials[i] = printed_material(*object.layers()[i], m_groups_regions);
+    }
+}
+
+// Section 3.5a: seam walls. Where the sparse fill of a region of the pattern borders sparse fill of another lattice (another
+// group or another pattern), a 0 % region or the air outside a part without walls, no lattice line belongs to both sides and the
+// two voids would join into one opening that no refinement can bound. One bead of the region's sparse infill then runs just
+// inside its boundary: it separates the voids, the lattice ends on it, and it is material of its layer on both sides from the
+// moment it is planned. Between two of the pattern's groups the region with the lower index lays the wall; against another
+// pattern, a 0 % region or air the pattern's region always does. A boundary is open by what lies next to it, never by what is
+// missing: material of any shape opens nothing.
+void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::function<void()> &cancel)
+{
+    constexpr double DELTA_S = 0.01;    // δ_s: a boundary is open where it lies within this of the neighbour, mm
+    const size_t layers = object.layers().size();
+    const size_t region_count = m_group_of_region.size();
+    for (size_t n = 0; n < layers; ++n) {
+        cancel();
+        const Layer &layer = *object.layers()[n];
+        // The sparse surfaces of every region of the layer, and what each is to its neighbours: beads (sparse fill of any
+        // lattice), a void (a 0 % region) or material (100 %).
+        std::vector<ExPolygons> sparse(region_count);
+        std::vector<char>       kind(region_count, 0);
+        std::set<int>           groups_present;
+        bool other_lattice = false, void_region = false, all_walled = true;
+        for (size_t r = 0; r < region_count && r < layer.regions().size(); ++r) {
+            const LayerRegion &lr = *layer.regions()[r];
+            for (const Surface &surface : lr.fill_surfaces.surfaces)
+                if (surface.surface_type == stInternal)
+                    sparse[r].push_back(surface.expolygon);
+            if (sparse[r].empty())
+                continue;
+            sparse[r] = union_ex(sparse[r]);
+            const PrintRegionConfig &config = lr.region().config();
+            const double density = config.sparse_infill_density.value;
+            kind[r] = density <= 0. ? 'v' : density < 100. ? 'b' : 'm';
+            if (kind[r] == 'v')
+                void_region = true;
+            if (kind[r] == 'b') {
+                if (m_group_of_region[r] >= 0)
+                    groups_present.insert(m_group_of_region[r]);
+                else
+                    other_lattice = true;
+            }
+            if (config.wall_loops.value <= 0)
+                all_walled = false;
+        }
+        if (groups_present.empty())
+            continue;
+        // A layer whose sparse fill is all of one group, each region with walls and none at 0 %, has no seam.
+        if (groups_present.size() == 1 && !other_lattice && !void_region && all_walled)
+            continue;
+        for (size_t r = 0; r < region_count; ++r) {
+            if (kind[r] != 'b' || m_group_of_region[r] < 0)
+                continue;
+            const size_t g = size_t(m_group_of_region[r]);
+            GroupPlan   &group = m_groups[g];
+            const double w = group.m_lattice.width;
+            Polygons bead_neighbours, void_neighbours;
+            for (size_t q = 0; q < region_count; ++q) {
+                if (q == r || kind[q] == 0 || kind[q] == 'm')
+                    continue;
+                if (kind[q] == 'v') {
+                    append(void_neighbours, to_polygons(sparse[q]));
+                    continue;
+                }
+                const int gq = m_group_of_region[q];
+                if (gq < 0 || (size_t(gq) != g && r < q))
+                    append(bead_neighbours, to_polygons(sparse[q]));
+            }
+            const Polylines boundary = to_polylines(sparse[r]);
+            Polylines open_beads, open_void;
+            if (!bead_neighbours.empty())
+                open_beads = intersection_pl(boundary, offset(bead_neighbours, float(scale_(DELTA_S))));
+            if (!void_neighbours.empty())
+                open_void = intersection_pl(boundary, offset(void_neighbours, float(scale_(DELTA_S))));
+            // The air outside a part without walls: the boundary within δ_s of the outside of the outline.
+            if (!all_walled)
+                append(open_void, diff_pl(boundary, offset_ex(layer.lslices, -float(scale_(DELTA_S)))));
+            Polylines walls;
+            const auto lay = [&](const Polylines &open, double inset) {
+                if (open.empty())
+                    return;
+                const ExPolygons inset_area = offset_ex(sparse[r], -float(scale_(inset)), ClipperLib::jtRound, ARC_TOLERANCE);
+                if (inset_area.empty())
+                    return;
+                // The inset contour within inset + δ_s of the open boundary, carried round the corner for one bead width at each end
+                // of an open stretch so that it still meets the material after path simplification (the reach from the stretch's end
+                // point to a contour point one bead past the inset corner). A closed contour comes back split at its start point:
+                // pieces that meet end to end are joined before the length test. Pieces shorter than a bead are dropped (one
+                // threshold for "a bead long", shared with the strands).
+                const double reach = std::sqrt((inset + w) * (inset + w) + inset * inset) + DELTA_S;
+                const Polygons near_open = offset(open, float(scale_(reach)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
+                Polylines pieces = intersection_pl(to_polylines(inset_area), near_open);
+                for (bool joined = true; joined;) {
+                    joined = false;
+                    for (size_t i = 0; i < pieces.size() && !joined; ++i)
+                        for (size_t j = 0; j < pieces.size() && !joined; ++j) {
+                            if (i == j || pieces[i].points.size() < 2 || pieces[j].points.size() < 2)
+                                continue;
+                            Points &a = pieces[i].points, &b = pieces[j].points;
+                            if (a.back() == b.front()) {
+                                a.insert(a.end(), b.begin() + 1, b.end());
+                            } else if (a.back() == b.back()) {
+                                a.insert(a.end(), b.rbegin() + 1, b.rend());
+                            } else if (a.front() == b.back()) {
+                                a.insert(a.begin(), b.begin(), b.end() - 1);
+                            } else if (a.front() == b.front()) {
+                                a.insert(a.begin(), b.rbegin(), b.rend() - 1);
+                            } else
+                                continue;
+                            pieces.erase(pieces.begin() + j);
+                            joined = true;
+                        }
+                }
+                for (Polyline &piece : pieces)
+                    if (piece.length() >= scale_(w - 1e-4))
+                        walls.push_back(std::move(piece));
+            };
+            lay(open_beads, 0.5 * w - 0.05);    // the 0.05 mm overlap closes the channel the neighbour's butt ends would leave
+            lay(open_void, 0.5 * w);
+            if (walls.empty())
+                continue;
+            // A lowest course over another pattern's void, a 0 % region or air, beyond h_n of the material below, cannot be bounded
+            // by the refinement: it prints as planned and a development build warns (5.2). Over the group's own void the plane
+            // beneath it holds it (3.4).
+            if (n > 0) {
+                const LayerMaterial &below = m_materials[n - 1];
+                const Polygons supported = offset(below.surely_prints, float(scale_(m_overhang[n])), ClipperLib::jtRound, ARC_TOLERANCE);
+                for (const Polyline &hanging : diff_pl(walls, supported)) {
+                    if (hanging.points.size() < 2)
+                        continue;
+                    if (g < below.void_of_group.size() && !intersection_pl(Polylines{ hanging }, below.void_of_group[g]).empty())
+                        continue;
+                    const Point mid = hanging.points[hanging.points.size() / 2];
+                    m_statistics.courses_over_other_void.push_back(Place{ n, Vec2d(unscale<double>(mid.x()), unscale<double>(mid.y())), "seam wall" });
+                }
+            }
+            add_courses(n, r, walls, true);
+            group.mark_courses();
+            BridgeAwareCubic::add_courses(m_materials[n], walls, w, layer, m_groups_regions);
+        }
     }
 }
 

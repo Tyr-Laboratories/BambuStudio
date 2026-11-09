@@ -135,7 +135,8 @@ void add_courses(LayerMaterial &material, const Polylines &courses, double width
 {
     if (courses.empty())
         return;
-    const Polygons beads = offset(courses, float(scale_(0.5 * width_mm)), ClipperLib::jtRound, ARC_TOLERANCE);
+    // Round ends: an extruded bead ends in a half disc, and a course that ends inside a wall's bead must seal the void there.
+    const Polygons beads = offset(courses, float(scale_(0.5 * width_mm)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
     Polygons may = to_polygons(material.may_print), surely = to_polygons(material.surely_prints);
     append(may, beads);
     append(surely, beads);

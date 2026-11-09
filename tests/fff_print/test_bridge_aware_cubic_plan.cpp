@@ -133,6 +133,27 @@ TEST_CASE("Bridge aware cubic material has one definition with two sides", "[Bri
         CHECK_FALSE(material.void_of_group.front().empty());
     }
 
+    SECTION("a seam wall separates the voids of two groups on every layer") {
+        Print print;
+        Model model = modifier();
+        slice(print, model, modifier_config("bridgeawarecubic"));
+        const PrintObject &object = *print.get_object(size_t(0));
+        const ObjectPlan *plan = object.bridge_aware_cubic_plan();
+        REQUIRE(plan != nullptr);
+        REQUIRE(plan->groups().size() == 2);
+        size_t layers_with_both = 0;
+        for (size_t l = 0; l < object.layers().size(); ++l) {
+            const LayerMaterial &material = plan->material(l);
+            REQUIRE(material.void_of_group.size() == 2);
+            if (material.void_of_group[0].empty() || material.void_of_group[1].empty())
+                continue;
+            INFO("layer " << l << " at z = " << object.layers()[l]->print_z);
+            CHECK(intersection_ex(material.void_of_group[0], material.void_of_group[1]).empty());
+            ++layers_with_both;
+        }
+        CHECK(layers_with_both >= 80);
+    }
+
     SECTION("the fill boundary is the island inset by half a spacing, less the courses at the perimeter overlap") {
         const double s_f = 0.357, w = 0.4;
         const ExPolygon island(Polygon({ Point::new_scale(0., 0.), Point::new_scale(30., 0.), Point::new_scale(30., 20.), Point::new_scale(0., 20.) }));

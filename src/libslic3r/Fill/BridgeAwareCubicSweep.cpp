@@ -119,9 +119,12 @@ public:
         // From the highest layer that has a swept strand down to layer 1 (layer 0 rests on the bed or the raft).
         size_t top = 0;
         bool any = false;
-        for (size_t l = 0; l < m_group.layer_count(); ++l)
+        for (size_t l = 0; l < m_group.layer_count(); ++l) {
             for (const Strand &s : m_group.strands(l))
                 if (swept(s)) { top = l; any = true; }
+            for (const size_t region_id : m_group.regions())
+                if (!m_plan.boundary_courses_at(l, region_id).empty()) { top = l; any = true; }
+        }
         if (!any)
             return;
         for (size_t m = top; m >= 1; --m) {
@@ -419,6 +422,70 @@ private:
             else
                 hold_strand(item, m);
         }
+        hold_course_ends(m);
+    }
+
+    // The ends of the courses of layer m (seam walls and rails, 3.5; a solid column's courses end on its faces): an end that the
+    // print set of m − 1 does not hold gets a holder, a column piece of some family through the end point at m − 1. A course's
+    // length is held by the demand its bead raises on the plane beneath it (3.4).
+    void hold_course_ends(size_t m)
+    {
+        const size_t below = m - 1;
+        for (const size_t region_id : m_group.regions()) {
+            const Polylines &courses = m_plan.boundary_courses_at(m, region_id);
+            if (courses.empty())
+                continue;
+            const double gap = m_plan.gap_of_region(region_id);
+            for (const Polyline &course : courses) {
+                if (course.points.size() < 2 || course.first_point() == course.last_point())
+                    continue;    // a closed course has no end
+                for (const Point &end : { course.first_point(), course.last_point() }) {
+                    const Vec2d p = m_lattice.relative(end);
+                    if (point_held(p, m))
+                        continue;
+                    bool placed = false;
+                    for (int j = 0; j < 3 && !placed; ++j) {
+                        const std::optional<PlaneKey> plane = plane_through(m_lattice, j, p, m_plan.print_z(below), m_tau);
+                        if (!plane)
+                            continue;
+                        const double y = trace(m_lattice, *plane, m_plan.print_z(below)).parameter(p), half = 0.5 * m_lambda;
+                        if (!admissible(*plane, y, below, half))
+                            continue;
+                        add_strand(below, Strand{ *plane, y - half, y + half, StrandKind::Column, gap });
+                        placed = true;
+                    }
+                    if (!placed)
+                        m_plan.statistics_mutable().unheld.push_back(Place{ m, Vec2d(unscale<double>(end.x()), unscale<double>(end.y())), "no admissible piece under a course's end" });
+                }
+            }
+        }
+    }
+
+    // Whether a point of layer m (mm, relative to the lattice centre) lies over a bead of the print set of m − 1: the material
+    // within w/2, a bulk line inside the boundary, or a strand, each less its margin.
+    bool point_held(const Vec2d &p, size_t m)
+    {
+        const LayerPrint &lp = print_set(m - 1);
+        if (!lp.material_reach->empty() && lp.material_reach->contains(m_lattice.scaled(p)))
+            return true;
+        const double pitch = unscale<double>(m_lattice.pitch);
+        const double band  = 0.5 * (m_lattice.multiline - 1) * m_lattice.spacing;
+        for (int j = 0; j < 3; ++j) {
+            const Vec2d  n   = m_lattice.normal(j);
+            const double v   = n.dot(p) + m_lattice.sigma[j] * lp.z / std::sqrt(2.);
+            const double off = v - std::round(v / pitch) * pitch;
+            if (std::abs(off) <= band + 0.5 * m_w - m_path_margin && !lp.boundary->index.empty() && lp.boundary->index.contains(m_lattice.scaled(p - off * n)))
+                return true;
+            for (const auto &[plane, interval] : lp.strands_of_family[j]) {
+                const Trace tj = trace(m_lattice, plane, lp.z);
+                if (std::abs(n.dot(p - tj.origin)) > band + 0.5 * m_w - m_vertex_margin)
+                    continue;
+                const double along = tj.parameter(p);
+                if (along >= interval.first - 1e-9 && along <= interval.second + 1e-9)
+                    return true;
+            }
+        }
+        return false;
     }
 
     // Steps 1 to 4 for a needed strand (with its extensions) at layer m.

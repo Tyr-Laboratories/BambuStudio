@@ -175,6 +175,7 @@ private:
 
     void collect_regions(const PrintObject &object, bool any_sparse_pattern = false);
     void collect_material(const PrintObject &object, const std::function<void()> &cancel);
+    void collect_seam_walls(const PrintObject &object, const std::function<void()> &cancel);
     void collect_planes(const PrintObject &object, const std::function<void()> &cancel);
     void collect_boundaries(const PrintObject &object, const std::function<void()> &cancel);
 
