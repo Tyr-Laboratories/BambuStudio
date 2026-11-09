@@ -54,7 +54,10 @@ LatticeParams LatticeParams::make(double infill_direction_deg, float density, do
     for (int k = 0; k < 3; ++k) {
         p.theta_fill[k] = double(base + sweeps[k]);
         p.theta[k]      = infill_direction_deg * M_PI / 180. + M_PI / 2. + k * M_PI / 3.;
+        p.normals[k]    = Vec2d(std::cos(p.theta[k]), std::sin(p.theta[k]));
+        p.directions[k] = Vec2d(-std::sin(p.theta[k]), std::cos(p.theta[k]));
     }
+    p.from_cube_matrix = to_cube_matrix(p).inverse();
     return p;
 }
 
@@ -74,7 +77,7 @@ double LatticeParams::cube_coordinate(int k, const Vec2d &p, double z) const
 
 std::pair<Vec2d, double> LatticeParams::from_cube(const std::array<double, 3> &u) const
 {
-    const Eigen::Vector3d x = to_cube_matrix(*this).inverse() * Eigen::Vector3d(u[0], u[1], u[2]);
+    const Eigen::Vector3d x = from_cube_matrix * Eigen::Vector3d(u[0], u[1], u[2]);
     return { Vec2d(x(0), x(1)), x(2) };
 }
 
@@ -113,7 +116,7 @@ Polygon section(const LatticeParams &lattice, const Cell &cell, double z)
     if (z < range.first || z > range.second)
         return Polygon();
     const double a = cell_edge(lattice, cell.depth);
-    const Eigen::Matrix3d from_cube = to_cube_matrix(lattice).inverse();
+    const Eigen::Matrix3d &from_cube = lattice.from_cube_matrix;
     std::array<Eigen::Vector3d, 8> corners;
     for (int c = 0; c < 8; ++c)
         corners[c] = from_cube * Eigen::Vector3d((cell.index[0] + (c & 1)) * a, (cell.index[1] + ((c >> 1) & 1)) * a, (cell.index[2] + ((c >> 2) & 1)) * a);
@@ -133,7 +136,10 @@ Polygon section(const LatticeParams &lattice, const Cell &cell, double z)
         }
     if (points.size() < 3)
         return Polygon();
-    return Geometry::convex_hull(points);
+    Polygon hull = Geometry::convex_hull(points);
+    if (hull.points.size() < 3)
+        return Polygon();    // the plane grazes a corner: three collinear rounded points are no section
+    return hull;
 }
 
 std::optional<Crossing> crossing(const LatticeParams &lattice, const PlaneKey &K, const PlaneKey &J, double z)
@@ -165,7 +171,7 @@ Lines bulk_lines(const LatticeParams &lattice, double z, const BoundingBox &bbox
     const std::array<Point, 4> corners = { bbox.min, Point(bbox.max.x(), bbox.min.y()), bbox.max, Point(bbox.min.x(), bbox.max.y()) };
     for (int k = 0; k < 3; ++k) {
         const float  angle = float(lattice.theta_fill[k]);
-        const double cos_a = std::cos(angle), sin_a = std::sin(angle);
+        const double cos_a = std::cos(double(angle)), sin_a = std::sin(double(angle));   // make_fill_lines: cos(angle) in double
         // The vertical frame of make_fill_lines: rotate by −angle; refpt is the reference point in that frame.
         const Point refpt_rotated = lattice.center.rotated(-angle);
         coord_t x_lo = std::numeric_limits<coord_t>::max(), x_hi = std::numeric_limits<coord_t>::min();
@@ -177,17 +183,19 @@ Lines bulk_lines(const LatticeParams &lattice, double z, const BoundingBox &bbox
         }
         const float shift_sign = lattice.sigma[k] > 0 ? dx : -dx;       // {0, dx}, {π/3, −dx}, {2π/3, dx}
         for (int i = 0; i < n; ++i) {
-            const coord_t group_offset    = i * line_spacing;
-            const coord_t internal_offset = coord_t((i - (n - 1) / 2.0f) * line_width);
-            const coord_t total_offset    = group_offset + internal_offset;
-            const coord_t pattern_shift   = coord_t(scale_(double(shift_sign) + unscale_(total_offset)));
-            const coord_t shift           = pattern_shift % line_spacing;
-            const coord_t ref             = refpt_rotated.x() - (shift >= 0 ? shift : line_spacing + shift);
+            // FillCubic's arithmetic, in 64 bits so that the clamped pitch cannot overflow it (past the clamp FillCubic's own
+            // coord_t conversion is undefined, so there is no parity to keep there).
+            const int64_t group_offset    = int64_t(i) * int64_t(line_spacing);
+            const int64_t internal_offset = int64_t(coord_t((i - (n - 1) / 2.0f) * line_width));
+            const int64_t total_offset    = group_offset + internal_offset;
+            const int64_t pattern_shift   = int64_t(std::trunc(scale_(double(shift_sign) + unscale_(double(total_offset)))));
+            const int64_t shift           = pattern_shift % int64_t(line_spacing);
+            const int64_t ref             = int64_t(refpt_rotated.x()) - (shift >= 0 ? shift : int64_t(line_spacing) + shift);
             // Every line x ≡ ref (mod L) inside [x_lo, x_hi].
-            const int64_t m_lo = int64_t(std::floor(double(x_lo - ref) / double(line_spacing)));
-            const int64_t m_hi = int64_t(std::ceil(double(x_hi - ref) / double(line_spacing)));
+            const int64_t m_lo = int64_t(std::floor(double(int64_t(x_lo) - ref) / double(line_spacing)));
+            const int64_t m_hi = int64_t(std::ceil(double(int64_t(x_hi) - ref) / double(line_spacing)));
             for (int64_t m = m_lo; m <= m_hi; ++m) {
-                const int64_t x = int64_t(ref) + m * int64_t(line_spacing);
+                const int64_t x = ref + m * int64_t(line_spacing);
                 if (x < x_lo || x > x_hi)
                     continue;
                 out.emplace_back(Point(coord_t(x), y_lo).rotated(cos_a, sin_a), Point(coord_t(x), y_hi).rotated(cos_a, sin_a));
@@ -203,19 +211,28 @@ std::vector<Cell> roots(const LatticeParams &lattice, const BoundingBox &bbox, d
     if (!bbox.defined || lattice.a0 <= 0.)
         return out;
     const std::array<Point, 4> corners = { bbox.min, Point(bbox.max.x(), bbox.min.y()), bbox.max, Point(bbox.min.x(), bbox.max.y()) };
-    int64_t lo[3], hi[3];
-    for (int k = 0; k < 3; ++k) { lo[k] = std::numeric_limits<int64_t>::max(); hi[k] = std::numeric_limits<int64_t>::min(); }
+    int64_t lo[2], hi[2];
+    for (int k = 0; k < 2; ++k) { lo[k] = std::numeric_limits<int64_t>::max(); hi[k] = std::numeric_limits<int64_t>::min(); }
     for (const Point &corner : corners) {
         const Vec2d p = lattice.relative(corner);
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < 2; ++k) {
             const int64_t i = int64_t(std::floor(lattice.cube_coordinate(k, p, z) / lattice.a0));
             lo[k] = std::min(lo[k], i);
             hi[k] = std::max(hi[k], i);
         }
     }
+    // The third index follows from the height: u_2 = σ_2 (√3 z − σ_0 u_0 − σ_1 u_1) over the cell's range of u_0 and u_1.
+    const double a = lattice.a0;
     for (int64_t i0 = lo[0]; i0 <= hi[0]; ++i0)
-        for (int64_t i1 = lo[1]; i1 <= hi[1]; ++i1)
-            for (int64_t i2 = lo[2]; i2 <= hi[2]; ++i2) {
+        for (int64_t i1 = lo[1]; i1 <= hi[1]; ++i1) {
+            double u2_lo = std::numeric_limits<double>::max(), u2_hi = std::numeric_limits<double>::lowest();
+            for (int c = 0; c < 4; ++c) {
+                const double u0 = (i0 + (c & 1)) * a, u1 = (i1 + ((c >> 1) & 1)) * a;
+                const double u2 = lattice.sigma[2] * (std::sqrt(3.) * z - lattice.sigma[0] * u0 - lattice.sigma[1] * u1);
+                u2_lo = std::min(u2_lo, u2);
+                u2_hi = std::max(u2_hi, u2);
+            }
+            for (int64_t i2 = int64_t(std::floor(u2_lo / a)) - 1; i2 <= int64_t(std::floor(u2_hi / a)) + 1; ++i2) {
                 Cell cell{ { i0, i1, i2 }, 0 };
                 const auto range = height_range(lattice, cell);
                 if (z < range.first || z > range.second)
@@ -225,6 +242,7 @@ std::vector<Cell> roots(const LatticeParams &lattice, const BoundingBox &bbox, d
                     continue;
                 out.push_back(cell);
             }
+        }
     return out;
 }
 
@@ -249,24 +267,32 @@ std::array<PlaneKey, 3> split_planes(const Cell &cell)
 
 PlaneKey face(const Cell &cell, int family, bool upper)
 {
-    return PlaneKey{ family, cell.depth, cell.index[family] + (upper ? 1 : 0) };
+    // Canonical: a face that is also a plane of a smaller depth carries that plane's key (an even numerator halves).
+    PlaneKey key{ family, cell.depth, cell.index[family] + (upper ? 1 : 0) };
+    while (key.depth > 0 && key.numerator % 2 == 0) {
+        key.numerator /= 2;
+        --key.depth;
+    }
+    return key;
 }
 
 std::optional<PlaneKey> plane_through(const LatticeParams &lattice, int family, const Vec2d &point, double z, double tolerance)
 {
     const double u = lattice.cube_coordinate(family, point, z);
-    for (int depth = 1; depth <= 16; ++depth) {
+    // Levels 1 to 16 (architecture, section 4), or deeper when the pitch is so large that level 16 is still coarser than the
+    // tolerance; the search stops at the first level whose nearest plane passes within the tolerance.
+    int levels = 16;
+    if (tolerance > 0.)
+        levels = std::max(16, std::min(60, int(std::ceil(std::log2(lattice.a0 / tolerance))) + 1));
+    for (int depth = 0; depth <= levels; ++depth) {
         const double a = cell_edge(lattice, depth);
-        const double q = u / a;
-        // The odd numerator nearest to q.
-        int64_t odd = int64_t(std::floor(q));
-        if (odd % 2 == 0)
-            ++odd;
-        if (std::abs(q - double(odd - 2)) < std::abs(q - double(odd)))
-            odd -= 2;
+        const int64_t q = int64_t(std::llround(u / a));
         // The trace's distance from the point in the XY plane is √(3/2) times the cube-coordinate distance.
-        if (SQRT_THREE_HALVES * std::abs(u - odd * a) <= tolerance)
-            return PlaneKey{ family, depth, odd };
+        if (SQRT_THREE_HALVES * std::abs(u - q * a) <= tolerance) {
+            if (depth == 0)
+                return std::nullopt;    // the point lies on a bulk line: had it printed there, the column would have landed
+            return PlaneKey{ family, depth, q };    // odd: an even q would have been found one level up
+        }
     }
     return std::nullopt;
 }

@@ -11,13 +11,16 @@
 //
 // bulk_lines() reproduces FillCubic's lines, with FillCubic's float-rounded angles and float-truncated pattern shift, so that
 // the pattern's bulk output equals Cubic's; the plane geometry (traces, sections, crossings) uses exact double angles and the
-// exact shift. The difference is below one scaled unit.
+// exact shift. The shift differs by less than one scaled unit; the float angles differ from the exact ones by up to 7e-7 rad,
+// which moves a bulk line off its plane's trace by about 9 units (0.09 µm) at 125 mm from the centre.
 
 #include "../libslic3r.h"
 #include "../BoundingBox.hpp"
 #include "../Line.hpp"
 #include "../Point.hpp"
 #include "../Polygon.hpp"
+
+#include <Eigen/Dense>
 
 #include <array>
 #include <cstdint>
@@ -40,14 +43,17 @@ struct LatticeParams
     double  theta_fill[3] = { 0., 0., 0. };   // θ_k as FillCubic's float arithmetic yields them: the bulk lines
     int     sigma[3]  = { +1, -1, +1 };
     Point   center;             // the filler's reference point: the object's bounding box centre, scaled
+    Vec2d   normals[3];         // n_k, cached
+    Vec2d   directions[3];      // d_k, cached
+    Eigen::Matrix3d from_cube_matrix = Eigen::Matrix3d::Identity();   // (u_0, u_1, u_2) → (x, y, z), cached
 
     // `density` is the fraction FillParams::density carries (float, 0.01 × the percent), `spacing_mm` the sparse flow's spacing,
     // `multiline` the fill_multiline count; `object_bbox` is what Fill::bounding_box holds, whose centre is the reference point.
     static LatticeParams make(double infill_direction_deg, float density, double spacing_mm, double width_mm, int multiline,
                               const BoundingBox &object_bbox);
 
-    Vec2d  normal(int k) const { return Vec2d(std::cos(theta[k]), std::sin(theta[k])); }       // n_k
-    Vec2d  direction(int k) const { return Vec2d(-std::sin(theta[k]), std::cos(theta[k])); }   // d_k
+    Vec2d  normal(int k) const { return normals[k]; }         // n_k
+    Vec2d  direction(int k) const { return directions[k]; }   // d_k
     double band_width() const { return (multiline - 1) * spacing + width; }                    // W_N
     std::vector<double> subline_offsets() const;                                               // o_i = (i − (N − 1)/2) s_f
 
