@@ -1,6 +1,6 @@
 {
   "exception_file": "scripts/bridge_aware_cubic_benchmark/baselines/official-2.9.1.70/intended_exceptions.json",
-  "exception_file_sha256": "8fa3b1164adbfd15fb4b88c367f00bd50f2c545cfa1f382b78c42b9916c52900",
+  "exception_file_sha256": "394f8684d9b42a8a4d3251596d3a8cf075da53b182e65a51c63d3dd37b04788c",
   "exceptions": {
     "ams_nozzle_idx": {
       "guard_groups": [
@@ -223,6 +223,14 @@
         "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.hpp#L798",
         "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeEditor.cpp#L470",
         "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1472"
+      ]
+    },
+    "flow_above_internal_bridges": {
+      "guard_groups": [
+        "bridge_defaults"
+      ],
+      "source_refs": [
+        "src/libslic3r/Fill/Fill.cpp (bridge_flow_mask: an empty mask when every region's value is 100) at the rewrite branch's commit that records this exception"
       ]
     },
     "handle_hotend_as_extruder": {
@@ -569,7 +577,7 @@
     },
     "bridge_defaults": {
       "archive_predicates": [
-        "Every local override of these four fork-only controls equals the specified global value."
+        "Every local override of these five fork-only controls equals the specified global value (flow_above_internal_bridges, added 9 November 2026, when present)."
       ],
       "both_emitted_exact": {
         "infill_wall_overlap": "15%"
@@ -578,6 +586,7 @@
         "bridge_acceleration": "0",
         "bridge_layer_density": "100%",
         "bridge_line_travel_extend": "15%",
+        "flow_above_internal_bridges": "100%",
         "internal_bridge_layers": "1"
       },
       "input_exact": {
@@ -586,6 +595,9 @@
         "bridge_line_travel_extend": "15%",
         "infill_wall_overlap": "15%",
         "internal_bridge_layers": "1"
+      },
+      "input_new_default_exact_if_present": {
+        "flow_above_internal_bridges": "100%"
       }
     },
     "derived_maps": {
@@ -905,13 +917,14 @@
     }
   },
   "guard_module": "scripts/bridge_aware_cubic_benchmark/reviewed_exception_guards.py",
-  "guard_module_sha256": "8e969609db2631eefee37e55475db7d150943687e31378c123a3ab16015d0338",
+  "guard_module_sha256": "434730f83c570eab4a2b4c4d3d88f23467ad294d822173f4168e48cfaa6aea35",
   "historical_observation_scope": "The observation hashes and validation flags describe the reviewed diagnostic outputs and parser-reference inputs. They do not establish performance qualification or describe a later executable.",
   "notes": [
     "Authoritative v4 official preflight exited successfully and supplied valid G-code; performance qualification still requires paired parity, complete family runs and repeated timing.",
     "Historical v2 52-difference artifacts are preserved separately; authoritative v4 has 51 because inherits_group now agrees exactly as ;;.",
     "Guard predicates are supplied separately because the current intended-exception loader accepts only expected/actual/reason fields. The harness owner must enforce them; the exception JSON alone is insufficient for qualification.",
-    "The fork BAC diagnostic now confirms all six shared CLI transformations. These are configuration/parity approvals only; no repeated benchmark timing or release-gate pass is established."
+    "The fork BAC diagnostic now confirms all six shared CLI transformations. These are configuration/parity approvals only; no repeated benchmark timing or release-gate pass is established.",
+    "9 November 2026 (rewrite branch): flow_above_internal_bridges, which the fork's master added after this review, is excepted at exactly 100% on the official side and in parity (official null, fork 100%), guarded as a new default (NEW_EXACT_IF_PRESENT, FORK_EXACT_IF_PRESENT, GOVERNED_KEYS): at 100% bridge_flow_mask in src/libslic3r/Fill/Fill.cpp returns an empty mask. The counts and hashes below were updated with it; the observed official configuration was not re-recorded."
   ],
   "observed_difference_sha256": "8fc939167cb2f2a5084a0b2e26b53ddfc7e7db05fba2e419c769396b7b045659",
   "observed_fork_emitted_config": "tests/data/bridge_aware_cubic_benchmark/fork-emitted-config.json",
@@ -920,13 +933,13 @@
   "observed_official_gcode_sha256": "003ca563b4161830a0b3f51e3ac97f0bec4b7a0669c86a1597c045534b8a6e26",
   "official_tag": "v02.09.01.70",
   "parity_exception_file": "scripts/bridge_aware_cubic_benchmark/baselines/official-2.9.1.70/parity_exceptions.json",
-  "parity_exception_sha256": "08b79b232833b83d69c67fae6587a856bfa6c2cac7edfaf9b06ffc28c1ba18ab",
+  "parity_exception_sha256": "384cbb3c2d44e466969d9d5657667a434b39450bd4f6d148af7b3800fa4f0635",
   "repository_paths_relative_to": "repository root",
   "reviewed_difference_count": {
     "fork": 6,
-    "official": 51
+    "official": 52
   },
-  "reviewed_parity_difference_count": 45,
+  "reviewed_parity_difference_count": 46,
   "schema_version": 1,
   "scope": "Exact observed expected/actual pairs only; every referenced guard group must be enforced. This file does not waive timing, output validity, or unreviewed configuration differences.",
   "source_reference_scope": "Official references use v02.09.01.70; fork references use the reviewed functional checkpoint 8c482d39a17a1fc511ebf461937ba3721dc6d089. Re-review exceptions when these relevant semantics change.",

@@ -89,6 +89,11 @@
     "official": "0",
     "reason": "Auxiliary hardware is disabled, producing no auxiliary/optional fan slots. The standard-side setting is GUI-only. The unconditional optional-speed maximum is neutral only at exact optional speed zero together with additional speed zero; scripts must remain exact and must not interpolate these settings. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
   },
+  "flow_above_internal_bridges": {
+    "fork": "100%",
+    "official": null,
+    "reason": "Exact 100% leaves bridge_flow_mask (src/libslic3r/Fill/Fill.cpp) empty: it returns at once when every region's value is 100, so no solid fill above a bridge changes its flow. Other values are not covered. Added 9 November 2026: the option came to the fork's master after the baseline review; reviewed against that function. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
   "handle_hotend_as_extruder": {
     "fork": null,
     "official": "0",
