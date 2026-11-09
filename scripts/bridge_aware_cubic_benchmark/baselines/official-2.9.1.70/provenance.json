@@ -1,0 +1,18 @@
+{
+  "architecture": "arm64",
+  "asset_digest": "sha256:e4f42ac1542cb107cb21cbf98717de7b17e735bdb46fd2a18249e30929e3310d",
+  "asset_id": 705484824,
+  "asset_size": 321670659,
+  "asset_url": "https://github.com/bambulab/BambuStudio/releases/download/v02.09.01.70/Bambu_Studio_mac-v02.09.01.70-20261103183404.dmg",
+  "executable_relative_path": "BambuStudio.app/Contents/MacOS/BambuStudio",
+  "executable_sha256": "af6e6342d5972a24e7f16bb66722cab92f0cc514cd311b4b6b0dd9a311ebe9de",
+  "prerelease": false,
+  "published_at": "2026-11-03T12:42:17Z",
+  "release_url": "https://github.com/bambulab/BambuStudio/releases/tag/v02.09.01.70",
+  "schema_version": 1,
+  "signing_team_identifier": "T3UBR9Y3B2",
+  "source_tag": "v02.09.01.70",
+  "verification_scope": "The downloaded release asset matched the recorded GitHub SHA-256 and its app passed codesign --verify --deep --strict during the 2026-11-06 baseline preparation. Verify a newly obtained copy independently. This record is not a timing result.",
+  "verified_local_sha256": "e4f42ac1542cb107cb21cbf98717de7b17e735bdb46fd2a18249e30929e3310d",
+  "version": "2.9.1.70"
+}

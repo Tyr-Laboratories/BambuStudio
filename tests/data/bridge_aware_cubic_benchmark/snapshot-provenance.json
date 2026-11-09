@@ -1,0 +1,125 @@
+{
+  "artifacts": {
+    "fork-emitted-config.json": {
+      "sha256": "9898765bd06dffebd32ea973952de5cbbdd05b263bdd5e0d368604effd5f07ca"
+    },
+    "official-emitted-config.json": {
+      "sha256": "c6ecf8c5bae7cce150c2f82d94bcf00aa59b40e5a80339e3d80a9499e7e8214b"
+    },
+    "official-result-schema.json": {
+      "sha256": "5a8f8941039731297b3a9844dbe60c320803219e2dbc0cddffea3818fe0e6a62"
+    },
+    "projects/large-bridgeawarecubic.3mf": {
+      "sha256": "55786a27c2f414d3d4a34a9b9e18d982bd90f9fd43cfcdd16b8b3198b15ce42a"
+    },
+    "projects/large-bridgeawarecubic.config.ini": {
+      "sha256": "160ceb2272a60175067d7d774bbf462202e0ad493ba90387759e3b461af52c6c"
+    },
+    "projects/large-bridgeawarecubic.config.json": {
+      "sha256": "acf4a986ec93b7085edfd2c8d7b3cdc864f6478b8bd7478c67c06fc31f3f37c8"
+    },
+    "projects/large-cubic.3mf": {
+      "sha256": "757d64b008eb6916508d52541c4dfcd2278620e18d1146569b3ebb2aecc41ea4"
+    },
+    "projects/large-cubic.config.ini": {
+      "sha256": "d7f61edf048ff61a17a4b5e2de4e6896085183d6bef24fd597c8f8fc44564d58"
+    },
+    "projects/large-cubic.config.json": {
+      "sha256": "7dc9b977284a3bdb2e94641f3cf3c52efaf41429f5046a9b4a521180d8a2871e"
+    },
+    "projects/manifest.json": {
+      "sha256": "620e12595d8b42770c2d2efad2e2ea1a4714446d3f2485966394693e7a3e2d9f"
+    },
+    "projects/modifier-bridgeawarecubic.3mf": {
+      "sha256": "44b06e6c4ba3da072d7e04b9d979e4b88be17da2382f319dab3681539d5720c5"
+    },
+    "projects/modifier-bridgeawarecubic.config.ini": {
+      "sha256": "e9c008d9b6c8ae082e671ec7d4c704d95d9016d07fd6bf5b3a1c40eedf485c26"
+    },
+    "projects/modifier-bridgeawarecubic.config.json": {
+      "sha256": "a1413b4ddc807fe6016e0386b2d86910825c05b8eea9e4233556a1b42d8ba25c"
+    },
+    "projects/modifier-cubic.3mf": {
+      "sha256": "851d7e164acf089f5d1c2b6b50b839c005c42ae91df994f181c39e45459efd0f"
+    },
+    "projects/modifier-cubic.config.ini": {
+      "sha256": "f3cb5411f3351316d6a1454123ebca51d548f5ba8674980e122f55788ea3e995"
+    },
+    "projects/modifier-cubic.config.json": {
+      "sha256": "6d73ffc70e57441d2d27228fa00c8679c2977e5162b25426a9b924ce09a20532"
+    },
+    "projects/rib-bridgeawarecubic.3mf": {
+      "sha256": "11aa2aeb9bf30395e463a774d5f9b6c1c1a98fd3da0d16e12a2cc76e622ff875"
+    },
+    "projects/rib-bridgeawarecubic.config.ini": {
+      "sha256": "33b0f3e693d348b5488cb0495e4649a3951f65fcefb85efb8365a3b3614cf0b3"
+    },
+    "projects/rib-bridgeawarecubic.config.json": {
+      "sha256": "7cf5f20769f7e853377fdb10e189cc12e02a3c9081c9f0de3e304bd7ac785de1"
+    },
+    "projects/rib-cubic.3mf": {
+      "sha256": "f47a9f25ec131eedaf801ec9b7ffa309011bb1f4fc40a0661c343640ba7f824f"
+    },
+    "projects/rib-cubic.config.ini": {
+      "sha256": "7b6628c3f663db970a36bb2d0c80ea9554c97e437084bab44a6c6065809dbcef"
+    },
+    "projects/rib-cubic.config.json": {
+      "sha256": "bc33d006758e588ea4811c1c720aaf8da901428b89b835de138ef4e274881bd8"
+    },
+    "projects/small-bridgeawarecubic.3mf": {
+      "sha256": "164ee1c641b6c8fad617dc4f12b7841f937fcf3472794333de7db54a18adec02"
+    },
+    "projects/small-bridgeawarecubic.config.ini": {
+      "sha256": "160ceb2272a60175067d7d774bbf462202e0ad493ba90387759e3b461af52c6c"
+    },
+    "projects/small-bridgeawarecubic.config.json": {
+      "sha256": "acf4a986ec93b7085edfd2c8d7b3cdc864f6478b8bd7478c67c06fc31f3f37c8"
+    },
+    "projects/small-cubic.3mf": {
+      "sha256": "75a32c59b2595850fc3f033a912a8d7837d09f0d61a78dba7bba48e70983c083"
+    },
+    "projects/small-cubic.config.ini": {
+      "sha256": "d7f61edf048ff61a17a4b5e2de4e6896085183d6bef24fd597c8f8fc44564d58"
+    },
+    "projects/small-cubic.config.json": {
+      "sha256": "7dc9b977284a3bdb2e94641f3cf3c52efaf41429f5046a9b4a521180d8a2871e"
+    }
+  },
+  "fork": {
+    "artifacts": [
+      "fork-emitted-config.json"
+    ],
+    "capture": "Small-BAC diagnostic v1",
+    "executable_sha256": "a0c8f972eff6291866b2d3aff0ea78f58e8eea2714b01cc17eeeea19453799c0",
+    "source_head": "8c482d39a17a1fc511ebf461937ba3721dc6d089",
+    "source_provenance_limitation": "Working-tree metadata alone does not establish source-to-binary build provenance",
+    "source_snapshot_sha256": "98134c7c530369e4b1e0980ade3a8199d66bdf64bde49d42c9db965fa346a9e4",
+    "source_tree_dirty": true
+  },
+  "official": {
+    "artifacts": [
+      "official-emitted-config.json",
+      "official-result-schema.json"
+    ],
+    "capture": "Official small-Cubic diagnostic preflight v4",
+    "executable_sha256": "af6e6342d5972a24e7f16bb66722cab92f0cc514cd311b4b6b0dd9a311ebe9de",
+    "release_url": "https://github.com/bambulab/BambuStudio/releases/tag/v02.09.01.70",
+    "result_transformation": "Retained only fields consumed by the result validator, with recorded values unchanged",
+    "version": "2.9.1.70"
+  },
+  "projects": {
+    "cases": [
+      "small",
+      "large",
+      "rib",
+      "modifier"
+    ],
+    "files_copied_without_modification": 25,
+    "generator_source": "tests/fff_print/test_bridge_aware_cubic_export.cpp",
+    "generator_version": "02.08.04.57",
+    "requires_fresh_generation_for_qualification": true,
+    "source": "Native BACBenchmarkFixtures generator output, fixture generation v2"
+  },
+  "purpose": "Parser regression reference snapshots; never release speed qualification inputs or measurements",
+  "schema_version": 1
+}
