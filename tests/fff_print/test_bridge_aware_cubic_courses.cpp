@@ -264,9 +264,9 @@ Polylines bridge_inner_edges(const EmittedLayer &upper, const EmittedLayer &lowe
 
 // R1: rails. At a bridged roof's inner edge the bridge reaches at most d_r + w_b + 0.05 past the edge over the void (Cubic's grows
 // further: the control, where it does on the fixture; the roof is what the layers above the bridge print); no bridge end over the
-// pattern's void hangs (an end inside the wall overlap is anchored); rail beads lie along the bridges' inner edges where roof edges
-// run over the void, and none where the roof edges are at the walls; the user's wall, bridge, anchor and density settings
-// included. Thick bases (two and three internal bridge layers) and the generator bridging a layer above the predicted roof are
+// pattern's void hangs (an end inside the wall overlap is anchored); rail beads lie along the inner edges of every bridge layer
+// whose roof edges run over the void, and no rail-like bead lies anywhere where the roof edges are at the walls; the user's wall,
+// bridge, anchor and density settings included. Thick bases (two and three internal bridge layers) and the generator bridging a layer above the predicted roof are
 // recorded limitations (docs/bridge-aware-cubic.md).
 struct RailCase {
     std::string          name;
@@ -277,6 +277,8 @@ struct RailCase {
     bool                 edge_over_void = false;    // a roof edge over the pattern's void: a rail is expected
     double               direction = 45.;
     bool                 cubic_overgrows = false;   // the control: Cubic's bridge grows past the limit on this fixture
+    bool                 rails_per_layer = true;    // every bridge layer with inner edges over the void has its rails (the
+                                                    // fuselage top's apex is bridged a layer above the prediction: recorded)
 };
 
 void check_rails(Workspace &workspace, const std::vector<RailCase> &cases);
@@ -288,11 +290,11 @@ TEST_CASE("Bridge aware cubic lays rails along the roof edges the bridges grow p
         { "partial roof", partial_roof, {}, 5., nullptr, true, 45., true },
         { "steps", steps, {}, 5., nullptr, true, 45., true },
         // Cubic's bridge here reaches a wall within the limit: no control.
-        { "fuselage top", fuselage_top, {}, 5., nullptr, true },
+        { "fuselage top", fuselage_top, {}, 5., nullptr, true, 45., false, false },
         // The user's settings: one Arachne wall at 75 % overlap, thick bridges, 1 mm anchors, 3 % density.
         { "fuselage top, the user's settings", fuselage_top,
           with({}, {{"wall_loops", "1"}, {"wall_generator", "arachne"}, {"infill_wall_overlap", "75%"}, {"thick_bridges", "1"},
-                    {"sparse_infill_anchor", "1"}, {"sparse_infill_anchor_max", "1"}, {"sparse_infill_density", "3%"}}), 5., nullptr, true, 45., false },
+                    {"sparse_infill_anchor", "1"}, {"sparse_infill_anchor_max", "1"}, {"sparse_infill_density", "3%"}}), 5., nullptr, true, 45., false, false },
         { "small cube", small_cube, {}, 5., nullptr, false },
         { "large cube", large_cube, {}, 5., nullptr, false },
         { "rib", rib, {}, 5., rib_config, true, 17., true },
@@ -337,27 +339,46 @@ void check_rails(Workspace &workspace, const std::vector<RailCase> &cases)
             directions.push_back(std::fmod(c.direction + 60. * k + 360., 180.));
         const std::map<int, EmittedLayer> layers = emitted_layers(sliced.paths), control_layers = emitted_layers(control);
         double rail_length = 0.;
+        size_t edge_layers = 0, railed_layers = 0;
+        std::ostringstream unrailed;
         for (auto it = layers.begin(); it != layers.end() && std::next(it) != layers.end(); ++it) {
             const Polylines edges = bridge_inner_edges(std::next(it)->second, it->second, w);
             double edge_length = 0.;
             for (const Polyline &edge : edges) edge_length += unscale<double>(edge.length());
             if (edge_length <= c.gap)
                 continue;
+            ++edge_layers;
             const ExPolygons near = union_ex(offset(edges, float(scale_(limit)), ClipperLib::jtRound, scale_(.001), ClipperLib::etOpenRound));
+            double here = 0.;
             for (auto below = it;; --below) {
                 for (const Line &bead : rail_like_beads(below->second, control_sparse_segments(control_layers, below->first), w, directions)) {
                     const Point mid = (bead.a + bead.b) / 2;
                     if (std::any_of(near.begin(), near.end(), [&mid](const ExPolygon &e) { return e.contains(mid); }))
-                        rail_length += unscale<double>(bead.length());
+                        here += unscale<double>(bead.length());
                 }
                 if (below == layers.begin() || std::distance(below, it) + 1 >= B)
                     break;
             }
+            rail_length += here;
+            if (here > w)
+                ++railed_layers;
+            else
+                unrailed << " " << std::next(it)->first / 1000.;
         }
-        if (c.edge_over_void)
+        if (c.edge_over_void) {
             CHECK(rail_length > w);
-        else
-            CHECK(rail_length == 0.);
+            if (c.rails_per_layer) {
+                INFO("bridge layers with inner edges over the void and no rail below:" << unrailed.str());
+                CHECK(railed_layers == edge_layers);
+            }
+        } else {
+            // The roofs end at the walls: no rail-like bead on any layer.
+            double stray = 0.;
+            for (const auto &[key, layer] : layers)
+                for (const Line &bead : rail_like_beads(layer, control_sparse_segments(control_layers, key), w, directions))
+                    stray += unscale<double>(bead.length());
+            CHECK(stray == 0.);
+        }
     }
 }
 

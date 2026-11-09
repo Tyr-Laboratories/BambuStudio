@@ -39,8 +39,8 @@ Known limitations (findings the construction does not yet meet, 9 November 2026;
   have no rail; no bridge end hangs and nothing overgrows. The cause: with thick bridges (the user's setting) `bridge_over_infill`
   narrows the candidates to the sparse area deep enough for a thick bridge, less what its own thick bridges on the layers within
   that height already took; the second part is the generator's own output, which the plan, made before the generator (user
-  decision), cannot read. R1 therefore checks the rails per fixture (along the bridges' inner edges, none where roofs end at the
-  walls), not per bridge layer, and does not scan for rails without a bridge above.
+  decision), cannot read. R1 therefore checks the fuselage's rails per fixture, every other fixture's per bridge layer, and
+  scans the fixtures whose roofs end at the walls for rail-like beads on every layer.
 - The stock generator grows a bridge along its direction until both ends reach an anchor. Where the pattern's refined lines lie
   close it bridges less than over Cubic's coarse lattice, but a single bridge line can run on across a sparse area to a distant
   anchor: on Heimdall plate 10 at z 186.4 one 38 mm line, which holds nothing up (the area above it is sparse too). The bridge
