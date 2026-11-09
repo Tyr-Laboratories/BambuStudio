@@ -1706,6 +1706,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "ensure_vertical_shell_thickness"
             || opt_key == "bridge_angle"
             || opt_key == "internal_bridge_layers"
+            || opt_key == "bridge_aware_cubic_max_gap"
             //BBS
         ) {
             steps.emplace_back(posPrepareInfill);
@@ -3956,6 +3957,7 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
 static const char *s_modifier_ignored_infill_keys[] = {
     "sparse_infill_density",
     "sparse_infill_pattern",
+    "bridge_aware_cubic_max_gap",
     "conformal_infill",
     "conformal_stagger",
     "conformal_link_keep_layers",

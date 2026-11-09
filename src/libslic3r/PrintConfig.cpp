@@ -242,7 +242,8 @@ static t_config_enum_values s_keys_map_InfillPattern {
     { "lockedzag",          ipLockedZag },
     { "2dlattice",          ip2DLattice  },
     { "ironingarchimedeanspiral", ipIroningArchimedeanSpiral },
-    { "globalmonotonicline", ipGlobalMonotonicLine }
+    { "globalmonotonicline", ipGlobalMonotonicLine },
+    { "bridgeawarecubic",   ipBridgeAwareCubic }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(InfillPattern)
 
@@ -3258,6 +3259,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_values.push_back("crosszag");
     def->enum_values.push_back("lockedzag");
     def->enum_values.push_back("2dlattice");
+    def->enum_values.push_back("bridgeawarecubic");
     def->enum_labels.push_back(L("Concentric"));
     def->enum_labels.push_back(L("Rectilinear"));
     def->enum_labels.push_back(L("Grid"));
@@ -3280,7 +3282,20 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("Cross Zag"));
     def->enum_labels.push_back(L("Locked Zag"));
     def->enum_labels.push_back(L("2D Lattice"));
+    def->enum_labels.push_back(L("Bridge aware cubic"));
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipCubic));
+
+    def = this->add("bridge_aware_cubic_max_gap", coFloat);
+    def->label = L("Unsupported gap size");
+    def->category = L("Strength");
+    def->tooltip = L("Bridge aware cubic only. The longest distance that walls, solid infill and internal bridges above the sparse infill "
+                     "may span unsupported. The pattern adds lines under them so that nothing spans more than this. "
+                     "A value below the nozzle diameter is raised to the nozzle diameter.");
+    def->sidetext = L("mm");
+    def->min = 0.01;
+    def->max = 1000;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(5));
 
     def                = this->add("locked_skin_infill_pattern", coEnum);
     def->label         = L("Skin infill pattern");

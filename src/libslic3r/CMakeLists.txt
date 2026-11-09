@@ -136,6 +136,8 @@ set(lisbslic3r_sources
     Fill/Lightning/TreeNode.hpp
     Fill/FillRectilinear.cpp
     Fill/FillRectilinear.hpp
+    Fill/FillBridgeAwareCubic.cpp
+    Fill/FillBridgeAwareCubic.hpp
     Fill/FillConformal.cpp
     Fill/FillConformal.hpp
     Fill/FillConformalChart.cpp

@@ -25,6 +25,7 @@
 #include "FillConcentricInternal.hpp"
 #include "FillCrossHatch.hpp"
 #include "FillFloatingConcentric.hpp"
+#include "FillBridgeAwareCubic.hpp"
 
 // #define INFILL_DEBUG_OUTPUT
 
@@ -63,6 +64,7 @@ Fill* Fill::new_from_type(const InfillPattern type)
     case ipFloatingConcentric:  return new FillFloatingConcentric();
     case ipLockedZag:           return new FillLockedZag();
     case ip2DLattice:           return new Fill2DLattice();
+    case ipBridgeAwareCubic:   return new FillBridgeAwareCubic();
     // Same filler as ipArchimedeanChords; the ironing specific lead-in and center-out ordering are
     // selected by FillParams::extrusion_role inside FillPlanePath::_fill_surface_single().
     case ipIroningArchimedeanSpiral: return new FillArchimedeanChords();

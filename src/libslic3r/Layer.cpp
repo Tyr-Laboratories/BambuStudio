@@ -622,6 +622,7 @@ coordf_t Layer::get_sparse_infill_max_void_area()
                 max_void_area = std::max(max_void_area, 4.0 * spacing * spacing);
                 break;
             case ipCubic:
+            case ipBridgeAwareCubic:
             case ipAdaptiveCubic:
             case ipTriangles:
             case ipStars:

@@ -943,9 +943,11 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     bool support_multiline_infill = pattern == ipCubic || pattern == ipGrid || pattern == ipRectilinear || pattern == ipStars || pattern == ipAlignedRectilinear ||
                                     pattern == ipGyroid || pattern == ipHoneycomb || pattern == ipLightning || pattern == ip3DHoneycomb ||
-                                    pattern == ipAdaptiveCubic || pattern == ipSupportCubic;
+                                    pattern == ipAdaptiveCubic || pattern == ipSupportCubic || pattern == ipBridgeAwareCubic;
 
     toggle_line("fill_multiline", have_infill && support_multiline_infill);
+    toggle_line("bridge_aware_cubic_max_gap", have_infill && pattern == ipBridgeAwareCubic &&
+                config->option<ConfigOptionPercent>("sparse_infill_density")->value < 100);
     // Only allow configuration of open anchors if the anchoring is enabled.
     bool has_infill_anchors = have_infill && config->option<ConfigOptionFloatOrPercent>("sparse_infill_anchor_max")->value > 0;
     toggle_line("sparse_infill_anchor", has_infill_anchors);
