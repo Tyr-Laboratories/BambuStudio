@@ -161,17 +161,18 @@ TEST_CASE("Bridge aware cubic gap change invalidates prepare infill and modifier
     }
 }
 
-// Stage 1 gate (the architecture's section 8): while no plan exists, the pattern's fills equal Cubic's on the four fixtures
-// within 0.001 mm per vertex. The enum's position changes the fill groups' clipping order by a safety offset, nothing more.
-// Folded into S2 when the filler prints the plan.
-TEST_CASE("Bridge aware cubic fills equal Cubic's on the four fixtures while no plan exists", "[BridgeAwareCubic][Stage1]")
+// S2 (open top): where nothing needs refinement, the pattern's fills equal Cubic's as deposited segments within 0.001 mm. A
+// part without top shells has no roof over its sparse fill, so the plan has nothing and the group prints as Cubic. The enum's
+// position reorders the fill groups and moves their shared edges by Clipper's safety offset, nothing more.
+TEST_CASE("Bridge aware cubic prints as Cubic where no roof needs refinement", "[BridgeAwareCubic][S2]")
 {
     struct Fixture { const char *name; Model (*model)(); DynamicPrintConfig (*config)(const char *); };
     const Fixture fixtures[] = {
-        { "small cube", small_cube, [](const char *p) { return fixture_config(5., p); } },
-        { "large cube", large_cube, [](const char *p) { return fixture_config(5., p); } },
-        { "rib", rib, rib_config },
-        { "modifier", modifier, modifier_config },
+        { "open-top small cube", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"top_shell_layers", "0"}}); } },
+        // Not the rib itself: the vertical shells under its ribs are roofs over sparse fill, so its plan has content.
+        { "open-top cube with the rib's settings", small_cube, [](const char *p) { return with(rib_config(p), {{"top_shell_layers", "0"}}); } },
+        { "open-top modifier", modifier, [](const char *p) { return with(modifier_config(p), {{"top_shell_layers", "0"}}); } },
+        { "open-top small cube, two lines", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"top_shell_layers", "0"}, {"fill_multiline", "2"}}); } },
     };
     for (const Fixture &fixture : fixtures) {
         INFO(fixture.name);
@@ -179,10 +180,10 @@ TEST_CASE("Bridge aware cubic fills equal Cubic's on the four fixtures while no 
         Model model_bac = fixture.model(), model_cubic = fixture.model();
         slice(bac, model_bac, fixture.config("bridgeawarecubic"));
         slice(cubic, model_cubic, fixture.config("cubic"));
+        REQUIRE(sparse_length(cubic) > 0.);
         std::string message;
         const bool same = same_fill_paths(fill_paths(bac), fill_paths(cubic), 0.001, message);
         INFO(message);
         CHECK(same);
-        CHECK(sparse_length(bac) == Approx(sparse_length(cubic)).epsilon(1e-6));
     }
 }

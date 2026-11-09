@@ -25,9 +25,18 @@ public:
     Polylines fill_surface(const Surface *surface, const FillParams &params) override;
 
 private:
-    const BridgeAwareCubic::ObjectPlan *m_plan  = nullptr;
-    const Layer                        *m_layer = nullptr;
+    const BridgeAwareCubic::ObjectPlan *m_plan        = nullptr;
+    const Layer                        *m_layer       = nullptr;
+    size_t                              m_layer_index = 0;    // the layer's index in the object's layers, as the plan counts them
 };
+
+namespace BridgeAwareCubic {
+
+// Section 3.8's pass, called once per layer at the end of Layer::make_fills, after every filler: prints the planned lines of
+// the layer that the pattern's fillers did not print, wherever nothing else prints.
+void print_uncovered(Layer &layer);
+
+} // namespace BridgeAwareCubic
 
 } // namespace Slic3r
 
