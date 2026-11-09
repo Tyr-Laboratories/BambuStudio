@@ -7,7 +7,7 @@ Layout:
 - `acc/`: `batch.sh VARIANT_DIR` slices all 16 Heimdall plates with `VARIANT_DIR/app/BambuStudio.app` (four at a time), `run.sh` one
   plate, `analyse2.sh` the K2 and bridge-end analyses. `measure/measure.sh LABEL APP` drives all of it and writes `table.md`.
 - `metrics/metrics.py`: per-G-code grams by role, estimated time, path and retraction counts (one line per plate in `summary.txt`).
-- `k2/`: `k2check.py` (the K2 checker; to be aligned to the hold rule of specification 3.7 before stage 5a), `causes.py`, `onbulk.py`,
+- `k2/`: `k2check.py` (the K2 checker, aligned to the hold rule R of specification 3.7: round-ended reach of w/2 from sparse centre lines, w/2 + 0.01 from other footprints, free ends unless fused alongside a bead of the same layer, long runs against G_b = G − 0.1), `causes.py`, `onbulk.py`,
   `classes.py`.
 - `tools/`: `bridgecheck.py` (bridge ends over sparse void against Cubic), `table.py` (the summary tables), the G-code readers `gcr.py`,
   `fp.py`, `dump.py`, and the one-off analyses of the old batches.
