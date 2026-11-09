@@ -184,8 +184,16 @@ static Model gap_only_modifier()
 // position reorders the fill groups and moves their shared edges by Clipper's safety offset, nothing more.
 TEST_CASE("Bridge aware cubic prints as Cubic where no roof needs refinement", "[BridgeAwareCubic][S2]")
 {
-    struct Fixture { const char *name; Model (*model)(); DynamicPrintConfig (*config)(const char *); };
+    struct Fixture { const char *name; Model (*model)(); DynamicPrintConfig (*config)(const char *); bool sparse = true; };
     const Fixture fixtures[] = {
+        // Settings the pattern honours as Cubic does (3.9): density under the stock limit, conformal infill (Cubic ignores it), a
+        // raft, spiral vase (no sparse infill at all), 100 % (no plan: the fill is Cubic's), with and without combination.
+        { "open-top small cube at 1 %", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"top_shell_layers", "0"}, {"sparse_infill_density", "1%"}}); } },
+        { "open-top small cube, conformal infill", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"top_shell_layers", "0"}, {"conformal_infill", "1"}}); } },
+        { "open-top small cube on a raft", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"top_shell_layers", "0"}, {"raft_layers", "3"}}); } },
+        { "small cube in spiral vase mode", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"spiral_mode", "1"}, {"wall_loops", "1"}, {"top_shell_layers", "0"}, {"sparse_infill_density", "0%"}}); }, false },
+        { "small cube at 100 %", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"sparse_infill_density", "100%"}}); }, false },
+        { "small cube at 100 %, combined", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"sparse_infill_density", "100%"}, {"infill_combination", "1"}}); }, false },
         { "open-top small cube", small_cube, [](const char *p) { return with(fixture_config(5., p), {{"top_shell_layers", "0"}}); } },
         // Not the rib itself: the vertical shells under its ribs are roofs over sparse fill, so its plan has content.
         { "open-top cube with the rib's settings", small_cube, [](const char *p) { return with(rib_config(p), {{"top_shell_layers", "0"}}); } },
@@ -199,12 +207,27 @@ TEST_CASE("Bridge aware cubic prints as Cubic where no roof needs refinement", "
         Model model_bac = fixture.model(), model_cubic = fixture.model();
         slice(bac, model_bac, fixture.config("bridgeawarecubic"));
         slice(cubic, model_cubic, fixture.config("cubic"));
-        REQUIRE(sparse_length(cubic) > 0.);
+        if (fixture.sparse)
+            REQUIRE(sparse_length(cubic) > 0.);
         std::string message;
         const bool same = same_fill_paths(fill_paths(bac), fill_paths(cubic), 0.001, message);
         INFO(message);
         CHECK(same);
     }
+    // At 100 % the configuration check says of the pattern what it says of Cubic (neither is a solid pattern).
+    const auto at_full = [](const char *pattern) {
+        FullPrintConfig config;
+        config.apply(fixture_config(5., pattern), true);
+        config.sparse_infill_density.value = 100.;
+        std::map<std::string, std::string> errors = validate(config);
+        auto it = errors.find("sparse_infill_pattern");
+        std::string message = it == errors.end() ? std::string() : it->second;
+        if (const size_t at = message.find(pattern); at != std::string::npos)
+            message.replace(at, std::strlen(pattern), "<pattern>");
+        return message;
+    };
+    CHECK_FALSE(at_full("cubic").empty());
+    CHECK(at_full("bridgeawarecubic") == at_full("cubic"));
 }
 
 // S6: setting invariance. Choosing the pattern changes no other setting: the region configs after processing equal Cubic's but
@@ -421,4 +444,3 @@ TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[Brid
         CHECK(boost::filesystem::file_size(filename) > 0);
     }
 }
-

@@ -23,7 +23,8 @@ scripts (`scripts/bridge_aware_cubic_acceptance/`, see its README) are in place.
 | 7b | done (Task 16) | S4: at N = 2 the bands equal Cubic's away from the roof, and K1 and K2 hold with bands; at N = 1 the four fixtures' G-code is byte-identical |
 | 8a | done (Task 17) | S5 (instances, a shared object and its plan), S6 (settings unchanged but for the pattern and the gap; bridge angles as Cubic's), D1 (byte-identical exports, reslices as fresh slices) |
 | 8b | done (Task 18) | S7 (nine stress settings on the small cube, a pocket block and a blind cavity, variable layer height, arc fitting); the hidden X1 (timing, information only) and X2 (the benchmark's fixture projects, carried over unchanged) |
-| 8c-10 | in progress | |
+| 8c | done (Task 19) | S2 at 1 %, with conformal infill, on a raft, in spiral vase mode and at 100 % with and without combination (fills equal Cubic's); the 100 % configuration check says of the pattern what it says of Cubic; S1 was complete |
+| 9-10 | in progress | |
 
 Known limitations (findings the construction does not yet meet, 9 November 2026; the local debug dump `[BACDebug]` measures them):
 
