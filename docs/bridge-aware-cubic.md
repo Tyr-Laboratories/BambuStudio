@@ -69,15 +69,17 @@ benchmark generator's projects, slice instructions retired, a warm-up and five a
 ad1a10e16 cut them without changing a path. The config copy was a shared file outside the hook list (2.3, 10.5), so the final
 review reverted it, and the final app (501020f91) passes without it:
 
-| Case | 5be6edb42: median, worst | ad1a10e16: median, worst | 501020f91 (final): median, worst | Build parity (fork Cubic over official), final |
-| --- | --- | --- | --- | --- |
-| small cube | 1.38, 1.39 | 1.17, 1.17 | 1.21, 1.22 | 0.98 |
-| large cube | 2.94, 2.94 | 1.76, 1.76 | 1.95, 1.96 | 0.99 |
-| rib | 1.11, 1.12 | 1.09, 1.09 | 1.10, 1.11 | 0.99 |
-| modifier | 1.47, 1.48 | 1.26, 1.27 | 1.33, 1.33 | 0.99 |
+| Case | 5be6edb42: median, worst | ad1a10e16: median, worst | 501020f91 (branch, final): median, worst | 56f6c993f (master, merged): median, worst | Build parity, master |
+| --- | --- | --- | --- | --- | --- |
+| small cube | 1.38, 1.39 | 1.17, 1.17 | 1.21, 1.22 | 1.17, 1.18 | 0.98 |
+| large cube | 2.94, 2.94 | 1.76, 1.76 | 1.95, 1.96 | 1.75, 1.76 | 0.98 |
+| rib | 1.11, 1.12 | 1.09, 1.09 | 1.10, 1.11 | 1.09, 1.09 | 0.98 |
+| modifier | 1.47, 1.48 | 1.26, 1.27 | 1.33, 1.33 | 1.26, 1.27 | 0.97 |
 
-The large cube's margin under 2.0 is small (2 %); the config copy (`LayerRegion::simplify_path` and its two siblings copy the
-print config for every path) was worth about 0.19 of its ratio and is a candidate for the legacy branch, for every pattern.
+Without the config copy's fix the large cube's margin under 2.0 was 2 %; the copy (`LayerRegion::simplify_path` and its two
+siblings copied the print config for every path) was worth about 0.19 of its ratio. The user put the fix on master as its own
+change (115ae497f), for every pattern, and the merged master's app passes with the large cube at 1.75 and 1.76 (build parity
+falls to 0.97-0.98 because the fork's Cubic gains from the fix too).
 
 The gate needed one new reviewed exception: `flow_above_internal_bridges`, which the fork's master added after the baseline
 review, at exactly 100 % (neutral: `bridge_flow_mask` stays empty).
