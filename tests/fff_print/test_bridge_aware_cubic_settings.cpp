@@ -206,100 +206,127 @@ TEST_CASE("Bridge aware cubic prints as Cubic where no roof needs refinement", "
 // S6: setting invariance. Choosing the pattern changes no other setting: the region configs after processing equal Cubic's but
 // for the pattern and the gap; arc fitting still fits arcs; an explicit bridge angle reaches every internal bridge; solid fills
 // merge as Cubic's away from the plan's layers.
+// A 40 x 20 x 10 mm tunnel: two legs 10 mm wide and a 4 mm slab whose underside spans the 20 mm between them over air (an external
+// bridge).
+Model tunnel()
+{
+    TriangleMesh body(its_make_cube(10., 20., 6.));
+    TriangleMesh right(its_make_cube(10., 20., 6.));
+    right.translate(30., 0., 0.);
+    TriangleMesh slab(its_make_cube(40., 20., 4.));
+    slab.translate(0., 0., 6.);
+    body.merge(right);
+    body.merge(slab);
+    return single_part("Bridge aware cubic tunnel", std::move(body));
+}
+
 TEST_CASE("Bridge aware cubic changes no other setting of the part", "[BridgeAwareCubic][S6]")
 {
-    SECTION("the region configs equal Cubic's but for the pattern and the gap") {
+    SECTION("the print, object and region configs equal Cubic's but for the pattern and the gap") {
         Print bac, cubic;
         Model model_bac = modifier(), model_cubic = modifier();
         slice(bac, model_bac, modifier_config("bridgeawarecubic"));
         slice(cubic, model_cubic, modifier_config("cubic"));
-        const PrintObject &a = *bac.get_object(0), &b = *cubic.get_object(0);
-        REQUIRE(a.num_printing_regions() == b.num_printing_regions());
-        for (size_t r = 0; r < a.num_printing_regions(); ++r) {
-            const PrintRegionConfig &ca = a.printing_region(r).config(), &cb = b.printing_region(r).config();
+        const auto compare = [](const ConfigBase &ca, const ConfigBase &cb, const std::string &what) {
             for (const std::string &key : ca.keys()) {
                 if (key == "sparse_infill_pattern" || key == gap_key)
                     continue;
-                INFO("region " << r << ": " << key);
+                INFO(what << ": " << key);
                 const ConfigOption *oa = ca.option(key), *ob = cb.option(key);
-                CHECK((oa == nullptr) == (ob == nullptr));
-                if (oa != nullptr && ob != nullptr)
-                    CHECK(*oa == *ob);
+                REQUIRE(oa != nullptr);
+                REQUIRE(ob != nullptr);
+                CHECK(*oa == *ob);
             }
-        }
+        };
+        compare(bac.config(), cubic.config(), "print");
+        const PrintObject &a = *bac.get_object(0), &b = *cubic.get_object(0);
+        compare(a.config(), b.config(), "object");
+        REQUIRE(a.num_printing_regions() == b.num_printing_regions());
+        for (size_t r = 0; r < a.num_printing_regions(); ++r)
+            compare(a.printing_region(r).config(), b.printing_region(r).config(), "region " + std::to_string(r));
     }
-    SECTION("arc fitting fits arcs") {
-        Print print;
-        Model model = small_cube();
-        slice(print, model, with(fixture_config(5., "bridgeawarecubic"), {{"enable_arc_fitting", "1"}}));
+    SECTION("arc fitting fits arcs as with Cubic, and none when it is off") {
+        // A cylinder, whose walls are arcs for either pattern (a box gives Cubic nothing to fit), with a roof for the plan.
         Workspace workspace;
-        const std::string filename = print.export_gcode((workspace.path / "s6-arcs.gcode").string(), nullptr);
-        std::ifstream file(filename);
-        std::string line;
-        size_t arcs = 0;
-        while (std::getline(file, line))
-            if (line.rfind("G2 ", 0) == 0 || line.rfind("G3 ", 0) == 0)
-                ++arcs;
-        CHECK(arcs > 0);
+        const auto extruding_arcs = [&workspace](const char *pattern, bool fit, const std::string &name) {
+            Print print;
+            Model model = single_part("Bridge aware cubic cylinder", TriangleMesh(its_make_cylinder(15., 18.)));
+            slice(print, model, with(fixture_config(5., pattern), {{"enable_arc_fitting", fit ? "1" : "0"}}));
+            std::ifstream file(print.export_gcode((workspace.path / name).string(), nullptr));
+            std::string line;
+            size_t arcs = 0;
+            while (std::getline(file, line))
+                if ((line.rfind("G2 ", 0) == 0 || line.rfind("G3 ", 0) == 0) && line.find(" E") != std::string::npos)
+                    ++arcs;
+            return arcs;
+        };
+        CHECK(extruding_arcs("bridgeawarecubic", true, "s6-arcs.gcode") > 0);
+        CHECK(extruding_arcs("cubic", true, "s6-arcs-cubic.gcode") > 0);
+        CHECK(extruding_arcs("bridgeawarecubic", false, "s6-no-arcs.gcode") == 0);
     }
-    SECTION("an explicit bridge angle reaches the internal bridges as with Cubic") {
-        // The stock pipeline gives a bridge the explicit angle, except a thick base over a required roof, whose angle it derives
-        // from the lines below (Cubic's too; the small cube's one internal bridge is such a base): per layer the internal bridges'
-        // angles equal Cubic's.
-        const auto angles = [](const Print &print) {
-            std::vector<std::set<long>> out;
-            for (const Layer *layer : print.get_object(0)->layers()) {
-                std::set<long> here;
+    SECTION("an explicit bridge angle reaches the external bridges as with Cubic") {
+        // The stock pipeline reads `bridge_angle` for the bridges over air (and overhang walls); an internal bridge takes the angle
+        // the generator derives from the anchors below, which spec 1.2 lets follow the pattern's lines.
+        const auto angles = [](const char *pattern) {
+            Print print;
+            Model model = tunnel();
+            slice(print, model, with(fixture_config(5., pattern), {{"bridge_angle", "30"}}));
+            std::vector<double> out;
+            for (const Layer *layer : print.get_object(0)->layers())
                 for (const LayerRegion *region : layer->regions())
                     for (const Surface &surface : region->fill_surfaces.surfaces)
-                        if (surface.surface_type == stInternalBridge)
-                            here.insert(std::lround(surface.bridge_angle * 1e6));
-                out.push_back(std::move(here));
-            }
+                        if (surface.surface_type == stBottomBridge)
+                            out.push_back(surface.bridge_angle);
             return out;
         };
-        Print bac, cubic;
-        Model model_bac = small_cube(), model_cubic = small_cube();
-        slice(bac, model_bac, with(fixture_config(5., "bridgeawarecubic"), {{"bridge_angle", "30"}}));
-        slice(cubic, model_cubic, with(fixture_config(5., "cubic"), {{"bridge_angle", "30"}}));
-        const std::vector<std::set<long>> a = angles(bac), b = angles(cubic);
-        REQUIRE(a.size() == b.size());
-        size_t bridged = 0;
-        for (size_t l = 0; l < a.size(); ++l) {
-            INFO("layer " << l);
-            CHECK(a[l] == b[l]);
-            bridged += !a[l].empty();
+        for (const char *pattern : { "bridgeawarecubic", "cubic" }) {
+            INFO(pattern);
+            const std::vector<double> found = angles(pattern);
+            CHECK_FALSE(found.empty());
+            for (const double angle : found)
+                CHECK(angle == Approx(Geometry::deg2rad(30.)).margin(1e-6));
         }
-        CHECK(bridged > 0);
     }
-    SECTION("solid fills merge as Cubic's away from the plan's layers") {
+    SECTION("solid fills as Cubic's away from the layers next to its internal bridges") {
+        // Next to an internal bridge the stock pipeline answers the pattern's lines (the generator anchors on them, 1.2); elsewhere
+        // the solid surfaces of every layer equal Cubic's, area within the outline's length times the resolution.
         Print bac, cubic;
         Model model_bac = small_cube(), model_cubic = small_cube();
-        slice(bac, model_bac, fixture_config(5., "bridgeawarecubic"));
+        const DynamicPrintConfig settings = fixture_config(5., "bridgeawarecubic");
+        slice(bac, model_bac, settings);
         slice(cubic, model_cubic, fixture_config(5., "cubic"));
         const PrintObject &a = *bac.get_object(0), &b = *cubic.get_object(0);
         REQUIRE(a.layers().size() == b.layers().size());
-        const BridgeAwareCubic::ObjectPlan *plan = a.bridge_aware_cubic_plan();
-        REQUIRE(plan != nullptr);
-        std::set<size_t> plan_layers;
-        for (const BridgeAwareCubic::PlaneSummary &plane : plan->planes()) {
-            plan_layers.insert(plane.plane_layer);
-            plan_layers.insert(plane.roof_layer);
-        }
-        const auto solid_count = [](const Layer &layer) {
-            size_t n = 0;
+        const double resolution = settings.opt_float("resolution");
+        const auto solid = [](const Layer &layer, SurfaceType type) {
+            double area = 0., outline = 0.;
             for (const LayerRegion *region : layer.regions())
                 for (const Surface &surface : region->fill_surfaces.surfaces)
-                    if (surface.surface_type == stInternalSolid)
-                        ++n;
-            return n;
+                    if (surface.surface_type == type) {
+                        area += surface.expolygon.area() * SCALING_FACTOR * SCALING_FACTOR;
+                        for (const Polygon &polygon : to_polygons(surface.expolygon))
+                            outline += unscale<double>(polygon.length());
+                    }
+            return std::make_pair(area, outline);
         };
+        std::set<size_t> near_bridges;
+        for (size_t l = 0; l < b.layers().size(); ++l)
+            if (solid(*b.layers()[l], stInternalBridge).first > 0.)
+                for (size_t k = l > 0 ? l - 1 : 0; k <= l + 1; ++k)
+                    near_bridges.insert(k);
+        REQUIRE_FALSE(near_bridges.empty());
+        size_t compared = 0;
         for (size_t l = 0; l < a.layers().size(); ++l) {
-            if (plan_layers.count(l) || plan_layers.count(l + 1) || (l > 0 && plan_layers.count(l - 1)))
+            if (near_bridges.count(l))
                 continue;
-            INFO("layer " << l);
-            CHECK(solid_count(*a.layers()[l]) == solid_count(*b.layers()[l]));
+            for (const SurfaceType type : { stInternalSolid, stTop, stBottom }) {
+                const auto mine = solid(*a.layers()[l], type), theirs = solid(*b.layers()[l], type);
+                INFO("layer " << l << " type " << int(type));
+                CHECK(std::abs(mine.first - theirs.first) <= std::max(mine.second, theirs.second) * resolution);
+                compared += theirs.first > 0.;
+            }
         }
+        CHECK(compared > 3);
     }
 }
 

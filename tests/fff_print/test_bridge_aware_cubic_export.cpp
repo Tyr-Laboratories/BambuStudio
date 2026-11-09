@@ -634,25 +634,33 @@ TEST_CASE("Bridge aware cubic prints every instance and shared object alike", "[
         ModelObject *copy = model.add_object(*model.objects.front());
         copy->instances.front()->set_offset(model.objects.front()->instances.front()->get_offset() + Vec3d(70., 0., 0.));
         Print print;
-        slice(print, model, fixture_config(5., "bridgeawarecubic"));
+        const DynamicPrintConfig settings = observed(fixture_config(5., "bridgeawarecubic"));
+        slice(print, model, settings);
         REQUIRE(print.objects().size() == 2);
         const PrintObject &first = *print.get_object(0), &second = *print.get_object(1);
         const PrintObject &sharing = second.get_shared_object() != nullptr ? second : first;
         REQUIRE(sharing.get_shared_object() != nullptr);
         CHECK(sharing.bridge_aware_cubic_plan() != nullptr);
         CHECK(sharing.bridge_aware_cubic_plan() == sharing.get_shared_object()->bridge_aware_cubic_plan());
+        // Both copies print, and each holds K1 alike: the bed's halves measured apart, as for two instances.
         const std::string filename = print.export_gcode((workspace.path / "s5-shared.gcode").string(), nullptr);
-        const std::vector<PlaneMeasure> planes = measure_planes(read_extrusions(filename, observed(fixture_config(5., "bridgeawarecubic"))), 0.4, 5.);
-        REQUIRE_FALSE(planes.empty());
-        for (const PlaneMeasure &plane : planes) {
-            CHECK(plane.widest_opening <= 5.);
-            CHECK(plane.longest_run <= 5.);
+        std::vector<EmittedPath> left, right;
+        for (const EmittedPath &path : read_extrusions(filename, settings))
+            (unscale<double>(get_extents(path.path).center().x()) < 80. + 32. + 19. ? left : right).push_back(path);
+        const std::vector<PlaneMeasure> a = measure_planes(left, 0.4, 5.), b = measure_planes(right, 0.4, 5.);
+        REQUIRE_FALSE(a.empty());
+        REQUIRE(a.size() == b.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+            INFO("plane below z = " << a[i].lower / 1000. << " mm");
+            CHECK(a[i].widest_opening == Approx(b[i].widest_opening).margin(1e-6));
+            CHECK(a[i].widest_opening <= 5.);
+            CHECK(b[i].longest_run <= 5.);
         }
     }
 }
 
-// D1: determinism. Two slices of one project export the same G-code byte for byte, and a reslice after a setting changed and
-// changed back fills as a fresh slice does.
+// D1: determinism. Two slices of one project export the same G-code byte for byte, and a reslice after a setting changed exports
+// what a fresh slice exports, at the changed value and after it changed back.
 TEST_CASE("Bridge aware cubic exports the same G-code on every slice and reslices to the same fills", "[BridgeAwareCubic][D1]")
 {
     Workspace workspace;
@@ -677,26 +685,43 @@ TEST_CASE("Bridge aware cubic exports the same G-code on every slice and reslice
         };
         CHECK(without_time(first) == without_time(second));
     }
+    // A reslice after a setting changed exports what a fresh slice at the changed value exports (the plan was rebuilt), and after it
+    // changed back what a fresh slice exports: on the partial roof with three internal bridge layers; the anchor settings feed the
+    // plan's fused ends.
+    const auto without_time = [](const std::string &gcode) {
+        std::istringstream in(gcode);
+        std::string out, line;
+        while (std::getline(in, line))
+            if (line.rfind("; generated", 0) != 0)
+                out += line + "\n";
+        return out;
+    };
+    const auto exported_now = [&workspace](Print &print, const std::string &name) {
+        std::ifstream file(print.export_gcode((workspace.path / name).string(), nullptr), std::ios::binary);
+        std::string out, line;
+        while (std::getline(file, line))
+            if (line.rfind("; OBJECT_ID:", 0) != 0)
+                out += line + "\n";
+        return out;
+    };
+    const DynamicPrintConfig settings = observed(with(fixture_config(5., "bridgeawarecubic"), {{"internal_bridge_layers", "3"}}));
+    const std::string fresh = without_time(exported_gcode(workspace, partial_roof(), settings, "d1-fresh.gcode"));
     const struct { const char *key, *changed; } changes[] = {
         { "bridge_aware_cubic_max_gap", "6" }, { "sparse_infill_density", "7%" }, { "infill_direction", "60" },
+        { "sparse_infill_anchor", "0" }, { "sparse_infill_anchor_max", "0" },
     };
     for (const auto &change : changes) {
         INFO("reslice after " << change.key << " = " << change.changed << " and back");
-        const DynamicPrintConfig settings = fixture_config(5., "bridgeawarecubic");
+        const DynamicPrintConfig changed = with(settings, {{change.key, change.changed}});
         Print print;
         Model model = partial_roof();
         slice(print, model, settings);
-        print.apply(model, with(settings, {{change.key, change.changed}}));
+        print.apply(model, changed);
         print.process();
+        CHECK(without_time(exported_now(print, "d1-changed.gcode")) == without_time(exported_gcode(workspace, partial_roof(), changed, "d1-changed-fresh.gcode")));
         print.apply(model, settings);
         print.process();
-        Print fresh;
-        Model fresh_model = partial_roof();
-        slice(fresh, fresh_model, settings);
-        std::string message;
-        const bool same = same_fill_paths(fill_paths(print), fill_paths(fresh), 0.001, message);
-        INFO(message);
-        CHECK(same);
+        CHECK(without_time(exported_now(print, "d1-back.gcode")) == fresh);
     }
 }
 
