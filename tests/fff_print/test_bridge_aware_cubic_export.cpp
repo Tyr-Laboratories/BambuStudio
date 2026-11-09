@@ -427,16 +427,16 @@ TEST_CASE("Bridge aware cubic honours infill combination through single-layer zo
                 }
             return std::make_tuple(voids, void_area, thick, outline);
         };
-        bool combines = false;
+        size_t combined_layers_count = 0;
         for (size_t l = 0; l < object.layers().size(); ++l) {
             INFO("layer " << l);
             const auto mine = summarise(*object.layers()[l]), theirs = summarise(*control_object.layers()[l]);
             CHECK(std::get<0>(mine) == std::get<0>(theirs));
             CHECK(std::abs(std::get<1>(mine) - std::get<1>(theirs)) <= std::max(std::get<3>(mine), std::get<3>(theirs)) * resolution);
             CHECK(std::get<2>(mine) == std::get<2>(theirs));
-            combines = combines || !std::get<2>(mine).empty();
+            combined_layers_count += !std::get<2>(mine).empty();
         }
-        CHECK(combines);
+        CHECK(combined_layers_count >= 5);
         const std::string filename = print.export_gcode((workspace.path / (fixture.name + "-s3.gcode")).string(), nullptr);
         const std::vector<EmittedPath> paths = read_extrusions(filename, settings);
         const std::string control_file = control_print.export_gcode((workspace.path / (fixture.name + "-s3-cubic.gcode")).string(), nullptr);
@@ -513,11 +513,38 @@ TEST_CASE("Bridge aware cubic honours infill combination through single-layer zo
                     } else if (thick && lattice && unscale<double>((b - a).cast<double>().norm()) >= path->width && !(in_wall_band(a) && in_wall_band(b))) {
                         ++thick_lattice;
                         CHECK(on_single);
-                    } else if (!thick && lattice && on_single && has_below && combined_keys.count(key)) {
-                        // A lattice line at layer height on a combined layer: each point a bead in from its ends rests on a line
-                        // of the layer below (its own plane drifts by less than half a bead a layer) or on other material.
+                        // Outside the single-layer zones only: on no layer the thick bead fills does a layer-height bead of its
+                        // direction run within half a bead of it (a bead in from its ends; the zone's edge cuts the two at
+                        // places a drift apart).
                         const Vec2d pa = a.cast<double>(), d = (b - a).cast<double>();
                         const double length = d.norm(), step = scale_(0.5 * path->width), margin = scale_(path->width);
+                        for (auto filled = unfolded_layers.find(key); filled != unfolded_layers.end(); --filled) {
+                            for (double t = margin; t <= length - margin; t += step) {
+                                const Point q = (pa + d * (t / length)).cast<coord_t>();
+                                double nearest = std::numeric_limits<double>::max();
+                                for (const EmittedPath *other : filled->second) {
+                                    if (other->role != erInternalInfill || other->height > (layer_height.count(filled->first) ? layer_height.at(filled->first) : h) + 1e-3)
+                                        continue;
+                                    for (size_t j = 1; j < other->path.points.size(); ++j) {
+                                        const Point &oa = other->path.points[j - 1], &ob = other->path.points[j];
+                                        const Vec2d od = (ob - oa).cast<double>();
+                                        if (od.norm() < 1. || std::abs(od.normalized().dot(d / length)) < 0.999)
+                                            continue;
+                                        nearest = std::min(nearest, unscale<double>(Line(oa, ob).distance_to(q)));
+                                    }
+                                }
+                                INFO("thick bead point " << unscale(q).transpose() << " on z = " << filled->first / 1000. << ": a layer-height bead of its direction at " << nearest << " mm");
+                                CHECK(nearest > 0.5 * path->width);
+                            }
+                            // On down while the next layer lies inside the bead's height.
+                            if (filled == unfolded_layers.begin() || std::prev(filled)->first <= plane_key(path->z - path->height + 1e-3))
+                                break;
+                        }
+                    } else if (!thick && lattice && on_single && has_below && combined_keys.count(key)) {
+                        // A lattice line at layer height on a combined layer: each point half a bead in from its ends rests on a
+                        // line of the layer below (its own plane drifts by less than half a bead a layer) or on other material.
+                        const Vec2d pa = a.cast<double>(), d = (b - a).cast<double>();
+                        const double length = d.norm(), step = scale_(0.5 * path->width), margin = scale_(0.5 * path->width);
                         for (double t = margin; t <= length - margin; t += step) {
                             const Point q = (pa + d * (t / length)).cast<coord_t>();
                             double nearest = std::numeric_limits<double>::max();
@@ -536,9 +563,16 @@ TEST_CASE("Bridge aware cubic honours infill combination through single-layer zo
         CHECK(added > 0);
         CHECK(thick_lattice > 0);
         CHECK(supported > 0);
+        // K1 on the unfolded paths: a thick bead holds every layer it fills.
+        const std::vector<PlaneMeasure> planes = measure_planes(unfolded, 0.4, fixture.gap);
+        REQUIRE_FALSE(planes.empty());
+        for (const PlaneMeasure &plane : planes) {
+            INFO("plane below z = " << plane.lower / 1000. << " mm");
+            CHECK(plane.widest_opening <= fixture.gap);
+            CHECK(plane.longest_run <= fixture.gap);
+        }
         // K2 judges the paths as emitted (an unfolded copy lies off its layer's lattice) against both Cubic slices: the combined
-        // one has the hooks along the combined islands' boundaries, the single-layer one the lattice of every layer. (K1 under
-        // combination is a recorded finding at an island's corner: docs/bridge-aware-cubic.md.)
+        // one has the hooks along the combined islands' boundaries, the single-layer one the lattice of every layer.
         std::vector<EmittedPath> control = combined_control;
         append(control, single_control);
         const K2Measure measure = measure_k2(paths, control, fixture.gap - 0.1, fixture.direction);
@@ -557,8 +591,13 @@ TEST_CASE("Bridge aware cubic honours fill multiline as bands", "[BridgeAwareCub
     Workspace workspace;
     check_coarse_away_from_roof(workspace, with(fixture_config(5., "bridgeawarecubic"), {{"fill_multiline", "2"}, {"sparse_infill_density", "10%"}}),
                                 with(fixture_config(5., "cubic"), {{"fill_multiline", "2"}, {"sparse_infill_density", "10%"}}), "s4");
-    check_k1(workspace, { { "small cube, two lines", small_cube, with({}, {{"fill_multiline", "2"}}), 5. } });
-    check_k2(workspace, { { "small cube, two lines", small_cube, with({}, {{"fill_multiline", "2"}}), 5. } });
+    // Three lines: a switched or cover piece is λ + 2 s_f / sin 60° long, or its outer sub-lines hang.
+    const std::vector<ExportFixture> bands = {
+        { "small cube, two lines", small_cube, with({}, {{"fill_multiline", "2"}}), 5. },
+        { "small cube, three lines", small_cube, with({}, {{"fill_multiline", "3"}}), 5. },
+    };
+    check_k1(workspace, bands);
+    check_k2(workspace, bands);
 }
 
 // S5: instances and shared objects. Two instances of one object print the same plan alike (the measures of each instance's half

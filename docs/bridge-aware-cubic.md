@@ -34,14 +34,17 @@ Known limitations (findings the construction does not yet meet, 9 November 2026;
   back at face junctions; printing a face shorter than a bead (lengthened to one) moved the counts from 599 and 221 only.
 - The candidate-test pin (hook 7): on Heimdall plate 1 sliced as Cubic the new app's moves equal the baseline's but for 22 lines of one Arachne outer-wall loop's start at z 214.2 mm (the loop's seam moved about 1 mm); two slices with the new app agree with each other, and every bridge and infill move matches, so the extraction left the bridging unchanged. The baseline was made by an earlier build of the branch.
 - R1 does not try a roof the candidate test rejects (one the generator fills with solid infill); rails are checked where bridges exist.
-- Under infill combination, K1 at an island's corner on a plane layer: the large cube's plane at 17.2 mm reads an opening of
-  5.89 mm at its corner (gap 5; without combination 4.72 mm at the same corner). The plan's measure leaves the triangle between
-  the island's last two lattice lines and the walls to the connector's hooks along the walls, and the zone's connector joins those
-  line ends with their other neighbours. S3 asserts K2, the layer heights and the zone lines' support, not K1.
 - At the fuselage top's apex the generator bridges one layer above the roof the candidate test predicted: rails lie at 23.8 and
   24.0 mm under predicted bridges at 24.0 and 24.2 mm, the generator prints solid at 24.2 and bridges at 24.4 mm, whose inner edges
-  have no rail; no bridge end hangs and nothing overgrows. R1 therefore checks the rails per fixture (along the bridges' inner
-  edges, none where roofs end at the walls), not per bridge layer, and does not scan for rails without a bridge above.
+  have no rail; no bridge end hangs and nothing overgrows. The cause: with thick bridges (the user's setting) `bridge_over_infill`
+  narrows the candidates to the sparse area deep enough for a thick bridge, less what its own thick bridges on the layers within
+  that height already took; the second part is the generator's own output, which the plan, made before the generator (user
+  decision), cannot read. R1 therefore checks the rails per fixture (along the bridges' inner edges, none where roofs end at the
+  walls), not per bridge layer, and does not scan for rails without a bridge above.
+- The stock generator grows a bridge along its direction until both ends reach an anchor. Where the pattern's refined lines lie
+  close it bridges less than over Cubic's coarse lattice, but a single bridge line can run on across a sparse area to a distant
+  anchor: on Heimdall plate 10 at z 186.4 one 38 mm line, which holds nothing up (the area above it is sparse too). The bridge
+  check counts such lines among its free stretches.
 
 Cubic baselines for the acceptance: the 16 Heimdall plates sliced with master's build (0568b9dad): 4,255.4 g, 308.0 h of
 model print time (`$BAC_DATA/baselines/cubic/`).

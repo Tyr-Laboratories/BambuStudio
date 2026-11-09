@@ -724,8 +724,13 @@ void print_uncovered(Layer &layer)
                 if (pa != pb)
                     strands.emplace_back(Points{ pa, pb });
             }
-        // Uncovered: outside the islands the fillers were handed. Each region keeps its own courses.
-        const Polylines uncovered_strands = strands.empty() ? Polylines() : (handed.empty() ? strands : diff_pl(strands, handed));
+        // Uncovered: outside the islands the fillers were handed and outside the regions' combination zones (whose strands print
+        // with the zone's lines, below). Each region keeps its own courses.
+        Polylines uncovered_strands = strands.empty() ? Polylines() : (handed.empty() ? strands : diff_pl(strands, handed));
+        if (!uncovered_strands.empty())
+            for (const size_t region_id : group.regions())
+                if (const ExPolygons *zone = zone_of_region(region_id))
+                    uncovered_strands = diff_pl(uncovered_strands, *zone);
         std::vector<Polylines> uncovered_courses(group.regions().size());
         bool any_course = false;
         for (size_t k = 0; k < group.regions().size(); ++k) {
@@ -741,11 +746,13 @@ void print_uncovered(Layer &layer)
         // (rule i): the zone's lines on the group's other layers, or, under its lowest layer, the thick line of the group below,
         // which is the plan's lattice too. No hook runs along the zone's edge, which is not material; where a line ends on another
         // line of the zone, it gets a nub along it (or the two ends join), with the region's sparse infill anchor settings.
-        // A lattice line's trace drifts from layer to layer, so the same zone cuts it at different places on the group's layers;
-        // where the zone's edge runs at a slant to the line, a zone line of a higher layer would end beyond the one below it. Each
-        // family's lines are therefore cut by the zone as seen from this layer and from every layer above it in the group (the
-        // zone shifted by the family's drift), so that a zone line rests on the zone line below it, and on the group's top layer
-        // the thick line takes over exactly where the zone line ends.
+        // A lattice line's trace drifts from layer to layer, so the same zone would cut it at different places on the group's
+        // layers: where the zone's edge runs at a slant to the line, a zone line of a higher layer would end beyond the one below
+        // it, and where a plane's line lies outside the zone on the group's top layer (the filler prints it thick there, filling
+        // every layer of the group) it could lie inside on a lower one and print twice. Each family's lines are therefore cut by
+        // the zone as the top layer sees it, carried down with the family's drift: on every layer of the group a plane's line is
+        // cut at the same place along it, so that each zone line rests on the one below and the thick line takes over exactly
+        // where the zone lines end.
         const auto zone_lines_of = [&](const ExPolygons &zone, size_t region_id, size_t top) {
             Polylines lines;
             const LatticeParams &lattice = group.lattice();
@@ -753,15 +760,12 @@ void print_uncovered(Layer &layer)
             ExPolygons seen_by_any;    // the zone as every family sees it: the connector's boundary and the trim's virtual zone
             for (int k = 0; k < 3; ++k) {
                 ExPolygons seen = zone;
-                const Point here = lattice.scaled(trace(lattice, PlaneKey{ k, 0, 0 }, z).origin);
-                for (size_t above = layer_index + 1; above <= top && above < plan->layer_count(); ++above) {
-                    const Point there = lattice.scaled(trace(lattice, PlaneKey{ k, 0, 0 }, plan->print_z(above)).origin);
-                    ExPolygons shifted = zone;
-                    for (ExPolygon &part : shifted)
+                if (top != layer_index && top < plan->layer_count()) {
+                    const Point here = lattice.scaled(trace(lattice, PlaneKey{ k, 0, 0 }, z).origin);
+                    const Point there = lattice.scaled(trace(lattice, PlaneKey{ k, 0, 0 }, plan->print_z(top)).origin);
+                    for (ExPolygon &part : seen)
                         part.translate(here - there);
-                    append(seen, std::move(shifted));
                 }
-                seen = union_ex(seen);
                 append(seen_by_any, seen);
                 const ExPolygons zone_boundary = intersection_ex(seen, boundary.boundary);
                 if (zone_boundary.empty())
@@ -782,13 +786,28 @@ void print_uncovered(Layer &layer)
                 }
             }
             seen_by_any = union_ex(seen_by_any);
-            const ExPolygons zone_boundary = intersection_ex(seen_by_any, boundary.boundary);
-            if (!handed.empty()) {
-                Polylines covered = intersection_pl(strands, handed);
-                append(covered, intersection_pl(plan->courses_at(layer_index, region_id), handed));
-                for (Polyline &piece : covered)
-                    append(lines, intersection_pl(Polylines{ piece }, zone));
+            // The connector's boundary as the filler's (3.8): no hook along a course of the layer or a rail of the layer below,
+            // whose ends there are junctions; those zones join the zone's edge as edges no hook may run along.
+            Polylines zone_courses = plan->boundary_courses_at(layer_index, region_id);
+            if (layer_index > 0) {
+                Polylines below = plan->boundary_courses_at(layer_index - 1, region_id);
+                if (!below.empty() && !zone_courses.empty())
+                    below = diff_pl(below, offset(zone_courses, float(scale_(w)), ClipperLib::jtRound, float(scale_(0.001))));
+                append(zone_courses, std::move(below));
             }
+            ExPolygons virtual_zones = seen_by_any;
+            ExPolygons zone_boundary = intersection_ex(seen_by_any, boundary.boundary);
+            if (!zone_courses.empty()) {
+                const ExPolygons course_zones = union_ex(offset(zone_courses, float(scale_(1.5 * w + 0.5 * lattice.spacing)), ClipperLib::jtRound, float(scale_(0.001))));
+                zone_boundary = diff_ex(zone_boundary, course_zones);
+                append(virtual_zones, course_zones);
+                virtual_zones = union_ex(virtual_zones);
+            }
+            // The strands of the layer inside the zone, on every layer of the group (on its void layers no island was handed), and the
+            // courses an island covered there (the filler skipped the zone).
+            append(lines, intersection_pl(strands, zone));
+            if (!handed.empty())
+                append(lines, intersection_pl(intersection_pl(plan->courses_at(layer_index, region_id), handed), zone));
             if (lines.empty() || zone_boundary.empty())
                 return lines;
             // Connected as the filler connects its lines (3.8 step 5), with the region's anchor settings: the connector's hooks
@@ -808,7 +827,7 @@ void print_uncovered(Layer &layer)
             const double gap_b = std::max(0., plan->gap_of_region(region_id) - 0.1);
             if (params.anchor_length > 0.f)
                 anchor_junctions(connected, zone_boundary, scale_(0.5 * w), scale_(double(params.anchor_length)), scale_(std::min(w, gap_b)));
-            trim_virtual_hooks(connected, seen_by_any, boundary.boundary, plan->courses_at(layer_index, region_id), scale_(plan->path_margin()));
+            trim_virtual_hooks(connected, virtual_zones, boundary.boundary, plan->courses_at(layer_index, region_id), scale_(plan->path_margin()));
             return connected;
         };
         std::vector<Polylines> zone_lines(group.regions().size());

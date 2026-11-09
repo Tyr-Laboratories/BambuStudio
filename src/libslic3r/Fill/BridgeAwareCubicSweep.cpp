@@ -400,6 +400,7 @@ private:
         const Vec2d p = tk.point(t);
         const double reach = 0.5 * m_w - m_vertex_margin;
         const double pitch = unscale<double>(m_lattice.pitch);
+        const std::vector<double> offsets = m_lattice.subline_offsets();
         for (int j = 0; j < 3; ++j) {
             if (j == K.family)
                 continue;
@@ -411,39 +412,50 @@ private:
                 return true;
             for (const auto &[plane, interval] : lp.strands_of_family[j]) {
                 const Trace tj = trace(m_lattice, plane, lp.z);
-                if (std::abs(n.dot(p - tj.origin)) > reach)
-                    continue;
-                // In the interior of the met strand: a nub needs the met bead on both sides of the junction.
-                const double along = tj.parameter(p);
-                if (along >= interval.first + 0.5 * m_w - 1e-6 && along <= interval.second - 0.5 * m_w + 1e-6)
+                // Every sub-line end of the band on a sub-line of the met strand (3.9b; at N = 1 the line's end on the strand's
+                // line), in the interior of the met strand: a nub needs the met bead on both sides of the junction.
+                bool fused = true;
+                for (const double oi : offsets) {
+                    const Vec2d pi = p + oi * m_lattice.normal(K.family);
+                    const double across = n.dot(pi - tj.origin);
+                    const double along = tj.parameter(pi);
+                    if (std::none_of(offsets.begin(), offsets.end(), [&](double oj) { return std::abs(across - oj) <= reach; }) ||
+                        along < interval.first + 0.5 * m_w - 1e-6 || along > interval.second - 0.5 * m_w + 1e-6) {
+                        fused = false;
+                        break;
+                    }
+                }
+                if (fused)
                     return true;
             }
         }
         // A boundary course of the layer (a seam wall, a rail): the line ends inside its bead (3.8) and the filler's nub fuses it,
-        // in the course's interior (half a bead from its ends; a closed course has none).
-        const Point  P = m_lattice.scaled(p);
+        // in the course's interior (half a bead from its ends; a closed course has none); every sub-line end of the band.
         const double reach_scaled = scale_(reach), end_margin = scale_(0.5 * m_w);
-        for (const size_t region_id : m_group.regions())
-            for (const Polyline &course : m_plan.boundary_courses_at(m, region_id)) {
-                if (course.points.size() < 2)
-                    continue;
-                const bool   course_closed = course.first_point() == course.last_point();
-                const double total = double(course.length());
-                double arc = 0.;
-                for (size_t i = 1; i < course.points.size(); ++i) {
-                    const Line   seg(course.points[i - 1], course.points[i]);
-                    const double seg_length = seg.length();
-                    if (seg.distance_to(P) <= reach_scaled) {
-                        const Vec2d  a = seg.a.cast<double>(), d = (seg.b - seg.a).cast<double>();
-                        const double t    = seg_length > 0. ? std::min(1., std::max(0., (P.cast<double>() - a).dot(d) / (seg_length * seg_length))) : 0.;
-                        const double foot = arc + t * seg_length;
-                        if (course_closed || (foot >= end_margin && total - foot >= end_margin))
-                            return true;
+        const auto on_course = [&](const Point &P) {
+            for (const size_t region_id : m_group.regions())
+                for (const Polyline &course : m_plan.boundary_courses_at(m, region_id)) {
+                    if (course.points.size() < 2)
+                        continue;
+                    const bool   course_closed = course.first_point() == course.last_point();
+                    const double total = double(course.length());
+                    double arc = 0.;
+                    for (size_t i = 1; i < course.points.size(); ++i) {
+                        const Line   seg(course.points[i - 1], course.points[i]);
+                        const double seg_length = seg.length();
+                        if (seg.distance_to(P) <= reach_scaled) {
+                            const Vec2d  a = seg.a.cast<double>(), d = (seg.b - seg.a).cast<double>();
+                            const double t    = seg_length > 0. ? std::min(1., std::max(0., (P.cast<double>() - a).dot(d) / (seg_length * seg_length))) : 0.;
+                            const double foot = arc + t * seg_length;
+                            if (course_closed || (foot >= end_margin && total - foot >= end_margin))
+                                return true;
+                        }
+                        arc += seg_length;
                     }
-                    arc += seg_length;
                 }
-            }
-        return false;
+            return false;
+        };
+        return std::all_of(offsets.begin(), offsets.end(), [&](double o) { return on_course(m_lattice.scaled(p + o * m_lattice.normal(K.family))); });
     }
 
     bool held_whole(const PlaneKey &K, double t0, double t1, size_t m)
@@ -453,15 +465,21 @@ private:
     }
 
     // Whether a piece [y − λ/2, y + λ/2] on K lies whole inside the fill boundary of layer l.
+    // Every sub-line of the band (3.9b; the one line at N = 1), since the filler clips each on its own.
     bool inside_boundary(const PlaneKey &K, double y, size_t l, double half_length)
     {
         const LayerPrint &lp = print_set(l);
         if (lp.boundary->index.empty())
             return false;
         const Trace t = trace(m_lattice, K, lp.z);
-        const Point a = m_lattice.scaled(t.point(y - half_length)), b = m_lattice.scaled(t.point(y + half_length));
-        const Intervals in = lp.boundary->index.segment_inside(a, b);
-        return in.size() == 1 && in.front().first <= 1e-9 && in.front().second >= 1. - 1e-9;
+        const Vec2d normal = m_lattice.normal(K.family);
+        for (const double o : m_lattice.subline_offsets()) {
+            const Point a = m_lattice.scaled(t.point(y - half_length) + o * normal), b = m_lattice.scaled(t.point(y + half_length) + o * normal);
+            const Intervals in = lp.boundary->index.segment_inside(a, b);
+            if (!(in.size() == 1 && in.front().first <= 1e-9 && in.front().second >= 1. - 1e-9))
+                return false;
+        }
+        return true;
     }
 
     // The nearest position to y within [y − reach, y + reach] whose piece lies inside the boundary of layer l, or nothing.
@@ -474,10 +492,21 @@ private:
             return std::nullopt;
         const Trace t = trace(m_lattice, K, lp.z);
         const double lo = y - reach - half_length, hi = y + reach + half_length;
-        const Point a = m_lattice.scaled(t.point(lo)), b = m_lattice.scaled(t.point(hi));
+        // Where every sub-line lies inside the boundary.
+        const Vec2d normal = m_lattice.normal(K.family);
+        Intervals inside;
+        bool first = true;
+        for (const double o : m_lattice.subline_offsets()) {
+            const Point a = m_lattice.scaled(t.point(lo) + o * normal), b = m_lattice.scaled(t.point(hi) + o * normal);
+            Intervals one;
+            for (const Interval &i : lp.boundary->index.segment_inside(a, b))
+                one.emplace_back(lo + i.first * (hi - lo), lo + i.second * (hi - lo));
+            inside = first ? std::move(one) : intersected(inside, one);
+            first = false;
+        }
         std::optional<double> best;
-        for (const Interval &i : lp.boundary->index.segment_inside(a, b)) {
-            const double il = lo + i.first * (hi - lo), ih = lo + i.second * (hi - lo);
+        for (const Interval &i : inside) {
+            const double il = i.first, ih = i.second;
             if (ih - il < 2. * half_length - 1e-9)
                 continue;
             const double candidate = std::min(std::max(y, il + half_length), ih - half_length);
@@ -1009,7 +1038,10 @@ private:
     bool change_family(const Item &item, double x, size_t m, double k_stay)
     {
         const size_t below = m - 1;
-        const double half = 0.5 * m_lambda, r_sw = std::max(0., 0.5 * (m_lambda - crossing_reach(m_vertex_margin)));
+        // A switched piece is λ_sw(N) = λ + (N − 1) s_f / sin 60° long, and the window r_sw = (λ − c)/2 is the single line's
+        // (3.9b): the band's crossing then holds every sub-line of the piece above whole.
+        const double half = 0.5 * m_lambda + (m_lattice.multiline - 1) * m_lattice.spacing / (2. * SIN_60);
+        const double r_sw = std::max(0., 0.5 * (m_lambda - std::max(1e-6, (0.5 * m_w - m_vertex_margin) / SIN_60)));
         const Trace tk = trace(m_lattice, item.plane, m_plan.print_z(m));
         const Vec2d centre = tk.point(x);
         struct Candidate { PlaneKey plane; double y, layers; int landing; };

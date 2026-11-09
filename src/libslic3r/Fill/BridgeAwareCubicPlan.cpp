@@ -481,13 +481,13 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
                     const Polygons   near_edge = offset(entry.second, float(scale_(d_i + 0.01)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
                     const ExPolygons grown     = offset_ex(roof_material, float(scale_(d_i)), ClipperLib::jtRound, ARC_TOLERANCE);
                     Polylines rail = intersection_pl(to_polylines(grown), near_edge);
-                    if (!rail.empty()) {
-                        rail = intersection_pl(rail, boundary_m);
-                        join_end_to_end(rail);    // a closed contour comes back split at its start vertex
-                        for (Polyline &piece : rail)
-                            if (piece.length() >= scale_(w - 1e-4))
-                                rails.push_back(std::move(piece));
-                    }
+                    if (rail.empty())
+                        break;    // no curve at this distance, nor beyond it: the band ends with the curves that exist
+                    rail = intersection_pl(rail, boundary_m);
+                    join_end_to_end(rail);    // a closed contour comes back split at its start vertex
+                    for (Polyline &piece : rail)
+                        if (piece.length() >= scale_(w - 1e-4))
+                            rails.push_back(std::move(piece));
                     if (i + 1 == N)
                         append(band, intersection_ex(diff_ex(grown, upper.may_print), near_edge));
                 }
@@ -977,6 +977,35 @@ private:
                             lo = bl;
                         if (bh_crossing && bh - hi <= carry)
                             hi = bh;
+                        // A band (3.9b) ending on a boundary crossing of its centre line: each sub-line meets the boundary at its own
+                        // place (staggered by o cot φ where a wall runs at φ to the trace) and the filler clips each on its own, so
+                        // the band runs on to the farthest sub-line's crossing within G_b, and every sub-line ends on the boundary,
+                        // anchored as a bulk line's end. Nothing to add at N = 1.
+                        if (lattice.multiline > 1) {
+                            const auto farthest = [&](double crossing, int outward) {
+                                double reached = crossing;
+                                const double probe_lo = outward < 0 ? crossing - (plane.gap - MU) : crossing - w;
+                                const double probe_hi = outward < 0 ? crossing + w : crossing + (plane.gap - MU);
+                                for (const double o : lattice.subline_offsets()) {
+                                    const Vec2d shift = o * lattice.normal(key.family);
+                                    const Point pa = lattice.scaled(t.point(probe_lo) + shift), pb = lattice.scaled(t.point(probe_hi) + shift);
+                                    const auto in = boundary.index.segment_inside(pa, pb);
+                                    if (in.empty())
+                                        continue;
+                                    // The interval holding the probe's inner end; its other end is this sub-line's crossing.
+                                    const auto &inner = outward < 0 ? in.back() : in.front();
+                                    if (outward < 0 && inner.second >= 1. - 1e-9 && inner.first > 1e-9)
+                                        reached = std::min(reached, probe_lo + inner.first * (probe_hi - probe_lo));
+                                    if (outward > 0 && inner.first <= 1e-9 && inner.second < 1. - 1e-9)
+                                        reached = std::max(reached, probe_lo + inner.second * (probe_hi - probe_lo));
+                                }
+                                return reached;
+                            };
+                            if (bl_crossing && lo == bl)
+                                lo = farthest(bl, -1);
+                            if (bh_crossing && hi == bh)
+                                hi = farthest(bh, +1);
+                        }
                         if (hi - lo < w - 1e-4) {
                             // Lengthen to a bead, centred, then shifted inside the boundary interval.
                             const double mid = 0.5 * (lo + hi);
