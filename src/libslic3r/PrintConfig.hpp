@@ -90,6 +90,7 @@ enum InfillPattern : int {
     ipHilbertCurve, ipArchimedeanChords, ipOctagramSpiral, ipSupportCubic, ipSupportBase, ipConcentricInternal,
     ipLightning, ipCrossHatch, ipZigZag, ipCrossZag,ipFloatingConcentric, ipLockedZag, ip2DLattice,
     ipIroningArchimedeanSpiral, ipGlobalMonotonicLine,
+    ipBridgeAwareCubic,
     ipCount,
 };
 
@@ -1125,6 +1126,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat, infill_lock_depth))
     ((ConfigOptionFloat, skin_infill_depth))
     ((ConfigOptionEnum<InfillPattern>, sparse_infill_pattern))
+    ((ConfigOptionFloat, bridge_aware_cubic_max_gap))
     ((ConfigOptionBool, conformal_infill))
     ((ConfigOptionEnum<ConformalStagger>, conformal_stagger))
     ((ConfigOptionInt, conformal_link_keep_layers))

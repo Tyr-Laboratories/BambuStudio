@@ -1,0 +1,232 @@
+{
+  "ams_nozzle_idx": {
+    "fork": null,
+    "official": "0",
+    "reason": "The fixture has an existing empty extruder_ams_count list; get_effective_ams_nozzle_idx finds no positive AMS count and returns -1, so the observed zero default is inactive. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "aux_fan_independent_control": {
+    "fork": null,
+    "official": "0",
+    "reason": "Auxiliary hardware is disabled, producing no auxiliary/optional fan slots. The standard-side setting is GUI-only. The unconditional optional-speed maximum is neutral only at exact optional speed zero together with additional speed zero; scripts must remain exact and must not interpolate these settings. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "aux_fan_standard_side": {
+    "fork": null,
+    "official": "right",
+    "reason": "Auxiliary hardware is disabled, producing no auxiliary/optional fan slots. The standard-side setting is GUI-only. The unconditional optional-speed maximum is neutral only at exact optional speed zero together with additional speed zero; scripts must remain exact and must not interpolate these settings. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "bridge_acceleration": {
+    "fork": "0",
+    "official": null,
+    "reason": "Exact zero bypasses the fork bridge-acceleration override; official bridge override is compiled out. Ordinary acceleration settings remain subject to full parity. Require effective zero at every selected nozzle. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "bridge_layer_density": {
+    "fork": "100%",
+    "official": null,
+    "reason": "Exact 100% becomes 1.f; both added spacing and initial-position branches require density below 1.f and are skipped. Reduced bridge density is not covered. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "bridge_line_travel_extend": {
+    "fork": "15%",
+    "official": null,
+    "reason": "Exact bridge overlap 15% equals ordinary infill_wall_overlap 15% on the identical calculation basis. The equal-overlap branch copies the ordinary infill footprint; zero overlap delta skips subsequent adjustment, matching official behavior. This exception requires both values to remain 15%. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "close_optional_fan_first_x_layers": {
+    "fork": null,
+    "official": "1",
+    "reason": "Auxiliary hardware is disabled, producing no auxiliary/optional fan slots. The standard-side setting is GUI-only. The unconditional optional-speed maximum is neutral only at exact optional speed zero together with additional speed zero; scripts must remain exact and must not interpolate these settings. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "default_wipe_tower_pos": {
+    "fork": null,
+    "official": "0.644,0.977",
+    "reason": "The exact normalized default equals the same literal fallback when absent. Tower and wrapping are disabled; arrangement/orientation and duplication are absent, and one filament prevents the no-arrange multi-filament fallback. This field has CLI consumers and is not classified as GUI-only. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "extra_wall_slope_angle": {
+    "fork": "0",
+    "official": null,
+    "reason": "Exact zero disables slope-wall preparation and fails the positive-threshold reinforcement predicate; no wall painting is present in these fixtures. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "extruder_nozzle_count": {
+    "fork": null,
+    "official": "1",
+    "reason": "The exact additions describe the same sole 0.4 mm Standard nozzle already specified by ordinary nozzle settings. The singleton ToolOrdering route bypasses multi-slot grouping; if consulted, the per-slot list reconstructs that identical sole nozzle. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "extruder_nozzle_diameter": {
+    "fork": null,
+    "official": "0.4",
+    "reason": "The exact additions describe the same sole 0.4 mm Standard nozzle already specified by ordinary nozzle settings. The singleton ToolOrdering route bypasses multi-slot grouping; if consulted, the per-slot list reconstructs that identical sole nozzle. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "extruder_nozzle_volume_type": {
+    "fork": null,
+    "official": "Standard",
+    "reason": "The exact additions describe the same sole 0.4 mm Standard nozzle already specified by ordinary nozzle settings. The singleton ToolOrdering route bypasses multi-slot grouping; if consulted, the per-slot list reconstructs that identical sole nozzle. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "filament_diameter_map": {
+    "fork": null,
+    "official": "",
+    "reason": "The exact empty per-filament diameter selection falls back to ordinary nozzle_diameter=0.4; there is one nozzle and no alternate diameter selection. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "filament_idle_travel_cooling_enabled": {
+    "fork": null,
+    "official": "1",
+    "reason": "The operative cooling use is within wipe-tower tool changes under handle_hotend_as_extruder. Both the tower and that hotend mode are disabled. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "filament_pre_heating_enabled": {
+    "fork": null,
+    "official": "1",
+    "reason": "The pre-cooling/heating injector receiving this exact default is constructed and run only when enable_pre_heating is true; the fixture has it disabled. Scripts must remain exact without interpolation of the option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "filament_prime_tower_speed_factor_curve": {
+    "fork": null,
+    "official": "\"\"",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "fins_extrude_safe_temp": {
+    "fork": null,
+    "official": "0",
+    "reason": "Exact zero is the documented disabled value. Fixture scripts remain exact and do not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "first_x_layer_optional_fan_speed": {
+    "fork": null,
+    "official": "0",
+    "reason": "Auxiliary hardware is disabled, producing no auxiliary/optional fan slots. The standard-side setting is GUI-only. The unconditional optional-speed maximum is neutral only at exact optional speed zero together with additional speed zero; scripts must remain exact and must not interpolate these settings. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "flow_above_internal_bridges": {
+    "fork": "100%",
+    "official": null,
+    "reason": "Exact 100% leaves bridge_flow_mask (src/libslic3r/Fill/Fill.cpp) empty: it returns at once when every region's value is 100, so no solid fill above a bridge changes its flow. Other values are not covered. Added 9 November 2026: the option came to the fork's master after the baseline review; reviewed against that function. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "handle_hotend_as_extruder": {
+    "fork": null,
+    "official": "0",
+    "reason": "Exact false disables single-extruder multi-nozzle handling and filament variant override alignment; ordinary singleton-nozzle behavior remains. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "hotend_cooling_rate_on_rack": {
+    "fork": null,
+    "official": "2",
+    "reason": "The pre-cooling/heating injector receiving this exact default is constructed and run only when enable_pre_heating is true; the fixture has it disabled. Scripts must remain exact without interpolation of the option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "internal_bridge_layers": {
+    "fork": "1",
+    "official": null,
+    "reason": "Exact one in all applicable regions does not prepare extra bridge layers; the added routine immediately returns on its empty input and ordinary bridge_over_infill remains. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "min_temperature_when_ec": {
+    "fork": null,
+    "official": "-1",
+    "reason": "The pre-cooling/heating injector receiving this exact default is constructed and run only when enable_pre_heating is true; the fixture has it disabled. Scripts must remain exact without interpolation of the option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "optional_cooling_fan_speed": {
+    "fork": null,
+    "official": "0",
+    "reason": "Auxiliary hardware is disabled, producing no auxiliary/optional fan slots. The standard-side setting is GUI-only. The unconditional optional-speed maximum is neutral only at exact optional speed zero together with additional speed zero; scripts must remain exact and must not interpolate these settings. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "optional_fan_full_speed_layer": {
+    "fork": null,
+    "official": "0",
+    "reason": "Auxiliary hardware is disabled, producing no auxiliary/optional fan slots. The standard-side setting is GUI-only. The unconditional optional-speed maximum is neutral only at exact optional speed zero together with additional speed zero; scripts must remain exact and must not interpolate these settings. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "painted_wall_loops": {
+    "fork": "2",
+    "official": null,
+    "reason": "Exact two is unused because archive wall paint is absent and slope angle is zero; no boundary painting policy is bound and ordinary wall_loops remains effective. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_acceleration": {
+    "fork": null,
+    "official": "0",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_feedrate_factor": {
+    "fork": null,
+    "official": "1",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_ironing_speed": {
+    "fork": null,
+    "official": "10",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_line_ironing": {
+    "fork": null,
+    "official": "1",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_line_width": {
+    "fork": null,
+    "official": "0",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_ramming_line_width": {
+    "fork": null,
+    "official": "0",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_side_scrape": {
+    "fork": null,
+    "official": "0",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_side_scrape_along_length": {
+    "fork": null,
+    "official": "2",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_side_scrape_face": {
+    "fork": null,
+    "official": "front_back",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_side_scrape_height": {
+    "fork": null,
+    "official": "1.5",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_side_scrape_length": {
+    "fork": null,
+    "official": "2",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_side_scrape_point_spacing": {
+    "fork": null,
+    "official": "1",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_side_scrape_speed": {
+    "fork": null,
+    "official": "1400",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_side_scrape_wall_gap": {
+    "fork": null,
+    "official": "0.2",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_tail_slowdown_volume": {
+    "fork": null,
+    "official": "10",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_tail_speed_factor": {
+    "fork": null,
+    "official": "100%",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_wipe_distance": {
+    "fork": null,
+    "official": "0",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "prime_tower_wipe_speed": {
+    "fork": null,
+    "official": "0",
+    "reason": "Prime tower is disabled, so no tower generation or emission uses this exact observed value. Side scraping is also disabled, including its margin calculation. Scripts must remain exact and must not interpolate this option. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "sync_auxiliary_fan_to_second_fan": {
+    "fork": null,
+    "official": "0",
+    "reason": "Auxiliary hardware is disabled, producing no auxiliary/optional fan slots. The standard-side setting is GUI-only. The unconditional optional-speed maximum is neutral only at exact optional speed zero together with additional speed zero; scripts must remain exact and must not interpolate these settings. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  },
+  "tree_support_tip_diameter": {
+    "fork": null,
+    "official": "0.8",
+    "reason": "Support generation is disabled by enable_support=0, enforce_support_layers=0, and raft_layers=0, so this exact tree-tip default is unused. Exact observed official/fork pair; all referenced guard predicates remain mandatory."
+  }
+}

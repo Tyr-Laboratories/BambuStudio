@@ -1,0 +1,959 @@
+{
+  "exception_file": "scripts/bridge_aware_cubic_benchmark/baselines/official-2.9.1.70/intended_exceptions.json",
+  "exception_file_sha256": "394f8684d9b42a8a4d3251596d3a8cf075da53b182e65a51c63d3dd37b04788c",
+  "exceptions": {
+    "ams_nozzle_idx": {
+      "guard_groups": [
+        "single_nozzle",
+        "ams_absent"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L1176"
+      ]
+    },
+    "aux_fan_independent_control": {
+      "guard_groups": [
+        "fans_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L8284",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.hpp#L798",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeEditor.cpp#L470",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1472"
+      ]
+    },
+    "aux_fan_standard_side": {
+      "guard_groups": [
+        "fans_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L8284",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.hpp#L798",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeEditor.cpp#L470",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1472"
+      ]
+    },
+    "bridge_acceleration": {
+      "guard_groups": [
+        "bridge_defaults"
+      ],
+      "source_refs": [
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/GCode.cpp#L7236",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode.cpp#L7646"
+      ]
+    },
+    "bridge_layer_density": {
+      "guard_groups": [
+        "bridge_defaults"
+      ],
+      "source_refs": [
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/Fill/Fill.cpp#L317",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/Fill/FillRectilinear.cpp#L2880",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/Fill/FillRectilinear.cpp#L2890",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Fill/FillRectilinear.cpp#L2859"
+      ]
+    },
+    "bridge_line_travel_extend": {
+      "guard_groups": [
+        "bridge_defaults"
+      ],
+      "source_refs": [
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/PerimeterGenerator.cpp#L1525",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/PerimeterGenerator.cpp#L1555",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/Fill/Fill.cpp#L419",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/LayerRegion.cpp#L76",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PerimeterGenerator.cpp#L1409"
+      ]
+    },
+    "close_optional_fan_first_x_layers": {
+      "guard_groups": [
+        "fans_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L8284",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.hpp#L798",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeEditor.cpp#L470",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1472"
+      ]
+    },
+    "default_wipe_tower_pos": {
+      "guard_groups": [
+        "tower_disabled",
+        "single_nozzle",
+        "fixed_placement"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L4295",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/slic3r/GUI/PartPlate.cpp#L102",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L5979"
+      ]
+    },
+    "different_settings_to_system": {
+      "guard_groups": [
+        "empty_inheritance",
+        "single_nozzle",
+        "fixed_configuration"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L2341",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L2224",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L3597"
+      ]
+    },
+    "extra_wall_slope_angle": {
+      "guard_groups": [
+        "unpainted_walls"
+      ],
+      "source_refs": [
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/WallPaintingSlice.cpp#L15",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/WallPainting.cpp#L183"
+      ]
+    },
+    "extruder_nozzle_count": {
+      "guard_groups": [
+        "single_nozzle"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/MultiNozzleUtils.cpp#L36",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1694",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L3798"
+      ]
+    },
+    "extruder_nozzle_diameter": {
+      "guard_groups": [
+        "single_nozzle"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/MultiNozzleUtils.cpp#L36",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1694",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L3798"
+      ]
+    },
+    "extruder_nozzle_volume_type": {
+      "guard_groups": [
+        "single_nozzle"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/MultiNozzleUtils.cpp#L36",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1694",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L3798"
+      ]
+    },
+    "filament_diameter_map": {
+      "guard_groups": [
+        "single_nozzle"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L454",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L11594"
+      ]
+    },
+    "filament_idle_travel_cooling_enabled": {
+      "guard_groups": [
+        "tower_disabled",
+        "single_nozzle",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L3542"
+      ]
+    },
+    "filament_map_2": {
+      "guard_groups": [
+        "single_nozzle",
+        "derived_maps"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3271",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L9133",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode.cpp#L2719",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/Print.cpp#L3086"
+      ]
+    },
+    "filament_nozzle_map": {
+      "guard_groups": [
+        "single_nozzle",
+        "derived_maps"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1694",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L2634",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L3609",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/MultiNozzleUtils.cpp#L515",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3258"
+      ]
+    },
+    "filament_pre_heating_enabled": {
+      "guard_groups": [
+        "preheating_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeProcessor.cpp#L1206"
+      ]
+    },
+    "filament_prime_tower_speed_factor_curve": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "fins_extrude_safe_temp": {
+      "guard_groups": [
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L3630"
+      ]
+    },
+    "first_x_layer_optional_fan_speed": {
+      "guard_groups": [
+        "fans_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L8284",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.hpp#L798",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeEditor.cpp#L470",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1472"
+      ]
+    },
+    "flow_above_internal_bridges": {
+      "guard_groups": [
+        "bridge_defaults"
+      ],
+      "source_refs": [
+        "src/libslic3r/Fill/Fill.cpp (bridge_flow_mask: an empty mask when every region's value is 100) at the rewrite branch's commit that records this exception"
+      ]
+    },
+    "handle_hotend_as_extruder": {
+      "guard_groups": [
+        "single_nozzle"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L1199",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L10512"
+      ]
+    },
+    "hotend_cooling_rate_on_rack": {
+      "guard_groups": [
+        "preheating_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeProcessor.cpp#L1206"
+      ]
+    },
+    "internal_bridge_layers": {
+      "guard_groups": [
+        "bridge_defaults"
+      ],
+      "source_refs": [
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/PrintObject.cpp#L1055",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/PrintObject.cpp#L3674",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintObject.cpp#L1039"
+      ]
+    },
+    "min_temperature_when_ec": {
+      "guard_groups": [
+        "preheating_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeProcessor.cpp#L1206"
+      ]
+    },
+    "optional_cooling_fan_speed": {
+      "guard_groups": [
+        "fans_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L8284",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.hpp#L798",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeEditor.cpp#L470",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1472"
+      ]
+    },
+    "optional_fan_full_speed_layer": {
+      "guard_groups": [
+        "fans_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L8284",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.hpp#L798",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeEditor.cpp#L470",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1472"
+      ]
+    },
+    "painted_wall_loops": {
+      "guard_groups": [
+        "unpainted_walls"
+      ],
+      "source_refs": [
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/WallPaintingSlice.cpp#L16",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/PerimeterGenerator.cpp#L1007",
+        "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/PerimeterGenerator.cpp#L1021"
+      ]
+    },
+    "prime_tower_acceleration": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_feedrate_factor": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_ironing_speed": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_line_ironing": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_line_width": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_ramming_line_width": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_side_scrape": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_side_scrape_along_length": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_side_scrape_face": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_side_scrape_height": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_side_scrape_length": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_side_scrape_point_spacing": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_side_scrape_speed": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_side_scrape_wall_gap": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_tail_slowdown_volume": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_tail_speed_factor": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_wipe_distance": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "prime_tower_wipe_speed": {
+      "guard_groups": [
+        "tower_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.cpp#L3655",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/WipeTower.cpp#L52"
+      ]
+    },
+    "print_compatible_printers": {
+      "guard_groups": [
+        "empty_inheritance",
+        "fixed_configuration"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L2301",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L2345",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L2222"
+      ]
+    },
+    "printer_technology": {
+      "guard_groups": [
+        "fff_only",
+        "fixed_configuration"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L1522",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L4482"
+      ]
+    },
+    "sync_auxiliary_fan_to_second_fan": {
+      "guard_groups": [
+        "fans_disabled",
+        "exact_scripts"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L8284",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.hpp#L798",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/GCodeEditor.cpp#L470",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/GCode/ToolOrdering.cpp#L1472"
+      ]
+    },
+    "tree_support_tip_diameter": {
+      "guard_groups": [
+        "support_disabled"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/Print.hpp#L524",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintObject.cpp#L1358"
+      ]
+    },
+    "upward_compatible_machine": {
+      "guard_groups": [
+        "empty_inheritance",
+        "fixed_configuration"
+      ],
+      "source_refs": [
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L2301",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/libslic3r/PrintConfig.cpp#L2345",
+        "https://github.com/bambulab/BambuStudio/blob/v02.09.01.70/src/BambuStudio.cpp#L2222"
+      ]
+    }
+  },
+  "fixture_manifest": "tests/data/bridge_aware_cubic_benchmark/projects/manifest.json",
+  "fixture_manifest_sha256": "620e12595d8b42770c2d2efad2e2ea1a4714446d3f2485966394693e7a3e2d9f",
+  "fork_exception_source_refs": {
+    "different_settings_to_system": [
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/BambuStudio.cpp#L2086",
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/BambuStudio.cpp#L3252"
+    ],
+    "filament_map_2": [
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/Print.cpp#L3086",
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/GCode.cpp#L2572"
+    ],
+    "filament_nozzle_map": [
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/GCode/ToolOrdering.cpp#L2804",
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/libslic3r/Print.cpp#L3074"
+    ],
+    "print_compatible_printers": [
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/BambuStudio.cpp#L2085"
+    ],
+    "printer_technology": [
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/BambuStudio.cpp#L4141"
+    ],
+    "upward_compatible_machine": [
+      "https://github.com/Tyr-Laboratories/BambuStudio/blob/8c482d39a17a1fc511ebf461937ba3721dc6d089/src/BambuStudio.cpp#L2084"
+    ]
+  },
+  "guard_groups": {
+    "ams_absent": {
+      "both_emitted_exact": {
+        "extruder_ams_count": ""
+      },
+      "input_exact": {
+        "extruder_ams_count": ""
+      },
+      "official_emitted_exact": {
+        "ams_nozzle_idx": "0"
+      }
+    },
+    "bridge_defaults": {
+      "archive_predicates": [
+        "Every local override of these five fork-only controls equals the specified global value (flow_above_internal_bridges, added 9 November 2026, when present)."
+      ],
+      "both_emitted_exact": {
+        "infill_wall_overlap": "15%"
+      },
+      "fork_emitted_exact": {
+        "bridge_acceleration": "0",
+        "bridge_layer_density": "100%",
+        "bridge_line_travel_extend": "15%",
+        "flow_above_internal_bridges": "100%",
+        "internal_bridge_layers": "1"
+      },
+      "input_exact": {
+        "bridge_acceleration": "0",
+        "bridge_layer_density": "100%",
+        "bridge_line_travel_extend": "15%",
+        "infill_wall_overlap": "15%",
+        "internal_bridge_layers": "1"
+      },
+      "input_new_default_exact_if_present": {
+        "flow_above_internal_bridges": "100%"
+      }
+    },
+    "derived_maps": {
+      "both_emitted_exact": {
+        "filament_map_2": "0",
+        "filament_nozzle_map": "0"
+      },
+      "input_exact": {
+        "filament_map_2": "1",
+        "filament_nozzle_map": "1"
+      },
+      "note": "Both engines derive exact zero and both successful observed outputs confirm it; six exact fork intended transformations are approved."
+    },
+    "empty_inheritance": {
+      "both_emitted_exact": {
+        "inherits": ""
+      },
+      "input_exact": {
+        "inherits": ""
+      },
+      "input_semantic_vector_equals": {
+        "inherits_group": [
+          "",
+          "",
+          ""
+        ]
+      },
+      "official_emitted_exact": {
+        "different_settings_to_system": ";;",
+        "inherits_group": ";;",
+        "print_compatible_printers": "",
+        "upward_compatible_machine": ""
+      }
+    },
+    "exact_scripts": {
+      "fixture_predicates": [
+        "All script values match the fixture manifest exactly.",
+        "No custom script interpolates an excepted inactive key or max_additional_fan."
+      ],
+      "script_fingerprints_by_archive": {
+        "large-bridgeawarecubic.3mf": {
+          "keys": [
+            "before_layer_change_gcode",
+            "change_filament_gcode",
+            "filament_end_gcode",
+            "filament_start_gcode",
+            "layer_change_gcode",
+            "machine_end_gcode",
+            "machine_pause_gcode",
+            "machine_start_gcode",
+            "printing_by_object_gcode",
+            "template_custom_gcode",
+            "time_lapse_gcode",
+            "wrapping_detection_gcode"
+          ],
+          "sha256": "7dbc5dc58365ef1562622412b6998c8f8529c8dcebb71ee29cc99316438170cf"
+        },
+        "large-cubic.3mf": {
+          "keys": [
+            "before_layer_change_gcode",
+            "change_filament_gcode",
+            "filament_end_gcode",
+            "filament_start_gcode",
+            "layer_change_gcode",
+            "machine_end_gcode",
+            "machine_pause_gcode",
+            "machine_start_gcode",
+            "printing_by_object_gcode",
+            "template_custom_gcode",
+            "time_lapse_gcode",
+            "wrapping_detection_gcode"
+          ],
+          "sha256": "7dbc5dc58365ef1562622412b6998c8f8529c8dcebb71ee29cc99316438170cf"
+        },
+        "modifier-bridgeawarecubic.3mf": {
+          "keys": [
+            "before_layer_change_gcode",
+            "change_filament_gcode",
+            "filament_end_gcode",
+            "filament_start_gcode",
+            "layer_change_gcode",
+            "machine_end_gcode",
+            "machine_pause_gcode",
+            "machine_start_gcode",
+            "printing_by_object_gcode",
+            "template_custom_gcode",
+            "time_lapse_gcode",
+            "wrapping_detection_gcode"
+          ],
+          "sha256": "b69085215cb0db73efcae3caf1d2853052e50e9b4279fbec6d747ef84cca8cfe"
+        },
+        "modifier-cubic.3mf": {
+          "keys": [
+            "before_layer_change_gcode",
+            "change_filament_gcode",
+            "filament_end_gcode",
+            "filament_start_gcode",
+            "layer_change_gcode",
+            "machine_end_gcode",
+            "machine_pause_gcode",
+            "machine_start_gcode",
+            "printing_by_object_gcode",
+            "template_custom_gcode",
+            "time_lapse_gcode",
+            "wrapping_detection_gcode"
+          ],
+          "sha256": "b69085215cb0db73efcae3caf1d2853052e50e9b4279fbec6d747ef84cca8cfe"
+        },
+        "rib-bridgeawarecubic.3mf": {
+          "keys": [
+            "before_layer_change_gcode",
+            "change_filament_gcode",
+            "filament_end_gcode",
+            "filament_start_gcode",
+            "layer_change_gcode",
+            "machine_end_gcode",
+            "machine_pause_gcode",
+            "machine_start_gcode",
+            "printing_by_object_gcode",
+            "template_custom_gcode",
+            "time_lapse_gcode",
+            "wrapping_detection_gcode"
+          ],
+          "sha256": "b69085215cb0db73efcae3caf1d2853052e50e9b4279fbec6d747ef84cca8cfe"
+        },
+        "rib-cubic.3mf": {
+          "keys": [
+            "before_layer_change_gcode",
+            "change_filament_gcode",
+            "filament_end_gcode",
+            "filament_start_gcode",
+            "layer_change_gcode",
+            "machine_end_gcode",
+            "machine_pause_gcode",
+            "machine_start_gcode",
+            "printing_by_object_gcode",
+            "template_custom_gcode",
+            "time_lapse_gcode",
+            "wrapping_detection_gcode"
+          ],
+          "sha256": "b69085215cb0db73efcae3caf1d2853052e50e9b4279fbec6d747ef84cca8cfe"
+        },
+        "small-bridgeawarecubic.3mf": {
+          "keys": [
+            "before_layer_change_gcode",
+            "change_filament_gcode",
+            "filament_end_gcode",
+            "filament_start_gcode",
+            "layer_change_gcode",
+            "machine_end_gcode",
+            "machine_pause_gcode",
+            "machine_start_gcode",
+            "printing_by_object_gcode",
+            "template_custom_gcode",
+            "time_lapse_gcode",
+            "wrapping_detection_gcode"
+          ],
+          "sha256": "7dbc5dc58365ef1562622412b6998c8f8529c8dcebb71ee29cc99316438170cf"
+        },
+        "small-cubic.3mf": {
+          "keys": [
+            "before_layer_change_gcode",
+            "change_filament_gcode",
+            "filament_end_gcode",
+            "filament_start_gcode",
+            "layer_change_gcode",
+            "machine_end_gcode",
+            "machine_pause_gcode",
+            "machine_start_gcode",
+            "printing_by_object_gcode",
+            "template_custom_gcode",
+            "time_lapse_gcode",
+            "wrapping_detection_gcode"
+          ],
+          "sha256": "7dbc5dc58365ef1562622412b6998c8f8529c8dcebb71ee29cc99316438170cf"
+        }
+      }
+    },
+    "fans_disabled": {
+      "both_emitted_exact": {
+        "additional_cooling_fan_speed": "0",
+        "auxiliary_fan": "0"
+      },
+      "input_exact": {
+        "additional_cooling_fan_speed": "0",
+        "auxiliary_fan": "0"
+      },
+      "official_emitted_exact": {
+        "aux_fan_independent_control": "0",
+        "aux_fan_standard_side": "right",
+        "close_optional_fan_first_x_layers": "1",
+        "first_x_layer_optional_fan_speed": "0",
+        "optional_cooling_fan_speed": "0",
+        "optional_fan_full_speed_layer": "0",
+        "sync_auxiliary_fan_to_second_fan": "0"
+      }
+    },
+    "fff_only": {
+      "fixture_predicates": [
+        "FFF fixture generator and FFF Print path; no technology override."
+      ],
+      "official_emitted_exact": {
+        "printer_technology": "FFF"
+      }
+    },
+    "fixed_configuration": {
+      "invocation_predicates": [
+        "One reviewed embedded project snapshot, no load-settings or load-filaments overrides.",
+        "No uptodate/uptodate-settings/uptodate-filaments or preset update option.",
+        "Keep all CLI validity checks enabled.",
+        "All non-excepted effective settings must match the intended serialized snapshot exactly."
+      ]
+    },
+    "fixed_placement": {
+      "cli_exact": {
+        "arrange": "0",
+        "orient": "0"
+      },
+      "invocation_predicates": [
+        "No duplication/repetitions transform.",
+        "One plate and the exact reviewed object placement."
+      ]
+    },
+    "preheating_disabled": {
+      "both_emitted_exact": {
+        "enable_pre_heating": "0"
+      },
+      "input_exact": {
+        "enable_pre_heating": "0"
+      }
+    },
+    "single_nozzle": {
+      "archive_predicates": [
+        "Exactly one used filament.",
+        "Every object/volume material assignment resolves to the same sole filament."
+      ],
+      "both_emitted_exact": {
+        "extruder_max_nozzle_count": "1",
+        "extruder_type": "Direct Drive",
+        "filament_map": "1",
+        "filament_map_mode": "Auto For Flush",
+        "filament_volume_map": "0",
+        "has_filament_switcher": "0",
+        "master_extruder_id": "1",
+        "nozzle_diameter": "0.4",
+        "nozzle_volume_type": "Standard",
+        "print_extruder_id": "1",
+        "print_extruder_variant": "\"Direct Drive Standard\"",
+        "print_sequence": "by layer",
+        "single_extruder_multi_material": "0"
+      },
+      "input_exact": {
+        "extruder_max_nozzle_count": "1",
+        "extruder_type": "Direct Drive",
+        "filament_map": "1",
+        "filament_map_mode": "Auto For Flush",
+        "filament_volume_map": "0",
+        "has_filament_switcher": "0",
+        "master_extruder_id": "1",
+        "nozzle_diameter": "0.4",
+        "nozzle_volume_type": "Standard",
+        "print_extruder_id": "1",
+        "print_extruder_variant": "\"Direct Drive Standard\"",
+        "print_sequence": "by layer",
+        "single_extruder_multi_material": "0"
+      },
+      "official_emitted_exact": {
+        "extruder_nozzle_count": "1",
+        "extruder_nozzle_diameter": "0.4",
+        "extruder_nozzle_volume_type": "Standard",
+        "filament_diameter_map": "",
+        "handle_hotend_as_extruder": "0"
+      }
+    },
+    "support_disabled": {
+      "archive_predicates": [
+        "No local support or raft enablement."
+      ],
+      "both_emitted_exact": {
+        "enable_support": "0",
+        "enforce_support_layers": "0",
+        "raft_layers": "0"
+      },
+      "input_exact": {
+        "enable_support": "0",
+        "enforce_support_layers": "0",
+        "raft_layers": "0"
+      }
+    },
+    "tower_disabled": {
+      "both_emitted_exact": {
+        "enable_prime_tower": "0",
+        "enable_wrapping_detection": "0"
+      },
+      "input_exact": {
+        "enable_prime_tower": "0",
+        "enable_wrapping_detection": "0"
+      },
+      "official_emitted_exact": {
+        "prime_tower_side_scrape": "0"
+      }
+    },
+    "unpainted_walls": {
+      "archive_predicates": [
+        "No painted wall facets.",
+        "Every local extra_wall_slope_angle override is zero.",
+        "Every local painted_wall_loops override is two."
+      ],
+      "fork_emitted_exact": {
+        "extra_wall_slope_angle": "0",
+        "painted_wall_loops": "2"
+      },
+      "input_exact": {
+        "extra_wall_slope_angle": "0",
+        "painted_wall_loops": "2"
+      }
+    }
+  },
+  "guard_module": "scripts/bridge_aware_cubic_benchmark/reviewed_exception_guards.py",
+  "guard_module_sha256": "434730f83c570eab4a2b4c4d3d88f23467ad294d822173f4168e48cfaa6aea35",
+  "historical_observation_scope": "The observation hashes and validation flags describe the reviewed diagnostic outputs and parser-reference inputs. They do not establish performance qualification or describe a later executable.",
+  "notes": [
+    "Authoritative v4 official preflight exited successfully and supplied valid G-code; performance qualification still requires paired parity, complete family runs and repeated timing.",
+    "Historical v2 52-difference artifacts are preserved separately; authoritative v4 has 51 because inherits_group now agrees exactly as ;;.",
+    "Guard predicates are supplied separately because the current intended-exception loader accepts only expected/actual/reason fields. The harness owner must enforce them; the exception JSON alone is insufficient for qualification.",
+    "The fork BAC diagnostic now confirms all six shared CLI transformations. These are configuration/parity approvals only; no repeated benchmark timing or release-gate pass is established.",
+    "9 November 2026 (rewrite branch): flow_above_internal_bridges, which the fork's master added after this review, is excepted at exactly 100% on the official side and in parity (official null, fork 100%), guarded as a new default (NEW_EXACT_IF_PRESENT, FORK_EXACT_IF_PRESENT, GOVERNED_KEYS): at 100% bridge_flow_mask in src/libslic3r/Fill/Fill.cpp returns an empty mask. The counts and hashes below were updated with it; the observed official configuration was not re-recorded."
+  ],
+  "observed_difference_sha256": "8fc939167cb2f2a5084a0b2e26b53ddfc7e7db05fba2e419c769396b7b045659",
+  "observed_fork_emitted_config": "tests/data/bridge_aware_cubic_benchmark/fork-emitted-config.json",
+  "observed_fork_emitted_config_sha256": "9898765bd06dffebd32ea973952de5cbbdd05b263bdd5e0d368604effd5f07ca",
+  "observed_official_emitted_config": "tests/data/bridge_aware_cubic_benchmark/official-emitted-config.json",
+  "observed_official_gcode_sha256": "003ca563b4161830a0b3f51e3ac97f0bec4b7a0669c86a1597c045534b8a6e26",
+  "official_tag": "v02.09.01.70",
+  "parity_exception_file": "scripts/bridge_aware_cubic_benchmark/baselines/official-2.9.1.70/parity_exceptions.json",
+  "parity_exception_sha256": "384cbb3c2d44e466969d9d5657667a434b39450bd4f6d148af7b3800fa4f0635",
+  "repository_paths_relative_to": "repository root",
+  "reviewed_difference_count": {
+    "fork": 6,
+    "official": 52
+  },
+  "reviewed_parity_difference_count": 46,
+  "schema_version": 1,
+  "scope": "Exact observed expected/actual pairs only; every referenced guard group must be enforced. This file does not waive timing, output validity, or unreviewed configuration differences.",
+  "source_reference_scope": "Official references use v02.09.01.70; fork references use the reviewed functional checkpoint 8c482d39a17a1fc511ebf461937ba3721dc6d089. Re-review exceptions when these relevant semantics change.",
+  "validation": {
+    "all_51_differences_have_exact_reason_and_guards": true,
+    "all_input_exact_guards_checked_against_all_8_v2_fixture_records": true,
+    "all_observed_nonpattern_parity_differences_covered_exactly": true,
+    "all_observed_official_and_fork_intended_differences_covered_exactly": true,
+    "all_official_guard_values_checked_against_observed_small_gcode": true,
+    "benchmark_release_gate_passed": false,
+    "fork_emitted_output_checked": true,
+    "other_official_emitted_fixtures_checked": false,
+    "pure_guard_module_passed_all_8_inputs_and_official_v4_small_output": true,
+    "pure_guard_negative_checks": 147,
+    "pure_guard_positive_checks": 11
+  }
+}

@@ -123,6 +123,7 @@ endif ()
 # Proposal for C++ unit tests and sandboxes
 option(SLIC3R_BUILD_SANDBOXES   "Build development sandboxes" OFF)
 option(SLIC3R_BUILD_TESTS       "Build unit tests" OFF)
+option(SLIC3R_BAC_DEVELOPMENT_CHECKS "Bridge aware cubic development checks: the verifier and the plan warnings, as non-critical slicing warnings" OFF)
 
 if (IS_CROSS_COMPILE)
     message("Detected cross compilation setup. Tests and encoding checks will be forcedly disabled!")

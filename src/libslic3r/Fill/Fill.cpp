@@ -10,12 +10,15 @@
 #include "../PrintConfig.hpp"
 #include "../Surface.hpp"
 
+#include "Fill.hpp"
 #include "FillBase.hpp"
 #include "FillRectilinear.hpp"
 #include "FillLightning.hpp"
 #include "FillConcentricInternal.hpp"
 #include "FillConcentric.hpp"
 #include "FillFloatingConcentric.hpp"
+#include "FillBridgeAwareCubic.hpp"
+#include "BridgeAwareCubicPlan.hpp"
 
 #define NARROW_INFILL_AREA_THRESHOLD 3
 
@@ -297,7 +300,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 bool support_multiline_infill = params.pattern == ipCubic || params.pattern == ipGrid || params.pattern == ipRectilinear || params.pattern == ipStars ||
                                                 params.pattern == ipAlignedRectilinear || params.pattern == ipGyroid || params.pattern == ipHoneycomb ||
                                                 params.pattern == ipLightning || params.pattern == ip3DHoneycomb || params.pattern == ipAdaptiveCubic ||
-                                                params.pattern == ipSupportCubic;
+                                                params.pattern == ipSupportCubic || params.pattern == ipBridgeAwareCubic;
                 params.multiline = (params.extrusion_role == erInternalInfill && support_multiline_infill) ? int(region_config.fill_multiline) : 1;
 
 		        // Calculate the actual flow we'll be using for this infill.
@@ -627,6 +630,18 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 	return surface_fills;
 }
 
+std::vector<SparseIslandOfPattern> sparse_islands_of_pattern(const Layer &layer, InfillPattern pattern)
+{
+    std::vector<SparseIslandOfPattern> out;
+    LockRegionParam lock_param;
+    std::vector<SurfaceFill> fills = group_fills(layer, lock_param);
+    for (SurfaceFill &fill : fills)
+        if (fill.surface.surface_type == stInternal && fill.params.pattern == pattern && fill.params.extrusion_role == erInternalInfill)
+            for (ExPolygon &island : fill.expolygons)
+                out.push_back({ fill.region_id_group, std::move(island) });
+    return out;
+}
+
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
 void export_group_fills_to_svg(const char *path, const std::vector<SurfaceFill> &fills)
 {
@@ -884,6 +899,10 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 			fill_contour->print_config = &this->object()->print()->config();
 			fill_contour->print_object_config = &this->object()->config();
 		}
+		else if (surface_fill.params.pattern == ipBridgeAwareCubic) {
+			if (const BridgeAwareCubic::ObjectPlan *plan = this->object()->bridge_aware_cubic_plan())
+				static_cast<FillBridgeAwareCubic*>(f.get())->bind(*plan, *this);
+		}
         // calculate flow spacing for infill pattern generation
         bool using_internal_flow = ! surface_fill.surface.is_solid() && ! surface_fill.params.bridge;
         double link_max_length = 0.;
@@ -982,6 +1001,9 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 	        collection.entities.push_back(thin_fill->clone());
 	    }
 
+    // Bridge aware cubic: the plan's lines of this layer that no filler printed and nothing covers (section 3.8's pass).
+    BridgeAwareCubic::print_uncovered(*this);
+
 #ifndef NDEBUG
 	for (LayerRegion *layerm : m_regions)
 	    for (size_t i = 0; i < layerm->fills.entities.size(); ++ i)
@@ -1028,6 +1050,7 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
         case ipZigZag:
         case ipCrossZag:
         case ip2DLattice:
+		case ipBridgeAwareCubic:
 		case ipLockedZag: break;
         }
 
@@ -1042,6 +1065,10 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
 
 		if (surface_fill.params.pattern == ipLightning)
 			dynamic_cast<FillLightning::Filler*>(f.get())->generator = lightning_generator;
+		else if (surface_fill.params.pattern == ipBridgeAwareCubic) {
+			if (const BridgeAwareCubic::ObjectPlan *plan = this->object()->bridge_aware_cubic_plan())
+				static_cast<FillBridgeAwareCubic*>(f.get())->bind(*plan, *this);
+		}
 
 		// calculate flow spacing for infill pattern generation
 		double link_max_length = 0.;

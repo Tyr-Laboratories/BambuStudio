@@ -1,3 +1,5 @@
+#include "Fill/BridgeAwareCubicPlan.hpp"
+#include "BridgeAwareCubicVerify.hpp"
 #include "Exception.hpp"
 #include "Print.hpp"
 #include "BoundingBox.hpp"
@@ -1006,6 +1008,9 @@ void PrintObject::prepare_infill()
                         original_sparse[index][region_id].push_back(surface);
         }
     }
+    // Bridge aware cubic plans once, before the bridges, so that the anchoring previews show its lines.
+    this->prepare_bridge_aware_cubic();
+    m_print->throw_if_canceled();
     this->bridge_over_infill();
     this->add_internal_bridge_layers(original_sparse);
     m_print->throw_if_canceled();
@@ -1120,6 +1125,35 @@ static std::vector<std::vector<ExPolygon>> conformal_modifier_islands(const Prin
         if (row.size() > 1)
             row = union_ex(row);
     return out;
+}
+
+const BridgeAwareCubic::ObjectPlan* PrintObject::bridge_aware_cubic_plan() const
+{
+    if (m_shared_object != nullptr)
+        return m_shared_object->bridge_aware_cubic_plan();
+    return m_bridge_aware_cubic_plan.get();
+}
+
+void PrintObject::prepare_bridge_aware_cubic()
+{
+    m_bridge_aware_cubic_plan.reset();
+    bool wanted = false;
+    for (const PrintRegion &region : this->all_regions()) {
+        const PrintRegionConfig &config = region.config();
+        if (config.sparse_infill_pattern.value == ipBridgeAwareCubic && config.sparse_infill_density.value > 0. && config.sparse_infill_density.value < 100.)
+            wanted = true;
+    }
+    if (!wanted)
+        return;
+    BOOST_LOG_TRIVIAL(info) << "Bridge aware cubic plan - Start" << log_memory_info();
+    std::unique_ptr<BridgeAwareCubic::ObjectPlan> plan = BridgeAwareCubic::ObjectPlan::build(*this, [this]() { m_print->throw_if_canceled(); });
+    m_bridge_aware_cubic_plan = std::move(plan);
+    BOOST_LOG_TRIVIAL(info) << "Bridge aware cubic plan - End" << log_memory_info();
+#if SLIC3R_BAC_DEVELOPMENT_CHECKS
+    // Development checks (architecture 5.2): warnings that change no path and stop no slice.
+    for (const std::string &message : BridgeAwareCubic::plan_warnings(*this))
+        this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, message);
+#endif
 }
 
 void PrintObject::infill()
@@ -1371,6 +1405,20 @@ void PrintObject::simplify_extrusion_path()
         );
         m_print->throw_if_canceled();
         BOOST_LOG_TRIVIAL(debug) << "Simplify infill extrusion path of object in parallel - end";
+#if SLIC3R_BAC_DEVELOPMENT_CHECKS
+        // Development check (architecture 5.1): the verifier on the paths as they are exported, and the rails' prediction misses
+        // (5.2) now that the bridges exist.
+        if (m_bridge_aware_cubic_plan != nullptr) {
+            for (const BridgeAwareCubic::PlaneReport &plane : BridgeAwareCubic::verify(*this, [this]() { m_print->throw_if_canceled(); }).planes)
+                if (!plane.passed)
+                    this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                        "Bridge aware cubic, object \"" + this->model_object()->name + "\": " + plane.failure + " at (" + std::to_string(plane.where.x()) + ", " +
+                        std::to_string(plane.where.y()) + ") on the plane at " + std::to_string(plane.z) + " mm under the roof of the layer at " +
+                        std::to_string(this->layers()[plane.roof_layer]->print_z) + " mm");
+            for (const std::string &message : BridgeAwareCubic::rail_warnings(*this))
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, message);
+        }
+#endif
         this->set_done(posSimplifyInfill);
     }
 
@@ -1706,6 +1754,12 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "ensure_vertical_shell_thickness"
             || opt_key == "bridge_angle"
             || opt_key == "internal_bridge_layers"
+            || opt_key == "bridge_aware_cubic_max_gap"
+            // The bridge generator's anchoring preview fills the sparse layer below with the anchor settings, and the bridge aware
+            // cubic plan reads them (its fused ends) and the top surfaces' flow (its printed material): both run in posPrepareInfill.
+            || opt_key == "sparse_infill_anchor"
+            || opt_key == "sparse_infill_anchor_max"
+            || opt_key == "top_surface_line_width"
             //BBS
         ) {
             steps.emplace_back(posPrepareInfill);
@@ -1720,9 +1774,6 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "internal_solid_infill_pattern"
             || opt_key == "sub_top_surface_pattern"
             || opt_key == "external_fill_link_max_length"
-            || opt_key == "sparse_infill_anchor"
-            || opt_key == "sparse_infill_anchor_max"
-            || opt_key == "top_surface_line_width"
             || opt_key == "initial_layer_line_width"
             || opt_key == "detect_floating_vertical_shell") {
             steps.emplace_back(posInfill);
@@ -2920,6 +2971,81 @@ static Polygons construct_anchored_polygon(Polygons bridged_area, Lines anchors,
         }
 
 // This method applies bridge flow to the first internal solid layer above sparse infill.
+// The candidate test of bridge_over_infill: the internal solid surfaces of a layer that the generator will bridge, each with the
+// part of it worth bridging, from the surfaces as they are before the bridges are made. Moved out of bridge_over_infill without a
+// change of behaviour (bridge aware cubic design, 2.3 hook 7), so that the pattern's plan reads the same prediction the generator
+// acts on.
+std::vector<PrintObject::BridgeCandidate> PrintObject::internal_bridge_candidates(const Layer &layer_) const
+{
+    std::vector<BridgeCandidate> out;
+    const Layer *layer = &layer_;
+    if (layer->lower_layer == nullptr)
+        return out;
+    const int lidx = int(layer_.id() - this->layers().front()->id());
+    double spacing = layer->regions().front()->flow(frSolidInfill).scaled_spacing();
+    // unsupported area will serve as a filter for polygons worth bridging.
+    Polygons   unsupported_area; // 下一层不提供支撑的区域
+    Polygons   lower_layer_solids;  // 下一层的实心区域，可以提供支撑
+    // 取当前层和下一层的数据
+    for (const LayerRegion *region : layer->lower_layer->regions()) {
+        Polygons fill_polys = to_polygons(region->fill_expolygons);
+        // initially consider the whole layer unsupported, but also gather solid layers to later cut off supported parts
+        unsupported_area.insert(unsupported_area.end(), fill_polys.begin(), fill_polys.end());
+        for (const Surface &surface : region->fill_surfaces.surfaces) {
+            if (surface.surface_type != stInternal || region->region().config().sparse_infill_density.value == 100) {
+                Polygons p = to_polygons(surface.expolygon);
+                lower_layer_solids.insert(lower_layer_solids.end(), p.begin(), p.end());
+            }
+        }
+    }
+    unsupported_area = closing(unsupported_area, float(SCALED_EPSILON));
+    // By expanding the lower layer solids, we avoid making bridges from the tiny internal overhangs that are (very likely) supported by previous layer solids
+    // NOTE that we cannot filter out polygons worth bridging by their area, because sometimes there is a very small internal island that will grow into large hole
+    lower_layer_solids = shrink(lower_layer_solids, 1 * spacing); // first remove thin regions that will not support anything
+    lower_layer_solids = expand(lower_layer_solids, (1 + 3) * spacing); // then expand back (opening), and further for parts supported by internal solids
+    // By shrinking the unsupported area, we avoid making bridges from narrow ensuring region along perimeters.
+    unsupported_area   = shrink(unsupported_area, 3 * spacing);
+    unsupported_area   = diff(unsupported_area, lower_layer_solids);
+
+    for (const LayerRegion *region : layer->regions()) {
+        for (const Surface &internal_solid : region->fill_surfaces.surfaces) { // 取当前层的实心区域
+            if (internal_solid.surface_type != stInternalSolid)
+                continue;
+            const Surface *s = &internal_solid;
+            Polygons unsupported         = intersection(to_polygons(s->expolygon), unsupported_area); // 当前层需要生成桥接的区域，通过当前层的实心区域与下一层的非实心区域求交得到
+            // The following flag marks those surfaces, which overlap with unuspported area, but at least part of them is supported.
+            // These regions can be filtered by area, because they for sure are touching solids on lower layers, and it does not make sense to bridge their tiny overhangs
+            bool     partially_supported = area(unsupported) < area(to_polygons(s->expolygon)) - EPSILON;
+            if (!unsupported.empty() && (!partially_supported || area(unsupported) > 3 * 3 * spacing * spacing)) {
+                Polygons worth_bridging = intersection(to_polygons(s->expolygon), expand(unsupported, 4 * spacing));
+                // after we extracted the part worth briding, we go over the leftovers and merge the tiny ones back, to not brake the surface too much
+                for (const Polygon& p : diff(to_polygons(s->expolygon), expand(worth_bridging, spacing))) {
+                    double area = p.area();
+                    if (area < spacing * scale_(12.0) && area > spacing * spacing) {
+                        worth_bridging.push_back(p);
+                    }
+                }
+                worth_bridging = intersection(closing(worth_bridging, float(SCALED_EPSILON)), s->expolygon);
+                // 对应哪个region下的那个surface需要生成桥接
+                out.push_back(BridgeCandidate{ s, lidx, std::move(worth_bridging), region });
+
+#ifdef DEBUG_BRIDGE_OVER_INFILL
+                debug_draw(std::to_string(lidx) + "_candidate_surface_" + std::to_string(area(s->expolygon)),
+                    to_lines(region->layer()->lslices), to_lines(s->expolygon), to_lines(worth_bridging),
+                    to_lines(unsupported_area));
+#endif
+#ifdef DEBUG_BRIDGE_OVER_INFILL
+                debug_draw(std::to_string(lidx) + "_candidate_processing_" + std::to_string(area(unsupported)),
+                    to_lines(unsupported), to_lines(intersection(to_polygons(s->expolygon), expand(unsupported, 5 * spacing))),
+                    to_lines(diff(to_polygons(s->expolygon), expand(worth_bridging, spacing))),
+                    to_lines(unsupported_area));
+#endif
+            }
+        }
+    }
+    return out;
+}
+
 void PrintObject::bridge_over_infill()
 {
     BOOST_LOG_TRIVIAL(info) << "Bridge over infill - Start" << log_memory_info();
@@ -2960,69 +3086,8 @@ void PrintObject::bridge_over_infill()
         auto po = static_cast<const PrintObject*>(this);
         for(size_t lidx =0;lidx<this->layers().size();++lidx){
 #endif
-                    const Layer *layer = po->get_layer(lidx);
-                    if (layer->lower_layer == nullptr) {
-                        continue;
-                    }
-                    double spacing = layer->regions().front()->flow(frSolidInfill).scaled_spacing();
-                    // unsupported area will serve as a filter for polygons worth bridging.
-                    Polygons   unsupported_area; // 下一层不提供支撑的区域
-                    Polygons   lower_layer_solids;  // 下一层的实心区域，可以提供支撑
-                    // 取当前层和下一层的数据
-                    for (const LayerRegion *region : layer->lower_layer->regions()) {
-                        Polygons fill_polys = to_polygons(region->fill_expolygons);
-                        // initially consider the whole layer unsupported, but also gather solid layers to later cut off supported parts
-                        unsupported_area.insert(unsupported_area.end(), fill_polys.begin(), fill_polys.end());
-                        for (const Surface &surface : region->fill_surfaces.surfaces) {
-                            if (surface.surface_type != stInternal || region->region().config().sparse_infill_density.value == 100) {
-                                Polygons p = to_polygons(surface.expolygon);
-                                lower_layer_solids.insert(lower_layer_solids.end(), p.begin(), p.end());
-                            }
-                        }
-                    }
-                    unsupported_area = closing(unsupported_area, float(SCALED_EPSILON));
-                    // By expanding the lower layer solids, we avoid making bridges from the tiny internal overhangs that are (very likely) supported by previous layer solids
-                    // NOTE that we cannot filter out polygons worth bridging by their area, because sometimes there is a very small internal island that will grow into large hole
-                    lower_layer_solids = shrink(lower_layer_solids, 1 * spacing); // first remove thin regions that will not support anything
-                    lower_layer_solids = expand(lower_layer_solids, (1 + 3) * spacing); // then expand back (opening), and further for parts supported by internal solids
-                    // By shrinking the unsupported area, we avoid making bridges from narrow ensuring region along perimeters.
-                    unsupported_area   = shrink(unsupported_area, 3 * spacing);
-                    unsupported_area   = diff(unsupported_area, lower_layer_solids);
-
-                    for (LayerRegion *region : layer->regions()) {
-                        auto region_internal_solids =  region->fill_surfaces.filter_by_type(stInternalSolid); // 取当前层的实心区域
-                        for (const Surface *s : region_internal_solids) {
-                            Polygons unsupported         = intersection(to_polygons(s->expolygon), unsupported_area); // 当前层需要生成桥接的区域，通过当前层的实心区域与下一层的非实心区域求交得到
-                            // The following flag marks those surfaces, which overlap with unuspported area, but at least part of them is supported.
-                            // These regions can be filtered by area, because they for sure are touching solids on lower layers, and it does not make sense to bridge their tiny overhangs
-                            bool     partially_supported = area(unsupported) < area(to_polygons(s->expolygon)) - EPSILON;
-                            if (!unsupported.empty() && (!partially_supported || area(unsupported) > 3 * 3 * spacing * spacing)) {
-                                Polygons worth_bridging = intersection(to_polygons(s->expolygon), expand(unsupported, 4 * spacing));
-                                // after we extracted the part worth briding, we go over the leftovers and merge the tiny ones back, to not brake the surface too much
-                                for (const Polygon& p : diff(to_polygons(s->expolygon), expand(worth_bridging, spacing))) {
-                                    double area = p.area();
-                                    if (area < spacing * scale_(12.0) && area > spacing * spacing) {
-                                        worth_bridging.push_back(p);
-                                    }
-                                }
-                                worth_bridging = intersection(closing(worth_bridging, float(SCALED_EPSILON)), s->expolygon);
-                                // 对应哪个region下的那个surface需要生成桥接
-                                candidate_surfaces.push_back(CandidateSurface(s, lidx, worth_bridging, region, 0));
-
-#ifdef DEBUG_BRIDGE_OVER_INFILL
-                                debug_draw(std::to_string(lidx) + "_candidate_surface_" + std::to_string(area(s->expolygon)),
-                                    to_lines(region->layer()->lslices), to_lines(s->expolygon), to_lines(worth_bridging),
-                                    to_lines(unsupported_area));
-#endif
-#ifdef DEBUG_BRIDGE_OVER_INFILL
-                                debug_draw(std::to_string(lidx) + "_candidate_processing_" + std::to_string(area(unsupported)),
-                                    to_lines(unsupported), to_lines(intersection(to_polygons(s->expolygon), expand(unsupported, 5 * spacing))),
-                                    to_lines(diff(to_polygons(s->expolygon), expand(worth_bridging, spacing))),
-                                    to_lines(unsupported_area));
-#endif
-                            }
-                        }
-                    }
+                    for (const BridgeCandidate &c : po->internal_bridge_candidates(*po->get_layer(lidx)))
+                        candidate_surfaces.push_back(CandidateSurface(c.surface, c.layer_index, c.worth_bridging, c.region, 0));
                 }
 #if USE_TBB_IN_INFILL
                 });
@@ -3956,6 +4021,7 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
 static const char *s_modifier_ignored_infill_keys[] = {
     "sparse_infill_density",
     "sparse_infill_pattern",
+    "bridge_aware_cubic_max_gap",
     "conformal_infill",
     "conformal_stagger",
     "conformal_link_keep_layers",

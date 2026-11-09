@@ -120,3 +120,14 @@ add_executable(slicing_spatial_tests fff_print_tests.cpp test_slicing_spatial.cp
 target_link_libraries(slicing_spatial_tests test_common libslic3r slicer_test_support)
 set_property(TARGET slicing_spatial_tests PROPERTY FOLDER "tests")
 add_test(slicing_spatial_tests slicing_spatial_tests ${CATCH_EXTRA_ARGS})
+
+add_executable(bridge_aware_cubic_tests fff_print_tests.cpp test_bridge_aware_cubic_settings.cpp test_bridge_aware_cubic_lattice.cpp test_bridge_aware_cubic_plan.cpp test_bridge_aware_cubic_export.cpp test_bridge_aware_cubic_courses.cpp)
+target_link_libraries(bridge_aware_cubic_tests test_common libslic3r slicer_test_support)
+target_include_directories(bridge_aware_cubic_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/libslic3r)
+set_property(TARGET bridge_aware_cubic_tests PROPERTY FOLDER "tests")
+add_test(bridge_aware_cubic_tests bridge_aware_cubic_tests ${CATCH_EXTRA_ARGS})
+# The release benchmark's project generator (docs/bridge-aware-cubic-benchmark.md): tooling, not a test, so it has no add_test.
+add_executable(bridge_aware_cubic_benchmark_fixtures fff_print_tests.cpp bridge_aware_cubic_benchmark_fixtures.cpp)
+target_link_libraries(bridge_aware_cubic_benchmark_fixtures test_common libslic3r slicer_test_support)
+target_include_directories(bridge_aware_cubic_benchmark_fixtures PRIVATE ${CMAKE_SOURCE_DIR}/src/libslic3r)
+set_property(TARGET bridge_aware_cubic_benchmark_fixtures PROPERTY FOLDER "tests")
