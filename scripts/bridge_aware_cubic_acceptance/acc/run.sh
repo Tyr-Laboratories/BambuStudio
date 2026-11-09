@@ -7,7 +7,8 @@ BAC_PYTHON=${BAC_PYTHON:-python3}
 BAC_WORK=${BAC_WORK:-$BAC_DATA/work}
 V=$1; shift
 APP="$V/app/BambuStudio.app/Contents/MacOS/BambuStudio"
-IN="$BAC_DATA/Heimdall2 - BAC review.3mf"
+# The project to slice: the BAC review copy by default; the Cubic baseline is made with BAC_PROJECT set to the Cubic copy.
+IN=${BAC_PROJECT:-"$BAC_DATA/Heimdall2 - BAC review.3mf"}
 METRICS=$TOOLING/metrics/metrics.py
 for p in "$@"; do
   d="$V/p$p"
