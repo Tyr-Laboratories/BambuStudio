@@ -33,6 +33,8 @@ namespace Slic3r {
 
 class GCode;
 class Layer;
+class LayerRegion;
+class Surface;
 class ModelObject;
 class Print;
 class PrintObject;
@@ -565,6 +567,17 @@ public:
     // Bridge aware cubic: the plan built once in prepare_infill before the bridges; null when no region prints the pattern.
     // A shared object returns its source's.
     const BridgeAwareCubic::ObjectPlan* bridge_aware_cubic_plan() const;
+    // The candidate test of bridge_over_infill: the internal solid surfaces of a layer the generator will bridge, each with the
+    // part of it worth bridging, from the surfaces as they are before the bridges are made. Read by the generator and by the
+    // bridge aware cubic plan (its rails follow the edges of these surfaces).
+    struct BridgeCandidate
+    {
+        const Surface     *surface;          // the internal solid surface of the layer
+        int                layer_index;      // the layer's index in layers()
+        Polygons           worth_bridging;   // the part of it to bridge
+        const LayerRegion *region;           // the surface's region
+    };
+    std::vector<BridgeCandidate> internal_bridge_candidates(const Layer &layer) const;
     void         set_shared_object(PrintObject *object);
     void         clear_shared_object();
     void         copy_layers_from_shared_object();
