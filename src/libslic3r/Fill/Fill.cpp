@@ -1001,6 +1001,9 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
 	        collection.entities.push_back(thin_fill->clone());
 	    }
 
+    // Bridge aware cubic: the plan's lines of this layer that no filler printed and nothing covers (section 3.8's pass).
+    BridgeAwareCubic::print_uncovered(*this);
+
 #ifndef NDEBUG
 	for (LayerRegion *layerm : m_regions)
 	    for (size_t i = 0; i < layerm->fills.entities.size(); ++ i)

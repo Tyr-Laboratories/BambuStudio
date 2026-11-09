@@ -3,6 +3,7 @@
 #include "BridgeAwareCubicPlan.hpp"
 #include "../BridgeAwareCubicMaterial.hpp"
 #include "../ClipperUtils.hpp"
+#include "../ExtrusionEntityCollection.hpp"
 #include "../EdgeGrid.hpp"
 #include "../Layer.hpp"
 #include "../Print.hpp"
@@ -348,9 +349,99 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
 
 namespace BridgeAwareCubic {
 
-void print_uncovered(Layer & /* layer */)
+// The pass of section 3.8, once per layer after every filler: the plan's lines of the layer that the pattern's fillers did not
+// print (strands and courses outside the islands handed to them: the generator and the thick bases take sparse area after the
+// plan), kept where no extrusion of the layer prints (perimeters and fills by their nominal width: where what took the area prints
+// material, that material holds; where it prints nothing, the plan's line must still print, since the preview showed it and a
+// bridge may be anchored on it, and a column above may rest on it), pieces shorter than a bead dropped, printed as sparse infill
+// of the region at the sparse flow, one collection per island of the outline. The pass changes no path already made.
+void print_uncovered(Layer &layer)
 {
-    // Section 3.8's pass, built in a later stage.
+    const PrintObject *object = layer.object();
+    const ObjectPlan  *plan   = object != nullptr ? object->bridge_aware_cubic_plan() : nullptr;
+    if (plan == nullptr || object->layers().empty())
+        return;
+    const size_t layer_index = layer.id() - object->layers().front()->id();
+    if (layer_index >= plan->layer_count())
+        return;
+    // Anything planned on this layer?
+    bool anything = false;
+    for (const GroupPlan &group : plan->groups())
+        if (layer_index < group.layer_count() && !group.strands(layer_index).empty())
+            anything = true;
+    for (size_t r = 0; r < layer.regions().size() && !anything; ++r)
+        if (!plan->courses_at(layer_index, r).empty())
+            anything = true;
+    if (!anything)
+        return;
+    // The islands the fillers were handed (the final surfaces), and the footprint of everything the layer prints.
+    const std::vector<SparseIsland> islands = sparse_islands(layer);
+    Polygons printed;
+    for (const LayerRegion *region : layer.regions()) {
+        region->perimeters.polygons_covered_by_width(printed, 0.f);
+        region->thin_fills.polygons_covered_by_width(printed, 0.f);
+        region->fills.polygons_covered_by_width(printed, 0.f);
+    }
+    const ExPolygons printed_ex = union_ex(printed);
+    const BoundingBox bbox = get_extents(layer.lslices);
+    for (size_t g = 0; g < plan->groups().size(); ++g) {
+        const GroupPlan &group = plan->groups()[g];
+        if (layer_index >= group.layer_count() || group.regions().empty())
+            continue;
+        const double w = group.lattice().width;
+        // The group's islands on this layer.
+        Polygons handed;
+        for (const SparseIsland &island : islands)
+            for (const size_t region_id : island.region_ids)
+                if (plan->group_of_region(region_id) == &group) {
+                    append(handed, to_polygons(island.island));
+                    break;
+                }
+        // The plan's lines of the layer: strands clipped to the plan's own fill boundary, and the courses.
+        Polylines planned;
+        const LayerBoundary &boundary = group.boundary(layer_index);
+        for (const Line &line : group.strands_at(layer_index, bbox))
+            for (const auto &interval : boundary.index.segment_inside(line.a, line.b)) {
+                const Vec2d a = line.a.cast<double>(), d = (line.b - line.a).cast<double>();
+                const Point pa(coord_t(std::llround(a.x() + interval.first * d.x())), coord_t(std::llround(a.y() + interval.first * d.y())));
+                const Point pb(coord_t(std::llround(a.x() + interval.second * d.x())), coord_t(std::llround(a.y() + interval.second * d.y())));
+                if (pa != pb)
+                    planned.emplace_back(Points{ pa, pb });
+            }
+        for (const size_t region_id : group.regions())
+            append(planned, plan->courses_at(layer_index, region_id));
+        if (planned.empty())
+            continue;
+        Polylines uncovered = handed.empty() ? planned : diff_pl(planned, handed);
+        if (uncovered.empty())
+            continue;
+        if (!printed_ex.empty())
+            uncovered = diff_pl(uncovered, printed_ex);
+        Polylines kept;
+        for (Polyline &piece : uncovered)
+            if (piece.length() >= scale_(w - 1e-4))
+                kept.push_back(std::move(piece));
+        if (kept.empty())
+            continue;
+        // Sparse infill of the group's first region on the layer, at the sparse flow, one collection per island of the outline.
+        size_t region_id = group.regions().front();
+        for (const size_t r : group.regions())
+            if (r < layer.regions().size() && !layer.regions()[r]->slices.empty()) { region_id = r; break; }
+        if (region_id >= layer.regions().size())
+            continue;
+        LayerRegion &layerm = *layer.regions()[region_id];
+        const Flow flow = layerm.flow(frInfill);
+        for (const ExPolygon &outline : layer.lslices) {
+            Polylines inside = intersection_pl(kept, outline);
+            inside.erase(std::remove_if(inside.begin(), inside.end(), [w](const Polyline &p) { return p.length() < scale_(w - 1e-4); }), inside.end());
+            if (inside.empty())
+                continue;
+            ExtrusionEntityCollection *collection = new ExtrusionEntityCollection();
+            collection->no_sort = false;
+            extrusion_entities_append_paths(collection->entities, std::move(inside), erInternalInfill, flow.mm3_per_mm(), float(flow.width()), float(flow.height()));
+            layerm.fills.entities.push_back(collection);
+        }
+    }
 }
 
 } // namespace BridgeAwareCubic
