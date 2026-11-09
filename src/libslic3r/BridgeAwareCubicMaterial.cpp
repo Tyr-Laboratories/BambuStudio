@@ -19,6 +19,7 @@ namespace {
 
 constexpr double SOLID_RULE    = 0.55;    // printing(A) = opening(A, 0.55 · s_role): a fill lays a line where ≥ 1.1 spacings wide
 constexpr float  ARC_TOLERANCE = float(scale_(0.001));
+constexpr double COURSE_OVERLAP_MM = 0.05;   // a line ends this far inside a course's bead (3.5a's overlap into the neighbour)
 
 ExPolygons round_offset(const ExPolygons &polygons, double delta_mm)
 {
@@ -161,7 +162,12 @@ ExPolygons fill_boundary(const ExPolygon &island, const Polylines &courses, doub
     const coord_t inset = coord_t(float(scale_(-0.5 * spacing_mm)));
     ExPolygons boundary = offset_ex(island, float(inset), ClipperLib::jtMiter, 3.);
     if (!courses.empty()) {
-        const double keep = (1. - 0.01 * infill_wall_overlap_percent) * (0.5 * width_mm + 0.5 * spacing_mm);
+        // A line ends inside a course's bead, w/2 − 0.05 from its centre line (the user's anchoring rule, 9 November 2026: a line
+        // that meets another extrusion is fused to it by a nub along it), not half a spacing short of it as at a perimeter: the
+        // course is one bead, often on one layer only (a rail), and a hook along a band half a spacing from it would hang over the
+        // void. `infill_wall_overlap_percent` no longer enters; the signature stays for the callers.
+        (void)infill_wall_overlap_percent;
+        const double keep = std::max(0.01, 0.5 * width_mm - COURSE_OVERLAP_MM);
         boundary = diff_ex(boundary, offset(courses, float(scale_(keep)), ClipperLib::jtRound, ARC_TOLERANCE));
     }
     return boundary;

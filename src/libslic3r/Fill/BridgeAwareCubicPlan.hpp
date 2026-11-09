@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -71,6 +72,7 @@ struct PlanStatistics
     std::vector<Place> courses_over_other_void;    // lowest courses over another pattern's void, a 0 % region or air
     std::vector<size_t> thick_layers;              // layers whose height gives s_m ≥ w/2
     size_t             rails = 0;                  // rails laid
+    std::vector<std::pair<size_t, ExPolygons>> rail_roofs;   // (roof layer, the candidate area each rail was laid for): the verifier counts the roofs the generator did not bridge
 };
 
 // The fill boundary of a group on one layer (3.8): every island of the group's sparse fill inset as the filler insets it,
@@ -176,8 +178,11 @@ private:
     void collect_regions(const PrintObject &object, bool any_sparse_pattern = false);
     void collect_material(const PrintObject &object, const std::function<void()> &cancel);
     void collect_seam_walls(const PrintObject &object, const std::function<void()> &cancel);
+    void collect_rails(const PrintObject &object, const std::function<void()> &cancel);
     void collect_planes(const PrintObject &object, const std::function<void()> &cancel);
     void collect_boundaries(const PrintObject &object, const std::function<void()> &cancel);
+    // The fill boundary of a group on a layer (3.8) from the layer's sparse islands and the group's boundary courses so far.
+    ExPolygons group_boundary(const PrintObject &object, size_t layer_index, size_t g, const std::vector<SparseIsland> &islands) const;
 
     std::vector<GroupPlan>                    m_groups;
     std::vector<std::vector<size_t>>          m_groups_regions;
@@ -189,6 +194,7 @@ private:
     std::vector<double>                       m_overhang;           // h_n by layer
     std::vector<std::vector<Polylines>>       m_courses;            // [layer][region]
     std::vector<std::vector<Polylines>>       m_boundary_courses;   // [layer][region]: those that cut the fill boundary
+    std::vector<std::map<size_t, ExPolygons>> m_rail_bands;         // [group][roof layer]: the band between a roof's edge and its rail (3.5b)
     double                                    m_vertex_margin = 0., m_path_margin = 0.;
     PlanStatistics                            m_statistics;
     Polylines                                 m_no_courses;

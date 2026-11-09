@@ -254,6 +254,21 @@ std::vector<std::string> plan_warnings(const PrintObject &object)
         out.push_back(name + ": the refinement visited more than 1,000,000 cells (" + std::to_string(stats.visits) + ")");
     for (const size_t layer : stats.thick_layers)
         out.push_back(name + ": the layer at " + height(layer) + " is too thick for the lattice to rest on itself (the drift of a plane's trace exceeds half a bead)");
+    // Rails laid for roofs the generator did not bridge in the end (prediction misses, 3.5b), from the final surfaces.
+    size_t misses = 0;
+    for (const auto &[roof_layer, predicted] : stats.rail_roofs) {
+        if (roof_layer >= object.layers().size())
+            continue;
+        ExPolygons bridged;
+        for (const LayerRegion *region : object.layers()[roof_layer]->regions())
+            for (const Surface &surface : region->fill_surfaces.surfaces)
+                if (surface.surface_type == stInternalBridge)
+                    bridged.push_back(surface.expolygon);
+        if (bridged.empty() || intersection_ex(predicted, bridged).empty())
+            ++misses;
+    }
+    if (misses > 0)
+        out.push_back(name + ": " + std::to_string(misses) + " rail(s) laid for roofs the bridge generator did not bridge in the end");
     for (const GroupPlan &group : plan->groups())
         if (!group.regions().empty())
             (void)region_text(group.regions().front());

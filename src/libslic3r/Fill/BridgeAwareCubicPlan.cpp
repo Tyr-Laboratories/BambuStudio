@@ -110,8 +110,11 @@ std::unique_ptr<ObjectPlan> ObjectPlan::build(const PrintObject &object, const s
     cancel();
     plan->collect_material(object, cancel);
     plan->collect_seam_walls(object, cancel);
+    // The rails come before the planes (the spec lists them after): a rail is material of its layer, and the planes under it
+    // (3.4, which hold its length) are computed from the material; the bands the rails add to the roofs' footprints are kept
+    // and joined when the planes are made.
+    plan->collect_rails(object, cancel);
     plan->collect_planes(object, cancel);
-    // Rails (3.5b) widen the footprints here; built in a later stage.
     plan->collect_boundaries(object, cancel);
     for (GroupPlan &group : plan->m_groups) {
         refine(group, *plan, cancel);
@@ -383,6 +386,133 @@ void ObjectPlan::collect_seam_walls(const PrintObject &object, const std::functi
     }
 }
 
+// Section 3.5b: rails. The stock generator grows a bridge past the roof's edge, over the sparse fill of the roof's layer, to the
+// nearest anchor beyond each section's end. A rail is a bead the pattern lays on the layer whose preview anchors the lowest
+// bridge base, m_r = n − B, just outside the roof's inner edge (d_r = s_b + w/2 + 0.05 from it), so that the generator finds its
+// closest anchor there and the growth stays within d_r + w_b of the edge. The band between the edge and the rail is demand on every
+// plane of the roof; the rail is material of m_r on both sides and a course of the roof's region there. No rail along walls (the
+// edge must border the group's sparse fill at n), over another group's void or air (it must lie over the group's void at m_r), or
+// for a surface the candidate test does not return.
+void ObjectPlan::collect_rails(const PrintObject &object, const std::function<void()> &cancel)
+{
+    constexpr double DELTA_S = 0.01;
+    const size_t layers = object.layers().size();
+    m_rail_bands.assign(m_groups.size(), {});
+    for (size_t n = 1; n < layers; ++n) {
+        cancel();
+        const Layer &layer = *object.layers()[n];
+        const std::vector<PrintObject::BridgeCandidate> candidates = object.internal_bridge_candidates(layer);
+        if (candidates.empty())
+            continue;
+        const LayerMaterial &upper = m_materials[n];
+        const Polylines roof_edge = to_polylines(upper.may_print);
+        for (size_t g = 0; g < m_groups.size(); ++g) {
+          GroupPlan &group = m_groups[g];
+          const int B = group.m_bridge_layers;
+          // A rail under every bridge layer of the stack, n − 1 down to n − B: each bridge layer is anchored on the preview of the
+          // layer below it, and this fork keeps the top bridge's own growth beside the thick base (the spec's one rail at n − B
+          // assumed the stack trimmed to the base).
+          for (int k = 1; k <= B; ++k) {
+            if (int(n) - k < 1)
+                break;
+            const size_t m_r = size_t(int(n) - k);
+            if (g >= m_materials[m_r].void_of_group.size() || m_materials[m_r].void_of_group[g].empty())
+                continue;
+            Polygons sparse_n;    // the group's sparse fill at the roof layer
+            for (const size_t r : group.m_regions)
+                if (r < layer.regions().size())
+                    for (const Surface &s : layer.regions()[r]->fill_surfaces.surfaces)
+                        if (s.surface_type == stInternal)
+                            append(sparse_n, to_polygons(s.expolygon));
+            if (sparse_n.empty())
+                continue;
+            const Polygons    near_sparse = offset(sparse_n, float(scale_(DELTA_S)));
+            const ExPolygons &void_m      = m_materials[m_r].void_of_group[g];
+            const double      w           = group.m_lattice.width;
+            ExPolygons boundary_m;
+            bool       boundary_known = false;
+            Polylines  rails;
+            ExPolygons band;
+            for (const PrintObject::BridgeCandidate &candidate : candidates) {
+                if (candidate.worth_bridging.empty() || candidate.region == nullptr)
+                    continue;
+                const Flow   bridge_flow = candidate.region->bridging_flow(frSolidInfill, true);
+                const double s_b = bridge_flow.spacing(), d_r = s_b + 0.5 * w + 0.05;
+                // E: the roof's inner edge at this candidate: the boundary of M⁺_n within s_b of it, bordering the group's sparse
+                // fill at n, over the group's void at m_r.
+                Polylines edge = intersection_pl(roof_edge, offset(candidate.worth_bridging, float(scale_(s_b))));
+                if (edge.empty())
+                    continue;
+                edge = intersection_pl(edge, near_sparse);
+                if (edge.empty())
+                    continue;
+                edge = intersection_pl(edge, void_m);
+                if (edge.empty())
+                    continue;
+                const Polygons   near_edge = offset(edge, float(scale_(d_r + 0.01)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
+                const ExPolygons grown     = offset_ex(upper.may_print, float(scale_(d_r)), ClipperLib::jtRound, ARC_TOLERANCE);
+                Polylines rail = intersection_pl(to_polylines(grown), near_edge);
+                if (rail.empty())
+                    continue;
+                // Clipped to the group's sparse surfaces at m_r (not the inset fill boundary): the rail must reach the walls'
+                // beads, since a bridge ray that passes beyond a rail's end grows on until the next anchor; the filler prints a
+                // course whole up to the island's edge.
+                if (!boundary_known) {
+                    Polygons surfaces_m;
+                    for (const size_t r : group.m_regions)
+                        if (r < object.layers()[m_r]->regions().size())
+                            for (const Surface &s : object.layers()[m_r]->regions()[r]->fill_surfaces.surfaces)
+                                if (s.surface_type == stInternal)
+                                    append(surfaces_m, to_polygons(s.expolygon));
+                    boundary_m     = union_ex(surfaces_m);
+                    boundary_known = true;
+                }
+                rail = intersection_pl(rail, boundary_m);
+                for (Polyline &piece : rail)
+                    if (piece.length() >= scale_(w - 1e-4))
+                        rails.push_back(std::move(piece));
+                append(band, intersection_ex(diff_ex(grown, upper.may_print), near_edge));
+            }
+            if (rails.empty())
+                continue;
+            // A course of the group's region whose sparse fill at m_r holds most of the rail.
+            const Layer &rail_layer = *object.layers()[m_r];
+            size_t region_id = group.m_regions.front();
+            double best = -1.;
+            for (const size_t r : group.m_regions) {
+                if (r >= rail_layer.regions().size())
+                    continue;
+                Polygons sparse;
+                for (const Surface &s : rail_layer.regions()[r]->fill_surfaces.surfaces)
+                    if (s.surface_type == stInternal)
+                        append(sparse, to_polygons(s.expolygon));
+                if (sparse.empty())
+                    continue;
+                double length = 0.;
+                for (const Polyline &piece : intersection_pl(rails, sparse))
+                    length += double(piece.length());
+                if (length > best) {
+                    best      = length;
+                    region_id = r;
+                }
+            }
+            add_courses(m_r, region_id, rails, true);
+            group.mark_courses();
+            BridgeAwareCubic::add_courses(m_materials[m_r], rails, w, rail_layer, m_groups_regions);
+            m_statistics.rails += rails.size();
+            if (k == 1) {
+                ExPolygons predicted;
+                for (const PrintObject::BridgeCandidate &candidate : candidates)
+                    append(predicted, union_ex(candidate.worth_bridging));
+                m_statistics.rail_roofs.emplace_back(n, std::move(predicted));
+            }
+            if (!band.empty() && k == 1)
+                append(m_rail_bands[g][n], union_ex(band));
+          }
+        }
+    }
+}
+
 void ObjectPlan::collect_planes(const PrintObject &object, const std::function<void()> &cancel)
 {
     const size_t layers = object.layers().size();
@@ -403,7 +533,14 @@ void ObjectPlan::collect_planes(const PrintObject &object, const std::function<v
                 continue;
             ExPolygons demand = intersection_ex(unsupported, lower.void_of_group[g]);
             demand = opening_ex(demand, float(scale_(SLIVER_MM)), ClipperLib::jtRound, ARC_TOLERANCE);
-            if (demand.empty())
+            // The band between the roof's edge and its rail (3.5b) is demand on every plane of the roof.
+            const ExPolygons *band = nullptr;
+            if (g < m_rail_bands.size()) {
+                auto found = m_rail_bands[g].find(n);
+                if (found != m_rail_bands[g].end() && !found->second.empty())
+                    band = &found->second;
+            }
+            if (demand.empty() && band == nullptr)
                 continue;
             // The gap of a piece is the gap of the region whose sparse surface at n − 1 lies nearest; where the group's regions
             // differ in gap, the demand is split by their surfaces grown by s_f.
@@ -412,7 +549,7 @@ void ObjectPlan::collect_planes(const PrintObject &object, const std::function<v
             for (const size_t region_id : group.m_regions)
                 if (m_gap_of_region[region_id] != m_gap_of_region[group.m_regions.front()])
                     one_gap = false;
-            if (one_gap) {
+            if (one_gap || demand.empty()) {
                 pieces.emplace_back(m_gap_of_region[group.m_regions.front()], std::move(demand));
             } else {
                 for (const size_t region_id : group.m_regions) {
@@ -436,19 +573,32 @@ void ObjectPlan::collect_planes(const PrintObject &object, const std::function<v
                 bead = std::min(bead, m_bead_of_region[r]);
             if (bead == std::numeric_limits<double>::max())
                 bead = 2. * m_overhang[n];
-            for (auto &[gap, footprint] : pieces)
+            for (size_t piece_index = 0; piece_index < pieces.size(); ++piece_index) {
+                const double      gap       = pieces[piece_index].first;
+                const ExPolygons &footprint = pieces[piece_index].second;
                 for (int j = 0; j <= group.m_bridge_layers; ++j) {
                     if (int(n) - 1 - j < 0)
                         break;
+                    const size_t m = n - 1 - j;
                     Plane plane;
                     plane.roof_layer  = n;
-                    plane.plane_layer = n - 1 - j;
+                    plane.plane_layer = m;
                     plane.gap         = gap;
                     plane.bead        = bead;
                     plane.footprint   = footprint;
-                    plane.bbox        = get_extents(footprint);
+                    if (band != nullptr && piece_index == 0 && g < m_materials[m].void_of_group.size()) {
+                        ExPolygons extra = intersection_ex(*band, m_materials[m].void_of_group[g]);
+                        if (!extra.empty()) {
+                            append(plane.footprint, extra);
+                            plane.footprint = union_ex(plane.footprint);
+                        }
+                    }
+                    if (plane.footprint.empty())
+                        continue;
+                    plane.bbox = get_extents(plane.footprint);
                     group.m_planes.push_back(std::move(plane));
                 }
+            }
         }
     }
     for (GroupPlan &group : m_groups)
@@ -457,31 +607,36 @@ void ObjectPlan::collect_planes(const PrintObject &object, const std::function<v
         });
 }
 
+ExPolygons ObjectPlan::group_boundary(const PrintObject &object, size_t layer_index, size_t g, const std::vector<SparseIsland> &islands) const
+{
+    const GroupPlan &group = m_groups[g];
+    const PrintRegionConfig &config = object.printing_region(group.m_regions.front()).config();
+    Polylines courses;
+    for (const size_t region_id : group.m_regions)
+        append(courses, m_boundary_courses[layer_index][region_id]);
+    ExPolygons boundary;
+    for (const SparseIsland &island : islands) {
+        bool of_group = false;
+        for (const size_t region_id : island.region_ids)
+            if (region_id < m_group_of_region.size() && m_group_of_region[region_id] == int(g))
+                of_group = true;
+        if (!of_group)
+            continue;
+        append(boundary, fill_boundary(island.island, courses, group.m_lattice.spacing, group.m_lattice.width,
+                                       config.infill_wall_overlap.get_abs_value(100.)));
+    }
+    return union_ex(boundary);
+}
+
 void ObjectPlan::collect_boundaries(const PrintObject &object, const std::function<void()> &cancel)
 {
     const size_t layers = object.layers().size();
     for (size_t i = 0; i < layers; ++i) {
         cancel();
-        const Layer &layer = *object.layers()[i];
-        std::vector<SparseIsland> islands = sparse_islands(layer);
+        const std::vector<SparseIsland> islands = sparse_islands(*object.layers()[i]);
         for (size_t g = 0; g < m_groups.size(); ++g) {
             GroupPlan &group = m_groups[g];
-            const PrintRegionConfig &config = object.printing_region(group.m_regions.front()).config();
-            Polylines courses;
-            for (const size_t region_id : group.m_regions)
-                append(courses, m_boundary_courses[i][region_id]);
-            ExPolygons boundary;
-            for (const SparseIsland &island : islands) {
-                bool of_group = false;
-                for (const size_t region_id : island.region_ids)
-                    if (region_id < m_group_of_region.size() && m_group_of_region[region_id] == int(g))
-                        of_group = true;
-                if (!of_group)
-                    continue;
-                append(boundary, fill_boundary(island.island, courses, group.m_lattice.spacing, group.m_lattice.width,
-                                               config.infill_wall_overlap.get_abs_value(100.)));
-            }
-            group.m_boundaries[i].boundary = union_ex(boundary);
+            group.m_boundaries[i].boundary = group_boundary(object, i, g, islands);
             group.m_boundaries[i].index    = AreaIndex(group.m_boundaries[i].boundary);
         }
     }
@@ -639,6 +794,7 @@ struct RefinementPlane
     size_t       group_index;
     ExPolygons   grown;        // D⁺ grown by r/2
     AreaIndex    footprint;    // of D⁺
+    AreaIndex    grown_index;  // of D⁺ grown by r/2: the needed strands span it, since the openings are measured within it
 };
 
 struct RootResult
@@ -750,7 +906,7 @@ private:
                 const AreaIndex section_index(ExPolygons{ ExPolygon(section_polygon) });
                 std::vector<std::pair<double, double>> pieces;
                 for (const auto &in_section : section_index.segment_inside(a, b))
-                    for (const auto &in_footprint : rp->footprint.segment_inside(a, b)) {
+                    for (const auto &in_footprint : rp->grown_index.segment_inside(a, b)) {
                         const double lo = std::max(in_section.first, in_footprint.first), hi = std::min(in_section.second, in_footprint.second);
                         if (hi > lo)
                             pieces.emplace_back(to_t(lo), to_t(hi));
@@ -835,7 +991,9 @@ void refine(GroupPlan &group, ObjectPlan &plan, const std::function<void()> &can
     std::vector<RefinementPlane> planes;
     planes.reserve(group.m_planes.size());
     for (const Plane &plane : group.m_planes) {
-        RefinementPlane rp{ &plane, group_index, offset_ex(plane.footprint, float(scale_(0.5 * plane.bead)), ClipperLib::jtRound, ARC_TOLERANCE), AreaIndex(plane.footprint) };
+        ExPolygons grown = offset_ex(plane.footprint, float(scale_(0.5 * plane.bead)), ClipperLib::jtRound, ARC_TOLERANCE);
+        AreaIndex grown_index(grown);
+        RefinementPlane rp{ &plane, group_index, std::move(grown), AreaIndex(plane.footprint), std::move(grown_index) };
         planes.push_back(std::move(rp));
     }
     // The roots: the coarse cells that meet some footprint at its plane's height, in a fixed order.

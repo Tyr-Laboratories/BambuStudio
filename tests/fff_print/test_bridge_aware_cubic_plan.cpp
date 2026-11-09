@@ -164,7 +164,7 @@ TEST_CASE("Bridge aware cubic material has one definition with two sides", "[Bri
 
         const Polylines courses{ Polyline(Point::new_scale(-1., 10.), Point::new_scale(31., 10.)) };
         const ExPolygons cut = fill_boundary(island, courses, s_f, w, 15.);
-        const double keep = (1. - 0.15) * (0.5 * w + 0.5 * s_f);
+        const double keep = 0.5 * w - 0.05;    // a line ends inside the course's bead (3.8 as amended): the filler's nub fuses it
         const AreaIndex index(cut);
         CHECK_FALSE(index.contains(Point::new_scale(15., 10. + keep - 0.01)));
         CHECK(index.contains(Point::new_scale(15., 10. + keep + 0.01)));

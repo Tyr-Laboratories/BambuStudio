@@ -6,6 +6,7 @@
 #include "libslic3r/Fill/BridgeAwareCubicPlan.hpp"
 
 #include <algorithm>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -136,6 +137,35 @@ double sparse_max_x(const std::vector<EmittedPath> &paths)
     return x;
 }
 
+// A 3-step staircase: a 40 x 30 x 6 mm body with 30, 20 and 10 mm deep blocks of 4 mm on it from x = 10, 20 and 30, so that four
+// roofs (at 6, 10, 14 and 18 mm) end over the sparse fill of the step beneath.
+Model steps()
+{
+    TriangleMesh body(its_make_cube(40., 30., 6.));
+    for (int i = 1; i <= 3; ++i) {
+        TriangleMesh block(its_make_cube(40. - 10. * i, 30., 4.));
+        block.translate(10. * i, 0., 6. + 4. * (i - 1));
+        body.merge(block);
+    }
+    return single_part("Bridge aware cubic steps", std::move(body));
+}
+
+// A fuselage top: a half cylinder of radius 15 mm, 40 mm long along y, on a 30 x 40 x 10 mm base (the convex hull of both).
+Model fuselage_top()
+{
+    std::vector<Vec3f> points;
+    for (const float x : { 0.f, 30.f })
+        for (const float y : { 0.f, 40.f })
+            for (const float z : { 0.f, 10.f })
+                points.emplace_back(x, y, z);
+    for (int k = 0; k <= 32; ++k) {
+        const double theta = M_PI * k / 32.;
+        for (const float y : { 0.f, 40.f })
+            points.emplace_back(float(15. + 15. * std::cos(theta)), y, float(10. + 15. * std::sin(theta)));
+    }
+    return single_part("Bridge aware cubic fuselage top", TriangleMesh(its_convex_hull(points)));
+}
+
 // Every layer and region of the plan has no course.
 bool no_courses(const ObjectPlan &plan, const PrintObject &object)
 {
@@ -146,7 +176,146 @@ bool no_courses(const ObjectPlan &plan, const PrintObject &object)
     return true;
 }
 
+// The bridge footprint of every layer beyond `limit_mm` of the roof's solid footprint of the plan (M⁺ of that layer, on the bed),
+// where it lies over the sparse void of the plane below: the generator's growth past the roof's inner edge beyond what the rails
+// allow. Returns the area (mm²) of that overgrowth, summed over the layers.
+double bridge_overgrowth_mm2(const std::vector<EmittedPath> &paths, const PrintObject &object, const ObjectPlan &plan, double limit_mm, int bridge_layers)
+{
+    double total = 0.;
+    const std::map<int, EmittedLayer> layers = emitted_layers(paths);
+    const Point shift = object.instances().front().shift;
+    for (auto it = layers.begin(); it != layers.end() && std::next(it) != layers.end(); ++it) {
+        const EmittedLayer &lower = it->second, &upper = std::next(it)->second;
+        EmittedLayer bridges, sparse;
+        for (const EmittedPath *path : upper)
+            if (path->role == erBridgeInfill) bridges.push_back(path);
+        for (const EmittedPath *path : lower)
+            if (path->role == erInternalInfill) sparse.push_back(path);
+        if (bridges.empty() || sparse.empty())
+            continue;
+        const int n = layer_of_key(object, std::next(it)->first);
+        if (n < 0)
+            continue;
+        // The roof of a bridge layer: the material the plan saw on it and on the layers above it within the bridge stack (a thick
+        // base lies under the roof's own layer).
+        ExPolygons roof;
+        for (int k = n; k < int(object.layers().size()) && k < n + bridge_layers; ++k)
+            append(roof, plan.material(size_t(k)).may_print);
+        roof = union_ex(roof);
+        for (ExPolygon &part : roof)
+            part.translate(shift);
+        const ExPolygons allowed = offset_ex(roof, float(scale_(limit_mm)), ClipperLib::jtRound, scale_(.001));
+        // The sparse void of the plane below, as the observer measures it: inside its outer wall, off what it prints, beside sparse fill.
+        ExPolygons domain;
+        for (const ExPolygon &wall : footprint(lower, erExternalPerimeter)) domain.emplace_back(wall.contour);
+        const ExPolygons printed = footprint(lower);
+        const ExPolygons near_sparse = offset_ex(footprint(sparse), float(scale_(.01)));
+        ExPolygons sparse_void;
+        for (ExPolygon &part : diff_ex(domain, printed))
+            if (!intersection_ex(ExPolygons{ part }, near_sparse).empty()) sparse_void.push_back(std::move(part));
+        const ExPolygons overgrowth = intersection_ex(diff_ex(footprint(bridges), allowed), sparse_void);
+        total += area(overgrowth) * SCALING_FACTOR * SCALING_FACTOR;
+    }
+    return total;
+}
+
 } // namespace
+
+// R1: rails. At a bridged roof's inner edge the bridge reaches at most d_r + w_b + 0.05 past the edge over the void; no bridge end
+// over the pattern's void hangs (an end inside the wall overlap is anchored); a rail lies at m_r under every roof whose bridge
+// borders sparse fill; no rail where no bridge is predicted; 1, 2 and 3 internal bridge layers.
+struct RailCase {
+    std::string          name;
+    Model              (*model)();
+    DynamicPrintConfig   settings;
+    double               gap = 5.;
+    DynamicPrintConfig (*base)(const char *) = nullptr;
+    bool                 edge_over_void = false;    // a roof edge over the pattern's void: a rail is expected
+};
+
+void check_rails(Workspace &workspace, const std::vector<RailCase> &cases);
+
+TEST_CASE("Bridge aware cubic lays rails along the roof edges the bridges grow past", "[BridgeAwareCubic][R1]")
+{
+    Workspace workspace;
+    check_rails(workspace, {
+        { "partial roof", partial_roof, {}, 5., nullptr, true },
+        { "steps", steps, {}, 5., nullptr, true },
+        { "fuselage top", fuselage_top, {}, 5., nullptr, true },
+        { "small cube", small_cube, {}, 5., nullptr, false },
+        { "large cube", large_cube, {}, 5., nullptr, false },
+        { "rib", rib, {}, 5., rib_config, true },
+        { "modifier", modifier, {}, 8., modifier_config, false },
+        { "small cube, two internal bridge layers", small_cube, with({}, {{"internal_bridge_layers", "2"}}), 5., nullptr, false },
+        { "small cube, three internal bridge layers", small_cube, with({}, {{"internal_bridge_layers", "3"}}), 5., nullptr, false },
+    });
+
+    SECTION("no rail where no bridge is predicted") {
+        Print print;
+        Model model = small_cube();
+        slice(print, model, with(fixture_config(5., "bridgeawarecubic"), {{"top_shell_layers", "0"}}));
+        const PrintObject &object = *print.get_object(size_t(0));
+        REQUIRE(object.bridge_aware_cubic_plan() != nullptr);
+        CHECK(no_courses(*object.bridge_aware_cubic_plan(), object));
+    }
+}
+
+// The thick bases (two and three internal bridge layers): see the K1 case of the same name for why these may fail.
+TEST_CASE("Bridge aware cubic lays rails under thick bridge bases", "[BridgeAwareCubic][R1][R1thick][!mayfail]")
+{
+    Workspace workspace;
+    check_rails(workspace, {
+        { "partial roof, two internal bridge layers", partial_roof, with({}, {{"internal_bridge_layers", "2"}}), 5., nullptr, true },
+        { "partial roof, three internal bridge layers", partial_roof, with({}, {{"internal_bridge_layers", "3"}}), 5., nullptr, true },
+    });
+}
+
+void check_rails(Workspace &workspace, const std::vector<RailCase> &cases)
+{
+    for (const RailCase &c : cases) {
+        INFO(c.name);
+        DynamicPrintConfig settings = c.base != nullptr ? c.base("bridgeawarecubic") : fixture_config(c.gap, "bridgeawarecubic");
+        settings.apply(c.settings, true);
+        Sliced sliced;
+        slice_and_export(sliced, workspace, c.model(), settings, c.name + "-r1.gcode");
+        const PrintObject &object = sliced.object();
+        const ObjectPlan *plan = sliced.plan();
+        REQUIRE(plan != nullptr);
+        const BACObserver::BridgeEnds ends = count_bridge_ends(sliced.paths);
+        REQUIRE(ends.paths > 0);
+        std::ostringstream hanging;
+        for (const auto &[z, at] : ends.where) hanging << " z " << z << " (" << at.x() << ", " << at.y() << ")";
+        INFO("hanging ends:" << hanging.str());
+        CHECK(ends.hanging == 0);
+        // d_r = s_b + w/2 + 0.05 with the thick bridge flow's spacing s_b and the sparse bead w; the bridge footprint may reach w_b past
+        // the rail's centre line and the touching measure further.
+        const PrintRegion &region = object.printing_region(0);
+        const double w = plan->groups().front().lattice().width;
+        const Flow bridge_flow = object.layers().front()->regions().front()->bridging_flow(frSolidInfill, true);
+        const double d_r = bridge_flow.spacing() + 0.5 * w + 0.05, limit = d_r + bridge_flow.width() + 0.05;
+        const int B = std::max(1, std::min(3, int(region.config().internal_bridge_layers.value)));
+        CHECK(bridge_overgrowth_mm2(sliced.paths, object, *plan, limit, B) <= 0.05);
+        // A rail at m_r = n − B under every roof whose bridge borders the pattern's sparse fill: the layer under the lowest bridge
+        // of the stack; none where no roof edge lies over the void.
+        const size_t rails = plan->statistics().rails;
+        if (c.edge_over_void) {
+            CHECK(rails > 0);
+            size_t first_bridge = size_t(-1);
+            for (size_t l = 0; l < object.layers().size() && first_bridge == size_t(-1); ++l)
+                for (const LayerRegion *lr : object.layers()[l]->regions())
+                    for (const Surface &surface : lr->fill_surfaces.surfaces)
+                        if (surface.surface_type == stInternalBridge) { first_bridge = l; break; }
+            REQUIRE(first_bridge != size_t(-1));
+            REQUIRE(first_bridge >= 1);
+            bool rail_under = false;
+            for (size_t r = 0; r < object.num_printing_regions(); ++r)
+                if (!plan->courses_at(first_bridge - 1, r).empty())
+                    rail_under = true;
+            CHECK(rail_under);
+        } else
+            CHECK(rails == 0);
+    }
+}
 
 // W1: seam walls. Where two lattices meet, the lower-index region lays one bead of its sparse infill just inside its boundary
 // (3.5a), on every layer where the seam exists; each half then holds its own gap; a floating modifier's first course is a roof

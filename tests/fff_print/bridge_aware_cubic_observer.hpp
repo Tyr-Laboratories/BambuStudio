@@ -317,6 +317,7 @@ struct BridgeEnds {
     size_t planes = 0;    // planes with bridge infill over a plane with sparse infill
     size_t paths = 0;     // the bridge paths of those planes
     size_t hanging = 0;   // the ends of those paths over the previous plane's sparse void, not anchored by a wall of their own plane
+    std::vector<std::pair<double, Vec2d>> where;   // z and place (mm, on the bed) of each hanging end
 };
 
 // Counts, on the exported G-code alone, the ends of the bridge paths that hang over the sparse void of the plane below: inside
@@ -353,7 +354,10 @@ inline BridgeEnds count_bridge_ends(const std::vector<EmittedPath> &paths)
                 const auto inside = [&end](const ExPolygons &area) {
                     return std::any_of(area.begin(), area.end(), [&end](const ExPolygon &part) { return part.contains(end); });
                 };
-                if (inside(sparse_void) && !inside(support) && !inside(anchored)) ++result.hanging;
+                if (inside(sparse_void) && !inside(support) && !inside(anchored)) {
+                    ++result.hanging;
+                    result.where.emplace_back(bridge->z, unscale(end));
+                }
             }
         }
     }
@@ -634,8 +638,11 @@ inline K2Measure measure_k2(const std::vector<EmittedPath> &paths, const std::ve
                 if (i == 0 || i + 1 >= own.path.points.size()) return false;
                 return is_hook(own.path.points[i - 1], own.path.points[i]) != is_hook(own.path.points[i], own.path.points[i + 1]);
             };
+            // A closed path (a course laid as a loop) has no ends: its first and last vertices count as fused.
+            const bool closed = path->path.points.size() > 2 && path->path.first_point() == path->path.last_point();
             std::vector<bool> fused_vertex(path->path.points.size(), false);
-            for (size_t i = 0; i < path->path.points.size(); ++i) fused_vertex[i] = fused(*path, i) || hook_junction(*path, i);
+            for (size_t i = 0; i < path->path.points.size(); ++i)
+                fused_vertex[i] = fused(*path, i) || hook_junction(*path, i) || (closed && (i == 0 || i + 1 == path->path.points.size()));
             struct Part { Polyline line; bool start_fused, end_fused; };
             std::vector<Part> parts;
             {

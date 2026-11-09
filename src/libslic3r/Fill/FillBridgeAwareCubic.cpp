@@ -255,13 +255,30 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
 
     // The courses of the regions whose sparse fill this island holds: the group's regions. Seam walls and rails cut the fill
     // boundary; a solid column's courses lie inside its faces and do not.
-    Polylines courses, boundary_courses;
+    Polylines courses, boundary_courses, courses_below;
     for (const size_t region_id : group->regions()) {
         append(courses, m_plan->courses_at(m_layer_index, region_id));
         append(boundary_courses, m_plan->boundary_courses_at(m_layer_index, region_id));
+        if (m_layer_index > 0)
+            append(courses_below, m_plan->boundary_courses_at(m_layer_index - 1, region_id));
     }
     const PrintRegionConfig &config = m_layer->regions()[this->lock_region_id]->region().config();
-    const ExPolygons boundary = fill_boundary(island, boundary_courses, lattice.spacing, lattice.width, config.infill_wall_overlap.get_abs_value(100.));
+    const double overlap_percent = config.infill_wall_overlap.get_abs_value(100.);
+    const ExPolygons boundary = fill_boundary(island, boundary_courses, lattice.spacing, lattice.width, overlap_percent);
+    // The connector's boundary: the island's inset without the courses' cut, less a zone around each boundary course of the layer
+    // and of the layer below, wide enough that the line ends there lie well inside it. At a course of the layer those ends are
+    // junctions with the course (a nub along it, like any line met), not the connector's (a hook along a band beside the course,
+    // hanging where the course is on one layer only). Above a rail the bridge it anchors ends a bridge bead past it, and the
+    // island's edge there is the bridge's front: a hook along the front would run beside the bridge beads' ends over the void
+    // inside the rail (the rib's K2: a 5 mm hook along the front), so the lines end on the front instead and run into it (below).
+    const double zone = 1.5 * lattice.width + 0.5 * lattice.spacing;
+    Polylines zone_courses = boundary_courses;
+    append(zone_courses, courses_below);
+    const ExPolygons connector_boundary = zone_courses.empty() ? boundary
+        : diff_ex(fill_boundary(island, Polylines(), lattice.spacing, lattice.width, overlap_percent),
+                  offset(zone_courses, float(scale_(zone)), ClipperLib::jtRound, float(scale_(0.001))));
+    const AreaIndex below_zone(courses_below.empty() ? ExPolygons()
+        : union_ex(offset(courses_below, float(scale_(zone)), ClipperLib::jtRound, float(scale_(0.001)))));
 
     Polylines out;
     // 4. Courses of the layer, clipped to the island, printed whole (each clipped alone: Clipper splits open paths clipped together).
@@ -274,15 +291,45 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
         return out;
     }
     const AreaIndex index(boundary);
-
-    // 2. Bulk lines: the three families, every sub-line, the extremes included, each clipped to the boundary along its trace.
-    Polylines bulk;
-    for (const Line &line : bulk_lines(lattice, this->z, bbox))
-        for (const auto &interval : index.segment_inside(line.a, line.b)) {
-            const Point a = along(line, interval.first), b = along(line, interval.second);
-            if (a != b)
-                bulk.emplace_back(Points{ a, b });
+    const AreaIndex surface_index(ExPolygons{ island });
+    const double spacing_scaled = scale_(lattice.spacing);
+    // Where the fill boundary cut a line (a surface laid after the plan took the sparse area there: the generator's ensuring strip
+    // one spacing wide along a bridge's edge, a bridge's front above a rail, a thick base), the line runs on to the edge of the
+    // sparse surface, at most a spacing further, so that it meets what that surface prints instead of stopping half a spacing
+    // short of it. `on_surface` are the line's intervals inside the island, `interval` the piece inside the fill boundary; the
+    // ends to carry are chosen by the caller (a strand's both; a bulk line's inside the zone of a course of the layer below).
+    const auto run_on_to_surface = [spacing_scaled](const Line &line, double length, const std::vector<std::pair<double, double>> &on_surface,
+                                                   const std::pair<double, double> &interval, Point &a, Point &b, bool at_a, bool at_b) {
+        for (const auto &s : on_surface) {
+            if (at_a && interval.first > 1e-6 && s.first < interval.first - 1e-9 && s.second >= interval.first - 1e-9 && (interval.first - s.first) * length <= spacing_scaled)
+                a = along(line, s.first);
+            if (at_b && interval.second < 1. - 1e-6 && s.second > interval.second + 1e-9 && s.first <= interval.second + 1e-9 && (s.second - interval.second) * length <= spacing_scaled)
+                b = along(line, s.second);
         }
+    };
+
+    // 2. Bulk lines: the three families, every sub-line, the extremes included, each clipped to the boundary along its trace. An
+    //    end inside the zone of a course of the layer below (a rail: the island's edge there is the front of the bridge the rail
+    //    anchors) runs on to the surface's edge, into the bridge beads' ends, since the connector lays no hook there.
+    Polylines bulk;
+    for (const Line &line : bulk_lines(lattice, this->z, bbox)) {
+        std::optional<std::vector<std::pair<double, double>>> on_surface;
+        const double length = (line.b - line.a).cast<double>().norm();
+        for (const auto &interval : index.segment_inside(line.a, line.b)) {
+            Point a = along(line, interval.first), b = along(line, interval.second);
+            if (a == b)
+                continue;
+            if (!below_zone.empty()) {
+                const bool at_a = below_zone.contains(a), at_b = below_zone.contains(b);
+                if (at_a || at_b) {
+                    if (!on_surface)
+                        on_surface = surface_index.segment_inside(line.a, line.b);
+                    run_on_to_surface(line, length, *on_surface, interval, a, b, at_a, at_b);
+                }
+            }
+            bulk.emplace_back(Points{ a, b });
+        }
+    }
 
     // 3. Strands of the layer whose trace meets the island, clipped along their trace; pieces shorter than a bead dropped. An end
     //    that stops within two beads of the fill boundary along its trace is carried on to it (as the plan carries the needed
@@ -293,30 +340,24 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     // would only lengthen the line into the void (the plan held the end where it was, not at the boundary).
     const bool anchoring = !params.dont_connect() && params.anchor_length > 0.f;
     const double shortest = scale_(lattice.width - 1e-4), reach = scale_(0.5 * lattice.width), carry = anchoring ? scale_(std::min(2. * lattice.width, gap_b)) : 0.;
-    const AreaIndex surface_index(ExPolygons{ island });
-    const double spacing_scaled = scale_(lattice.spacing);
     for (const Line &line : group->strands_at(m_layer_index, bbox)) {
         const double length = (line.b - line.a).cast<double>().norm();
         const std::vector<std::pair<double, double>> on_surface = surface_index.segment_inside(line.a, line.b);
         for (const auto &interval : index.segment_inside(line.a, line.b)) {
             Point a = along(line, interval.first), b = along(line, interval.second);
-            if ((b - a).cast<double>().norm() < shortest)
+            if (a == b)
                 continue;
             const Point a0 = a, b0 = b;
             if (carry > 0.) {
                 a = carried_to_boundary(b0, a0, index, carry);
                 b = carried_to_boundary(a0, b0, index, carry);
             }
-            // Where the fill boundary cut a planned line (a surface laid after the plan took the sparse area there: the generator's
-            // ensuring strip one spacing wide along a bridge's edge, a thick base), the line runs on to the edge of the sparse
-            // surface, at most a spacing further, so that it meets what that surface prints instead of stopping half a spacing short
-            // of it. A line the plan itself ended at the boundary is left as it is.
-            for (const auto &s : on_surface) {
-                if (interval.first > 1e-6 && s.first < interval.first - 1e-9 && s.second >= interval.first - 1e-9 && (interval.first - s.first) * length <= spacing_scaled)
-                    a = along(line, s.first);
-                if (interval.second < 1. - 1e-6 && s.second > interval.second + 1e-9 && s.first <= interval.second + 1e-9 && (s.second - interval.second) * length <= spacing_scaled)
-                    b = along(line, s.second);
-            }
+            // Where the fill boundary cut a planned line, it runs on to the sparse surface's edge (above). A line the plan itself
+            // ended at the boundary is left as it is.
+            run_on_to_surface(line, length, on_surface, interval, a, b, true, true);
+            // A bead long after the carries (a piece exactly a bead long that a later surface cut must run on, not vanish).
+            if ((b - a).cast<double>().norm() < shortest)
+                continue;
             strands.emplace_back(Points{ a, b });
         }
     }
@@ -333,9 +374,9 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
             lines = chain_polylines(std::move(lines));
         connected = std::move(lines);
     } else
-        connect_infill(std::move(lines), to_polygons(boundary), get_extents(island.contour), connected, this->spacing, params);
+        connect_infill(std::move(lines), to_polygons(connector_boundary), get_extents(island.contour), connected, this->spacing, params);
     if (!params.dont_connect() && params.anchor_length > 0.f)
-        anchor_junctions(connected, boundary, reach, scale_(double(params.anchor_length)), scale_(std::min(lattice.width, gap_b)));
+        anchor_junctions(connected, connector_boundary, reach, scale_(double(params.anchor_length)), scale_(std::min(lattice.width, gap_b)));
     append(out, std::move(connected));
     return out;
 }

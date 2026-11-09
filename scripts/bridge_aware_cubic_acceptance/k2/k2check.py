@@ -285,7 +285,8 @@ def main():
             # A junction: a vertex fused to another bead, or the vertex where a lattice line turns into a connector hook along the
             # boundary (Cubic's boundary behaviour, accepted by the user): the hook is measured as a connection piece of its own
             # and the line's end at the junction is not free.
-            fused_vertex = [fused(i) or (0 < i < len(pts) - 1 and hooks[i] != hooks[i + 1]) for i in range(len(pts))]
+            closed = len(pts) > 2 and pts[0] == pts[-1]   # a course laid as a loop has no ends
+            fused_vertex = [fused(i) or (0 < i < len(pts) - 1 and hooks[i] != hooks[i + 1]) or (closed and (i == 0 or i == len(pts) - 1)) for i in range(len(pts))]
             # The parts of the path between its junction vertices.
             parts, part, part_start = [], [pts[0]], 0
             for i in range(1, len(pts)):

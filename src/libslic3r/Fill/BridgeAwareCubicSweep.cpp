@@ -451,9 +451,43 @@ private:
                 continue;
             const double gap = m_plan.gap_of_region(region_id);
             for (const Polyline &course : courses) {
-                if (course.points.size() < 2 || course.first_point() == course.last_point())
-                    continue;    // a closed course has no end
-                for (const Point &end : { course.first_point(), course.last_point() }) {
+                if (course.points.size() < 2)
+                    continue;
+                const bool closed = course.first_point() == course.last_point();
+                // The points to hold: both ends of an open course, and along every course the points where a stretch over the
+                // void would otherwise exceed G_b (the roof measure bounds the openings under a course within G, which leaves its
+                // bead's own stretches between held points up to G plus the band's width; rule R asks for G_b).
+                std::vector<Point> to_hold;
+                if (!closed) {
+                    to_hold.push_back(course.first_point());
+                    to_hold.push_back(course.last_point());
+                }
+                {
+                    const double gb = gap - MU, step_mm = 0.5 * m_lambda;
+                    const double length = unscale<double>(course.length());
+                    double along = 0., unheld_from = -1.;
+                    std::vector<double> stations;
+                    for (double s = 0.; s <= length + 1e-9; s += step_mm)
+                        stations.push_back(std::min(s, length));
+                    for (size_t i = 0; i < stations.size(); ++i) {
+                        along = stations[i];
+                        const Point at = point_at_arc_length(course, along);
+                        const bool held = point_held(m_lattice.relative(at), m);
+                        if (!held && unheld_from < 0.)
+                            unheld_from = along;
+                        if ((held || i + 1 == stations.size()) && unheld_from >= 0.) {
+                            const double unheld_to = held ? along : length;
+                            // Holders every G_b at most along an unheld stretch longer than G_b, starting half a stretch in.
+                            if (unheld_to - unheld_from > gb) {
+                                const int n = int(std::ceil((unheld_to - unheld_from) / gb));
+                                for (int k = 1; k < n; ++k)
+                                    to_hold.push_back(point_at_arc_length(course, unheld_from + (unheld_to - unheld_from) * double(k) / double(n)));
+                            }
+                            unheld_from = -1.;
+                        }
+                    }
+                }
+                for (const Point &end : to_hold) {
                     const Vec2d p = m_lattice.relative(end);
                     if (point_held(p, m))
                         continue;
@@ -479,6 +513,22 @@ private:
                 }
             }
         }
+    }
+
+    // The point of a polyline at an arc length from its start (scaled), clamped to its ends.
+    static Point point_at_arc_length(const Polyline &polyline, double along_mm)
+    {
+        double remaining = scale_(along_mm);
+        for (size_t i = 1; i < polyline.points.size(); ++i) {
+            const Vec2d a = polyline.points[i - 1].cast<double>(), d = (polyline.points[i] - polyline.points[i - 1]).cast<double>();
+            const double length = d.norm();
+            if (remaining <= length || i + 1 == polyline.points.size()) {
+                const double t = length > 0. ? std::min(1., std::max(0., remaining / length)) : 0.;
+                return Point(coord_t(std::llround(a.x() + t * d.x())), coord_t(std::llround(a.y() + t * d.y())));
+            }
+            remaining -= length;
+        }
+        return polyline.points.front();
     }
 
     // Whether a point of layer m (mm, relative to the lattice centre) lies over a bead of the print set of m − 1: the material
