@@ -403,6 +403,7 @@ TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[Brid
     };
     struct Part { const char *name; Model (*model)(); };
     const Part parts[] = { { "small cube", small_cube }, { "pocket block", pocket_block }, { "blind cavity", blind_cavity } };
+    size_t cubic_exceeds = 0;    // the control: rows where Cubic on the same settings opens wider than the gap somewhere
     for (const Part &part : parts)
         for (const Stress &stress : stresses) {
             INFO(part.name << ", " << stress.name);
@@ -412,12 +413,18 @@ TEST_CASE("Bridge aware cubic slices and holds K1 under stress settings", "[Brid
             CHECK_FALSE(paths.empty());
             if (!stress.k1)
                 continue;
-            for (const PlaneMeasure &plane : measure_planes(paths, 0.4, stress.gap)) {
+            const std::vector<PlaneMeasure> planes = measure_planes(paths, 0.4, stress.gap);
+            REQUIRE_FALSE(planes.empty());
+            for (const PlaneMeasure &plane : planes) {
                 INFO("plane below z = " << plane.lower / 1000. << " mm");
                 CHECK(plane.widest_opening <= stress.gap);
                 CHECK(plane.longest_run <= stress.gap);
             }
+            const std::vector<PlaneMeasure> control = measure_planes(
+                exported_extrusions(workspace, part.model(), with(fixture_config(stress.gap, "cubic"), stress.settings), "s7-cubic.gcode"), 0.4, stress.gap);
+            cubic_exceeds += std::any_of(control.begin(), control.end(), [&stress](const PlaneMeasure &p) { return p.widest_opening > stress.gap; });
         }
+    CHECK(cubic_exceeds > 0);
     SECTION("variable layer height") {
         Model model = small_cube();
         model.objects.front()->layer_height_profile.set(std::vector<coordf_t>{ 0., .2, 3., .2, 5., .12, 12., .12, 18., .24 });

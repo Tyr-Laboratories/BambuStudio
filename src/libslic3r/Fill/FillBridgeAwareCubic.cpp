@@ -726,13 +726,9 @@ void print_uncovered(Layer &layer)
                 if (pa != pb)
                     strands.emplace_back(Points{ pa, pb });
             }
-        // Uncovered: outside the islands the fillers were handed and outside the regions' combination zones (whose strands print
-        // with the zone's lines, below). Each region keeps its own courses.
-        Polylines uncovered_strands = strands.empty() ? Polylines() : (handed.empty() ? strands : diff_pl(strands, handed));
-        if (!uncovered_strands.empty())
-            for (const size_t region_id : group.regions())
-                if (const ExPolygons *zone = zone_of_region(region_id))
-                    uncovered_strands = diff_pl(uncovered_strands, *zone);
+        // Uncovered: outside the islands the fillers were handed (each region below leaves out its own combination zone, whose
+        // strands print with the zone's lines). Each region keeps its own courses.
+        const Polylines uncovered_strands = strands.empty() ? Polylines() : (handed.empty() ? strands : diff_pl(strands, handed));
         std::vector<Polylines> uncovered_courses(group.regions().size());
         bool any_course = false;
         for (size_t k = 0; k < group.regions().size(); ++k) {
@@ -802,8 +798,9 @@ void print_uncovered(Layer &layer)
             if (!zone_courses.empty()) {
                 const ExPolygons course_zones = union_ex(offset(zone_courses, float(scale_(1.5 * w + 0.5 * lattice.spacing)), ClipperLib::jtRound, float(scale_(0.001))));
                 zone_boundary = diff_ex(zone_boundary, course_zones);
+                // Kept apart from the zone, not united with it: the connector's boundary has the course zones' edges inside the
+                // zone too, and the trim reads every contour of the list.
                 append(virtual_zones, course_zones);
-                virtual_zones = union_ex(virtual_zones);
             }
             // The strands of the layer inside the zone, on every layer of the group (on its void layers no island was handed), and the
             // courses an island covered there (the filler skipped the zone).
@@ -849,8 +846,12 @@ void print_uncovered(Layer &layer)
                 continue;
             LayerRegion &layerm = *layer.regions()[region_id];
             Polylines lines = uncovered_courses[k];
-            if (!uncovered_strands.empty() && !layerm.slices.empty())
-                append(lines, intersection_pl(uncovered_strands, to_polygons(layerm.slices.surfaces)));
+            if (!uncovered_strands.empty() && !layerm.slices.empty()) {
+                Polylines over_slices = intersection_pl(uncovered_strands, to_polygons(layerm.slices.surfaces));
+                if (const ExPolygons *zone = zone_of_region(region_id))
+                    over_slices = diff_pl(over_slices, *zone);
+                append(lines, std::move(over_slices));
+            }
             if (!zone_lines[k].empty() && !layerm.slices.empty())
                 append(lines, intersection_pl(zone_lines[k], to_polygons(layerm.slices.surfaces)));
             if (lines.empty())

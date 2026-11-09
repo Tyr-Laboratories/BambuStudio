@@ -588,6 +588,7 @@ TEST_CASE("Bridge aware cubic honours infill combination through single-layer zo
         append(control, single_control);
         const K2Measure measure = measure_k2(paths, control, fixture.gap - 0.1, fixture.direction);
         INFO("added pieces " << measure.added_pieces << ", first place " << (measure.where.empty() ? Vec2d(0, 0) : measure.where.front()).transpose());
+        CHECK(measure.added_pieces > 0);
         CHECK(measure.free_ends == 0);
         CHECK(measure.long_stretches == 0);
     }
@@ -664,8 +665,9 @@ TEST_CASE("Bridge aware cubic prints every instance and shared object alike", "[
         for (size_t i = 0; i < a.size(); ++i) {
             INFO("plane below z = " << a[i].lower / 1000. << " mm");
             CHECK(a[i].widest_opening == Approx(b[i].widest_opening).margin(1e-6));
+            CHECK(a[i].longest_run == Approx(b[i].longest_run).margin(1e-6));
             CHECK(a[i].widest_opening <= 5.);
-            CHECK(b[i].longest_run <= 5.);
+            CHECK(a[i].longest_run <= 5.);
         }
     }
 }
@@ -777,11 +779,14 @@ TEST_CASE("Bridge aware cubic timing against Cubic", "[.][BACTiming]")
             else               { b = slice_cost(model, bac, gcode); c = slice_cost(model, cubic, gcode); }
             if (pair > 0) { cubic_cost.push_back(c); bac_cost.push_back(b); }
         }
+        std::vector<double> ratios;
+        for (size_t i = 0; i < cubic_cost.size(); ++i)
+            ratios.push_back(cubic_cost[i] > 0. ? bac_cost[i] / cubic_cost[i] : 0.);
         std::sort(cubic_cost.begin(), cubic_cost.end());
         std::sort(bac_cost.begin(), bac_cost.end());
-        const double cubic_median = cubic_cost[cubic_cost.size() / 2], bac_median = bac_cost[bac_cost.size() / 2];
-        std::cout << "BAC_TIMING " << fixture.name << " cubic " << cubic_median << " bac " << bac_median << " ratio "
-                  << (cubic_median > 0. ? bac_median / cubic_median : 0.) << std::endl;
+        std::sort(ratios.begin(), ratios.end());
+        std::cout << "BAC_TIMING " << fixture.name << " cubic " << cubic_cost[cubic_cost.size() / 2] << " bac " << bac_cost[bac_cost.size() / 2]
+                  << " pair ratio median " << ratios[ratios.size() / 2] << " worst " << ratios.back() << std::endl;
     }
 }
 

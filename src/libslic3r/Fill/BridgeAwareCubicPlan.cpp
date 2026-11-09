@@ -476,10 +476,12 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
                 // N offset curves at d_r + i·s_f (3.9b): a rail is a band of N beads like every line of the lattice; the demand
                 // band reaches the outer curve. One curve at N = 1.
                 const int N = group.m_lattice.multiline;
+                ExPolygons outer_grown;    // the outermost curve that exists: the band reaches it
+                Polygons   outer_near;
                 for (int i = 0; i < N; ++i) {
                     const double     d_i       = entry.first + i * group.m_lattice.spacing;
-                    const Polygons   near_edge = offset(entry.second, float(scale_(d_i + 0.01)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
-                    const ExPolygons grown     = offset_ex(roof_material, float(scale_(d_i)), ClipperLib::jtRound, ARC_TOLERANCE);
+                    Polygons         near_edge = offset(entry.second, float(scale_(d_i + 0.01)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound);
+                    ExPolygons       grown     = offset_ex(roof_material, float(scale_(d_i)), ClipperLib::jtRound, ARC_TOLERANCE);
                     Polylines rail = intersection_pl(to_polylines(grown), near_edge);
                     if (rail.empty())
                         break;    // no curve at this distance, nor beyond it: the band ends with the curves that exist
@@ -488,9 +490,11 @@ void ObjectPlan::collect_rails(const PrintObject &object, const std::function<vo
                     for (Polyline &piece : rail)
                         if (piece.length() >= scale_(w - 1e-4))
                             rails.push_back(std::move(piece));
-                    if (i + 1 == N)
-                        append(band, intersection_ex(diff_ex(grown, upper.may_print), near_edge));
+                    outer_grown = std::move(grown);
+                    outer_near  = std::move(near_edge);
                 }
+                if (!outer_near.empty())
+                    append(band, intersection_ex(diff_ex(outer_grown, upper.may_print), outer_near));
             }
             if (rails.empty())
                 continue;
