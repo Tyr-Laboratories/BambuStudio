@@ -35,6 +35,10 @@ namespace BridgeAwareCubic {
 // Section 3.8's pass, called once per layer at the end of Layer::make_fills, after every filler: prints the planned lines of
 // the layer that the pattern's fillers did not print, wherever nothing else prints.
 void print_uncovered(Layer &layer);
+// The single-layer zone of a combined group of layers (3.9a): the union of the plan's Z_l over the `count` layers ending at `top`.
+ExPolygons combined_zone(const ObjectPlan &plan, size_t top, size_t count);
+// The combined group a layer belongs to, from the final surfaces of a region: (top layer, layer count), count 0 when not combined.
+std::pair<size_t, size_t> combined_group_of(const Layer &layer, size_t layer_index, size_t region_id);
 
 } // namespace BridgeAwareCubic
 

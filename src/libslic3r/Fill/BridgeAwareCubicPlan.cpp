@@ -690,10 +690,31 @@ std::vector<PlaneSummary> ObjectPlan::planes() const
     return out;
 }
 
-ExPolygons ObjectPlan::single_layer_zone(size_t /* layer */) const
+ExPolygons ObjectPlan::single_layer_zone(size_t layer) const
 {
-    // Section 3.9a, built in a later stage.
-    return ExPolygons();
+    // Z_l (3.9a): the footprints of the plan's strands and courses at l and l + 1 grown by c + w (and by the band's half width),
+    // and the footprints of the planes on l grown by w. Inside it every layer prints as without combination.
+    Polygons zone;
+    for (const GroupPlan &group : m_groups) {
+        const double w = group.m_lattice.width, c = w / std::sqrt(3.);
+        const double band = 0.5 * (group.m_lattice.multiline - 1) * group.m_lattice.spacing;
+        for (size_t l = layer; l <= layer + 1 && l < group.layer_count(); ++l) {
+            Polylines lines;
+            for (const Strand &strand : group.m_strands[l]) {
+                const Line segment = group.segment(strand, l, m_layer_heights[l].first);
+                lines.emplace_back(Points{ segment.a, segment.b });
+            }
+            for (const size_t region_id : group.m_regions)
+                if (l < m_courses.size() && region_id < m_courses[l].size())
+                    append(lines, m_courses[l][region_id]);
+            if (!lines.empty())
+                append(zone, offset(lines, float(scale_(c + w + band)), ClipperLib::jtRound, ARC_TOLERANCE, ClipperLib::etOpenRound));
+        }
+        for (const Plane &plane : group.m_planes)
+            if (plane.plane_layer == layer)
+                append(zone, offset(plane.footprint, float(scale_(w)), ClipperLib::jtRound, ARC_TOLERANCE));
+    }
+    return union_ex(zone);
 }
 
 double ObjectPlan::gap_of_region(size_t region_id) const

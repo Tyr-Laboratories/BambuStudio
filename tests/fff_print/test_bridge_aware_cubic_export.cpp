@@ -3,7 +3,11 @@
 #include "bridge_aware_cubic_fixtures.hpp"
 #include "bridge_aware_cubic_observer.hpp"
 
+#include "libslic3r/Fill/BridgeAwareCubicPlan.hpp"
+#include "libslic3r/Fill/FillBridgeAwareCubic.hpp"
+
 #include <algorithm>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -385,4 +389,119 @@ TEST_CASE("Bridge aware cubic holds the contract at the nozzle-floor gap", "[Bri
     const K2Measure measure = measure_k2(paths, control, 0.3, 45.);
     CHECK(measure.free_ends == 0);
     CHECK(measure.long_stretches == 0);
+}
+
+// S3: infill combination (3.9a). The pattern's combined surfaces equal Cubic's (the void surfaces and the thick surfaces per
+// layer); inside the single-layer zone of a combined group every sparse path prints at layer height and outside it the group's
+// top layer prints at the combined height; K1 and K2 hold.
+TEST_CASE("Bridge aware cubic honours infill combination through single-layer zones", "[BridgeAwareCubic][S3]")
+{
+    Workspace workspace;
+    const std::vector<ExportFixture> fixtures = {
+        { "small cube", small_cube, with({}, {{"infill_combination", "1"}}), 5. },
+        { "large cube", large_cube, with({}, {{"infill_combination", "1"}}), 5. },
+    };
+    for (const ExportFixture &fixture : fixtures) {
+        INFO(fixture.name);
+        const DynamicPrintConfig settings = observed(settings_of(fixture, "bridgeawarecubic")), control_settings = observed(settings_of(fixture, "cubic"));
+        Print print, control_print;
+        Model model = fixture.model(), control_model = fixture.model();
+        slice(print, model, settings);
+        slice(control_print, control_model, control_settings);
+        const PrintObject &object = *print.get_object(size_t(0)), &control_object = *control_print.get_object(size_t(0));
+        REQUIRE(object.layers().size() == control_object.layers().size());
+        // The surfaces: the void surfaces (count and area) and the thick surfaces' thicknesses per layer equal Cubic's.
+        const auto summarise = [](const Layer &layer) {
+            size_t voids = 0; double void_area = 0.; std::multiset<int> thick;
+            for (const LayerRegion *region : layer.regions())
+                for (const Surface &surface : region->fill_surfaces.surfaces) {
+                    if (surface.surface_type == stInternalVoid) { ++voids; void_area += surface.expolygon.area() * SCALING_FACTOR * SCALING_FACTOR; }
+                    else if (surface.surface_type == stInternal && surface.thickness_layers > 1) thick.insert(int(surface.thickness_layers));
+                }
+            return std::make_tuple(voids, void_area, thick);
+        };
+        size_t combined_layers = 0;
+        for (size_t l = 0; l < object.layers().size(); ++l) {
+            INFO("layer " << l);
+            const auto mine = summarise(*object.layers()[l]), theirs = summarise(*control_object.layers()[l]);
+            CHECK(std::get<0>(mine) == std::get<0>(theirs));
+            CHECK(std::abs(std::get<1>(mine) - std::get<1>(theirs)) < 0.5);
+            CHECK(std::get<2>(mine) == std::get<2>(theirs));
+            if (!std::get<2>(mine).empty()) ++combined_layers;
+        }
+        CHECK(combined_layers >= 5);
+        // The export: inside the zone of a combined group the sparse paths print at layer height; outside it the top layer of the
+        // group prints at the combined height.
+        const std::string filename = print.export_gcode((workspace.path / (fixture.name + "-s3.gcode")).string(), nullptr);
+        const std::vector<EmittedPath> paths = read_extrusions(filename, settings);
+        // A combined surface's path is twice the layer height tall and covers the layer below it too: the measures see it on both.
+        const double layer_height = settings.opt_float("layer_height");
+        std::vector<EmittedPath> unfolded = paths;
+        for (const EmittedPath &path : paths)
+            if (path.height > 1.5 * layer_height) {
+                EmittedPath lower = path;
+                lower.z -= layer_height;
+                lower.height = layer_height;
+                unfolded.push_back(lower);
+            }
+        const std::map<int, EmittedLayer> layers = emitted_layers(paths);
+        const BridgeAwareCubic::ObjectPlan *plan = object.bridge_aware_cubic_plan();
+        REQUIRE(plan != nullptr);
+        const Point shift = object.instances().front().shift;
+        // A path is inside the zone when a segment's midpoint lies in the zone shrunk by a twentieth of a bead: the thick lines end
+        // on the zone's edge and the connector hooks them along it, so vertices on the edge decide nothing.
+        size_t zone_paths = 0, thick_paths = 0;
+        for (size_t l = 0; l < object.layers().size(); ++l) {
+            const auto [top, count] = BridgeAwareCubic::combined_group_of(*object.layers()[l], l, 0);
+            if (count <= 1)
+                continue;
+            ExPolygons zone = BridgeAwareCubic::combined_zone(*plan, top, count);
+            for (ExPolygon &part : zone) part.translate(shift);
+            const ExPolygons zone_inner = offset_ex(zone, -float(scale_(0.02)));
+            const auto it = layers.find(plane_key(object.layers()[l]->print_z));
+            if (it == layers.end())
+                continue;
+            for (const EmittedPath *path : it->second) {
+                if (path->role != erInternalInfill) continue;
+                Point where;
+                bool in_zone = false;
+                for (size_t i = 1; i < path->path.points.size() && !in_zone; ++i) {
+                    const Point mid = (path->path.points[i - 1] + path->path.points[i]) / 2;
+                    if (std::any_of(zone_inner.begin(), zone_inner.end(), [&mid](const ExPolygon &part) { return part.contains(mid); })) {
+                        in_zone = true;
+                        where = mid;
+                    }
+                }
+                if (in_zone) {
+                    ++zone_paths;
+                    INFO("z = " << path->z << " at " << unscale(where).transpose() << " points " << path->path.points.size() << " length " << unscale<double>(path->path.length())
+                         << " from " << unscale(path->path.first_point()).transpose() << " to " << unscale(path->path.last_point()).transpose()
+                         << " width " << path->width << " top " << top << " count " << count << " layer " << l);
+                    CHECK(path->height == Approx(object.layers()[l]->height).margin(0.011));
+                } else if (l == top && path->height > object.layers()[l]->height + 0.05)
+                    ++thick_paths;
+            }
+        }
+        CHECK(zone_paths > 0);
+        CHECK(thick_paths > 0);
+        // K1 and K2 hold under combination. K1 sees the thick paths on both their layers. K2 judges the paths as emitted (an
+        // unfolded copy lies off its layer's lattice and would be judged as an added line) against Cubic without combination: the
+        // zone's lines are Cubic's bulk lines of their layer printed at layer height, and the thick lines lie on the top layer's.
+        const std::vector<PlaneMeasure> planes = measure_planes(unfolded, 0.4, fixture.gap);
+        REQUIRE_FALSE(planes.empty());
+        for (const PlaneMeasure &plane : planes) {
+            INFO("plane below z = " << plane.lower / 1000. << " mm");
+            CHECK(plane.widest_opening <= fixture.gap);
+            CHECK(plane.longest_run <= fixture.gap);
+        }
+        // Both Cubic slices tell the pattern's lines from Cubic's: the combined one has the thick lines and their hooks along the
+        // combined island's boundary, the single-layer one the lattice lines of every layer (the zone's lines).
+        const std::string control_file = control_print.export_gcode((workspace.path / (fixture.name + "-s3-cubic.gcode")).string(), nullptr);
+        std::vector<EmittedPath> control = read_extrusions(control_file, control_settings);
+        append(control, exported_extrusions(workspace, fixture.model(), with(settings_of(fixture, "cubic"), {{"infill_combination", "0"}}), fixture.name + "-s3-cubic-single.gcode"));
+        const K2Measure measure = measure_k2(paths, control, fixture.gap - 0.1, fixture.direction);
+        INFO("added pieces " << measure.added_pieces << ", first place " << (measure.where.empty() ? Vec2d(0, 0) : measure.where.front()).transpose());
+        CHECK(measure.free_ends == 0);
+        CHECK(measure.long_stretches == 0);
+    }
 }

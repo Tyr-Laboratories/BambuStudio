@@ -18,7 +18,7 @@ scripts (`scripts/bridge_aware_cubic_acceptance/`, see its README) are in place.
 | 3 | done (d04dd8e56, f9c4b13d5) | M1, P1 pass |
 | 4-5a | done (d10faed9d, c9c197be3) | P2, K1 (openings and runs) on the cubes, phases, instances, densities and gaps; K2 on the cubes, the rib and the 40 mm box at 3 %; V1. Anchors: every pattern line goes through the stock connector and gets a nub where it meets another line, with the stock sparse infill anchor settings (user, 9 November 2026). |
 | 5b-6c | done (01fe19e87, 64ace2a9a, 38c1ee3b2, 8a66896e7) | the pass (3.8), seam walls (W1, M1), rails (R1), K1 on roofs with edges over the void and on the modifier, K2 across the seam; columns land |
-| 7a | in the tree | S3 (infill combination) |
+| 7a | done | S3 (infill combination): the surfaces combine as Cubic's; outside the single-layer zones a combined island prints Cubic's own combined fill, inside them the plan's lines print at layer height on every layer |
 | 7b-10 | not started | |
 
 Known limitations (findings the construction does not yet meet, 9 November 2026; the local debug dump `[BACDebug]` measures them):
