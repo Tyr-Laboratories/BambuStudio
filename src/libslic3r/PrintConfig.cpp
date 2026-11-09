@@ -6853,6 +6853,7 @@ void PrintConfigDef::init_filament_option_keys()
 
     m_filament_retract_keys = {
         "deretraction_speed",
+        "filament_retract_length_nc",
         "long_retractions_when_cut",
         "retract_before_wipe",
         "retract_restart_extra",
@@ -6866,7 +6867,6 @@ void PrintConfigDef::init_filament_option_keys()
         "z_hop",
         "z_hop_types"
     };
-        "filament_retract_length_nc",
     assert(std::is_sorted(m_filament_retract_keys.begin(), m_filament_retract_keys.end()));
 }
 
@@ -7862,6 +7862,9 @@ DynamicPrintConfig DynamicPrintConfig::full_print_config()
 
 DynamicPrintConfig::DynamicPrintConfig(const StaticPrintConfig& rhs)
 {
+    // Static generic enum vectors contain values but no serialization dictionary.
+    // Create definition-backed dynamic options before copying their values.
+    this->apply_only(rhs, rhs.keys_ref());
 }
 
 DynamicPrintConfig* DynamicPrintConfig::new_from_defaults_keys(const std::vector<std::string> &keys)
@@ -7876,9 +7879,6 @@ double min_object_distance(const ConfigBase &cfg)
     const ConfigOptionEnum<PrinterTechnology> *opt_printer_technology = cfg.option<ConfigOptionEnum<PrinterTechnology>>("printer_technology");
     auto printer_technology = opt_printer_technology ? opt_printer_technology->value : ptUnknown;
 
-    // Static generic enum vectors contain values but no serialization dictionary.
-    // Create definition-backed dynamic options before copying their values.
-    this->apply_only(rhs, rhs.keys_ref());
     double ret = 0.;
 
     if (printer_technology == ptSLA)
