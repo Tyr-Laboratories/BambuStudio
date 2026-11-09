@@ -48,6 +48,78 @@ Point carried_to_boundary(const Point &from, const Point &end, const BridgeAware
     return end;
 }
 
+// The parts of a course inside an island, each run on along the course by up to `run_on` (scaled) where the island's edge cut it
+// and the course goes on: a surface laid after the plan (the generator's one-spacing ensuring strip along a bridge's edge) cuts a
+// course short of the material the plan ended it on (the wall's overlap), and the end it leaves hangs. The run-on stops at the
+// course's own end; pieces whose run-ons meet are joined.
+Polylines course_inside(const Polyline &course, const BridgeAwareCubic::AreaIndex &island, double run_on)
+{
+    Polylines out;
+    if (course.points.size() < 2)
+        return out;
+    // Arc positions of the course's vertices, and the arc intervals inside the island.
+    std::vector<double> arc(course.points.size(), 0.);
+    for (size_t i = 1; i < course.points.size(); ++i)
+        arc[i] = arc[i - 1] + (course.points[i] - course.points[i - 1]).cast<double>().norm();
+    const double total = arc.back();
+    if (total <= 0.)
+        return out;
+    std::vector<std::pair<double, double>> inside;
+    for (size_t i = 1; i < course.points.size(); ++i) {
+        const double length = arc[i] - arc[i - 1];
+        if (length <= 0.)
+            continue;
+        for (const auto &interval : island.segment_inside(course.points[i - 1], course.points[i])) {
+            const double a = arc[i - 1] + interval.first * length, b = arc[i - 1] + interval.second * length;
+            if (!inside.empty() && a <= inside.back().second + 1.)
+                inside.back().second = std::max(inside.back().second, b);
+            else
+                inside.emplace_back(a, b);
+        }
+    }
+    // Run on where the island cut the course (not at the course's own ends), then merge what meets.
+    for (auto &interval : inside) {
+        if (interval.first > 1.)
+            interval.first = std::max(0., interval.first - run_on);
+        if (interval.second < total - 1.)
+            interval.second = std::min(total, interval.second + run_on);
+    }
+    std::vector<std::pair<double, double>> merged;
+    for (const auto &interval : inside) {
+        if (!merged.empty() && interval.first <= merged.back().second + 1.)
+            merged.back().second = std::max(merged.back().second, interval.second);
+        else
+            merged.push_back(interval);
+    }
+    // The sub-polylines of the course over those arc intervals.
+    const auto point_at = [&](double at) {
+        const size_t i = size_t(std::upper_bound(arc.begin(), arc.end(), at) - arc.begin());
+        if (i == 0)
+            return course.points.front();
+        if (i >= arc.size())
+            return course.points.back();
+        const double length = arc[i] - arc[i - 1];
+        const double t = length > 0. ? (at - arc[i - 1]) / length : 0.;
+        const Vec2d p = course.points[i - 1].cast<double>() + t * (course.points[i] - course.points[i - 1]).cast<double>();
+        return Point(coord_t(std::llround(p.x())), coord_t(std::llround(p.y())));
+    };
+    for (const auto &[a, b] : merged) {
+        if (b - a < 1.)
+            continue;
+        Polyline piece;
+        piece.points.push_back(point_at(a));
+        for (size_t i = 0; i < course.points.size(); ++i)
+            if (arc[i] > a && arc[i] < b && course.points[i] != piece.points.back())
+                piece.points.push_back(course.points[i]);
+        const Point end = point_at(b);
+        if (end != piece.points.back())
+            piece.points.push_back(end);
+        if (piece.points.size() >= 2)
+            out.push_back(std::move(piece));
+    }
+    return out;
+}
+
 // Anchors the interior ends of the paths where they meet another path of the layer (a needed strand ends on the line of its
 // cell's face: a bulk line or a parent strand): two ends that meet each other are joined into one path; an end that meets the
 // interior of another line gets a nub along that line's centre line from the junction, `anchor_length` long, clipped to the met
@@ -401,11 +473,16 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
         : offset_ex(m_plan->material(m_layer_index).walls, float(scale_(lattice.spacing)), ClipperLib::jtRound, float(scale_(0.001))));
 
     Polylines out;
-    // 4. Courses of the layer, clipped to the island, printed whole (each clipped alone: Clipper splits open paths clipped together).
+    // 4. Courses of the layer, clipped to the island, printed whole; where the island's edge cut one (a surface laid after the plan),
+    //    it runs on along the course across a one-spacing strip and a bead beyond it, so that its end stays on the material the plan
+    //    ended it on.
     Polylines course_pieces;
-    const Polygons island_polygons = to_polygons(island);
-    for (const Polyline &course : courses)
-        append(course_pieces, intersection_pl(Polylines{ course }, island_polygons));
+    {
+        const AreaIndex island_index(ExPolygons{ island });
+        const double run_on = scale_(lattice.spacing + lattice.width);
+        for (const Polyline &course : courses)
+            append(course_pieces, course_inside(course, island_index, run_on));
+    }
     if (boundary.empty()) {
         append(out, std::move(course_pieces));
         return out;
@@ -464,6 +541,9 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
     // would only lengthen the line into the void (the plan held the end where it was, not at the boundary).
     const bool anchoring = !params.dont_connect() && params.anchor_length > 0.f;
     const double shortest = scale_(lattice.width - 1e-4), reach = scale_(0.5 * lattice.width), carry = anchoring ? scale_(std::min(2. * lattice.width, gap_b)) : 0.;
+    // The ends carried on to the boundary, with where the plan ended them: a carry the connector did not anchor is undone after it
+    // (the carried stretch would hang over the void; the plan held the end where it was).
+    std::map<std::pair<coord_t, coord_t>, Point> carried_from;
     for (const Line &line : group->strands_at(m_layer_index, bbox)) {
         const double length = (line.b - line.a).cast<double>().norm();
         const std::vector<std::pair<double, double>> on_surface = surface_index.segment_inside(line.a, line.b);
@@ -475,6 +555,10 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
             if (carry > 0.) {
                 a = carried_to_boundary(b0, a0, index, carry);
                 b = carried_to_boundary(a0, b0, index, carry);
+                if (a != a0)
+                    carried_from.emplace(std::make_pair(a.x(), a.y()), a0);
+                if (b != b0)
+                    carried_from.emplace(std::make_pair(b.x(), b.y()), b0);
             }
             // Where the fill boundary cut a planned line, it runs on to the sparse surface's edge (above). A line the plan itself
             // ended at the boundary is left as it is.
@@ -503,6 +587,16 @@ Polylines FillBridgeAwareCubic::fill_surface(const Surface *surface, const FillP
         anchor_junctions(connected, connector_boundary, reach, scale_(double(params.anchor_length)), scale_(std::min(lattice.width, gap_b)));
     if (!virtual_zones.empty() && !params.dont_connect())
         trim_virtual_hooks(connected, virtual_zones, plain_boundary, courses, lattice, reach);
+    if (!carried_from.empty())
+        for (Polyline &path : connected) {
+            if (path.points.size() < 2)
+                continue;
+            for (Point *end : { &path.points.front(), &path.points.back() }) {
+                const auto found = carried_from.find(std::make_pair(end->x(), end->y()));
+                if (found != carried_from.end())
+                    *end = found->second;
+            }
+        }
     append(out, std::move(connected));
     return out;
 }
