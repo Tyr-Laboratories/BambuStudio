@@ -138,6 +138,8 @@ set(lisbslic3r_sources
     Fill/FillRectilinear.hpp
     Fill/FillBridgeAwareCubic.cpp
     Fill/FillBridgeAwareCubic.hpp
+    Fill/BridgeAwareCubicLattice.cpp
+    Fill/BridgeAwareCubicLattice.hpp
     Fill/FillConformal.cpp
     Fill/FillConformal.hpp
     Fill/FillConformalChart.cpp
