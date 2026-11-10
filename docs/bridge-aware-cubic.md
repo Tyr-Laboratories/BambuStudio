@@ -4,7 +4,17 @@ A sparse infill pattern: Cubic's lattice everywhere, plus lines under roofs, led
 too far over the sparse void, so that nothing above spans more than the Unsupported gap size (`bridge_aware_cubic_max_gap`,
 default 5 mm). It exists for single-wall parts at 3% infill whose first roof layer fails on ordinary Cubic.
 
-**Status (9 November 2026).** Rewritten from `master` against the
+**Status (9 November 2026, evening): failed the user's review.** On Heimdall plate 1 the support sweep's columns print as towers of
+0.5 mm pieces, one per layer and tens of layers tall, each with its own travel and retraction, which cannot be printed (145,624
+sparse paths against Cubic's 30,349, 87,849 of them 0.6 mm or shorter; 148,952 retractions against 62,670). The user's rule:
+extrusions move together to form the faces of geometric structures. The architecture's section 3.7 is deleted (59cc1b404), and
+an amendment for the user's review replaces the single-layer construction with growing faces (architecture 3.6, decisions F1 to
+F8 in 9.2, answered by the user the same day: the pass deleted, Support Cubic's hook at interior ends); the faces are
+estimated at +0.6 to +0.85 kg and +35 to +50 h on the 16 plates at the 10 mm gap of the first run (stage F1). The code on master still implements the deleted
+design. Output is reviewed by the user from a sliced `.gcode.3mf` in Bambu Studio's preview (architecture 7.4). The status below
+is the record of the first version.
+
+**Status of the first version (9 November 2026).** Rewritten from `master` against the
 [rewrite architecture](superpowers/specs/2026-11-08-bridge-aware-cubic-rewrite-design.md), which replaces the earlier
 constructive branch, following the [implementation plan](superpowers/plans/2026-11-08-bridge-aware-cubic-rewrite.md): every
 stage is built, the whole-branch review's fix round is in (501020f91), the tests pass and the release gate passes, and the branch
