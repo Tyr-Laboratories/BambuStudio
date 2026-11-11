@@ -42,10 +42,3 @@ compile_commands.json
 resources/web/device_page/assets/
 resources/web/device_page/index.html
 
-
-# Generated Python bytecode and local slicer execution results.
-__pycache__/
-/result.json
-
-# Subagent-driven development scratch (ledgers, briefs, review packages)
-.superpowers/

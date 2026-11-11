@@ -136,17 +136,6 @@ set(lisbslic3r_sources
     Fill/Lightning/TreeNode.hpp
     Fill/FillRectilinear.cpp
     Fill/FillRectilinear.hpp
-    Fill/FillBridgeAwareCubic.cpp
-    Fill/FillBridgeAwareCubic.hpp
-    Fill/BridgeAwareCubicLattice.cpp
-    Fill/BridgeAwareCubicLattice.hpp
-    Fill/BridgeAwareCubicPlan.cpp
-    Fill/BridgeAwareCubicPlan.hpp
-    Fill/BridgeAwareCubicSweep.cpp
-    BridgeAwareCubicMaterial.cpp
-    BridgeAwareCubicMaterial.hpp
-    BridgeAwareCubicVerify.cpp
-    BridgeAwareCubicVerify.hpp
     Fill/FillConformal.cpp
     Fill/FillConformal.hpp
     Fill/FillConformalChart.cpp
@@ -690,9 +679,6 @@ endif ()
 encoding_check(libslic3r)
 
 target_compile_definitions(libslic3r PUBLIC -DUSE_TBB -DTBB_USE_CAPTURED_EXCEPTION=0)
-if (SLIC3R_BAC_DEVELOPMENT_CHECKS)
-    target_compile_definitions(libslic3r PUBLIC SLIC3R_BAC_DEVELOPMENT_CHECKS=1)
-endif()
 target_include_directories(libslic3r PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/TextureToColor PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(libslic3r PUBLIC ${EXPAT_INCLUDE_DIRS})
 

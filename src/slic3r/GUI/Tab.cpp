@@ -3338,7 +3338,6 @@ void TabPrint::build()
         optgroup->append_single_option_line("sparse_infill_density");
         optgroup->append_single_option_line("fill_multiline");
         optgroup->append_single_option_line("sparse_infill_pattern", "fill-patterns#infill types and their properties of sparse");
-        optgroup->append_single_option_line("bridge_aware_cubic_max_gap", "", -1, true);
         optgroup->append_single_option_line("conformal_infill", "", -1, true);
         optgroup->append_single_option_line("conformal_stagger", "", -1, true);
         optgroup->append_single_option_line("conformal_link_keep_layers", "", -1, true);
