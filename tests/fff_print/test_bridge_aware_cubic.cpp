@@ -31,15 +31,29 @@ DynamicPrintConfig sparse_infill_config(const std::string &pattern, const std::s
 }
 
 // A box with a smaller box on top of it: the roof of the lower box closes only a part of its sparse infill.
-Model terrace_model()
+Model terrace_model(double tower_height = 8.)
 {
     Model model;
     auto *object = model.add_object();
     TriangleMesh mesh(its_make_cube(48., 48., 24.));
-    TriangleMesh tower(its_make_cube(16., 16., 8.));
+    TriangleMesh tower(its_make_cube(16., 16., tower_height));
     tower.translate(6., 16., 24.);
     mesh.merge(tower);
     object->add_volume(mesh);
+    object->add_instance()->set_offset(Vec3d(80., 80., 0.));
+    return model;
+}
+
+// A box with a blind hole from the top: the floor of the hole is an internal bridge in the middle of the sparse infill,
+// anchored on the lines of the lattice around it.
+Model blind_hole_model()
+{
+    Model model;
+    auto *object = model.add_object();
+    object->add_volume(TriangleMesh(its_make_cube(48., 48., 30.)));
+    TriangleMesh hole(its_make_cube(12., 12., 12.));
+    hole.translate(18., 18., 20.);
+    object->add_volume(std::move(hole))->set_type(ModelVolumeType::NEGATIVE_VOLUME);
     object->add_instance()->set_offset(Vec3d(80., 80., 0.));
     return model;
 }
@@ -78,21 +92,24 @@ std::vector<const ExtrusionPath *> layer_paths(const Layer &layer)
 }
 
 // Which of the three directions of the lattice a straight infill line follows.
-int line_direction(const Polyline &line)
+int line_direction(const Line &line)
 {
-    const Vec2d v = (line.last_point() - line.first_point()).cast<double>();
+    const Vec2d v = (line.b - line.a).cast<double>();
     return (int(std::lround((std::atan2(v.y(), v.x()) - infill_angle) / (M_PI / 3.))) % 3 + 3) % 3;
 }
 
 // Offsets of the sparse infill lines of a layer in one direction, perpendicular to the lines, sorted, each line once.
+// The hook connector joins the lines into paths, therefore each straight segment of a path is a piece of a line.
 std::vector<double> line_offsets(const Layer &layer, int direction)
 {
     const double angle = infill_angle + direction * M_PI / 3.;
     const Vec2d  normal(- std::sin(angle), std::cos(angle));
     std::vector<double> offsets;
     for (const ExtrusionPath *path : layer_paths(layer))
-        if (path->role() == erInternalInfill && path->polyline.length() > scale_(1.) && line_direction(path->polyline) == direction)
-            offsets.push_back(normal.dot(unscaled<double>(path->polyline.first_point())));
+        if (path->role() == erInternalInfill)
+            for (size_t i = 1; i < path->polyline.size(); ++ i)
+                if (const Line line(path->polyline.points[i - 1], path->polyline.points[i]); line.length() > scale_(1.) && line_direction(line) == direction)
+                    offsets.push_back(normal.dot(unscaled<double>(line.a)));
     std::sort(offsets.begin(), offsets.end());
     // Pieces of one line.
     offsets.erase(std::unique(offsets.begin(), offsets.end(), [](double a, double b) { return b - a < 0.01; }), offsets.end());
@@ -146,52 +163,117 @@ TEST_CASE("Bridge Aware Cubic prints the lines of Cubic, subdivided below intern
         }
 }
 
-TEST_CASE("Bridge Aware Cubic lines end on the layer below or on another extrusion", "[BridgeAwareCubic]")
+TEST_CASE("Bridge Aware Cubic prints the lines of Cubic above the internal bridges", "[BridgeAwareCubic]")
+{
+    // A wall of the subdivided lattice stops at the last internal bridge resting on it.
+    const std::string bridge_aware_density = GENERATE("20%", "25%");
+    CAPTURE(bridge_aware_density);
+    // The roof of the tower is far above the roof of the box, out of reach of the subdivided lattice below the roof of the tower.
+    Model model = terrace_model(30.);
+    Print cubic, bridge_aware;
+    slice(cubic, model, sparse_infill_config("cubic", bridge_aware_density));
+    slice(bridge_aware, model, sparse_infill_config("bridgeawarecubic", bridge_aware_density));
+
+    // Above the box: the sparse infill of the tower, out of reach of the subdivided lattices below the roofs of the box and of the tower.
+    const LayerPtrs &layers = bridge_aware.get_object(0)->layers();
+    REQUIRE(std::any_of(layers.begin(), layers.end(), has_internal_bridge));
+    size_t layers_checked = 0;
+    for (const Layer *layer : layers)
+        if (layer->print_z > 24. + EPSILON && layer->print_z < 32.)
+            for (int direction = 0; direction < 3; ++ direction) {
+                const std::vector<double> lattice = line_offsets(*cubic.get_object(0)->get_layer(layer->id()), direction);
+                const std::vector<double> lines   = line_offsets(*layer, direction);
+                CAPTURE(layer->print_z, direction, lattice, lines);
+                REQUIRE(lines.size() == lattice.size());
+                for (size_t i = 0; i < lines.size(); ++ i)
+                    CHECK(lines[i] == Approx(lattice[i]).margin(0.01));
+                layers_checked += ! lattice.empty();
+            }
+    CHECK(layers_checked > 20);
+}
+
+TEST_CASE("Bridge Aware Cubic lines end on another line or on the edge of the sparse infill", "[BridgeAwareCubic]")
 {
     Model model = terrace_model();
     Print print;
     slice(print, model, sparse_infill_config("bridgeawarecubic", "25%"));
 
-    // The area covered by the extrusions of the layer below.
-    Polygons below;
-    size_t   ends_checked = 0;
+    size_t ends_checked = 0;
     for (const Layer *layer : print.get_object(0)->layers()) {
-        // All the extrusions of the layer, and per direction all of them but the sparse infill lines of that direction.
-        std::array<Polylines, 3> sparse;
-        std::array<Polygons, 3>  others;
-        Polygons                 deposited;
-        double                   width = 0.;
-        for (const ExtrusionPath *path : layer_paths(*layer)) {
-            Polygons covered;
-            path->polygons_covered_by_width(covered, float(SCALED_EPSILON));
-            const int direction = path->role() == erInternalInfill ? line_direction(path->polyline) : -1;
-            if (direction >= 0) {
-                sparse[direction].push_back(path->polyline);
+        // The sparse infill paths cut into their straight segments, the ends of the paths with their segments, the edges of the sparse infill.
+        Lines                                  segments;
+        std::vector<std::pair<Point, size_t>>  ends;
+        Lines                                  edges;
+        double                                 width = 0.;
+        for (const ExtrusionPath *path : layer_paths(*layer))
+            if (path->role() == erInternalInfill) {
+                const Points &points = path->polyline.points;
+                ends.emplace_back(points.front(), segments.size());
+                for (size_t i = 1; i < points.size(); ++ i)
+                    segments.emplace_back(points[i - 1], points[i]);
+                ends.emplace_back(points.back(), segments.size() - 1);
                 width = path->width;
             }
-            for (int i = 0; i < 3; ++ i)
-                if (i != direction)
-                    append(others[i], covered);
-            append(deposited, std::move(covered));
+        for (const LayerRegion *region : layer->regions())
+            for (const Surface &surface : region->fill_surfaces.surfaces)
+                if (surface.surface_type == stInternal)
+                    for (const Polygon &polygon : to_polygons(surface.expolygon))
+                        append(edges, polygon.lines());
+        for (const auto &[end, segment] : ends) {
+            // No line ends in the air, not even above a line of the layer below: it touches another line of its layer,
+            // one it grows from or ends on, not the line it continues, or it is cut by the edge of the sparse infill.
+            const Line &own    = segments[segment];
+            const Vec2d dir    = (own.b - own.a).cast<double>().normalized();
+            auto        on_own = [&own, &dir](const Point &p) { return std::abs(cross2(dir, (p - own.a).cast<double>())) < scale_(0.01); };
+            const bool  ends_on_line = std::any_of(segments.begin(), segments.end(), [&](const Line &line) {
+                return ! (on_own(line.a) && on_own(line.b)) && line.distance_to(end) < scale_(width); });
+            const bool  ends_on_edge = std::any_of(edges.begin(), edges.end(), [&](const Line &edge) { return edge.distance_to(end) < scale_(width); });
+            CAPTURE(layer->print_z, unscaled<double>(end));
+            CHECK((ends_on_line || ends_on_edge));
         }
-        if (! below.empty())
-            for (int direction = 0; direction < 3; ++ direction) {
-                // The ends of the lines, 1 um long.
-                Polylines ends;
-                for (const Polyline &polyline : sparse[direction]) {
-                    const double cut = std::max(0., polyline.length() - scale_(0.001));
-                    ends.push_back(polyline);
-                    ends.back().clip_end(cut);
-                    ends.push_back(polyline);
-                    ends.back().clip_start(cut);
-                }
-                ends_checked += ends.size();
-                // No line ends in the air: it ends on an extrusion of the layer below, or it touches another extrusion of its layer
-                // to which it is anchored, as a line that grows from the crossing of two infill walls.
-                CAPTURE(layer->print_z, direction);
-                CHECK(diff_pl(ends, union_(below, offset(union_(others[direction]), float(scale_(0.5 * width))))).empty());
-            }
-        below = union_(deposited);
+        ends_checked += ends.size();
     }
     CHECK(ends_checked > 2000);
+}
+
+TEST_CASE("Bridge Aware Cubic keeps the lines its internal bridges are anchored on", "[BridgeAwareCubic]")
+{
+    Model model = blind_hole_model();
+    Print print;
+    slice(print, model, sparse_infill_config("bridgeawarecubic", "25%"));
+
+    size_t       ends_checked = 0;
+    const Layer *below        = nullptr;
+    for (const Layer *layer : print.get_object(0)->layers()) {
+        if (below != nullptr && has_internal_bridge(layer)) {
+            // The center lines of the extrusions of the layer below.
+            Lines lines_below;
+            for (const ExtrusionPath *path : layer_paths(*below))
+                append(lines_below, path->polyline.lines());
+            // Each strand of a bridge ends on the boundary of the bridge, which reaches one strand width past the line it is anchored on.
+            for (const ExtrusionPath *path : layer_paths(*layer))
+                if (path->role() == erBridgeInfill) {
+                    const Points &points = path->polyline.points;
+                    const double  width  = scale_(path->width);
+                    for (size_t i = 0; i < points.size(); ++ i) {
+                        // The ends of the strands: the ends of the path and its turns, past steps shorter than a strand width.
+                        size_t prev = i, next = i;
+                        while (prev > 0 && (points[prev] - points[i]).cast<double>().norm() < width)
+                            -- prev;
+                        while (next + 1 < points.size() && (points[next] - points[i]).cast<double>().norm() < width)
+                            ++ next;
+                        const Vec2d in  = (points[i] - points[prev]).cast<double>();
+                        const Vec2d out = (points[next] - points[i]).cast<double>();
+                        if (prev != i && next != i && in.norm() >= width && out.norm() >= width && in.normalized().dot(out.normalized()) > std::cos(M_PI / 4.))
+                            continue;
+                        const Point &end = points[i];
+                        CAPTURE(layer->print_z, unscaled<double>(end.x()), unscaled<double>(end.y()));
+                        CHECK(std::any_of(lines_below.begin(), lines_below.end(), [&end, width](const Line &line) { return line.distance_to(end) < 2. * width; }));
+                        ++ ends_checked;
+                    }
+                }
+        }
+        below = layer;
+    }
+    CHECK(ends_checked > 20);
 }

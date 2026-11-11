@@ -69,12 +69,21 @@ std::vector<BridgeAwareLattice> bridge_aware_lattices(const PrintObject &print_o
 
 // Octree of the Bridge Aware Cubic infill: all the cubes of the unsubdivided lattice overlapping the object, placed and rotated
 // as the lattice of the Cubic infill, and the cubes of the subdivided lattices, the infill planes of which are crossed by the internal bridges.
+// All its infill walls are printed, the internal bridges anchor on them, until prune_bridge_aware_octree().
 FillAdaptive::OctreePtr         build_bridge_aware_octree(
     // Bounding box of the object.
     const BoundingBoxf3         &bbox,
     // Triangles of the internal bridges, at the bottom of their layers.
     const std::vector<Vec3d>    &bridge_triangles,
     const BridgeAwareLattice    &lattice);
+
+// Once the internal bridges are anchored on the lattice, an infill wall of the subdivided lattices is printed from its bottom
+// up to the highest finished bridge resting on it, or up to where the lines of a printed wall end on it, whichever is higher.
+// A wall needed by neither is not printed.
+void                            prune_bridge_aware_octree(
+    Octree                      &octree,
+    // Triangles of the finished internal bridges resting on sparse infill, at the bottom of their layers.
+    const std::vector<Vec3d>    &bridge_triangles);
 
 //
 // Some of the algorithms used by class FillAdaptive were inspired by

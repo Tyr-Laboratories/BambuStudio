@@ -641,6 +641,7 @@ private:
     void discover_shell_for_perimeters();
     void bridge_over_infill();
     void add_internal_bridge_layers(const std::vector<std::vector<Surfaces>> &original_sparse);
+    void prune_bridge_aware_infill();
     void clip_fill_surfaces();
     void discover_horizontal_shells();
     void merge_infill_types();

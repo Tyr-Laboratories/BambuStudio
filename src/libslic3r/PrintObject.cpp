@@ -1009,6 +1009,9 @@ void PrintObject::prepare_infill()
     this->bridge_over_infill();
     this->add_internal_bridge_layers(original_sparse);
     m_print->throw_if_canceled();
+    // The internal bridges are anchored on the whole lattice of Bridge Aware Cubic, which keeps only the walls they need.
+    this->prune_bridge_aware_infill();
+    m_print->throw_if_canceled();
 
     // combine fill surfaces to honor the "infill every N layers" option
     this->combine_infill();
@@ -1461,6 +1464,28 @@ std::vector<std::shared_ptr<FillAdaptive::Octree>> PrintObject::prepare_bridge_a
             octrees[region_id] = first < region_id ? octrees[first] : std::shared_ptr<Octree>(build_bridge_aware_octree(bboxf, bridge_triangles, lattices[region_id]));
         }
     return octrees;
+}
+
+void PrintObject::prune_bridge_aware_infill()
+{
+    if (std::none_of(m_bridge_aware_fill_octrees.begin(), m_bridge_aware_fill_octrees.end(), [](const auto &octree) { return bool(octree); }))
+        return;
+    // The finished internal bridges resting on sparse infill, at the bottom of their layers. A follow-up bridge rests on another bridge.
+    std::vector<Vec3d> bridge_triangles;
+    for (const Layer *layer : m_layers) {
+        m_print->throw_if_canceled();
+        for (const LayerRegion *region : layer->regions())
+            for (const Surface &surface : region->fill_surfaces.surfaces)
+                if (surface.surface_type == stInternalBridge && ! surface.bridge_followup)
+                    append(bridge_triangles, triangulate_expolygon_3d(surface.expolygon, layer->bottom_z()));
+    }
+    // Regions with the same lattice share an octree.
+    std::vector<const FillAdaptive::Octree*> pruned;
+    for (const std::shared_ptr<FillAdaptive::Octree> &octree : m_bridge_aware_fill_octrees)
+        if (octree && std::find(pruned.begin(), pruned.end(), octree.get()) == pruned.end()) {
+            FillAdaptive::prune_bridge_aware_octree(*octree, bridge_triangles);
+            pruned.push_back(octree.get());
+        }
 }
 
 FillLightning::GeneratorPtr PrintObject::prepare_lightning_infill_data()
