@@ -448,6 +448,8 @@ public:
     double                      max_z() const         { return m_max_z; }
     // Centering offset of the sliced mesh from the scaled and rotated mesh of the model.
     const Point& 			     center_offset() const  { return m_center_offset; }
+    // Octree of the Bridge Aware Cubic infill of a printing region, nullptr if the region does not use that pattern.
+    FillAdaptive::Octree*        bridge_aware_fill_octree(size_t region_id) const { return region_id < m_bridge_aware_fill_octrees.size() ? m_bridge_aware_fill_octrees[region_id].get() : nullptr; }
 
     // BBS
     void generate_support_preview();
@@ -647,6 +649,8 @@ private:
     void _generate_support_material();
     std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> prepare_adaptive_infill_data(
         const std::vector<std::pair<const Surface*, float>>& surfaces_w_bottom_z) const;
+    std::vector<std::shared_ptr<FillAdaptive::Octree>> prepare_bridge_aware_infill_data(
+        const std::vector<std::pair<const Surface*, float>>& surfaces_w_bottom_z) const;
     FillLightning::GeneratorPtr prepare_lightning_infill_data();
 
     // BBS
@@ -686,6 +690,8 @@ private:
     bool                    				m_typed_slices = false;
 
     std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> m_adaptive_fill_octrees;
+    // Octrees of the Bridge Aware Cubic infill by printing region. Regions with the same lattice share an octree.
+    std::vector<std::shared_ptr<FillAdaptive::Octree>> m_bridge_aware_fill_octrees;
     FillLightning::GeneratorPtr m_lightning_generator;
     // Imported toolpaths do not include the generators or pre-bridge surfaces needed for refill.
     bool m_cached_infill_dependencies_missing = false;

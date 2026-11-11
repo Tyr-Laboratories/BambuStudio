@@ -89,7 +89,7 @@ enum InfillPattern : int {
     ipConcentric, ipRectilinear, ipGrid, ipLine, ipCubic, ipTriangles, ipStars, ipGyroid, ipHoneycomb, ipAdaptiveCubic, ipMonotonic, ipMonotonicLine, ipAlignedRectilinear, ip3DHoneycomb,
     ipHilbertCurve, ipArchimedeanChords, ipOctagramSpiral, ipSupportCubic, ipSupportBase, ipConcentricInternal,
     ipLightning, ipCrossHatch, ipZigZag, ipCrossZag,ipFloatingConcentric, ipLockedZag, ip2DLattice,
-    ipIroningArchimedeanSpiral, ipGlobalMonotonicLine,
+    ipIroningArchimedeanSpiral, ipGlobalMonotonicLine, ipBridgeAwareCubic,
     ipCount,
 };
 
@@ -1121,6 +1121,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionPercent, skeleton_infill_density))
     ((ConfigOptionPercent, skin_infill_density))
     ((ConfigOptionPercent, sparse_infill_density))
+    ((ConfigOptionPercent, bridge_aware_cubic_density))
     ((ConfigOptionInt, fill_multiline))
     ((ConfigOptionFloat, infill_lock_depth))
     ((ConfigOptionFloat, skin_infill_depth))
