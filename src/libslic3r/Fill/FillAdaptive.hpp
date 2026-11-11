@@ -48,6 +48,34 @@ FillAdaptive::OctreePtr         build_octree(
     // If true, octree is densified below internal overhangs only.
     bool                         support_overhangs_only);
 
+// Bridge Aware Cubic infill: the Cubic lattice of the sparse infill density, subdivided below internal bridges.
+// Each subdivision halves the distance between the infill planes, doubling the density.
+struct BridgeAwareLattice
+{
+    // Distance between the infill planes of the subdivided lattice, as line_spacing of build_octree().
+    // Zero if the region does not use the pattern.
+    double                       line_spacing { 0. };
+    // Number of subdivisions between the lattice of the sparse infill density and the lattice below internal bridges.
+    int                          subdivisions { 0 };
+    // Rotation of the lattice around the Z axis, the infill direction of the Cubic infill.
+    double                       angle { 0. };
+
+    bool operator==(const BridgeAwareLattice &rhs) const
+        { return this->line_spacing == rhs.line_spacing && this->subdivisions == rhs.subdivisions && this->angle == rhs.angle; }
+};
+
+// Lattice of the Bridge Aware Cubic infill for each printing region of the object.
+std::vector<BridgeAwareLattice> bridge_aware_lattices(const PrintObject &print_object);
+
+// Octree of the Bridge Aware Cubic infill: all the cubes of the unsubdivided lattice overlapping the object, placed and rotated
+// as the lattice of the Cubic infill, and the cubes of the subdivided lattices, the infill planes of which are crossed by the internal bridges.
+FillAdaptive::OctreePtr         build_bridge_aware_octree(
+    // Bounding box of the object.
+    const BoundingBoxf3         &bbox,
+    // Triangles of the internal bridges, at the bottom of their layers.
+    const std::vector<Vec3d>    &bridge_triangles,
+    const BridgeAwareLattice    &lattice);
+
 //
 // Some of the algorithms used by class FillAdaptive were inspired by
 // Cura Engine's class SubDivCube

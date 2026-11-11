@@ -242,7 +242,8 @@ static t_config_enum_values s_keys_map_InfillPattern {
     { "lockedzag",          ipLockedZag },
     { "2dlattice",          ip2DLattice  },
     { "ironingarchimedeanspiral", ipIroningArchimedeanSpiral },
-    { "globalmonotonicline", ipGlobalMonotonicLine }
+    { "globalmonotonicline", ipGlobalMonotonicLine },
+    { "bridgeawarecubic",   ipBridgeAwareCubic }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(InfillPattern)
 
@@ -3257,6 +3258,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_values.push_back("crosszag");
     def->enum_values.push_back("lockedzag");
     def->enum_values.push_back("2dlattice");
+    def->enum_values.push_back("bridgeawarecubic");
     def->enum_labels.push_back(L("Concentric"));
     def->enum_labels.push_back(L("Rectilinear"));
     def->enum_labels.push_back(L("Grid"));
@@ -3279,7 +3281,21 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back(L("Cross Zag"));
     def->enum_labels.push_back(L("Locked Zag"));
     def->enum_labels.push_back(L("2D Lattice"));
+    def->enum_labels.push_back(L("Bridge Aware Cubic"));
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipCubic));
+
+    def = this->add("bridge_aware_cubic_density", coPercent);
+    def->label = L("Bridge aware cubic density");
+    def->category = L("Strength");
+    // xgettext:no-c-format, no-boost-format
+    def->tooltip = L("Density that Bridge Aware Cubic infill reaches where internal bridges are printed on it. "
+                     "Away from internal bridges the infill keeps the sparse infill density; below them it is subdivided, "
+                     "doubling its density with each subdivision, until it reaches at least this density.");
+    def->sidetext = "%";
+    def->min = 0;
+    def->max = 100;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionPercent(10));
 
     def                = this->add("locked_skin_infill_pattern", coEnum);
     def->label         = L("Skin infill pattern");

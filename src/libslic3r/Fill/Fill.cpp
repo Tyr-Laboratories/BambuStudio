@@ -88,6 +88,9 @@ struct SurfaceFillParams
     float lattice_angle_1 = -45.0f;
     float lattice_angle_2 = 45.0f;
 
+    // Density of the Bridge Aware Cubic infill below internal bridges. Regions differing in it have different octrees.
+    float bridge_aware_density = 0.f;
+
 	bool operator<(const SurfaceFillParams &rhs) const {
 #define RETURN_COMPARE_NON_EQUAL(KEY) if (this->KEY < rhs.KEY) return true; if (this->KEY > rhs.KEY) return false;
 #define RETURN_COMPARE_NON_EQUAL_TYPED(TYPE, KEY) if (TYPE(this->KEY) < TYPE(rhs.KEY)) return true; if (TYPE(this->KEY) > TYPE(rhs.KEY)) return false;
@@ -129,6 +132,7 @@ struct SurfaceFillParams
 		RETURN_COMPARE_NON_EQUAL(conformal_hub_radius);
         RETURN_COMPARE_NON_EQUAL(lattice_angle_1);
         RETURN_COMPARE_NON_EQUAL(lattice_angle_2);
+        RETURN_COMPARE_NON_EQUAL(bridge_aware_density);
         RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, skin_pattern);
         RETURN_COMPARE_NON_EQUAL_TYPED(unsigned, skeleton_pattern);
 		return false;
@@ -167,6 +171,7 @@ struct SurfaceFillParams
 				this->conformal_hub_radius		== rhs.conformal_hub_radius &&
 			    this->lattice_angle_1 == rhs.lattice_angle_1 &&
                 this->lattice_angle_2 == rhs.lattice_angle_2&&
+                this->bridge_aware_density == rhs.bridge_aware_density &&
 				this-> skin_pattern     == rhs.skin_pattern &&
 				this-> skeleton_pattern == rhs.skeleton_pattern;
 	}
@@ -262,6 +267,8 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 } else if (params.pattern == ip2DLattice) {
                     params.lattice_angle_1 = region_config.sparse_infill_lattice_angle_1;
                     params.lattice_angle_2 = region_config.sparse_infill_lattice_angle_2;
+                } else if (params.pattern == ipBridgeAwareCubic) {
+                    params.bridge_aware_density = float(region_config.bridge_aware_cubic_density);
 				}
 
 				if (surface.is_solid()) {
@@ -297,7 +304,7 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
                 bool support_multiline_infill = params.pattern == ipCubic || params.pattern == ipGrid || params.pattern == ipRectilinear || params.pattern == ipStars ||
                                                 params.pattern == ipAlignedRectilinear || params.pattern == ipGyroid || params.pattern == ipHoneycomb ||
                                                 params.pattern == ipLightning || params.pattern == ip3DHoneycomb || params.pattern == ipAdaptiveCubic ||
-                                                params.pattern == ipSupportCubic;
+                                                params.pattern == ipSupportCubic || params.pattern == ipBridgeAwareCubic;
                 params.multiline = (params.extrusion_role == erInternalInfill && support_multiline_infill) ? int(region_config.fill_multiline) : 1;
 
 		        // Calculate the actual flow we'll be using for this infill.
@@ -820,6 +827,8 @@ void Layer::make_fills(FillAdaptive::Octree* adaptive_fill_octree, FillAdaptive:
         f->z 		= this->print_z;
         f->angle 	= surface_fill.params.angle;
         f->adapt_fill_octree = (surface_fill.params.pattern == ipSupportCubic) ? support_fill_octree : adaptive_fill_octree;
+        if (surface_fill.params.pattern == ipBridgeAwareCubic)
+            f->adapt_fill_octree = this->object()->bridge_aware_fill_octree(surface_fill.region_id);
         if (surface_fill.params.pattern == ipZigZag) {
             if (f->layer_id % 2 == 0)
                 f->angle -= surface_fill.params.infill_rotate_step * (f->layer_id / 2);
@@ -1010,6 +1019,7 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
 		case ipLightning:
 		case ipAdaptiveCubic:
         case ipSupportCubic:
+        case ipBridgeAwareCubic:
         case ipRectilinear:
         case ipMonotonic:
         case ipAlignedRectilinear:
@@ -1039,6 +1049,8 @@ Polylines Layer::generate_sparse_infill_polylines_for_anchoring(FillAdaptive::Oc
 		f->z = this->print_z;
 		f->angle = surface_fill.params.angle;
 		f->adapt_fill_octree = (surface_fill.params.pattern == ipSupportCubic) ? support_fill_octree : adaptive_fill_octree;
+		if (surface_fill.params.pattern == ipBridgeAwareCubic)
+			f->adapt_fill_octree = this->object()->bridge_aware_fill_octree(surface_fill.region_id);
 
 		if (surface_fill.params.pattern == ipLightning)
 			dynamic_cast<FillLightning::Filler*>(f.get())->generator = lightning_generator;

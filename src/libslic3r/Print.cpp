@@ -5420,6 +5420,7 @@ int Print::load_cached_data(const std::string& directory)
             // Keep it usable for export; a later infill edit must rebuild preparation.
             obj->m_adaptive_fill_octrees.first.reset();
             obj->m_adaptive_fill_octrees.second.reset();
+            obj->m_bridge_aware_fill_octrees.clear();
             obj->m_lightning_generator.reset();
             obj->m_typed_slices = true;
             obj->m_cached_infill_dependencies_missing = true;

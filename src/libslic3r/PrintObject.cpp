@@ -1429,6 +1429,40 @@ std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> PrintObject::prepare
         support_line_spacing  ? build_octree(mesh, overhangs.front(), support_line_spacing, true) : OctreePtr());
 }
 
+std::vector<std::shared_ptr<FillAdaptive::Octree>> PrintObject::prepare_bridge_aware_infill_data(
+    const std::vector<std::pair<const Surface *, float>> &surfaces_w_bottom_z) const
+{
+    using namespace FillAdaptive;
+
+    std::vector<BridgeAwareLattice>      lattices = bridge_aware_lattices(*this);
+    std::vector<std::shared_ptr<Octree>> octrees(lattices.size());
+
+    // Bounding box of the sliced object.
+    BoundingBox bbox;
+    if (std::any_of(lattices.begin(), lattices.end(), [](const BridgeAwareLattice &lattice) { return lattice.line_spacing > 0.; }))
+        for (const Layer *layer : this->layers())
+            bbox.merge(get_extents(layer->lslices));
+    if (! bbox.defined)
+        return octrees;
+    BoundingBoxf3 bboxf(Vec3d(unscaled<double>(bbox.min.x()), unscaled<double>(bbox.min.y()), 0.),
+                        Vec3d(unscaled<double>(bbox.max.x()), unscaled<double>(bbox.max.y()), this->layers().back()->print_z));
+
+    // Triangulate internal bridging surfaces.
+    std::vector<Vec3d> bridge_triangles;
+    for (const std::pair<const Surface *, float> &surface_w_bottom_z : surfaces_w_bottom_z) {
+        m_print->throw_if_canceled();
+        append(bridge_triangles, triangulate_expolygon_3d(surface_w_bottom_z.first->expolygon, surface_w_bottom_z.second));
+    }
+
+    for (size_t region_id = 0; region_id < lattices.size(); ++ region_id)
+        if (lattices[region_id].line_spacing > 0.) {
+            // Regions with the same lattice share an octree.
+            size_t first = std::find(lattices.begin(), lattices.begin() + region_id, lattices[region_id]) - lattices.begin();
+            octrees[region_id] = first < region_id ? octrees[first] : std::shared_ptr<Octree>(build_bridge_aware_octree(bboxf, bridge_triangles, lattices[region_id]));
+        }
+    return octrees;
+}
+
 FillLightning::GeneratorPtr PrintObject::prepare_lightning_infill_data()
 {
     bool has_lightning_infill = false;
@@ -1727,6 +1761,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "detect_floating_vertical_shell") {
             steps.emplace_back(posInfill);
         } else if (opt_key == "sparse_infill_pattern"
+                   || opt_key == "bridge_aware_cubic_density"
                    || opt_key == "conformal_infill"
                    || opt_key == "conformal_stagger"
                    || opt_key == "conformal_link_keep_layers"
@@ -3136,6 +3171,7 @@ void PrintObject::bridge_over_infill()
         }
 
         this->m_adaptive_fill_octrees = this->prepare_adaptive_infill_data(surfaces_w_bottom_z);
+        this->m_bridge_aware_fill_octrees = this->prepare_bridge_aware_infill_data(surfaces_w_bottom_z);
 
         std::vector<size_t> layers_to_generate_infill;
         for (const auto &pair : surfaces_by_layer) {
@@ -3742,6 +3778,7 @@ void PrintObject::add_internal_bridge_layers(const std::vector<std::vector<Surfa
     for (size_t index = 0; index < demands.size(); ++index)
         surfaces_w_bottom_z.emplace_back(&demands[index], demand_bottom_z[index]);
     m_adaptive_fill_octrees = prepare_adaptive_infill_data(surfaces_w_bottom_z);
+    m_bridge_aware_fill_octrees = prepare_bridge_aware_infill_data(surfaces_w_bottom_z);
 
     std::map<LayerRegion *, ExPolygons> lightning_demands;
     for (const BridgeBase &base : bases) {
@@ -3956,6 +3993,7 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
 static const char *s_modifier_ignored_infill_keys[] = {
     "sparse_infill_density",
     "sparse_infill_pattern",
+    "bridge_aware_cubic_density",
     "conformal_infill",
     "conformal_stagger",
     "conformal_link_keep_layers",

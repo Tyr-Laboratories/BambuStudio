@@ -262,6 +262,8 @@ struct Octree
     Cube*                       root_cube { nullptr };
     Vec3d                       origin;
     std::vector<CubeProperties> cubes_properties;
+    // Rotation of the octree around the Z axis, applied after transform_to_world().
+    double                      angle { 0. };
 
     Octree(const Vec3d &origin, const std::vector<CubeProperties> &cubes_properties)
         : root_cube(pool.construct(origin)), origin(origin), cubes_properties(cubes_properties) {}
@@ -371,8 +373,9 @@ struct FillContext
         cubes_properties(octree.cubes_properties),
         z_position(z_position),
         traversal_order(child_traversal_order[direction_idx]),
-        cos_a(cos(direction_angles[direction_idx])),
-        sin_a(sin(direction_angles[direction_idx]))
+        octree_angle(octree.angle),
+        cos_a(cos(direction_angles[direction_idx] + octree.angle)),
+        sin_a(sin(direction_angles[direction_idx] + octree.angle))
     {
         static constexpr auto unused = std::numeric_limits<coord_t>::max();
         temp_lines.assign((1 << octree.cubes_properties.size()) - 1, Line(Point(unused, unused), Point(unused, unused)));
@@ -386,6 +389,8 @@ struct FillContext
     const double                        z_position;
     // Order of traversal for this line direction.
     const std::array<int, 8>            traversal_order;
+    // Rotation of the octree around the Z axis.
+    const double                        octree_angle;
     // Rotation of the generated line for this line direction.
     const double                        cos_a;
     const double                        sin_a;
@@ -420,7 +425,7 @@ static bool verify_traversal_order(
     const Vec2d  &line_to)
 {
     std::array<Vec3d, 8> c;
-    Eigen::Quaterniond to_world = transform_to_world();
+    Eigen::Quaterniond to_world = Eigen::AngleAxisd(context.octree_angle, Vec3d::UnitZ()) * transform_to_world();
     for (int i = 0; i < 8; ++i) {
         int j = context.traversal_order[i];
         Vec3d cntr = to_world * (cube->center_octree + (child_centers[j] * (context.cubes_properties[depth].edge_length / 4.)));
@@ -1512,6 +1517,178 @@ OctreePtr build_octree(
             octree->origin = rot * octree->origin;
         }
     }
+
+    return octree;
+}
+
+std::vector<BridgeAwareLattice> bridge_aware_lattices(const PrintObject &print_object)
+{
+    std::vector<BridgeAwareLattice> lattices(print_object.num_printing_regions());
+    for (size_t region_id = 0; region_id < lattices.size(); ++ region_id) {
+        const PrintRegion       &region = print_object.printing_region(region_id);
+        const PrintRegionConfig &config = region.config();
+        if (config.sparse_infill_density > 0 && config.sparse_infill_pattern == ipBridgeAwareCubic) {
+            // Distance between the parallel lines of a layer at the sparse infill density, the same as of the Cubic infill.
+            double line_distance = 3. * region.flow(print_object, frInfill, print_object.config().layer_height, false).spacing() * config.fill_multiline.value /
+                                   (0.01 * config.sparse_infill_density.value);
+            // Double the density until it reaches the density wanted below the internal bridges.
+            int    subdivisions  = 0;
+            for (double density = config.sparse_infill_density.value; density < config.bridge_aware_cubic_density.value - EPSILON && density * 2. <= 100.; density *= 2.)
+                ++ subdivisions;
+            // The infill planes are inclined, therefore they are closer to each other than their lines in a layer.
+            lattices[region_id] = { line_distance * sqrt(2. / 3.) / double(1 << subdivisions), subdivisions, Geometry::deg2rad(config.infill_direction.value) };
+        }
+    }
+    return lattices;
+}
+
+// Bounding box of the object as seen from the octree, to find the cubes of the octree overlapping the object.
+struct ObjectBox
+{
+    // Center of the box in the coordinate system of the octree.
+    Vec3d           center;
+    // Half of the size of the box along the world axes.
+    Vec3d           half_size;
+    // Half of the size of the box along the octree axes.
+    Vec3d           half_extent;
+    Eigen::Matrix3d to_world;
+    // Half of the size of a cube with an edge of 2 along the world axes.
+    Vec3d           cube_extent;
+
+    ObjectBox(const BoundingBoxf3 &bbox, const Eigen::Matrix3d &to_octree) :
+        center(to_octree * bbox.center()), half_size(0.5 * bbox.size()), half_extent(to_octree.cwiseAbs() * half_size),
+        to_world(to_octree.transpose()), cube_extent(to_world.cwiseAbs() * Vec3d::Ones()) {}
+
+    // The box and the cube are tested along the axes of both. The test is conservative: A cube close to the box may pass without overlapping it.
+    bool overlaps_cube(const Vec3d &cube_center, double half_edge) const
+    {
+        Vec3d d = cube_center - this->center;
+        return ((d.cwiseAbs() - this->half_extent).array() <= half_edge).all() &&
+               (((this->to_world * d).cwiseAbs() - this->half_size - half_edge * this->cube_extent).array() <= 0.).all();
+    }
+};
+
+// Create all the cubes down to min_depth, which overlap the object.
+static void insert_all_cubes(Octree &octree, const ObjectBox &object_box, Cube *current_cube, int depth, int min_depth)
+{
+    assert(current_cube);
+
+    if (depth == min_depth)
+        return;
+
+    --depth;
+
+    const double half_edge = octree.cubes_properties[depth].edge_length / 2.;
+    for (size_t i = 0; i < 8; ++ i) {
+        Vec3d child_center = current_cube->center + (child_centers[i] * half_edge);
+        if (object_box.overlaps_cube(child_center, half_edge)) {
+            current_cube->children[i] = octree.pool.construct(child_center);
+            insert_all_cubes(octree, object_box, current_cube->children[i], depth, min_depth);
+        }
+    }
+}
+
+// Whether the triangle crosses one of the three infill planes of a cube.
+static bool triangle_intersects_infill_planes(const Vec3d &a, const Vec3d &b, const Vec3d &c, const Vec3d &cube_center, const BoundingBoxf3 &cube_bbox)
+{
+    for (int k = 0; k < 3; ++ k) {
+        // The infill plane is slightly thickened to cope with numeric errors, the same as the cubes are expanded by Octree::insert_triangle().
+        BoundingBoxf3 plane_bbox = cube_bbox;
+        plane_bbox.min[k] = cube_center[k] - EPSILON;
+        plane_bbox.max[k] = cube_center[k] + EPSILON;
+        if (triangle_AABB_intersects(a, b, c, plane_bbox))
+            return true;
+    }
+    return false;
+}
+
+// Subdivide the lattice below the triangle of an internal bridge: Create the cubes of the subdivided lattices,
+// the infill planes of which are crossed by the triangle, and the cubes containing them, so that the infill planes
+// of the created cubes always end on the infill planes of the larger cubes.
+// Returns the cube at the given center, nullptr if the cube neither existed nor it was created.
+static Cube* insert_bridge_triangle(
+    Octree &octree, const Vec3d &a, const Vec3d &b, const Vec3d &c,
+    Cube *cube, const Vec3d &center, const BoundingBoxf3 &bbox, int depth, int subdivisions)
+{
+    if (! cube) {
+        if (depth >= subdivisions)
+            // A cube of the unsubdivided lattice outside of the object.
+            return nullptr;
+        if (triangle_intersects_infill_planes(a, b, c, center, bbox))
+            cube = octree.pool.construct(center);
+    }
+
+    if (depth > 0) {
+        --depth;
+
+        for (size_t i = 0; i < 8; ++ i) {
+            const Vec3d &child_center_dir = child_centers[i];
+            // A slightly expanded bounding box of a child cube, see Octree::insert_triangle().
+            BoundingBoxf3 child_bbox;
+            for (int k = 0; k < 3; ++ k) {
+                if (child_center_dir[k] == -1.) {
+                    child_bbox.min[k] = bbox.min[k];
+                    child_bbox.max[k] = center[k] + EPSILON;
+                } else {
+                    child_bbox.min[k] = center[k] - EPSILON;
+                    child_bbox.max[k] = bbox.max[k];
+                }
+            }
+            if (triangle_AABB_intersects(a, b, c, child_bbox)) {
+                Vec3d child_center = center + (child_center_dir * (octree.cubes_properties[depth].edge_length / 2.));
+                Cube *child        = insert_bridge_triangle(octree, a, b, c, cube ? cube->children[i] : nullptr, child_center, child_bbox, depth, subdivisions);
+                if (child) {
+                    if (! cube)
+                        cube = octree.pool.construct(center);
+                    cube->children[i] = child;
+                }
+            }
+        }
+    }
+
+    return cube;
+}
+
+OctreePtr build_bridge_aware_octree(
+    const BoundingBoxf3         &bbox,
+    const std::vector<Vec3d>    &bridge_triangles,
+    const BridgeAwareLattice    &lattice)
+{
+    assert(bbox.defined);
+    assert(lattice.line_spacing > 0);
+
+    // The lattice of the Cubic infill is rotated by the infill direction.
+    const Eigen::Matrix3d       to_octree = transform_to_octree().toRotationMatrix() * Eigen::AngleAxisd(- lattice.angle, Vec3d::UnitZ()).toRotationMatrix();
+    const ObjectBox             object_box(bbox, to_octree);
+    // The infill planes of the Cubic infill cross at the center of the object at the print bed, the origin of the octree coordinates.
+    // The root cube is centered at the crossing of the unsubdivided infill planes closest to the center of the object.
+    const double                plane_distance   = lattice.line_spacing * double(1 << lattice.subdivisions);
+    const Vec3d                 root_center      = ((object_box.center / plane_distance).array().round() * plane_distance).matrix();
+    // The root cube contains the object and it is not smaller than a cube of the unsubdivided lattice.
+    std::vector<CubeProperties> cubes_properties = make_cubes_properties(
+        std::max(2. * ((root_center - object_box.center).cwiseAbs() + object_box.half_extent).maxCoeff(), plane_distance), lattice.line_spacing);
+    auto                        octree           = OctreePtr(new Octree(root_center, cubes_properties));
+    int                         max_depth        = int(cubes_properties.size()) - 1;
+    assert(max_depth >= lattice.subdivisions);
+    octree->angle = lattice.angle;
+
+    // The unsubdivided lattice fills the whole object.
+    insert_all_cubes(*octree, object_box, octree->root_cube, max_depth, lattice.subdivisions);
+
+    // The lattice is subdivided where its infill planes are crossed by the internal bridges.
+    if (lattice.subdivisions > 0) {
+        double        edge_length_half = 0.5 * cubes_properties.back().edge_length;
+        Vec3d         diag_half(edge_length_half, edge_length_half, edge_length_half);
+        BoundingBoxf3 root_bbox(octree->root_cube->center - diag_half, octree->root_cube->center + diag_half);
+        for (size_t i = 0; i < bridge_triangles.size(); i += 3)
+            insert_bridge_triangle(
+                *octree, to_octree * bridge_triangles[i], to_octree * bridge_triangles[i + 1], to_octree * bridge_triangles[i + 2],
+                octree->root_cube, octree->root_cube->center, root_bbox, max_depth, lattice.subdivisions);
+    }
+
+    // Transform the octree to world coordinates to reduce computation when extracting infill lines.
+    transform_center(octree->root_cube, object_box.to_world);
+    octree->origin = object_box.to_world * octree->origin;
 
     return octree;
 }
