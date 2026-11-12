@@ -59,6 +59,8 @@ struct Joint
     double    extension   = 0.;
     // Outer wall line width at the joint layer, scaled.
     coord_t   line_width  = 0;
+    // Slicing tolerance, scaled (JointSettings::tolerance).
+    coord_t   tolerance   = 0;
 };
 
 // Depth in mm of the top shell under a top surface on `surface_layer`, built as discover_vertical_shells() builds it:
@@ -74,6 +76,20 @@ double bottom_shell_depth(const std::vector<LayerGeometry> &layers, size_t surfa
 // bottom joint is the mirror image. At most one joint per side.
 std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t layer, const Polylines &outer_wall_lines,
                                const JointSettings &settings);
+
+struct ExtensionArea
+{
+    // Covered by extension lines and chamfers at the target layer, before clipping to the part.
+    ExPolygons all;
+    // The part of `all` on a top joint's deepest layer: nothing of the extension is below it.
+    ExPolygons hanging;
+};
+
+// Area at `target_layer` covered by the extension lines and 45 degree chamfers of `joints`. A top joint's extension
+// reaches down to shell_depth + extension below the surface, a bottom joint's up to the same distance above it. The
+// chamfer lies on the layers beyond the shell, on the surface side only: as wide as the extension next to the shell,
+// narrowing by one layer height per layer to nothing at the extension's far end.
+ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std::vector<Joint> &joints, size_t target_layer);
 
 } // namespace WallInternalExtension
 } // namespace Slic3r

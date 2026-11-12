@@ -172,3 +172,81 @@ TEST_CASE("Shell depth follows the shell settings in millimetres", "[WallExtensi
     CHECK(top_shell_depth(mixed, 15, 4, 0.6) == Approx(0.6));
     CHECK(bottom_shell_depth(mixed, 10, 4, 0.) == Approx(0.4));
 }
+
+namespace {
+double area_mm2(const ExPolygons &expolygons)
+{
+    double area = 0.;
+    for (const ExPolygon &expolygon : expolygons)
+        area += expolygon.area();
+    return area * SCALING_FACTOR * SCALING_FACTOR;
+}
+
+// Width in mm of `area` along a 0.2 mm tall strip crossing the right side (x = 15) of the 10 mm tower: exact on a
+// straight side, unlike an area divided by a perimeter, which the corners distort.
+double width_across_right_side(const ExPolygons &area)
+{
+    return area_mm2(intersection_ex(area, ExPolygons{ rect(13., 9.9, 18., 10.1) })) / 0.2;
+}
+}
+
+TEST_CASE("Under a tower the extension goes through the shell and 1 mm below with a widening chamfer", "[WallExtension][Area]")
+{
+    const auto layers = stack(concat(repeat(box20, 30), repeat(tower10, 15)));
+    const auto joints = find_joints(layers, 30, outer_lines(tower10), settings());
+    REQUIRE(joints.size() == 1);
+    REQUIRE(joints.front().shell_depth == Approx(0.8));
+    for (size_t l = 0; l < layers.size(); ++l) {
+        CAPTURE(l);
+        const ExtensionArea a = extension_area(layers, joints, l);
+        CHECK(a.all.empty() == (l < 21 || l > 29));
+        CHECK(a.hanging.empty() == (l != 21));
+        if (a.all.empty())
+            continue;
+        // The extension line lies inside the tower's outline, right under the wall; only the chamfer lies outside it.
+        CHECK(area_mm2(intersection_ex(a.all, tower10)) == Approx(4. * (10. - line_w) * line_w).epsilon(0.05));
+        const double chamfer = l >= 26 ? 0. : 0.2 * double(l - 20);
+        CHECK(width_across_right_side(a.all) == Approx(line_w + chamfer).margin(0.02));
+        if (l == 21)
+            CHECK(area_mm2(a.hanging) == Approx(area_mm2(a.all)));
+    }
+}
+
+TEST_CASE("Over a column the extension rises through the bottom shell and 1 mm above", "[WallExtension][Area]")
+{
+    const auto layers = stack(concat(repeat(tower10, 30), repeat(box20, 30)));
+    const auto joints = find_joints(layers, 29, outer_lines(tower10), settings());
+    REQUIRE(joints.size() == 1);
+    REQUIRE(joints.front().side == JointSide::Bottom);
+    for (size_t l = 0; l < layers.size(); ++l) {
+        CAPTURE(l);
+        const ExtensionArea a = extension_area(layers, joints, l);
+        CHECK(a.all.empty() == (l < 30 || l > 38));
+        CHECK(a.hanging.empty());
+        if (a.all.empty())
+            continue;
+        // Narrows going up: 1.0 mm just above the shell (layer 34), 0.2 mm on the last layer (38).
+        const double chamfer = l <= 33 ? 0. : 0.2 * double(39 - l);
+        CHECK(width_across_right_side(a.all) == Approx(line_w + chamfer).margin(0.02));
+    }
+}
+
+TEST_CASE("Overlapping extensions form one area", "[WallExtension][Area]")
+{
+    const ExPolygon  left = rect(6., 11., 14., 19.), right = rect(15., 11., 23., 19.);
+    const ExPolygons both { left, right };
+    const auto layers = stack(concat(repeat(ExPolygons{ rect(0., 0., 30., 30.) }, 30), repeat(both, 15)));
+    const auto joints_left  = find_joints(layers, 30, outer_lines({ left }), settings());
+    const auto joints_right = find_joints(layers, 30, outer_lines({ right }), settings());
+    REQUIRE(joints_left.size() == 1);
+    REQUIRE(joints_right.size() == 1);
+    const std::vector<Joint> joints { joints_left.front(), joints_right.front() };
+    // Layer 25 is just under the shell, where each chamfer is 1.0 mm wide; they meet across the 1.0 mm gap.
+    const ExPolygons together = extension_area(layers, joints, 25).all;
+    double sum = 0.;
+    for (const ExPolygon &expolygon : together)
+        sum += area_mm2({ expolygon });
+    CHECK(sum == Approx(area_mm2(union_ex(together))));
+    CHECK(area_mm2(together) < area_mm2(extension_area(layers, joints_left, 25).all) +
+                               area_mm2(extension_area(layers, joints_right, 25).all) - 1.);
+}
