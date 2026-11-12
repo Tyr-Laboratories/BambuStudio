@@ -94,6 +94,12 @@ the UI thread. Post-processing scripts receive their own plate configuration in
 a child environment. Individual-plate slicing and imported-G-code previews keep
 their existing workflows.
 
+## Reproducible slicing
+
+Slicing the same plate again gives the same G-code with **Tree Organic** supports, normal supports, or none. Mesh slicing, the projections of support painting, and Organic support generation used to depend on the order in which parallel threads finished, so a plate sliced twice could differ in the start points and order of its paths and slightly in its supports. **Tree Slim**, **Tree Strong** and **Tree Hybrid** supports can still differ from one run to the next.
+
+Support generation is also faster. On a private 16-plate aircraft project with Organic supports, slicing took 11% fewer retired instructions than before these optimizations, and 31% fewer on its most support-heavy plate. Each optimization left the G-code byte-identical.
+
 ## Paint bases for Organic tree supports
 
 With **Tree Organic** selected and **On build plate only** enabled, select an object in Prepare, open **Supports Painting**, and choose **Support bases**. Paint an upward-facing surface below an overhang to allow trees to start there. This can replace a tall tower from the bed with a short tree on a raised part of the model.
