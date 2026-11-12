@@ -5662,6 +5662,19 @@ static void smooth_organic_forest(
 
 }
 
+// intersection(a, b).empty(), without running Clipper where the answer is plain: when one of
+// them is empty, or their bounding boxes are apart. The polygons must have points.
+static bool polygons_disjoint(const Polygons &a, const Polygons &b)
+{
+    return a.empty() || b.empty() || ! get_extents(a).overlap(get_extents(b)) || intersection(a, b).empty();
+}
+
+// intersection(a, b), without running Clipper when one of them is empty.
+static Polygons intersection_if_any(const Polygons &a, const Polygons &b)
+{
+    return a.empty() || b.empty() ? Polygons{} : intersection(a, b);
+}
+
 // Validate physical stems rather than individual graph nodes: neighboring seam
 // sections may join into one stem, while isolated stems need their own feet.
 static bool foundation_components_have_multiple_feet(
@@ -5694,7 +5707,7 @@ static bool foundation_components_have_multiple_feet(
     std::vector<Polygons> reached_feet(parents.size());
     auto collect_feet = [&](const std::vector<LabeledPart> &parts, size_t layer) {
         for (const LabeledPart &part : parts) {
-            append(reached_feet[part.label], intersection(part.polygons, feet[layer]));
+            append(reached_feet[part.label], intersection_if_any(part.polygons, feet[layer]));
             if (cancel)
                 cancel();
         }
@@ -5707,7 +5720,7 @@ static bool foundation_components_have_multiple_feet(
             Polygons polygons = to_polygons(std::move(part));
             size_t label = parents.size();
             for (const LabeledPart &neighbor : above)
-                if (area(intersection(polygons, neighbor.polygons)) > 0.) {
+                if (get_extents(polygons).overlap(get_extents(neighbor.polygons)) && area(intersection(polygons, neighbor.polygons)) > 0.) {
                     const size_t neighbor_root = root(neighbor.label);
                     if (label == parents.size())
                         label = neighbor_root;
@@ -6505,21 +6518,25 @@ void organic_draw_branches(
             // Every component must grow from a permitted foot or overlap material in
             // the preceding physical layer. A failed candidate leaves the old tree.
             Polygons grounded_below;
+            // The parts of each layer, kept for the walk back from the seam.
+            std::vector<ExPolygons> candidate_parts(candidate.size());
             for (LayerIndex physical = base; physical <= seam; ++physical) {
                 const size_t i = size_t(physical - base);
                 const Polygons &collision = reverse_volumes.getCollision(0, seam - physical, true);
                 candidate[i] = intersection(diff_clipped(candidate[i], collision), volumes.m_bed_area);
                 branch_material[i] = intersection(diff_clipped(branch_material[i], collision), volumes.m_bed_area);
-                tip_contacts[i] = intersection(candidate[i], tip_contacts[i]);
+                tip_contacts[i] = intersection_if_any(candidate[i], tip_contacts[i]);
                 // A tilted tip's sliced footprint must fit its permitted landing,
                 // not merely intersect it at the sampled center.
-                if (const double outside = area(diff(tip_contacts[i], volumes.getPlaceableAreas(0, physical, throw_on_cancel)));
-                    outside > tiny_area_threshold) {
-                    return false;
-                }
-                for (const ExPolygon &part : union_ex(candidate[i])) {
+                if (! tip_contacts[i].empty())
+                    if (const double outside = area(diff(tip_contacts[i], volumes.getPlaceableAreas(0, physical, throw_on_cancel)));
+                        outside > tiny_area_threshold) {
+                        return false;
+                    }
+                candidate_parts[i] = union_ex(candidate[i]);
+                for (const ExPolygon &part : candidate_parts[i]) {
                     const Polygons polygon = to_polygons(part);
-                    if (intersection(polygon, grounded_below).empty() && intersection(polygon, tip_contacts[i]).empty())
+                    if (polygons_disjoint(polygon, grounded_below) && polygons_disjoint(polygon, tip_contacts[i]))
                         return false;
                 }
                 grounded_below = candidate[i];
@@ -6532,19 +6549,19 @@ void organic_draw_branches(
             for (LayerIndex physical = seam; physical >= base; --physical) {
                 const size_t i = size_t(physical - base);
                 Polygons connected;
-                for (const ExPolygon &part : union_ex(candidate[i]))
-                    if (!intersection(to_polygons(part), connected_above).empty())
+                for (const ExPolygon &part : candidate_parts[i])
+                    if (! polygons_disjoint(to_polygons(part), connected_above))
                         append(connected, to_polygons(part));
                 candidate[i] = std::move(connected);
-                tip_contacts[i] = intersection(tip_contacts[i], candidate[i]);
+                tip_contacts[i] = intersection_if_any(tip_contacts[i], candidate[i]);
                 // A continuous interface band must not make a clipped-away stem
                 // count as a second foundation branch. Trace the branch material
                 // independently of interfaces back to the midpoint.
                 Polygons connected_branches;
                 for (const ExPolygon &part : union_ex(branch_material[i]))
-                    if (!intersection(to_polygons(part), branches_above).empty())
+                    if (! polygons_disjoint(to_polygons(part), branches_above))
                         append(connected_branches, to_polygons(part));
-                branch_feet[i] = intersection(branch_feet[i], connected_branches);
+                branch_feet[i] = intersection_if_any(branch_feet[i], connected_branches);
                 append(connected_feet, branch_feet[i]);
                 branch_material[i] = connected_branches;
                 branches_above = std::move(connected_branches);
@@ -6688,7 +6705,80 @@ void organic_draw_branches(
     std::unordered_map<const SupportElement*, Point> committed_upper_positions;
     std::unordered_set<const SupportElement*> discarded_forward_cooling;
     std::vector<ExPolygons> foundation_cooldown_areas(cooldown_areas.size());
-    for (const FoundationRequest &request : foundation_requests) {
+    // Whether the tower check could move a tree to the bed: standing on paint,
+    // with every one of its tips able to reach the bed. A tip left behind on
+    // paint would lose the branches it merged with, and alone it may be too
+    // short to stand on the paint.
+    std::vector<char> movable;
+    if (slender_painted_tips && config.painted_bases_only) {
+        movable.assign(trees.size(), 0);
+        for (const Tree &tree : trees) {
+            if (tree.first_layer_id <= LayerIndex(config.raft_layers.size()))
+                continue; // Stands on the bed or raft.
+            bool all_reach_bed = true;
+            for (const Branch &branch : tree.branches)
+                if (branch.has_tip) {
+                    const SupportElementState &tip = branch.path.back()->state;
+                    if (tip_bed_route(volumes, config, tip.target_height, tip.target_position) == TipBedRoute::None) {
+                        all_reach_bed = false;
+                        break;
+                    }
+                }
+            movable[&tree - trees.data()] = all_reach_bed;
+        }
+    }
+    auto tree_movable = [&](const Tree &tree) { return ! movable.empty() && movable[&tree - trees.data()]; };
+    // Lists the tips of the towers too slender for their anchor. Returns whether there are any.
+    auto check_towers = [&]() {
+        // A tree standing on the build plate widens toward its base by the
+        // branch diameter angle, which keeps it standing while it prints. A
+        // tower standing on paint has to be as stable: its anchor, everywhere
+        // it rests on paint, all of its feet together, must span at least the
+        // base that taper gives a tree of its height, in X or in Y.
+        for (const Tree &tree : trees) {
+            throw_on_cancel();
+            if (! tree_movable(tree))
+                continue;
+            Polygons   anchor;
+            LayerIndex anchor_bottom = std::numeric_limits<LayerIndex>::max();
+            LayerIndex top           = -1;
+            for (size_t i = 0; i < tree.slices.size(); ++ i) {
+                if (tree.slices[i].polygons.empty())
+                    continue;
+                const LayerIndex layer = tree.first_layer_id + LayerIndex(i);
+                top = layer;
+                if (Polygons rests = intersection(tree.slices[i].polygons, volumes.getPlaceableAreas(0, layer, throw_on_cancel)); ! rests.empty()) {
+                    append(anchor, std::move(rests));
+                    anchor_bottom = std::min(anchor_bottom, layer);
+                }
+            }
+            // The root's foot rests on all of the paint below it, stepping down a
+            // slope. On a steep slope no layer's band of paint is wider than the
+            // XY distance, so no single layer has a placeable area there.
+            const LayerIndex root_layer = tree.branches.front().path.front()->state.layer_idx;
+            if (root_layer >= tree.first_layer_id && root_layer < tree.first_layer_id + LayerIndex(tree.slices.size()))
+                if (Polygons rests = intersection(tree.slices[root_layer - tree.first_layer_id].polygons, volumes.getPaintedBaseSurface(root_layer));
+                    ! rests.empty()) {
+                    append(anchor, std::move(rests));
+                    anchor_bottom = std::min(anchor_bottom, tree.first_layer_id);
+                }
+            if (anchor.empty())
+                continue;
+            const Point  span   = get_extents(anchor).size();
+            const double needed = 2. * double(top - anchor_bottom) * config.branch_radius_increase_per_layer;
+            if (double(std::max(span.x(), span.y())) >= needed)
+                continue;
+            for (const Branch &branch : tree.branches)
+                if (branch.has_tip)
+                    slender_painted_tips->emplace_back(branch.path.back()->state.target_height, branch.path.back()->state.target_position);
+        }
+        return ! slender_painted_tips->empty();
+    };
+    // The cooldown areas of each request, appended in the order of the requests
+    // whichever order their foundations are built in.
+    std::vector<std::vector<std::pair<LayerIndex, ExPolygons>>> request_cooldown(foundation_requests.size());
+    auto build_foundation = [&](const size_t request_idx) {
+        const FoundationRequest &request = foundation_requests[request_idx];
         throw_on_cancel();
         Tree &tree = *request.tree;
         const LayerIndex base = request.base;
@@ -6710,6 +6800,35 @@ void organic_draw_branches(
             std::vector<Polygons> upper_sections;
             std::vector<size_t> upper_branch_counts;
             LayerIndex changed_upper_end;
+        };
+        // Both join construction and validation use the regularized contours
+        // that reach toolpath generation. Repairing raw tube outlines cannot
+        // account for the concave corners that this existing operation fills.
+        auto regularize = [&](const Polygons &section) {
+            return polygons_simplify(smooth_outward(union_(section), config.support_line_width),
+                std::min(scaled<double>(0.03), double(config.resolution)));
+        };
+        // The same sections are regularized again and again while this foundation's choices are
+        // assembled and validated: keep each section's contour and shell, found by its contents.
+        struct SectionShell { Polygons section, contour, shell; };
+        std::unordered_multimap<uint64_t, SectionShell> section_shells;
+        auto section_shell = [&](const Polygons &section) -> const SectionShell & {
+            uint64_t hash = 1469598103934665603ull;
+            auto mix = [&hash](uint64_t v) { hash = (hash ^ v) * 1099511628211ull; };
+            for (const Polygon &polygon : section) {
+                mix(polygon.points.size());
+                for (const Point &point : polygon.points) {
+                    mix(uint64_t(point.x()));
+                    mix(uint64_t(point.y()));
+                }
+            }
+            auto [begin, end] = section_shells.equal_range(hash);
+            for (auto it = begin; it != end; ++ it)
+                if (it->second.section == section)
+                    return it->second;
+            Polygons contour = regularize(section);
+            Polygons shell   = diff(contour, offset(contour, -config.support_line_width));
+            return section_shells.emplace(hash, SectionShell{ section, std::move(contour), std::move(shell) })->second;
         };
         auto assemble_foundation = [&](const std::vector<bool> &selected,
                                        const FoundationAssembly *previous) -> std::optional<FoundationAssembly> {
@@ -6766,18 +6885,9 @@ void organic_draw_branches(
             const Polygons &upper_section = upper_sections.front();
             if (upper_section.empty() || intersection(foundation.back(), upper_section).empty())
                 return std::nullopt;
-            // Both join construction and validation use the regularized contours
-            // that reach toolpath generation. Repairing raw tube outlines cannot
-            // account for the concave corners that this existing operation fills.
-            auto regularize = [&](const Polygons &section) {
-                return polygons_simplify(smooth_outward(union_(section), config.support_line_width),
-                    std::min(scaled<double>(0.03), double(config.resolution)));
-            };
             auto supported_sheath = [&](const Polygons &above, const Polygons &below) {
-                const Polygons above_contour = regularize(above);
-                const Polygons below_contour = regularize(below);
-                const Polygons above_shell = diff(above_contour, offset(above_contour, -config.support_line_width));
-                const Polygons below_shell = diff(below_contour, offset(below_contour, -config.support_line_width));
+                const Polygons &above_shell = section_shell(above).shell;
+                const Polygons &below_shell = section_shell(below).shell;
                 for (const ExPolygon &part : union_ex(above_shell))
                     if (intersection(to_polygons(part), below_shell).empty())
                         return false;
@@ -6788,10 +6898,7 @@ void organic_draw_branches(
             };
             auto changed_sheath_supported = [&](const Polygons &above, const Polygons &below,
                                                 const Polygons &previous_above, const Polygons &previous_below) {
-                auto shell = [&](const Polygons &section) {
-                    const Polygons contour = regularize(section);
-                    return diff(contour, offset(contour, -config.support_line_width));
-                };
+                auto shell = [&](const Polygons &section) -> const Polygons & { return section_shell(section).shell; };
                 return organic_changed_sheath_supported(shell(above), shell(below),
                     shell(previous_above), shell(previous_below),
                     config.maximum_move_distance + coord_t(std::ceil(config.branch_radius_increase_per_layer)) + 2 * config.resolution,
@@ -6819,7 +6926,7 @@ void organic_draw_branches(
                     break;
                 }
 
-                const Polygons above_contour = regularize(above);
+                const Polygons &above_contour = section_shell(above).contour;
                 const Polygons &collision = collar_volumes.getCollision(0, seam - layer, true);
                 bool joined = false;
                 // A full inset/outset step can merge neighboring tubes and remove
@@ -6833,7 +6940,7 @@ void organic_draw_branches(
                     section = intersection(diff_clipped(section, collision), volumes.m_bed_area);
                     if (supported_sheath(above, section)) {
                         Polygons branches = step == 0 ? above_branches :
-                            union_(offset(regularize(above_branches), -step), intersection(foundation_branches[i], outer));
+                            union_(offset(section_shell(above_branches).contour, -step), intersection(foundation_branches[i], outer));
                         foundation_branches[i] = intersection(diff_clipped(branches, collision), volumes.m_bed_area);
                         foundation[i] = std::move(section);
                         joined = true;
@@ -6853,11 +6960,14 @@ void organic_draw_branches(
             // Recheck ground-to-seam connectivity. Material
             // outside the connected foundation cannot count as a stabilizing foot.
             Polygons connected;
+            // The parts of each layer, kept for the walk back from the seam.
+            std::vector<ExPolygons> foundation_parts(foundation.size());
             for (size_t i = 0; valid && i < foundation.size(); ++i) {
                 throw_on_cancel();
-                for (const ExPolygon &part : union_ex(foundation[i])) {
+                foundation_parts[i] = union_ex(foundation[i]);
+                for (const ExPolygon &part : foundation_parts[i]) {
                     const Polygons polygon = to_polygons(part);
-                    if (intersection(polygon, connected).empty() && intersection(polygon, foundation_contacts[i]).empty()) {
+                    if (polygons_disjoint(polygon, connected) && polygons_disjoint(polygon, foundation_contacts[i])) {
                         valid = false;
                         break;
                     }
@@ -6869,16 +6979,16 @@ void organic_draw_branches(
             for (size_t i = foundation.size(); valid && i-- > 0;) {
                 throw_on_cancel();
                 Polygons kept;
-                for (const ExPolygon &part : union_ex(foundation[i]))
-                    if (!intersection(to_polygons(part), connected).empty())
+                for (const ExPolygon &part : foundation_parts[i])
+                    if (! polygons_disjoint(to_polygons(part), connected))
                         append(kept, to_polygons(part));
                 foundation[i] = std::move(kept);
-                foundation_contacts[i] = intersection(foundation_contacts[i], foundation[i]);
+                foundation_contacts[i] = intersection_if_any(foundation_contacts[i], foundation[i]);
                 Polygons kept_branches;
-                for (const ExPolygon &part : union_ex(intersection(foundation_branches[i], foundation[i])))
-                    if (!intersection(to_polygons(part), connected_branches).empty())
+                for (const ExPolygon &part : union_ex(intersection_if_any(foundation_branches[i], foundation[i])))
+                    if (! polygons_disjoint(to_polygons(part), connected_branches))
                         append(kept_branches, to_polygons(part));
-                foundation_feet[i] = intersection(foundation_feet[i], kept_branches);
+                foundation_feet[i] = intersection_if_any(foundation_feet[i], kept_branches);
                 foundation_branches[i] = kept_branches;
                 connected_branches = std::move(kept_branches);
                 connected = foundation[i];
@@ -6932,7 +7042,7 @@ void organic_draw_branches(
             std::fill(selected.begin(), selected.end(), false);
             accepted = std::move(original);
             if (!accepted)
-                continue;
+                return;
             for (size_t i = 0; i < choices.size(); ++i)
                 if (choices[i].straightened) {
                     selected[i] = true;
@@ -6963,7 +7073,7 @@ void organic_draw_branches(
             slice.bottom_contacts = render_bottom_interfaces ?
                 union_(foundation_contacts[layer - base]) : Polygons{};
             slice.num_branches = 1;
-            append(foundation_cooldown_areas[layer], std::move(foundation_cooldown[layer - base]));
+            request_cooldown[request_idx].emplace_back(layer, std::move(foundation_cooldown[layer - base]));
         }
         if (!replacements.empty()) {
             for (size_t i = 0; i < upper_sections.size() && seam + 1 + LayerIndex(i) < changed_upper_end; ++i) {
@@ -6977,7 +7087,27 @@ void organic_draw_branches(
                     committed_upper_positions[node] = point;
             }
         }
+    };
+
+    if (movable.empty()) {
+        for (size_t i = 0; i < foundation_requests.size(); ++ i)
+            build_foundation(i);
+    } else {
+        // When a tower is too slender, everything is generated again: build the
+        // foundations of the trees that the check cannot move only after it.
+        for (size_t i = 0; i < foundation_requests.size(); ++ i)
+            if (tree_movable(*foundation_requests[i].tree))
+                build_foundation(i);
+        if (check_towers())
+            // The caller generates again, with these tips routed to the bed.
+            return;
+        for (size_t i = 0; i < foundation_requests.size(); ++ i)
+            if (! tree_movable(*foundation_requests[i].tree))
+                build_foundation(i);
     }
+    for (std::vector<std::pair<LayerIndex, ExPolygons>> &contributions : request_cooldown)
+        for (auto &[layer, areas] : contributions)
+            append(foundation_cooldown_areas[layer], std::move(areas));
 
     // Ownership decisions for every tree use the same original seam geometry.
     // Publish axis changes only after generation, before tree connectivity uses
@@ -6986,67 +7116,6 @@ void organic_draw_branches(
         for (SupportElement &element : layer)
             if (auto found = committed_upper_positions.find(&element); found != committed_upper_positions.end())
                 element.state.result_on_layer = found->second;
-
-    if (slender_painted_tips && config.painted_bases_only) {
-        // A tree standing on the build plate widens toward its base by the
-        // branch diameter angle, which keeps it standing while it prints. A
-        // tower standing on paint has to be as stable: its anchor, everywhere
-        // it rests on paint, all of its feet together, must span at least the
-        // base that taper gives a tree of its height, in X or in Y.
-        for (const Tree &tree : trees) {
-            throw_on_cancel();
-            if (tree.first_layer_id <= LayerIndex(config.raft_layers.size()))
-                continue; // Stands on the bed or raft.
-            Polygons   anchor;
-            LayerIndex anchor_bottom = std::numeric_limits<LayerIndex>::max();
-            LayerIndex top           = -1;
-            for (size_t i = 0; i < tree.slices.size(); ++ i) {
-                if (tree.slices[i].polygons.empty())
-                    continue;
-                const LayerIndex layer = tree.first_layer_id + LayerIndex(i);
-                top = layer;
-                if (Polygons rests = intersection(tree.slices[i].polygons, volumes.getPlaceableAreas(0, layer, throw_on_cancel)); ! rests.empty()) {
-                    append(anchor, std::move(rests));
-                    anchor_bottom = std::min(anchor_bottom, layer);
-                }
-            }
-            // The root's foot rests on all of the paint below it, stepping down a
-            // slope. On a steep slope no layer's band of paint is wider than the
-            // XY distance, so no single layer has a placeable area there.
-            const LayerIndex root_layer = tree.branches.front().path.front()->state.layer_idx;
-            if (root_layer >= tree.first_layer_id && root_layer < tree.first_layer_id + LayerIndex(tree.slices.size()))
-                if (Polygons rests = intersection(tree.slices[root_layer - tree.first_layer_id].polygons, volumes.getPaintedBaseSurface(root_layer));
-                    ! rests.empty()) {
-                    append(anchor, std::move(rests));
-                    anchor_bottom = std::min(anchor_bottom, tree.first_layer_id);
-                }
-            if (anchor.empty())
-                continue;
-            const Point  span   = get_extents(anchor).size();
-            const double needed = 2. * double(top - anchor_bottom) * config.branch_radius_increase_per_layer;
-            if (double(std::max(span.x(), span.y())) >= needed)
-                continue;
-            // Build the tower from the bed only when every one of its tips can reach
-            // the bed: a tip left behind on paint would lose the branches it merged
-            // with, and alone it may be too short to stand on the paint.
-            std::vector<std::pair<LayerIndex, Point>> tips;
-            bool all_reach_bed = true;
-            for (const Branch &branch : tree.branches)
-                if (branch.has_tip) {
-                    const SupportElementState &tip = branch.path.back()->state;
-                    if (tip_bed_route(volumes, config, tip.target_height, tip.target_position) == TipBedRoute::None) {
-                        all_reach_bed = false;
-                        break;
-                    }
-                    tips.emplace_back(tip.target_height, tip.target_position);
-                }
-            if (all_reach_bed)
-                append(*slender_painted_tips, std::move(tips));
-        }
-        if (! slender_painted_tips->empty())
-            // The caller generates again, with these tips routed to the bed.
-            return;
-    }
 
     // Generate forward cooling from the committed graph positions. Removed
     // lower edges are represented by the accepted reverse forest instead.

@@ -24,6 +24,7 @@
 #include <boost/log/trivial.hpp>
 
 #include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 #include <tbb/task_group.h>
 
 namespace Slic3r::TreeSupport3D
@@ -49,6 +50,25 @@ static Polygons calculateMachineBorderCollision(Polygon machine_border)
     out.emplace_back(std::move(machine_border));
     return out;
 #endif
+}
+
+template<typename Done, typename Compute>
+void TreeModelVolumes::compute_once(const LazyCache cache, const coord_t radius, Done &&done, Compute &&compute) const
+{
+    std::mutex *lock;
+    {
+        std::lock_guard<std::mutex> guard(m_lazy_locks->mutex);
+        std::unique_ptr<std::mutex> &slot = m_lazy_locks->locks[{ int(cache), radius }];
+        if (! slot)
+            slot = std::make_unique<std::mutex>();
+        lock = slot.get();
+    }
+    std::lock_guard<std::mutex> guard(*lock);
+    // Another thread may have computed the entry while this one waited.
+    if (! done())
+        // Waiting for its nested loops, this thread must not pick up a task that
+        // requests the same entries: that task would wait for this very thread.
+        tbb::this_task_arena::isolate(std::forward<Compute>(compute));
 }
 
 TreeModelVolumes::TreeModelVolumes(
@@ -401,8 +421,9 @@ const Polygons& TreeModelVolumes::getCollision(const coord_t orig_radius, LayerI
         if (m_reversed_throw_on_cancel) {
             const coord_t source_radius = m_reversed_source->ceilRadius(orig_radius, min_xy_dist);
             if (!m_reversed_source->m_collision_cache.getArea({source_radius, physical_layer})) {
-                const_cast<TreeModelVolumes*>(m_reversed_source)->calculateCollision(
-                    source_radius, physical_layer, m_reversed_throw_on_cancel);
+                m_reversed_source->compute_once(LazyCache::Collision, source_radius,
+                    [&] { return m_reversed_source->m_collision_cache.getArea({source_radius, physical_layer}).has_value(); },
+                    [&] { const_cast<TreeModelVolumes*>(m_reversed_source)->calculateCollision(source_radius, physical_layer, m_reversed_throw_on_cancel); });
                 m_reversed_throw_on_cancel();
             }
         }
@@ -432,7 +453,9 @@ const Polygons& TreeModelVolumes::getCollision(const coord_t orig_radius, LayerI
         BOOST_LOG_TRIVIAL(error_level_not_in_cache) << "Had to calculate collision at radius " << radius << " and layer " << layer_idx << ", but precalculate was called. Performance may suffer!";
         tree_supports_show_error("Not precalculated Collision requested."sv, false);
     }
-    const_cast<TreeModelVolumes*>(this)->calculateCollision(radius, layer_idx, []{});
+    compute_once(LazyCache::Collision, radius,
+        [&] { return m_collision_cache.getArea({ radius, layer_idx }).has_value(); },
+        [&] { const_cast<TreeModelVolumes*>(this)->calculateCollision(radius, layer_idx, []{}); });
     return getCollision(orig_radius, layer_idx, min_xy_dist);
 }
 
@@ -464,15 +487,19 @@ const Polygons& TreeModelVolumes::getCollisionHolefree(coord_t radius, LayerInde
         BOOST_LOG_TRIVIAL(error_level_not_in_cache) << "Had to calculate collision holefree at radius " << radius << " and layer " << layer_idx << ", but precalculate was called. Performance may suffer!";
         tree_supports_show_error("Not precalculated Holefree Collision requested."sv, false);
     }
-    if (m_reversed_source) {
-        const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree(
-            std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
-        // A nested TBB loop may return without filling its cache when a sibling
-        // throws. Observe cancellation before recursively requesting that entry.
-        if (m_reversed_throw_on_cancel)
-            m_reversed_throw_on_cancel();
-    } else
-        const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree({ radius, layer_idx });
+    compute_once(LazyCache::CollisionHolefree, radius,
+        [&] { return m_collision_cache_holefree.getArea({ radius, layer_idx }).has_value(); },
+        [&] {
+            if (m_reversed_source)
+                const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree(
+                    std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
+            else
+                const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree({ radius, layer_idx });
+        });
+    // A nested TBB loop may return without filling its cache when a sibling
+    // throws. Observe cancellation before recursively requesting that entry.
+    if (m_reversed_source && m_reversed_throw_on_cancel)
+        m_reversed_throw_on_cancel();
     return getCollisionHolefree(radius, layer_idx);
 }
 
@@ -533,13 +560,17 @@ const Polygons& TreeModelVolumes::getAvoidanceImpl(const coord_t orig_radius, La
             tree_supports_show_error("Not precalculated Avoidance(to buildplate) requested."sv, false);
         }
     }
-    if (m_reversed_source) {
-        const_cast<TreeModelVolumes*>(this)->calculateAvoidance(
-            std::vector<RadiusLayerPair>{{radius, layer_idx}}, !to_model, to_model, m_reversed_throw_on_cancel);
-        if (m_reversed_throw_on_cancel)
-            m_reversed_throw_on_cancel();
-    } else
-        const_cast<TreeModelVolumes*>(this)->calculateAvoidance({ radius, layer_idx }, ! to_model, to_model);
+    compute_once(to_model ? LazyCache::AvoidanceToModel : LazyCache::AvoidanceToBuildPlate, radius,
+        [&] { return this->avoidance_cache(type, to_model).getArea({ radius, layer_idx }).has_value(); },
+        [&] {
+            if (m_reversed_source)
+                const_cast<TreeModelVolumes*>(this)->calculateAvoidance(
+                    std::vector<RadiusLayerPair>{{radius, layer_idx}}, !to_model, to_model, m_reversed_throw_on_cancel);
+            else
+                const_cast<TreeModelVolumes*>(this)->calculateAvoidance({ radius, layer_idx }, ! to_model, to_model);
+        });
+    if (m_reversed_source && m_reversed_throw_on_cancel)
+        m_reversed_throw_on_cancel();
     // Retrive failed and correct result was calculated. Now it has to be retrived.
     return getAvoidanceImpl(orig_radius, layer_idx, type, to_model, min_xy_dist);
 }
@@ -566,7 +597,9 @@ const Polygons& TreeModelVolumes::getPlaceableAreas(const coord_t orig_radius, L
         static const Polygons no_model_contacts;
         return no_model_contacts;
     }
-    const_cast<TreeModelVolumes*>(this)->calculatePlaceables(radius, layer_idx, throw_on_cancel);
+    compute_once(LazyCache::Placeables, radius,
+        [&] { return m_placeable_areas_cache.getArea({ radius, layer_idx }).has_value(); },
+        [&] { const_cast<TreeModelVolumes*>(this)->calculatePlaceables(radius, layer_idx, throw_on_cancel); });
     return getPlaceableAreas(orig_radius, layer_idx, throw_on_cancel);
 }
 
@@ -593,13 +626,17 @@ const Polygons& TreeModelVolumes::getWallRestriction(const coord_t orig_radius, 
                 "Not precalculated Wall restriction requested )."sv
             , false);
     }
-    if (m_reversed_source) {
-        const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions(
-            std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
-        if (m_reversed_throw_on_cancel)
-            m_reversed_throw_on_cancel();
-    } else
-        const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions({ radius, layer_idx });
+    compute_once(LazyCache::WallRestrictions, radius,
+        [&] { return (min_xy_dist ? m_wall_restrictions_cache_min : m_wall_restrictions_cache).getArea({ radius, layer_idx }).has_value(); },
+        [&] {
+            if (m_reversed_source)
+                const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions(
+                    std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
+            else
+                const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions({ radius, layer_idx });
+        });
+    if (m_reversed_source && m_reversed_throw_on_cancel)
+        m_reversed_throw_on_cancel();
     return getWallRestriction(orig_radius, layer_idx, min_xy_dist); // Retrieve failed and correct result was calculated. Now it has to be retrieved.
 }
 
@@ -882,7 +919,10 @@ void TreeModelVolumes::calculateAvoidance(const std::vector<RadiusLayerPair> &ke
                 holefree_keys.push_back(key);
         if (!holefree_keys.empty()) {
             getCollision(m_increase_until_radius, 0, false);
-            calculateCollisionHolefree(holefree_keys, throw_on_cancel);
+            for (const RadiusLayerPair &key : holefree_keys)
+                compute_once(LazyCache::CollisionHolefree, key.first,
+                    [&] { return m_collision_cache_holefree.getArea(key).has_value(); },
+                    [&] { calculateCollisionHolefree(std::vector<RadiusLayerPair>{ key }, throw_on_cancel); });
         }
     }
 

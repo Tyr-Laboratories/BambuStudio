@@ -3232,9 +3232,13 @@ void TreeSupport::drop_nodes()
         m_object->print()->set_status(60 + int(10 * (1 - float(layer_nr) / contact_nodes.size())), _u8L("Generating support"));// (boost::format(_u8L("Support: propagate branches at layer %d")) % layer_nr).str());
 
         Polygons layer_contours = std::move(m_ts_data->get_contours_with_holes(obj_layer_nr));
+        std::vector<BoundingBox> layer_contour_bboxes;
+        layer_contour_bboxes.reserve(layer_contours.size());
+        for (const Polygon &contour : layer_contours)
+            layer_contour_bboxes.emplace_back(get_extents(contour));
         //std::unordered_map<Line, bool, LineHash>& mst_line_x_layer_contour_cache = m_mst_line_x_layer_contour_caches[layer_nr];
         tbb::concurrent_unordered_map<Line, bool, LineHash> mst_line_x_layer_contour_cache;
-        auto is_line_cut_by_contour = [&mst_line_x_layer_contour_cache,&layer_contours](Point a, Point b)
+        auto is_line_cut_by_contour = [&mst_line_x_layer_contour_cache,&layer_contours,&layer_contour_bboxes](Point a, Point b)
         {
             auto iter = mst_line_x_layer_contour_cache.find({ a, b });
             if (iter != mst_line_x_layer_contour_cache.end()) {
@@ -3242,12 +3246,16 @@ void TreeSupport::drop_nodes()
                     return true;
             }
             else {
-                profiler.tic();
                 Line ln(b, a);
-                Lines pls_intersect = intersection_ln(ln, layer_contours);
+                // Only the contours, or holes, around the line can have any of it inside.
+                const BoundingBox line_bbox(Points{ a, b });
+                Polygons near_contours;
+                for (size_t i = 0; i < layer_contours.size(); ++ i)
+                    if (layer_contour_bboxes[i].overlap(line_bbox))
+                        near_contours.emplace_back(layer_contours[i]);
+                Lines pls_intersect = near_contours.empty() ? Lines{} : intersection_ln(ln, near_contours);
                 mst_line_x_layer_contour_cache.insert({ {a, b}, !pls_intersect.empty() });
                 mst_line_x_layer_contour_cache.insert({ ln, !pls_intersect.empty() });
-                profiler.stage_add(STAGE_intersection_ln);
                 if (!pls_intersect.empty())
                     return true;
             }
@@ -4304,6 +4312,13 @@ void TreeSupport::generate_contact_points()
             };
 
             auto extrudable_collision = offset_ex(layer->lower_layer->lslices_extrudable, m_ts_data->m_xy_distance);
+            // The same for every overhang of this layer: offset it once, when first needed.
+            std::optional<ExPolygons> outlines_below_xy;
+            auto outlines_below_with_xy = [&]() -> const ExPolygons & {
+                if (! outlines_below_xy)
+                    outlines_below_xy = offset_ex(m_ts_data->m_layer_outlines_below[layer_nr - 1], scale_(config.support_object_xy_distance.value));
+                return *outlines_below_xy;
+            };
             for (const auto& overhang_with_type : layer->loverhangs_with_type)  {
                 const auto &overhang_part = overhang_with_type.first;
                 const auto &overhang_type = overhang_with_type.second;
@@ -4316,11 +4331,11 @@ void TreeSupport::generate_contact_points()
                     overhangs = safe_offset_inc({overhang_part}, scale_(config.support_expansion.value), relevant_forbidden, scale_(MIN_BRANCH_RADIUS * 1.75), 0, 1);
                 if (m_support_params.support_style == smsTreeHybrid &&
                     (overhang_type & (BigFlat | ThinPlate))) {
-                    overhangs_regular = intersection_ex(overhangs, offset_ex(m_ts_data->m_layer_outlines_below[layer_nr - 1], scale_(config.support_object_xy_distance.value)));
+                    overhangs_regular = intersection_ex(overhangs, outlines_below_with_xy());
                     ExPolygons overhangs_normal = offset2_ex(diff_ex({overhang_part}, overhangs_regular), scale_(extrusion_width), -scale_(extrusion_width));
                     if (add_interface && xy_expansion > EPSILON && !is_sharp_tail)
                         overhangs_normal = safe_offset_inc(overhangs_normal, xy_expansion,
-                                                           offset_ex(m_ts_data->m_layer_outlines_below[layer_nr - 1], scale_(config.support_object_xy_distance.value)),
+                                                           outlines_below_with_xy(),
                                                            scale_(MIN_BRANCH_RADIUS * 1.75), 0, 1);
                     // if the outside area is still big, we can need normal nodes
                     coord_t gap_width = scale_(extrusion_width / 2.) + scale_(m_ts_data->m_xy_distance);
@@ -4507,25 +4522,35 @@ TreeSupportData::TreeSupportData(const PrintObject &object, coordf_t xy_distance
 
 const ExPolygons& TreeSupportData::get_collision(coordf_t radius, size_t layer_nr) const
 {
-    profiler.tic();
     radius = ceil_radius(radius);
     RadiusLayerPair key{radius, layer_nr};
     const auto it = m_collision_cache.find(key);
-    const ExPolygons& collision = it != m_collision_cache.end() ? it->second : calculate_collision(key);
-    profiler.stage_add(STAGE_get_collision);
-    return collision;
+    return it != m_collision_cache.end() ? it->second : calculate_collision(key);
 }
 
 const ExPolygons& TreeSupportData::get_avoidance(coordf_t radius, size_t layer_nr, int recursions) const
 {
-    profiler.tic();
     radius = ceil_radius(radius);
     RadiusLayerPair key{radius, layer_nr, recursions };
-    const auto it = m_avoidance_cache.find(key);
-    const ExPolygons& avoidance = it != m_avoidance_cache.end() ? it->second : calculate_avoidance(key);
-
-    profiler.stage_add(STAGE_GET_AVOIDANCE);
-    return avoidance;
+    if (const auto it = m_avoidance_cache.find(key); it != m_avoidance_cache.end())
+        return it->second;
+    std::mutex *lock;
+    {
+        std::lock_guard<std::mutex> guard(m_avoidance_locks->mutex);
+        std::unique_ptr<std::mutex> &slot = m_avoidance_locks->locks[radius];
+        if (! slot)
+            slot = std::make_unique<std::mutex>();
+        lock = slot.get();
+    }
+    std::lock_guard<std::mutex> guard(*lock);
+    // Climb from the highest layer below with its avoidance computed already, one layer at a time.
+    size_t first = layer_nr;
+    while (first > 0 && m_avoidance_cache.find({ radius, first - 1, 0 }) == m_avoidance_cache.end())
+        -- first;
+    for (size_t layer = first; layer <= layer_nr; ++ layer)
+        if (m_avoidance_cache.find({ radius, layer, 0 }) == m_avoidance_cache.end())
+            calculate_avoidance({ radius, layer, 0 });
+    return m_avoidance_cache.find(key)->second;
 }
 
 Polygons TreeSupportData::get_contours(size_t layer_nr) const
@@ -4596,19 +4621,10 @@ const ExPolygons& TreeSupportData::calculate_avoidance(const RadiusLayerPair& ke
     const auto &layer_nr = key.layer_nr;
     ExPolygons avoidance_areas;
     if (layer_nr > 0) {
-        // Avoidance for a given layer depends on all layers beneath it so could have very deep recursion depths if
-        // called at high layer heights. We can limit the reqursion depth to N by checking if the layer N
-        // below the current one exists and if not, forcing the calculation of that layer. This may cause another recursion
-        // if the layer at 2N below the current one but we won't exceed our limit unless there are N*N uncalculated layers
-        // below our current one.
-        constexpr auto max_recursion_depth = 100;
-        // Check if we would exceed the recursion limit by trying to process this layer
-        if (layer_nr >= max_recursion_depth && m_avoidance_cache.find({radius, layer_nr - max_recursion_depth}) == m_avoidance_cache.end()) {
-            // Force the calculation of the layer `max_recursion_depth` below our current one, ignoring the result.
-            get_avoidance(radius, layer_nr - max_recursion_depth);
-        }
-
-        avoidance_areas = std::move(offset_ex(get_avoidance(radius, layer_nr - 1), scale_(-m_max_move_distances[layer_nr-1])));
+        // get_avoidance() computes the layers in order, the one below is ready.
+        const auto below = m_avoidance_cache.find({ radius, layer_nr - 1, 0 });
+        assert(below != m_avoidance_cache.end());
+        avoidance_areas = std::move(offset_ex(below->second, scale_(-m_max_move_distances[layer_nr-1])));
     }
     const ExPolygons &collision       = get_collision(radius, layer_nr);
     avoidance_areas.insert(avoidance_areas.end(), collision.begin(), collision.end());

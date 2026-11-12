@@ -2,6 +2,9 @@
 #define TREESUPPORT_H
 
 #include <forward_list>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <unordered_set>
 #include "tbb/concurrent_unordered_map.h"
 #include "../ExPolygon.hpp"
@@ -277,7 +280,8 @@ private:
     };
     struct RadiusLayerPairHash {
         size_t operator()(const RadiusLayerPair& elem) const {
-            return std::hash<coord_t>()(elem.radius) ^ std::hash<coord_t>()(elem.layer_nr * 7919);
+            // Radii are fractions of a millimetre: truncated to an integer, most of them would share a bucket.
+            return std::hash<coordf_t>()(elem.radius) ^ std::hash<coord_t>()(elem.layer_nr * 7919);
         }
     };
 
@@ -305,6 +309,14 @@ private:
     const ExPolygons& calculate_avoidance(const RadiusLayerPair& key) const;
 
     tbb::spin_mutex  m_mutex;
+
+    // The avoidance of a layer is built on the avoidance of the layer below. Threads asking
+    // for one radius at once would each compute the whole chain: let one compute it.
+    struct AvoidanceLocks {
+        std::mutex                                       mutex;
+        std::map<coordf_t, std::unique_ptr<std::mutex>> locks;
+    };
+    std::unique_ptr<AvoidanceLocks> m_avoidance_locks { std::make_unique<AvoidanceLocks>() };
 
 public:
     bool is_slim = false;
