@@ -1,5 +1,6 @@
 #pragma once
 #include <boost/container/small_vector.hpp>
+#include <set>
 #include "../Point.hpp"
 #include "../libslic3r.h"
 #include "../Print.hpp"
@@ -410,6 +411,9 @@ public:
     bool support_rests_on_model;
     // Set from the sliced painted bases, after TreeModelVolumes construction.
     bool painted_bases_only { false };
+    // Tips, by insertion layer and position, whose towers on paint an earlier
+    // pass found too slender for their anchor. They are routed to the bed.
+    const std::set<std::pair<LayerIndex, Point>> *painted_tips_to_bed { nullptr };
     /*!
      * \brief How far should support be from the model.
      */

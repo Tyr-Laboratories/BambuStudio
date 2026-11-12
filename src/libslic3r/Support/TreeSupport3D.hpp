@@ -87,7 +87,8 @@ struct SupportElementStateBits {
         verylost(false),
 #endif // TREE_SUPPORTS_TRACK_LOST
         deleted(false),
-        marked(false)
+        marked(false),
+        to_buildplate_only(false)
     {}
 
     /*!
@@ -131,6 +132,10 @@ struct SupportElementStateBits {
 
     // General purpose flag marking a visited element.
     bool marked : 1;
+
+    // An earlier pass stood this branch on paint in a tower too slender for its
+    // anchor: it must reach the build plate, merging only with branches like it.
+    bool to_buildplate_only : 1;
 };
 
 struct SupportElementState : public SupportElementStateBits
@@ -333,7 +338,10 @@ void organic_draw_branches(
     SupportGeneratorLayerStorage& layer_storage,
     std::vector<ExPolygons>& cooldown_areas,
 
-    std::function<void()> throw_on_cancel);
+    std::function<void()> throw_on_cancel,
+    // When given: the tips of towers standing on paint that are too slender for
+    // their anchor. If any are found, nothing is output and the caller re-routes.
+    std::vector<std::pair<LayerIndex, Point>> *slender_painted_tips = nullptr);
 
 } // namespace TreeSupport3D
 

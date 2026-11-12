@@ -972,6 +972,23 @@ inline std::pair<SlabLines, SlabLines> slice_slabs_make_lines(
             }
         }
     );
+
+    // The lines were appended to their layers from many threads at once. Chained
+    // in that order, the loops would start at different points and come out in a
+    // different order from one run to the next. Put them in an order of their own.
+    auto sort_lines = [](std::vector<IntersectionLines> &layers) {
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, layers.size()), [&layers](const tbb::blocked_range<size_t> &range) {
+            for (size_t i = range.begin(); i < range.end(); ++ i)
+                std::sort(layers[i].begin(), layers[i].end(), [](const IntersectionLine &l, const IntersectionLine &r) {
+                    return std::make_tuple(l.a.x(), l.a.y(), l.b.x(), l.b.y(), l.a_id, l.b_id, l.edge_a_id, l.edge_b_id, int(l.edge_type), l.flags) <
+                           std::make_tuple(r.a.x(), r.a.y(), r.b.x(), r.b.y(), r.a_id, r.b_id, r.edge_a_id, r.edge_b_id, int(r.edge_type), r.flags);
+                });
+        });
+    };
+    for (SlabLines *lines : { &lines_top, &lines_bottom }) {
+        sort_lines(lines->at_slice);
+        sort_lines(lines->between_slices);
+    }
     return out;
 }
 

@@ -183,6 +183,10 @@ public:
     // In this mode to_model avoidances describe routes to paint, not to the bed.
     bool painted_bases_only() const { return m_painted_bases_only; }
 
+    // The paint visible from above under a branch ending at layer_idx, across
+    // every lower layer it spans; empty unless paint lies at that branch's base.
+    const Polygons& getPaintedBaseSurface(LayerIndex layer_idx) const;
+
     Polygon m_bed_area;
 
 private:
@@ -417,6 +421,10 @@ private:
      */
     void calculatePlaceables(const std::vector<RadiusLayerPair> &keys, std::function<void()> throw_on_cancel);
 
+    // Centres where a branch with this footprint radius may end at layer_idx,
+    // touching paint at its base layer and with all of its footprint over paint.
+    Polygons calculatePaintedPlaceables(coord_t footprint, LayerIndex layer_idx) const;
+
     /*!
      * \brief Creates the areas that can not be passed when expanding an area downwards. As such these areas are an somewhat abstract representation of a wall (as in a printed object).
      *
@@ -505,6 +513,12 @@ private:
     bool m_painted_bases_only { false };
     // Actual painted surface footprints, indexed with the organic raft offset.
     std::vector<Polygons> m_painted_base_areas;
+    // At each layer holding painted surface: all paint visible from above there,
+    // including the uncovered paint of lower layers. A sloped base gives each
+    // layer only a thin band, so a branch foot on it spans several layers' bands.
+    std::vector<Polygons> m_painted_base_visible;
+    // A branch ending at layer L rests on the surface of layer L - m_painted_base_below.
+    LayerIndex m_painted_base_below { 1 };
     // Filled work domain used to seed model-only reachability below any paint.
     Polygons m_painted_route_domain;
     /*!

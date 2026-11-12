@@ -18,6 +18,7 @@ struct BaseRouteOptions {
     double bottom_gap = 0.2;
     int raft_layers = 0;
     bool barrier = false;
+    double branch_diameter = 2.;
 };
 
 struct BaseRouteScene {
@@ -62,7 +63,7 @@ struct BaseRouteScene {
             {"support_bottom_z_distance", std::to_string(options.bottom_gap)}, {"support_top_z_distance", "0.2"},
             {"raft_layers", std::to_string(options.raft_layers)},
             {"support_object_xy_distance", "0.35"}, {"tree_support_branch_angle", "30"},
-            {"tree_support_branch_diameter", "2"}, {"brim_type", "no_brim"}
+            {"tree_support_branch_diameter", std::to_string(options.branch_diameter)}, {"brim_type", "no_brim"}
         });
         print.set_status_silent();
         print.auto_assign_extruders(object);
@@ -166,6 +167,64 @@ TEST_CASE("Painted bases smaller than the branch footprint never open a model ro
     CHECK_FALSE(contains(volumes.getAvoidance(tip_radius, scene.layer(6.), TreeModelVolumes::AvoidanceType::Fast, false, true), clear));
 }
 
+TEST_CASE("Painted routes plan with the widest foot a branch lands with", "[SupportBase][Routes][Footprint]")
+{
+    // A thin branch is drawn up to the increase-until radius, and one keeping the
+    // regular XY distance lands with that distance's difference added. Wherever
+    // even the thinnest route may go, that widest foot must fit as well.
+    BaseRouteOptions options;
+    options.branch_diameter = 5.;
+    BaseRouteScene scene(true, true, false, options);
+    TreeSupportSettings settings(TreeSupportMeshGroupSettings(scene.object()), scene.object().slicing_parameters());
+    TreeModelVolumes volumes(scene.object(), scene.bed(), settings.maximum_move_distance, settings.maximum_move_distance_slow, 0);
+    const coord_t delta = settings.xy_distance - settings.xy_min_distance;
+    REQUIRE(delta > 0);
+    // The difference crosses a step of the radius cache grid.
+    REQUIRE(volumes.ceilRadius(settings.increase_radius_until_radius, false) > volumes.ceilRadius(settings.increase_radius_until_radius, true));
+    const auto base = scene.layer(4.4);
+    const Polygons &widest = volumes.getPlaceableAreas(settings.increase_radius_until_radius + delta, base, [] {});
+    REQUIRE_FALSE(widest.empty());
+    CHECK(diff(volumes.getPlaceableAreas(settings.getRadius(0), base, [] {}), widest).empty());
+}
+
+TEST_CASE("A branch moved off a slender painted tower never merges into a branch to paint", "[SupportBase][Routes][BedOnly]")
+{
+    const bool bed_only = GENERATE(false, true);
+    BaseRouteScene scene(true);
+    TreeSupportSettings settings(TreeSupportMeshGroupSettings(scene.object()), scene.object().slicing_parameters());
+    TreeModelVolumes volumes(scene.object(), scene.bed(), settings.maximum_move_distance, settings.maximum_move_distance_slow, 0);
+    settings.painted_bases_only = volumes.painted_bases_only();
+    settings.support_rests_on_model = true;
+    REQUIRE(settings.painted_bases_only);
+    // Two tips close to the edge of the painted platform: one bound for the
+    // paint, one able to reach the bed as well.
+    const LayerIndex top = scene.layer(8.);
+    std::vector<SupportElements> nodes(top + 1);
+    auto add_tip = [&](const Point &point, bool to_bed) {
+        SupportElementState state{};
+        state.layer_idx = top;
+        state.target_height = top;
+        state.target_position = point;
+        state.next_position = point;
+        state.result_on_layer = point;
+        state.to_buildplate = to_bed;
+        state.to_buildplate_only = to_bed && bed_only;
+        state.to_model_gracious = true;
+        state.use_min_xy_dist = settings.xy_distance > settings.xy_min_distance;
+        Polygon tip = make_circle(scaled<coord_t>(0.01), 25);
+        tip.translate(point);
+        nodes[top].emplace_back(state, Polygons{tip});
+    };
+    add_tip(scene.point(17., 10.), false);
+    add_tip(scene.point(19., 10.), true);
+    REQUIRE_FALSE(contains(volumes.getAvoidance(settings.getRadius(0), top, TreeModelVolumes::AvoidanceType::Fast, false,
+        settings.xy_distance > settings.xy_min_distance), scene.point(19., 10.)));
+    create_layer_pathing(volumes, settings, nodes, [] {});
+    // Merged into the branch to paint, the bed branch would land on the paint too.
+    CAPTURE(bed_only, nodes.front().size());
+    CHECK(nodes.front().empty() != bed_only);
+}
+
 TEST_CASE("Painted support routes cannot pass through a separating model wall", "[SupportBase][Routes]")
 {
     const bool barrier = GENERATE(false, true);
@@ -238,10 +297,12 @@ TEST_CASE("Invalid painted branches stop slicing instead of leaving unsupported 
     state.distance_to_top = failure == TooShort ? 0 : uint32_t(settings.increase_radius_until_layer);
     state.effective_radius_height = 0;
     if (failure == FootprintTooLarge) {
-        // The route initially admits a thin node, but the actual branch foot
-        // cannot fit at the selected location after radius growth/rounding.
+        // A thin node's foot is drawn wider than the node and checked at that
+        // radius rounded up to the cache grid. The route plans with the same
+        // rounded foot, so it never admits a location that foot cannot fit; a
+        // branch ending there anyway must still stop slicing.
         REQUIRE(support_element_collision_radius(settings, state) < support_element_radius(settings, state));
-        REQUIRE_FALSE(intersection(Polygons{footprint}, volumes.getPlaceableAreas(support_element_collision_radius(settings, state), base, [] {})).empty());
+        CHECK(intersection(Polygons{footprint}, volumes.getPlaceableAreas(support_element_collision_radius(settings, state), base, [] {})).empty());
         REQUIRE(intersection(Polygons{footprint}, volumes.getPlaceableAreas(support_element_radius(settings, state), base, [] {})).empty());
     } else if (failure == TooShort) {
         REQUIRE(settings.min_dtt_to_model > 0);

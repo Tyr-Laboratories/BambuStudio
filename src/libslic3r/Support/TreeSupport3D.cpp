@@ -411,6 +411,15 @@ static Polygons support_tip_forbidden(const TreeModelVolumes &volumes, const Tre
         volumes.getAvoidance(radius, layer_idx, TreeModelVolumes::AvoidanceType::Fast, false, min_xy_dist);
 }
 
+// The radius whose painted placeable areas a branch's to-model route was
+// planned with: its drawn radius, widened by the XY distance difference when it
+// keeps the regular XY distance, as getAvoidance() widens it. On a slope a wider
+// foot touches the paint farther away, so landing must be judged at this radius.
+static coord_t painted_landing_radius(const TreeSupportSettings &config, const SupportElementState &state)
+{
+    return support_element_radius(config, state) + (state.use_min_xy_dist ? 0 : config.xy_distance - config.xy_min_distance);
+}
+
 /*!
  * \brief Converts a Polygons object representing a line into the internal format.
  *
@@ -769,6 +778,20 @@ static std::optional<std::pair<Point, size_t>> polyline_sample_next_point_at_dis
 #endif
 }
 
+// How a tip placed at this layer and position reaches the build plate: over the
+// safe route that avoids holes, only over the fast one, or not at all.
+enum class TipBedRoute { None, Fast, Safe };
+static TipBedRoute tip_bed_route(const TreeModelVolumes &volumes, const TreeSupportSettings &config, LayerIndex layer, const Point &point)
+{
+    const coord_t radius      = config.getRadius(0);
+    const bool    min_xy_dist = config.xy_distance > config.xy_min_distance;
+    if (! contains(volumes.getAvoidance(radius, layer, TreeModelVolumes::AvoidanceType::FastSafe, false, min_xy_dist), point))
+        return TipBedRoute::Safe;
+    if (! contains(volumes.getAvoidance(radius, layer, TreeModelVolumes::AvoidanceType::Fast, false, min_xy_dist), point))
+        return TipBedRoute::Fast;
+    return TipBedRoute::None;
+}
+
 class RichInterfacePlacer : public InterfacePlacer {
 public:
     RichInterfacePlacer(
@@ -876,6 +899,21 @@ private:
         bool to_bp = p.second == LineStatus::TO_BP || p.second == LineStatus::TO_BP_SAFE;
         bool gracious = to_bp || p.second == LineStatus::TO_MODEL_GRACIOUS || p.second == LineStatus::TO_MODEL_GRACIOUS_SAFE;
         bool safe_radius = p.second == LineStatus::TO_BP_SAFE || p.second == LineStatus::TO_MODEL_GRACIOUS_SAFE;
+        bool to_bp_only = false;
+        if (config.painted_tips_to_bed && config.painted_tips_to_bed->count({ insert_layer, p.first })) {
+            // An earlier pass stood this tip on paint in a tower too slender for its
+            // anchor, and found that it can reach the bed. Build it from there, apart
+            // from the branches of every other tree.
+            if (! to_bp) {
+                const TipBedRoute route = tip_bed_route(volumes, config, insert_layer, p.first);
+                assert(route != TipBedRoute::None);
+                if (route != TipBedRoute::None) {
+                    to_bp = gracious = true;
+                    safe_radius = route == TipBedRoute::Safe;
+                }
+            }
+            to_bp_only = to_bp;
+        }
         if (! config.support_rests_on_model && ! to_bp) {
             BOOST_LOG_TRIVIAL(warning) << "Tried to add an invalid support point";
             tree_supports_show_error("Unable to add tip. Some overhang may not be supported correctly."sv, true);
@@ -897,6 +935,7 @@ private:
                 state.layer_idx = insert_layer;
                 state.effective_radius_height = dtt;
                 state.to_buildplate = to_bp;
+                state.to_buildplate_only = to_bp_only;
                 state.distance_to_top = dtt;
                 state.result_on_layer = p.first;
                 assert(state.result_on_layer_is_set());
@@ -1725,6 +1764,17 @@ static void increase_areas_one_layer(
             SupportElementMerging   &merging_area   = merging_areas[merging_area_idx];
             assert(merging_area.parents.size() == 1);
             SupportElement          &parent         = layer_elements[merging_area.parents.front()];
+            if (config.painted_bases_only && parent.state.to_model_gracious && ! parent.state.to_buildplate &&
+                (parent.state.distance_to_top >= config.min_dtt_to_model || parent.state.supports_roof) &&
+                ! intersection(parent.influence_area, volumes.getPlaceableAreas(
+                    painted_landing_radius(config, parent.state), layer_idx, throw_on_cancel)).empty()) {
+                // A branch rests on the first painted base it reaches. Searching on for
+                // lower paint lets branches slip out of the opening above their own
+                // base and run far down, at whatever radius their path allows: long
+                // and thin, without the taper that makes build plate trees printable.
+                parent.state.result_on_layer_reset();
+                continue;
+            }
             SupportElementState      elem           = SupportElementState::propagate_down(parent.state);
             const Polygons          &wall_restriction =
                 // Abstract representation of the model outline. If an influence area would move through it, it could teleport through a wall.
@@ -1834,7 +1884,8 @@ static void increase_areas_one_layer(
                 }
                 order = new_order;
             }
-            if (elem.to_buildplate || (elem.to_model_gracious && intersection(parent.influence_area, volumes.getPlaceableAreas(radius, layer_idx, throw_on_cancel)).empty())) {
+            if (elem.to_buildplate || (elem.to_model_gracious && intersection(parent.influence_area, volumes.getPlaceableAreas(
+                    config.painted_bases_only ? painted_landing_radius(config, parent.state) : radius, layer_idx, throw_on_cancel)).empty())) {
                 // error case
                 // it is normal that we wont be able to find a new area at some point in time if we wont be able to reach layer 0 aka have to connect with the model
                 insertSetting({ AvoidanceType::Fast, fast_speed, !increase_radius, !no_error, elem.use_min_xy_dist, move }, true);
@@ -1984,6 +2035,7 @@ static void increase_areas_one_layer(
     out.distance_to_top = std::max(first.distance_to_top, second.distance_to_top);
 
     out.to_buildplate = first.to_buildplate && second.to_buildplate;
+    out.to_buildplate_only = first.to_buildplate_only || second.to_buildplate_only;
     out.to_model_gracious = first.to_model_gracious && second.to_model_gracious; // valid as we do not merge non-gracious with gracious
 
     out.elephant_foot_increases = 0;
@@ -2016,8 +2068,11 @@ static bool merge_influence_areas_two_elements(
     // by the delta to the larger it is engulfed by it already. But because a different collision
     // may be removed from the in draw_area() generated circles, this assumption could be wrong.
     const bool merging_min_and_regular_xy        = dst.state.use_min_xy_dist != src.state.use_min_xy_dist;
+    // A branch moved off a slender painted tower must not land on paint again, nor
+    // take over a branch of a tree that the earlier pass found stable on its own.
+    const bool merging_bed_only_and_other        = dst.state.to_buildplate_only != src.state.to_buildplate_only;
 
-    if (merging_gracious_and_non_gracious || merging_min_and_regular_xy)
+    if (merging_gracious_and_non_gracious || merging_min_and_regular_xy || merging_bed_only_and_other)
         return false;
 
     const bool dst_radius_bigger = support_element_collision_radius(config, dst.state) > support_element_collision_radius(config, src.state);
@@ -2548,7 +2603,7 @@ static void set_to_model_contact_to_model_gracious(
         SupportElement *elem = &first_elem;
         for (LayerIndex layer_check = elem->state.layer_idx;
             ! intersection(elem->influence_area, volumes.getPlaceableAreas(config.painted_bases_only ?
-                support_element_radius(config, elem->state) : support_element_collision_radius(config, elem->state), layer_check, throw_on_cancel)).empty();
+                painted_landing_radius(config, elem->state) : support_element_collision_radius(config, elem->state), layer_check, throw_on_cancel)).empty();
             elem = &move_bounds[++ layer_check][elem->parents.front()]) {
             assert(elem->state.layer_idx == layer_check);
             assert(! elem->state.deleted);
@@ -2582,7 +2637,7 @@ static void set_to_model_contact_to_model_gracious(
         // Guess a point inside the influence area, in which the branch will be placed in.
         const Polygons contact_area = config.painted_bases_only ?
             intersection(last_successfull_layer->influence_area,
-                volumes.getPlaceableAreas(support_element_radius(config, last_successfull_layer->state),
+                volumes.getPlaceableAreas(painted_landing_radius(config, last_successfull_layer->state),
                     last_successfull_layer->state.layer_idx, throw_on_cancel)) : last_successfull_layer->influence_area;
         const Point best = move_inside_if_outside(contact_area, last_successfull_layer->state.next_position);
         last_successfull_layer->state.result_on_layer = best;
@@ -2670,6 +2725,7 @@ void create_nodes_from_area(
         for (SupportElement &elem : layer) {
             assert(! elem.state.deleted);
             assert(elem.state.layer_idx == layer_idx);
+            bool landed_on_model = false;
             // check if the resulting center point is not yet set
             if (! elem.state.result_on_layer_is_set()) {
                 if (elem.state.to_buildplate || (elem.state.distance_to_top < config.min_dtt_to_model && ! elem.state.supports_roof)) {
@@ -2685,9 +2741,10 @@ void create_nodes_from_area(
                     elem.state.deleted = true;
                 } else {
                     // set the point where the branch will be placed on the model
-                    if (elem.state.to_model_gracious)
+                    if (elem.state.to_model_gracious) {
                         set_to_model_contact_to_model_gracious(volumes, config, move_bounds, elem, throw_on_cancel);
-                    else if (config.painted_bases_only)
+                        landed_on_model = elem.state.result_on_layer_is_set();
+                    } else if (config.painted_bases_only)
                         fail_painted_support_base();
                     else
                         set_to_model_contact_simple(elem);
@@ -2695,8 +2752,10 @@ void create_nodes_from_area(
             }
             if (! elem.state.deleted && ! elem.state.marked && elem.state.target_height == layer_idx) {
                 // Just a tip surface with no supporting element. Painted
-                // routing must not leave its already generated roof floating.
-                if (config.painted_bases_only && !elem.state.to_buildplate)
+                // routing must not leave its already generated roof floating,
+                // unless the tip touches the paint where it was placed: then
+                // its roof stands on the paint, as on an unpainted model.
+                if (config.painted_bases_only && !elem.state.to_buildplate && !landed_on_model)
                     fail_painted_support_base();
                 elem.state.deleted = true;
             }
@@ -5077,50 +5136,68 @@ static void generate_support_areas(Print &print, TreeSupport* tree_support, cons
         if (has_support) {
             auto t_precalc = std::chrono::high_resolution_clock::now();
             // value is the area where support may be placed. As this is calculated in CreateLayerPathing it is saved and reused in draw_areas
-            std::vector<SupportElements> move_bounds(num_support_layers);
+            std::vector<SupportElements> move_bounds;
+            std::chrono::high_resolution_clock::time_point t_gen, t_path, t_place;
+            // Tips whose towers on paint were too slender for their anchor; a
+            // second pass builds them from the bed instead.
+            std::set<std::pair<LayerIndex, Point>> painted_tips_to_bed;
+            for (bool check_painted_towers = config.painted_bases_only; ;) {
+                move_bounds.assign(num_support_layers, {});
 
-
-            for (size_t mesh_idx : processing.second)
-                generate_initial_areas(*print.get_object(mesh_idx), volumes, config, overhangs,
-                    move_bounds, interface_placer, throw_on_cancel);
-            auto t_gen = std::chrono::high_resolution_clock::now();
+                for (size_t mesh_idx : processing.second)
+                    generate_initial_areas(*print.get_object(mesh_idx), volumes, config, overhangs,
+                        move_bounds, interface_placer, throw_on_cancel);
+                t_gen = std::chrono::high_resolution_clock::now();
 
 #ifdef TREESUPPORT_DEBUG_SVG
-            for (size_t layer_idx = 0; layer_idx < move_bounds.size(); ++layer_idx) {
-                Polygons polys;
-                for (auto& area : move_bounds[layer_idx])
-                    append(polys, area.influence_area);
-                if (auto begin = move_bounds[layer_idx].begin(); begin != move_bounds[layer_idx].end())
-                    SVG::export_expolygons(debug_out_path("treesupport-initial_areas-%d.svg", layer_idx),
-                        { { { union_ex(volumes.getWallRestriction(support_element_collision_radius(config, begin->state), layer_idx, begin->state.use_min_xy_dist)) },
-                        { "wall_restricrictions", "gray", 0.5f } },
-                      { { union_ex(polys) }, { "parent", "red",  "black", "", scaled<coord_t>(0.1f), 0.5f } } });
-            }
+                for (size_t layer_idx = 0; layer_idx < move_bounds.size(); ++layer_idx) {
+                    Polygons polys;
+                    for (auto& area : move_bounds[layer_idx])
+                        append(polys, area.influence_area);
+                    if (auto begin = move_bounds[layer_idx].begin(); begin != move_bounds[layer_idx].end())
+                        SVG::export_expolygons(debug_out_path("treesupport-initial_areas-%d.svg", layer_idx),
+                            { { { union_ex(volumes.getWallRestriction(support_element_collision_radius(config, begin->state), layer_idx, begin->state.use_min_xy_dist)) },
+                            { "wall_restricrictions", "gray", 0.5f } },
+                          { { union_ex(polys) }, { "parent", "red",  "black", "", scaled<coord_t>(0.1f), 0.5f } } });
+                }
 #endif // TREESUPPORT_DEBUG_SVG
 
-            // ### Propagate the influence areas downwards. This is an inherently serial operation.
-            print.set_status(60, _L("Generating support"));
-            create_layer_pathing(volumes, config, move_bounds, throw_on_cancel);
-            auto t_path = std::chrono::high_resolution_clock::now();
+                // ### Propagate the influence areas downwards. This is an inherently serial operation.
+                print.set_status(60, _L("Generating support"));
+                create_layer_pathing(volumes, config, move_bounds, throw_on_cancel);
+                t_path = std::chrono::high_resolution_clock::now();
 
-            // ### Set a point in each influence area
-            create_nodes_from_area(volumes, config, move_bounds, throw_on_cancel);
-            auto t_place = std::chrono::high_resolution_clock::now();
+                // ### Set a point in each influence area
+                create_nodes_from_area(volumes, config, move_bounds, throw_on_cancel);
+                t_place = std::chrono::high_resolution_clock::now();
 
-            // ### draw these points as circles
+                // ### draw these points as circles
 #if 0
-            indexed_triangle_set branches = draw_branches(*print.get_object(processing.second.front()), volumes, config, move_bounds, throw_on_cancel);
-            // Reduce memory footprint. After this point only slice_branches() will use volumes and from that only collisions with zero radius will be used.
-            volumes.clear_all_but_object_collision();
-            slice_branches(*print.get_object(processing.second.front()), volumes, config, overhangs, move_bounds, branches,
-                bottom_contacts, top_contacts, intermediate_layers, layer_storage, throw_on_cancel);
+                indexed_triangle_set branches = draw_branches(*print.get_object(processing.second.front()), volumes, config, move_bounds, throw_on_cancel);
+                // Reduce memory footprint. After this point only slice_branches() will use volumes and from that only collisions with zero radius will be used.
+                volumes.clear_all_but_object_collision();
+                slice_branches(*print.get_object(processing.second.front()), volumes, config, overhangs, move_bounds, branches,
+                    bottom_contacts, top_contacts, intermediate_layers, layer_storage, throw_on_cancel);
+                break;
 #else
-            // this new function give correct result when raft is also enabled
-            organic_draw_branches(
-                *print.get_object(processing.second.front()), volumes, config, move_bounds,
-                bottom_contacts, top_contacts, interface_placer, intermediate_layers, layer_storage, cooldown_areas,
-                throw_on_cancel);
+                // this new function give correct result when raft is also enabled
+                std::vector<std::pair<LayerIndex, Point>> slender_painted_tips;
+                organic_draw_branches(
+                    *print.get_object(processing.second.front()), volumes, config, move_bounds,
+                    bottom_contacts, top_contacts, interface_placer, intermediate_layers, layer_storage, cooldown_areas,
+                    throw_on_cancel, check_painted_towers ? &slender_painted_tips : nullptr);
+                if (slender_painted_tips.empty())
+                    break;
+                // Start over with those tips routed to the bed. Nothing was output
+                // but the roofs and contacts of the tips; drop them.
+                painted_tips_to_bed.insert(slender_painted_tips.begin(), slender_painted_tips.end());
+                config.painted_tips_to_bed = &painted_tips_to_bed;
+                check_painted_towers = false;
+                for (SupportGeneratorLayersPtr *layers : { &top_contacts, &bottom_contacts, &interface_layers, &base_interface_layers })
+                    std::fill(layers->begin(), layers->end(), nullptr);
 #endif
+            }
+            config.painted_tips_to_bed = nullptr;
 
             // ### Lightning infill for newly opened internal voids in organic hollow trunks (always on).
             organic_lightning_infill(print_object, volumes, config,
@@ -5731,7 +5808,8 @@ void organic_draw_branches(
     SupportGeneratorLayerStorage& layer_storage,
     std::vector<ExPolygons>& cooldown_areas,
 
-    std::function<void()>            throw_on_cancel)
+    std::function<void()>            throw_on_cancel,
+    std::vector<std::pair<LayerIndex, Point>> *slender_painted_tips)
 {
     smooth_organic_forest(print_object, volumes, config, move_bounds, throw_on_cancel);
 
@@ -5971,9 +6049,43 @@ void organic_draw_branches(
                     else {
                         if (branch.has_root) {
                             if (branch.path.front()->state.to_model_gracious) {
-                                if (config.settings.support_floor_layers > 0)
+                                // A branch lands on a painted base where its foot first touches the paint.
+                                // On a slope the rest of the foot is still above it: step that part down the
+                                // slope one layer at a time, over paint only, as the roof interface steps up
+                                // a curved overhang. On a flat base nothing remains below the first layer.
+                                std::vector<Polygons> foot;
+                                // What would continue below the lowest step: too little to print.
+                                Polygons              below_foot;
+                                const Polygons       &paint = volumes.getPaintedBaseSurface(layer_begin);
+                                if (config.painted_bases_only) {
+                                    // Less than one support line cannot be printed.
+                                    const double printable = sqr(double(config.support_line_width));
+                                    for (LayerIndex layer_idx = layer_begin - 1; layer_idx >= 0; -- layer_idx) {
+                                        if (((layer_begin - 1 - layer_idx) & 15) == 15)
+                                            throw_on_cancel();
+                                        Polygons step = intersection(diff_clipped(foot.empty() ? slices.front() : foot.back(),
+                                            volumes.getCollision(0, layer_idx, false)), paint);
+                                        if (area(step) < printable) {
+                                            below_foot = std::move(step);
+                                            break;
+                                        }
+                                        foot.push_back(std::move(step));
+                                    }
+                                }
+                                if (config.settings.support_floor_layers > 0) {
+                                    // One contact per slice, from the lowest step of the foot up. Each slice
+                                    // rests on the paint where it stops stepping down; on a steep slope no
+                                    // layer's band of paint is wider than the XY distance, so no single
+                                    // layer has a placeable area there.
+                                    for (size_t i = foot.size(); i -- > 0;)
+                                        bottom_contacts.emplace_back(diff(foot[i], i + 1 < foot.size() ? foot[i + 1] : below_foot));
                                     //FIXME one may just take the whole tree slice as bottom interface.
-                                    bottom_contacts.emplace_back(intersection_clipped(slices.front(), volumes.getPlaceableAreas(0, layer_begin, [] {})));
+                                    bottom_contacts.emplace_back(foot.empty() ?
+                                        intersection_clipped(slices.front(), volumes.getPlaceableAreas(0, layer_begin, [] {})) :
+                                        diff(intersection(slices.front(), paint), foot.front()));
+                                }
+                                layer_begin -= LayerIndex(foot.size());
+                                slices.insert(slices.begin(), std::make_move_iterator(foot.rbegin()), std::make_move_iterator(foot.rend()));
                             }
                             else if (layer_begin > 0) {
                                 // Drop down areas that do rest non - gracefully on the model to ensure the branch actually rests on something.
@@ -6129,13 +6241,13 @@ void organic_draw_branches(
         const LayerIndex seam = base + (highest_tip - base) / 2;
         if (seam - base < 2 || lowest_tip <= seam)
             continue;
+        // In the order the tree is traversed: the order of the nodes' addresses
+        // differs from one run to the next, and so would the foundations.
         std::vector<const SupportElement*> seam_nodes;
         for (const Branch &branch : tree.branches)
             for (const SupportElement *node : branch.path)
-                if (node->state.layer_idx == seam)
+                if (node->state.layer_idx == seam && std::find(seam_nodes.begin(), seam_nodes.end(), node) == seam_nodes.end())
                     seam_nodes.push_back(node);
-        std::sort(seam_nodes.begin(), seam_nodes.end());
-        seam_nodes.erase(std::unique(seam_nodes.begin(), seam_nodes.end()), seam_nodes.end());
         if (seam_nodes.empty())
             continue;
         foundation_requests.push_back({&tree, base, seam, std::move(seam_nodes)});
@@ -6187,6 +6299,7 @@ void organic_draw_branches(
         TreeSupportSettings reverse_config = config;
         reverse_config.support_rests_on_model = false;
         reverse_config.painted_bases_only = false;
+        reverse_config.painted_tips_to_bed = nullptr;
         reverse_config.raft_layers.clear();
         // The virtual bed is the midpoint weld, not a physical plate foot.
         reverse_config.layer_start_bp_radius = 0;
@@ -6873,6 +6986,67 @@ void organic_draw_branches(
         for (SupportElement &element : layer)
             if (auto found = committed_upper_positions.find(&element); found != committed_upper_positions.end())
                 element.state.result_on_layer = found->second;
+
+    if (slender_painted_tips && config.painted_bases_only) {
+        // A tree standing on the build plate widens toward its base by the
+        // branch diameter angle, which keeps it standing while it prints. A
+        // tower standing on paint has to be as stable: its anchor, everywhere
+        // it rests on paint, all of its feet together, must span at least the
+        // base that taper gives a tree of its height, in X or in Y.
+        for (const Tree &tree : trees) {
+            throw_on_cancel();
+            if (tree.first_layer_id <= LayerIndex(config.raft_layers.size()))
+                continue; // Stands on the bed or raft.
+            Polygons   anchor;
+            LayerIndex anchor_bottom = std::numeric_limits<LayerIndex>::max();
+            LayerIndex top           = -1;
+            for (size_t i = 0; i < tree.slices.size(); ++ i) {
+                if (tree.slices[i].polygons.empty())
+                    continue;
+                const LayerIndex layer = tree.first_layer_id + LayerIndex(i);
+                top = layer;
+                if (Polygons rests = intersection(tree.slices[i].polygons, volumes.getPlaceableAreas(0, layer, throw_on_cancel)); ! rests.empty()) {
+                    append(anchor, std::move(rests));
+                    anchor_bottom = std::min(anchor_bottom, layer);
+                }
+            }
+            // The root's foot rests on all of the paint below it, stepping down a
+            // slope. On a steep slope no layer's band of paint is wider than the
+            // XY distance, so no single layer has a placeable area there.
+            const LayerIndex root_layer = tree.branches.front().path.front()->state.layer_idx;
+            if (root_layer >= tree.first_layer_id && root_layer < tree.first_layer_id + LayerIndex(tree.slices.size()))
+                if (Polygons rests = intersection(tree.slices[root_layer - tree.first_layer_id].polygons, volumes.getPaintedBaseSurface(root_layer));
+                    ! rests.empty()) {
+                    append(anchor, std::move(rests));
+                    anchor_bottom = std::min(anchor_bottom, tree.first_layer_id);
+                }
+            if (anchor.empty())
+                continue;
+            const Point  span   = get_extents(anchor).size();
+            const double needed = 2. * double(top - anchor_bottom) * config.branch_radius_increase_per_layer;
+            if (double(std::max(span.x(), span.y())) >= needed)
+                continue;
+            // Build the tower from the bed only when every one of its tips can reach
+            // the bed: a tip left behind on paint would lose the branches it merged
+            // with, and alone it may be too short to stand on the paint.
+            std::vector<std::pair<LayerIndex, Point>> tips;
+            bool all_reach_bed = true;
+            for (const Branch &branch : tree.branches)
+                if (branch.has_tip) {
+                    const SupportElementState &tip = branch.path.back()->state;
+                    if (tip_bed_route(volumes, config, tip.target_height, tip.target_position) == TipBedRoute::None) {
+                        all_reach_bed = false;
+                        break;
+                    }
+                    tips.emplace_back(tip.target_height, tip.target_position);
+                }
+            if (all_reach_bed)
+                append(*slender_painted_tips, std::move(tips));
+        }
+        if (! slender_painted_tips->empty())
+            // The caller generates again, with these tips routed to the bed.
+            return;
+    }
 
     // Generate forward cooling from the committed graph positions. Removed
     // lower edges are represented by the accepted reverse forest instead.

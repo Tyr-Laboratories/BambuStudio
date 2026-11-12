@@ -871,9 +871,6 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
             }
         });
 
-    typedef std::chrono::high_resolution_clock clock_;
-    typedef std::chrono::duration<double, std::ratio<1> > second_;
-    std::chrono::time_point<clock_> t0{ clock_::now() };
     // main part of overhang detection can be parallel
     tbb::concurrent_vector<ExPolygons> overhangs_all_layers(m_object->layer_count());
 
@@ -893,13 +890,19 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
     trim_tail_empty(enforcers);
     trim_tail_empty(blockers);
 
+    // Kept for the sharp tail and cantilever detection, which runs after all layers' overhangs are known.
+    std::vector<ExPolygons> layers_blocker(m_object->layer_count()), layers_enforced_overhangs(m_object->layer_count()),
+                            layers_lower_offseted(m_object->layer_count());
+    auto detect_in_layer = [&](size_t layer_nr) {
+        // FIXME the param enforce_support_layers is not set yet
+        return is_auto(stype) || (enforce_support_layers > 0 && layer_nr >= enforce_support_layers) || (layer_nr < enforcers.size() && !enforcers[layer_nr].empty());
+    };
     tbb::parallel_for(tbb::blocked_range<size_t>(0, m_object->layer_count()),
         [&](const tbb::blocked_range<size_t>& range) {
             for (size_t layer_nr = range.begin(); layer_nr < range.end(); layer_nr++) {
                 if (m_object->print()->canceled())
                     break;
-                // FIXME the param enforce_support_layers is not set yet
-                if (!(is_auto(stype) || (enforce_support_layers > 0 && layer_nr >= enforce_support_layers) || (layer_nr < enforcers.size() && !enforcers[layer_nr].empty())))
+                if (! detect_in_layer(layer_nr))
                     continue;
 
                 Layer* layer = m_object->get_layer(layer_nr);
@@ -960,13 +963,40 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
                     }
                 }
 
-                double duration{ std::chrono::duration_cast<second_>(clock_::now() - t0).count() };
-                if (duration > 30 || overhangs_all_layers[layer_nr].size() > 100) {
-                    BOOST_LOG_TRIVIAL(info) << "detect_overhangs takes more than 30 secs, skip cantilever and sharp tails detection: layer_nr=" << layer_nr << " duration=" << duration;
-                    config_detect_sharp_tails = false;
-                    config_remove_small_overhangs = false;
+                layers_blocker[layer_nr]            = std::move(blocker);
+                layers_enforced_overhangs[layer_nr] = std::move(enforced_overhangs);
+                layers_lower_offseted[layer_nr]     = std::move(lower_layer_offseted);
+            }
+        }
+    );
+
+    // A layer with this many overhangs makes the sharp tail detection too expensive. Decide it
+    // once from all of them: deciding it while the layers were processed made the overhangs
+    // depend on the order the threads happened to process them in.
+    for (size_t layer_nr = 0; layer_nr < m_object->layer_count(); ++ layer_nr)
+        if (overhangs_all_layers[layer_nr].size() > 100) {
+            BOOST_LOG_TRIVIAL(info) << "detect_overhangs: too many overhangs, skip sharp tails detection and keep small overhangs: layer_nr=" << layer_nr;
+            config_detect_sharp_tails = false;
+            config_remove_small_overhangs = false;
+            break;
+        }
+
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, m_object->layer_count()),
+        [&](const tbb::blocked_range<size_t>& range) {
+            for (size_t layer_nr = range.begin(); layer_nr < range.end(); layer_nr++) {
+                if (m_object->print()->canceled())
+                    break;
+                Layer* layer = m_object->get_layer(layer_nr);
+                // This layer's own overhangs are too many for the cantilever detection.
+                if (! detect_in_layer(layer_nr) || layer->lower_layer == nullptr || overhangs_all_layers[layer_nr].size() > 100)
                     continue;
-                }
+                Layer* lower_layer = layer->lower_layer;
+                coordf_t lower_layer_offset = layer_nr < enforce_support_layers ? -0.15 * extrusion_width : (float)lower_layer->height / tan(threshold_rad);
+                ExPolygons& curr_polys = layer->lslices_extrudable;
+                ExPolygons& lower_polys = lower_layer->lslices_extrudable;
+                ExPolygons& lower_layer_offseted = layers_lower_offseted[layer_nr];
+                const ExPolygons& blocker = layers_blocker[layer_nr];
+                const ExPolygons& enforced_overhangs = layers_enforced_overhangs[layer_nr];
                 if (is_auto(stype) && config_detect_sharp_tails)
                 {
                     ExPolygons curr = curr_polys;
