@@ -66,6 +66,9 @@ public:
     SurfaceCollection           fill_surfaces;
     // BBS: Unspecified fill polygons, used for interecting when we don't want the infill/perimeter overlap
     ExPolygons                  fill_no_overlap_expolygons;
+    // Area of this region's wall extension lines on this layer (wall_internal_extension), cut out of the fill sets above.
+    // Treated as interior when ensuring vertical shell thickness. Empty when there are none.
+    ExPolygons                  wall_extension_area;
 
     // collection of expolygons representing the bridged areas (thus not
     // needing support material)

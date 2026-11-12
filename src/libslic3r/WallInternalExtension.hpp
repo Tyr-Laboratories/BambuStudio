@@ -6,11 +6,16 @@
 // chamfer on the surface side. See docs/superpowers/specs/2026-11-11-wall-internal-extension-design.md.
 
 #include "ExPolygon.hpp"
+#include "ExtrusionEntityCollection.hpp"
 #include "Polyline.hpp"
 
 #include <vector>
 
 namespace Slic3r {
+class Flow;
+class PrintObject;
+namespace Arachne { struct WallToolPathsParams; }
+
 namespace WallInternalExtension {
 
 // What the joint search needs from one layer. Geometry is scaled, z values are in mm.
@@ -90,6 +95,22 @@ struct ExtensionArea
 // chamfer lies on the layers beyond the shell, on the surface side only: as wide as the extension next to the shell,
 // narrowing by one layer height per layer to nothing at the extension's far end.
 ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std::vector<Joint> &joints, size_t target_layer);
+
+// Centrelines of the outer wall extrusions (erExternalPerimeter, erOverhangPerimeter) in `perimeters`, at any depth.
+// The consecutive outer wall paths of a loop are joined back into one closed line.
+Polylines outer_wall_lines(const ExtrusionEntityCollection &perimeters);
+
+// Lines of role erWallExtension filling `area`: variable width Arachne walls of `flow`'s spacing. A line with more than
+// half its length inside `bridge_area` is printed like a bridge: one constant width path of `bridge_flow`, flagged
+// cfWallExtensionBridge.
+ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const ExPolygons &bridge_area, const Flow &flow,
+                                               const Flow &bridge_flow, double layer_height, size_t inset_count,
+                                               const Arachne::WallToolPathsParams &params);
+
+// Runs the wall internal extension on an object whose walls are generated: adds the extension lines to the regions'
+// perimeters, cuts their area out of the fill sets and records it in LayerRegion::wall_extension_area. Does nothing in
+// spiral vase mode or when no region has wall_internal_extension above 0.
+void apply(PrintObject &object);
 
 } // namespace WallInternalExtension
 } // namespace Slic3r

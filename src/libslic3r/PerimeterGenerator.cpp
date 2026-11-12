@@ -1636,6 +1636,27 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
     append(*this->fill_no_overlap, offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.), float(+min_perimeter_infill_spacing / 2.)));
 }
 
+Arachne::WallToolPathsParams make_wall_tool_paths_params(const PrintObjectConfig &object_config, const PrintConfig &print_config)
+{
+    const double min_nozzle_diameter = *std::min_element(print_config.nozzle_diameter.values.begin(), print_config.nozzle_diameter.values.end());
+    Arachne::WallToolPathsParams input_params;
+    if (const auto& min_feature_size_opt = object_config.min_feature_size)
+        input_params.min_feature_size = min_feature_size_opt.value * 0.01 * min_nozzle_diameter;
+
+    if (const auto& min_bead_width_opt = object_config.min_bead_width)
+        input_params.min_bead_width = min_bead_width_opt.value * 0.01 * min_nozzle_diameter;
+
+    if (const auto& wall_transition_filter_deviation_opt = object_config.wall_transition_filter_deviation)
+        input_params.wall_transition_filter_deviation = wall_transition_filter_deviation_opt.value * 0.01 * min_nozzle_diameter;
+
+    if (const auto& wall_transition_length_opt = object_config.wall_transition_length)
+        input_params.wall_transition_length = wall_transition_length_opt.value * 0.01 * min_nozzle_diameter;
+
+    input_params.wall_transition_angle = object_config.wall_transition_angle.value;
+    input_params.wall_distribution_count = object_config.wall_distribution_count.value;
+    return input_params;
+}
+
 // Thanks, Cura developers, for implementing an algorithm for generating perimeters with variable width (Arachne) that is based on the paper
 // "A framework for adaptive width control of dense contour-parallel toolpaths in fused deposition modeling"
 void PerimeterGenerator::process_arachne()
@@ -1733,24 +1754,7 @@ void PerimeterGenerator::process_arachne()
             // whether to seperate the generatation of wall into two parts,first generate outer wall,then generate the remaining wall
             bool seperate_wall_generation = !is_one_wall && generate_one_wall_by_top;
 
-            double min_nozzle_diameter = *std::min_element(print_config->nozzle_diameter.values.begin(), print_config->nozzle_diameter.values.end());
-            Arachne::WallToolPathsParams input_params;
-            {
-                if (const auto& min_feature_size_opt = object_config->min_feature_size)
-                    input_params.min_feature_size = min_feature_size_opt.value * 0.01 * min_nozzle_diameter;
-
-                if (const auto& min_bead_width_opt = object_config->min_bead_width)
-                    input_params.min_bead_width = min_bead_width_opt.value * 0.01 * min_nozzle_diameter;
-
-                if (const auto& wall_transition_filter_deviation_opt = object_config->wall_transition_filter_deviation)
-                    input_params.wall_transition_filter_deviation = wall_transition_filter_deviation_opt.value * 0.01 * min_nozzle_diameter;
-
-                if (const auto& wall_transition_length_opt = object_config->wall_transition_length)
-                    input_params.wall_transition_length = wall_transition_length_opt.value * 0.01 * min_nozzle_diameter;
-
-                input_params.wall_transition_angle = this->object_config->wall_transition_angle.value;
-                input_params.wall_distribution_count = this->object_config->wall_distribution_count.value;
-            }
+            const Arachne::WallToolPathsParams input_params = make_wall_tool_paths_params(*this->object_config, *this->print_config);
 
             // these variables are only valid if need to seperate wall generation
             ExPolygons top_expolys_by_one_wall;

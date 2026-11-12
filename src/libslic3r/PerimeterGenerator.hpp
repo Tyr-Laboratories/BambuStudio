@@ -133,6 +133,10 @@ private:
     Polygons    m_lower_slices_polygons;
 };
 
+namespace Arachne { struct WallToolPathsParams; }
+// Arachne settings for WallToolPaths, as process_arachne() derives them from the object and print configuration.
+Arachne::WallToolPathsParams make_wall_tool_paths_params(const PrintObjectConfig &object_config, const PrintConfig &print_config);
+
 }
 
 #endif

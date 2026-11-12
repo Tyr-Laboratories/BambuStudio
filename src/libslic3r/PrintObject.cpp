@@ -6,6 +6,7 @@
 #include "Geometry.hpp"
 #include "I18N.hpp"
 #include "Layer.hpp"
+#include "WallInternalExtension.hpp"
 #include "MutablePolygon.hpp"
 #include "Support/SupportMaterial.hpp"
 #include "Support/TreeSupport.hpp"
@@ -637,6 +638,11 @@ void PrintObject::make_perimeters()
         m_print->throw_if_canceled();
         BOOST_LOG_TRIVIAL(debug) << "Recrod cooling_node id for each extrusion in parallel - end";
     }
+
+    // Continue outer walls that rise out of or end under a surface inside the part (wall_internal_extension).
+    WallInternalExtension::apply(*this);
+    m_print->throw_if_canceled();
+
     this->set_done(posPerimeters);
 
     if (record_wall_time)
@@ -2363,6 +2369,8 @@ void PrintObject::discover_vertical_shells()
                             perimeter_min_spacing = std::min(perimeter_min_spacing, float(std::min(extflow.scaled_spacing(), flow.scaled_spacing())));
                         }
                         polygons_append(cache.holes, to_polygons(layerm.fill_expolygons));
+                        // Wall extension lines are interior; they must not make the shells around them solid.
+                        polygons_append(cache.holes, to_polygons(layerm.wall_extension_area));
                     }
                     // For a multi-material print, simulate perimeter / infill split as if only a single extruder has been used for the whole print.
                     const bool painted_layer=idx_layer<m_wall_painting.size() &&
@@ -2418,8 +2426,11 @@ void PrintObject::discover_vertical_shells()
 //                        append(cache.bottom_surfaces, offset(layerm.fill_surfaces().filter_by_types(surfaces_bottom), top_bottom_expansion));
                         // Holes over all regions. Only collect them once, they are valid for all region_id iterations.
                         if (cache.holes.empty()) {
-                            for (size_t region_id = 0; region_id < layer.regions().size(); ++ region_id)
+                            for (size_t region_id = 0; region_id < layer.regions().size(); ++ region_id) {
                                 polygons_append(cache.holes, to_polygons(layer.regions()[region_id]->fill_expolygons));
+                                // Wall extension lines are interior; they must not make the shells around them solid.
+                                polygons_append(cache.holes, to_polygons(layer.regions()[region_id]->wall_extension_area));
+                            }
                         }
                     }
                 });

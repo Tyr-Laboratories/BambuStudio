@@ -1,7 +1,16 @@
 #include "WallInternalExtension.hpp"
 
+#include "Arachne/WallToolPaths.hpp"
+#include "Arachne/utils/ExtrusionLine.hpp"
 #include "ClipperUtils.hpp"
+#include "Flow.hpp"
+#include "Layer.hpp"
+#include "PerimeterGenerator.hpp"
+#include "Print.hpp"
 #include "libslic3r.h"
+
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
 #include <algorithm>
 #include <cmath>
@@ -195,6 +204,260 @@ ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std
     area.all     = union_ex(all);
     area.hanging = union_ex(hanging);
     return area;
+}
+
+namespace {
+
+bool is_outer_wall(const ExtrusionPath &path) { return path.role() == erExternalPerimeter || path.role() == erOverhangPerimeter; }
+
+// Joins consecutive outer wall paths into lines; a loop made only of outer wall paths becomes one closed line.
+void append_outer_wall_runs(const ExtrusionPaths &paths, bool closed, Polylines &out)
+{
+    Polyline run;
+    bool     all_outer = true;
+    for (const ExtrusionPath &path : paths) {
+        if (!is_outer_wall(path)) {
+            all_outer = false;
+            if (run.points.size() >= 2)
+                out.emplace_back(std::move(run));
+            run.points.clear();
+            continue;
+        }
+        for (const Point &point : path.polyline.points)
+            if (run.points.empty() || run.points.back() != point)
+                run.points.push_back(point);
+    }
+    if (closed && all_outer && run.points.size() > 2 && run.points.front() != run.points.back())
+        run.points.push_back(run.points.front());
+    if (run.points.size() >= 2)
+        out.emplace_back(std::move(run));
+}
+
+void collect_outer_wall_lines(const ExtrusionEntity &entity, Polylines &out)
+{
+    if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
+        for (const ExtrusionEntity *child : collection->entities)
+            collect_outer_wall_lines(*child, out);
+    } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
+        append_outer_wall_runs(loop->paths, true, out);
+    } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+        append_outer_wall_runs(multipath->paths, false, out);
+    } else if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+        if (is_outer_wall(*path) && path->polyline.points.size() >= 2)
+            out.push_back(path->polyline);
+    }
+}
+
+} // namespace
+
+Polylines outer_wall_lines(const ExtrusionEntityCollection &perimeters)
+{
+    Polylines out;
+    collect_outer_wall_lines(perimeters, out);
+    return out;
+}
+
+ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const ExPolygons &bridge_area, const Flow &flow,
+                                               const Flow &bridge_flow, double layer_height, size_t inset_count,
+                                               const Arachne::WallToolPathsParams &params)
+{
+    ExtrusionEntityCollection out;
+    const coord_t             spacing = flow.scaled_spacing();
+    // WallToolPaths keeps a reference to its outline: it must outlive tool_paths.
+    const Polygons            outline = to_polygons(area);
+    Arachne::WallToolPaths    tool_paths(outline, spacing, spacing, inset_count, 0, layer_height, params);
+    std::vector<Arachne::VariableWidthLines> tool_lines = tool_paths.getToolPaths();
+    for (Arachne::VariableWidthLines &inset : tool_lines)
+        for (Arachne::ExtrusionLine &line : inset) {
+            if (line.junctions.size() < 2)
+                continue;
+            // As in process_arachne(): a closed line occasionally comes without its closing junction.
+            if (line.is_closed && line.junctions.front().p != line.junctions.back().p)
+                line.junctions.emplace_back(line.junctions.front());
+            Polyline centreline;
+            for (const Arachne::ExtrusionJunction &junction : line.junctions)
+                centreline.points.emplace_back(junction.p);
+            const double length = centreline.length();
+            if (length <= 0.)
+                continue;
+            if (!bridge_area.empty() && total_length(intersection_pl(Polylines{ centreline }, bridge_area)) > 0.5 * length) {
+                ExtrusionPath path(erWallExtension, bridge_flow.mm3_per_mm(), bridge_flow.width(), bridge_flow.height());
+                path.polyline = std::move(centreline);
+                path.set_customize_flag(CustomizeFlag::cfWallExtensionBridge);
+                if (line.is_closed) {
+                    ExtrusionLoop loop;
+                    loop.paths.emplace_back(std::move(path));
+                    out.append(std::move(loop));
+                } else
+                    out.append(std::move(path));
+                continue;
+            }
+            ExtrusionPaths paths;
+            extrusion_paths_append(paths, line, erWallExtension, flow);
+            if (paths.empty())
+                continue;
+            if (line.is_closed) {
+                out.append(ExtrusionLoop(std::move(paths)));
+                continue;
+            }
+            // One open line gives connected paths; split where rounding left a gap, as process_arachne() does.
+            ExtrusionMultiPath multipath;
+            for (ExtrusionPath &path : paths) {
+                if (!multipath.paths.empty() && multipath.paths.back().last_point() != path.first_point()) {
+                    out.append(std::move(multipath));
+                    multipath = ExtrusionMultiPath();
+                }
+                multipath.paths.emplace_back(std::move(path));
+            }
+            out.append(std::move(multipath));
+        }
+    return out;
+}
+
+void apply(PrintObject &object)
+{
+    LayerPtrs &layers = object.layers();
+    for (Layer *layer : layers)
+        for (LayerRegion *region : layer->regions())
+            region->wall_extension_area.clear();
+
+    const Print &print = *object.print();
+    const auto throw_if_canceled = [&print]() {
+        if (print.canceled())
+            throw CanceledException();
+    };
+    if (print.config().spiral_mode.value || layers.size() < 3)
+        return;
+    double extension_max = 0.;
+    for (size_t region_id = 0; region_id < object.num_printing_regions(); ++region_id)
+        extension_max = std::max(extension_max, object.printing_region(region_id).config().wall_internal_extension.value);
+    if (extension_max <= 0.)
+        return;
+    const coord_t tolerance = scaled<coord_t>(std::max(print.config().resolution.value, object.config().slice_closing_radius.value));
+
+    // Every layer's outline and walls, read before any layer is changed.
+    std::vector<LayerGeometry> geometry(layers.size());
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, layers.size()), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t i = range.begin(); i < range.end(); ++i) {
+            const Layer   &layer = *layers[i];
+            LayerGeometry &g     = geometry[i];
+            g.bottom_z = layer.bottom_z();
+            g.print_z  = layer.print_z;
+            g.outline  = layer.lslices;
+            Polygons walls;
+            for (const LayerRegion *region : layer.regions())
+                polygons_append(walls, region->perimeters.polygons_covered_by_width());
+            g.walls = union_ex(walls);
+        }
+    });
+    throw_if_canceled();
+
+    // Joints. Regions that differ only in wall_internal_extension share one perimeter group, whose walls all sit in its
+    // first region, so every outer wall line of the layer is split among the regions by their slices.
+    std::vector<std::vector<Joint>> joints(layers.size());
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, layers.size()), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t i = range.begin(); i < range.end(); ++i) {
+            const Layer &layer = *layers[i];
+            Polylines    lines;
+            for (const LayerRegion *region : layer.regions())
+                append(lines, outer_wall_lines(region->perimeters));
+            if (lines.empty())
+                continue;
+            for (const LayerRegion *region : layer.regions()) {
+                const PrintRegionConfig &config = region->region().config();
+                if (config.wall_internal_extension.value <= 0. || region->slices.empty())
+                    continue;
+                const Polylines own = intersection_pl(lines, to_expolygons(region->slices.surfaces));
+                if (own.empty())
+                    continue;
+                JointSettings settings;
+                settings.extension              = config.wall_internal_extension.value;
+                settings.top_shell_layers       = config.top_shell_layers.value;
+                settings.top_shell_thickness    = config.top_shell_thickness.value;
+                settings.bottom_shell_layers    = config.bottom_shell_layers.value;
+                settings.bottom_shell_thickness = config.bottom_shell_thickness.value;
+                settings.line_width             = region->flow(frExternalPerimeter).scaled_width();
+                settings.tolerance              = tolerance;
+                append(joints[i], find_joints(geometry, i, own, settings));
+            }
+        }
+    });
+    throw_if_canceled();
+
+    double reach_max = 0.;
+    for (const std::vector<Joint> &layer_joints : joints)
+        for (const Joint &joint : layer_joints)
+            reach_max = std::max(reach_max, joint.shell_depth + joint.extension);
+    if (reach_max <= 0.)
+        return;
+
+    // The area each region prints on each layer: inside the part with material directly above and below (never on a
+    // surface or over air), inside the region's fill area, and only where the region itself has the setting above 0.
+    std::vector<std::vector<ExPolygons>> areas(layers.size());
+    std::vector<ExPolygons>              hanging(layers.size());
+    tbb::parallel_for(tbb::blocked_range<size_t>(1, layers.size() - 1), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t l = range.begin(); l < range.end(); ++l) {
+            std::vector<Joint> nearby;
+            for (size_t n = l + 1; n < layers.size() && geometry[n].bottom_z - geometry[l].bottom_z <= reach_max + EPSILON; ++n)
+                append(nearby, joints[n]);
+            for (size_t n = l; n-- > 0 && geometry[l].print_z - geometry[n].print_z <= reach_max + EPSILON;)
+                append(nearby, joints[n]);
+            if (nearby.empty())
+                continue;
+            ExtensionArea area = extension_area(geometry, nearby, l);
+            if (area.all.empty())
+                continue;
+            area.all = intersection_ex(area.all, intersection_ex(layers[l - 1]->lslices, layers[l + 1]->lslices));
+            const LayerRegionPtrs &regions = layers[l]->regions();
+            areas[l].assign(regions.size(), ExPolygons());
+            for (size_t r = 0; r < regions.size(); ++r)
+                if (regions[r]->region().config().wall_internal_extension.value > 0.)
+                    areas[l][r] = intersection_ex(area.all, regions[r]->fill_no_overlap_expolygons);
+            hanging[l] = std::move(area.hanging);
+        }
+    });
+    throw_if_canceled();
+
+    // Lines and cut-outs. Each layer only changes its own regions.
+    const Arachne::WallToolPathsParams params = make_wall_tool_paths_params(object.config(), print.config());
+    tbb::parallel_for(tbb::blocked_range<size_t>(1, layers.size() - 1), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t l = range.begin(); l < range.end(); ++l) {
+            if (areas[l].empty())
+                continue;
+            throw_if_canceled();
+            // What lines on this layer stand on: the walls and the extension lines of the layer below.
+            Polygons support_below = to_polygons(geometry[l - 1].walls);
+            for (const ExPolygons &below : areas[l - 1])
+                polygons_append(support_below, to_polygons(below));
+            const LayerRegionPtrs &regions = layers[l]->regions();
+            for (size_t r = 0; r < regions.size() && r < areas[l].size(); ++r) {
+                const ExPolygons &area = areas[l][r];
+                if (area.empty())
+                    continue;
+                LayerRegion &region      = *regions[r];
+                const Flow   flow        = region.flow(frExternalPerimeter);
+                const Flow   bridge_flow = region.bridging_flow(frPerimeter, object.config().thick_bridges);
+                // Only a top joint's deepest layer can hang over the sparse infill.
+                const ExPolygons bridge_area = diff_ex(intersection_ex(hanging[l], area),
+                                                       offset(support_below, float(flow.scaled_spacing()) / 2.f));
+                const size_t inset_count = size_t(std::ceil(double(flow.scaled_width() + scaled<coord_t>(extension_max)) /
+                                                            double(flow.scaled_spacing()))) + 1;
+                for (const ExPolygon &piece : area) {
+                    ExtrusionEntityCollection lines = extension_extrusions(piece, bridge_area, flow, bridge_flow, layers[l]->height,
+                                                                           inset_count, params);
+                    if (!lines.entities.empty())
+                        region.perimeters.append(std::move(lines));
+                }
+                // Fill meets the extension lines at normal line spacing, as neighbouring solid lines meet.
+                region.fill_expolygons            = diff_ex(region.fill_expolygons, area);
+                region.fill_no_overlap_expolygons = diff_ex(region.fill_no_overlap_expolygons, area);
+                region.bridge_fill_expolygons     = diff_ex(region.bridge_fill_expolygons, area);
+                region.fill_surfaces.set(region.fill_expolygons, stInternal);
+                region.wall_extension_area        = area;
+            }
+        }
+    });
+    throw_if_canceled();
 }
 
 } // namespace WallInternalExtension
