@@ -126,6 +126,8 @@ their existing workflows.
 
 Slicing the same plate again gives the same G-code with **Tree Organic** supports, normal supports, or none. Mesh slicing, the projections of support painting, and Organic support generation used to depend on the order in which parallel threads finished, so a plate sliced twice could differ in the start points and order of its paths and slightly in its supports. **Tree Slim**, **Tree Strong** and **Tree Hybrid** supports can still differ from one run to the next.
 
+The overhang detection of all tree supports no longer depends on time either. It used to stop detecting sharp tails and removing small overhangs once it had run for 30 seconds, so a slower or busier computer could produce different supports. As before, a layer with more than 100 overhangs turns both off for its object.
+
 Support generation is also faster. On a private 16-plate aircraft project with Organic supports, slicing took 11% fewer retired instructions than before these optimizations, and 31% fewer on its most support-heavy plate. Each optimization left the G-code byte-identical.
 
 ## Paint bases for Organic tree supports
