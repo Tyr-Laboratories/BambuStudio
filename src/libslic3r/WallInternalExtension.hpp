@@ -27,6 +27,10 @@ struct LayerGeometry
     ExPolygons outline;
     // Area covered by every wall extrusion of the layer.
     ExPolygons walls;
+    // `walls` grown by `carried_reach` (scaled): the area that carries a joint line, made once per layer when the joint
+    // lines of both neighbours have that reach. find_joints() computes it itself for any other reach.
+    ExPolygons carried;
+    float      carried_reach = -1.f;
 };
 
 // Settings of the region whose outer wall forms a joint.
@@ -76,6 +80,10 @@ struct Joint
 double top_shell_depth(const std::vector<LayerGeometry> &layers, size_t surface_layer, int shell_layers, double shell_thickness);
 // The mirror image for the bottom shell above a bottom surface on `surface_layer`.
 double bottom_shell_depth(const std::vector<LayerGeometry> &layers, size_t surface_layer, int shell_layers, double shell_thickness);
+
+// How far, scaled, a neighbouring layer's walls are grown to find where they carry a joint line of `settings`: half the
+// line width, less the overlap of neighbouring lines and the slicing tolerance.
+float carried_reach(const JointSettings &settings);
 
 // Joints formed by `outer_wall_lines`, the centrelines of one region's outer wall extrusions at `layer`. A piece of the
 // line is a top joint where its whole width stands over the inside of the layer below, away from that layer's walls (a

@@ -99,12 +99,14 @@ Polylines clip(const Polylines &lines, const ExPolygons &area)
     return pieces;
 }
 
-// Pieces of `lines` whose whole line width stands over the inside of `neighbour`, clear of its walls. A wall line that
-// only touches the line, overlapping it by no more than `allowance`, is beside it rather than under it.
-Polylines standing_on(const Polylines &lines, const LayerGeometry &neighbour, coord_t line_width, coord_t allowance)
+// Pieces of `lines` outside `area`, joined again where a closed line was cut at its start.
+Polylines cut(const Polylines &lines, const ExPolygons &area)
 {
-    const float half_width = float(line_width) / 2.f;
-    return clip(lines, diff_ex(offset_ex(neighbour.outline, -half_width), offset_ex(neighbour.walls, half_width - float(allowance))));
+    if (lines.empty() || area.empty())
+        return lines;
+    Polylines pieces = diff_pl(lines, area);
+    join_touching_pieces(pieces);
+    return pieces;
 }
 
 // Keeps the pieces of `lines`, an outer wall line at `layer`, where the wall continues strictly steeper than 45 degrees
@@ -144,24 +146,42 @@ void drop_shorter_than(Polylines &lines, coord_t min_length)
 
 } // namespace
 
+float carried_reach(const JointSettings &settings)
+{
+    // Neighbouring lines of one layer overlap by their width less their spacing; a wall line that overlaps the joint line
+    // no more than that (and the slicing tolerance) only touches it.
+    const coord_t allowance = (settings.line_spacing > 0 ? std::max<coord_t>(0, settings.line_width - settings.line_spacing) : 0) +
+                              settings.tolerance;
+    return float(settings.line_width) / 2.f - float(allowance);
+}
+
 std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t layer, const Polylines &outer_wall_lines,
                                const JointSettings &settings)
 {
     std::vector<Joint> joints;
     if (settings.extension <= 0. || settings.line_width <= 0 || layer >= layers.size() || outer_wall_lines.empty())
         return joints;
-    // Only the outer wall: its centreline lies within one line width of the layer's outline.
-    const LayerGeometry &here  = layers[layer];
-    const Polylines      outer = clip(outer_wall_lines, diff_ex(here.outline, offset_ex(here.outline, -float(settings.line_width))));
-    if (outer.empty())
-        return joints;
-
+    const LayerGeometry &here       = layers[layer];
+    const float          half_width = float(settings.line_width) / 2.f;
     // Neighbouring lines of one layer overlap by their width less their spacing; a wall line below that overlaps the joint
     // line no more than that (and the slicing tolerance) only touches it.
-    const coord_t allowance = (settings.line_spacing > 0 ? std::max<coord_t>(0, settings.line_width - settings.line_spacing) : 0) +
-                              settings.tolerance;
+    const float reach = carried_reach(settings);
+    // Only the outer wall counts: its centreline lies within one line width of the layer's outline.
+    ExPolygons outer_band;
+    // The pieces of the outer wall line whose whole width stands over the inside of `neighbour`, clear of its walls. Nearly
+    // all of the line stands on the neighbour's walls, so those go first, and the outline offsets are made only for what
+    // is left.
+    const auto standing_on = [&](const LayerGeometry &neighbour) {
+        Polylines lines = neighbour.carried_reach == reach ? cut(outer_wall_lines, neighbour.carried) :
+                                                             cut(outer_wall_lines, offset_ex(neighbour.walls, reach));
+        if (lines.empty())
+            return lines;
+        if (outer_band.empty())
+            outer_band = diff_ex(here.outline, offset_ex(here.outline, -float(settings.line_width)));
+        return clip(clip(lines, outer_band), offset_ex(neighbour.outline, -half_width));
+    };
     if (layer >= 1) {
-        Polylines lines = steep_for_extension(standing_on(outer, layers[layer - 1], settings.line_width, allowance), layers, layer, +1, settings);
+        Polylines lines = steep_for_extension(standing_on(layers[layer - 1]), layers, layer, +1, settings);
         drop_shorter_than(lines, settings.line_width);
         if (!lines.empty())
             joints.push_back({ layer, JointSide::Top, std::move(lines),
@@ -169,7 +189,7 @@ std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t 
                                settings.extension, settings.line_width, settings.tolerance });
     }
     if (layer + 1 < layers.size()) {
-        Polylines lines = steep_for_extension(standing_on(outer, layers[layer + 1], settings.line_width, allowance), layers, layer, -1, settings);
+        Polylines lines = steep_for_extension(standing_on(layers[layer + 1]), layers, layer, -1, settings);
         drop_shorter_than(lines, settings.line_width);
         if (!lines.empty())
             joints.push_back({ layer, JointSide::Bottom, std::move(lines),
@@ -403,6 +423,18 @@ void apply(PrintObject &object)
             for (const LayerRegion *region : layer.regions())
                 polygons_append(walls, region->perimeters.polygons_covered_by_width());
             g.walls = union_ex(walls);
+            // The area carrying joint lines on both neighbouring layers, made once here for the line width of the first
+            // region with the extension on; find_joints() makes its own for any other line width.
+            for (const LayerRegion *region : layer.regions())
+                if (region->region().config().wall_internal_extension.value > 0.) {
+                    JointSettings settings;
+                    settings.line_width   = region->flow(frExternalPerimeter).scaled_width();
+                    settings.line_spacing = region->flow(frExternalPerimeter).scaled_spacing();
+                    settings.tolerance    = tolerance;
+                    g.carried_reach       = carried_reach(settings);
+                    g.carried             = offset_ex(g.walls, g.carried_reach);
+                    break;
+                }
         }
     });
     throw_if_canceled();
@@ -422,7 +454,8 @@ void apply(PrintObject &object)
                 const PrintRegionConfig &config = region->region().config();
                 if (config.wall_internal_extension.value <= 0. || region->slices.empty())
                     continue;
-                const Polylines own = intersection_pl(lines, to_expolygons(region->slices.surfaces));
+                // A layer of one region owns all its lines; otherwise each region takes the pieces inside its slices.
+                const Polylines own = layer.regions().size() == 1 ? lines : intersection_pl(lines, to_expolygons(region->slices.surfaces));
                 if (own.empty())
                     continue;
                 JointSettings settings;
