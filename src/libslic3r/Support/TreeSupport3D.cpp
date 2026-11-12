@@ -5671,10 +5671,33 @@ static void smooth_organic_forest(
 }
 
 // intersection(a, b).empty(), without running Clipper where the answer is plain: when one of
-// them is empty, or their bounding boxes are apart. The polygons must have points.
+// them is empty, or no polygon of b has a bounding box touching a's. The polygons must have points.
+// Clipper sweeps along Y. A polygon of b that lies wholly above or below a never shares a scanbeam
+// with a and puts no scanbeam boundary inside a's Y range, so it cannot add or remove any part of
+// the intersection: Clipper runs only on the polygons of b that reach a's Y range.
 static bool polygons_disjoint(const Polygons &a, const Polygons &b)
 {
-    return a.empty() || b.empty() || ! get_extents(a).overlap(get_extents(b)) || intersection(a, b).empty();
+    if (a.empty() || b.empty())
+        return true;
+    const BoundingBox   box_a = get_extents(a);
+    std::vector<size_t> in_band;
+    bool                touches = false;
+    for (size_t i = 0; i < b.size(); ++ i) {
+        const BoundingBox box = get_extents(b[i]);
+        if (box.max.y() >= box_a.min.y() && box.min.y() <= box_a.max.y()) {
+            in_band.emplace_back(i);
+            touches |= box.max.x() >= box_a.min.x() && box.min.x() <= box_a.max.x();
+        }
+    }
+    if (! touches)
+        return true;
+    if (in_band.size() == b.size())
+        return intersection(a, b).empty();
+    Polygons b_in_band;
+    b_in_band.reserve(in_band.size());
+    for (size_t i : in_band)
+        b_in_band.emplace_back(b[i]);
+    return intersection(a, b_in_band).empty();
 }
 
 // intersection(a, b), without running Clipper when one of them is empty.
