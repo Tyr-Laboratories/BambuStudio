@@ -79,6 +79,11 @@ target_link_libraries(overhang_wall_tests test_common libslic3r slicer_test_supp
 set_property(TARGET overhang_wall_tests PROPERTY FOLDER "tests")
 add_test(overhang_wall_tests overhang_wall_tests ${CATCH_EXTRA_ARGS})
 
+add_executable(wall_internal_extension_tests fff_print_tests.cpp test_wall_internal_extension_config.cpp)
+target_link_libraries(wall_internal_extension_tests test_common libslic3r slicer_test_support)
+set_property(TARGET wall_internal_extension_tests PROPERTY FOLDER "tests")
+add_test(wall_internal_extension_tests wall_internal_extension_tests ${CATCH_EXTRA_ARGS})
+
 # Keep the relevant pre-existing model/3MF/slicing checks runnable even when
 # unrelated legacy G-code tests target APIs that have since been removed.
 add_executable(wall_painting_regression_tests

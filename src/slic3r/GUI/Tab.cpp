@@ -3314,6 +3314,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("wall_loops","wall-generator");
         optgroup->append_single_option_line("painted_wall_loops");
         optgroup->append_single_option_line("extra_wall_slope_angle");
+        optgroup->append_single_option_line("wall_internal_extension");
         optgroup->append_single_option_line("alternate_extra_wall");
         optgroup->append_single_option_line("embedding_wall_into_infill");
 

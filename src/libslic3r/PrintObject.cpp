@@ -1611,6 +1611,7 @@ bool PrintObject::invalidate_state_by_config_options(
                opt_key == "wall_loops"
             || opt_key == "painted_wall_loops"
             || opt_key == "extra_wall_slope_angle"
+            || opt_key == "wall_internal_extension"
             || opt_key == "top_one_wall_type"
             || opt_key == "top_area_threshold"
             || opt_key == "only_one_wall_first_layer"

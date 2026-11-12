@@ -174,6 +174,7 @@ bool Layer::has_compatible_layer_regions(const PrintRegionConfig &config, const 
 {
     return config.wall_filament == other_config.wall_filament
            && config.wall_loops == other_config.wall_loops
+           && config.wall_internal_extension == other_config.wall_internal_extension
            && config.wall_sequence == other_config.wall_sequence
            && config.inner_wall_speed.get_at(get_process_config_idx(config.wall_filament)) == other_config.inner_wall_speed.get_at(get_process_config_idx(config.wall_filament))
            && config.outer_wall_speed.get_at(get_process_config_idx(config.wall_filament)) == other_config.outer_wall_speed.get_at(get_process_config_idx(config.wall_filament))

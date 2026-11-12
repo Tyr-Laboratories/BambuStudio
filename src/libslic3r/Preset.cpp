@@ -1034,7 +1034,7 @@ bool Preset::has_cali_lines(PresetBundle* preset_bundle)
 }
 
 static std::vector<std::string> s_Preset_print_options {
-    "layer_height", "initial_layer_print_height", "wall_loops", "painted_wall_loops", "extra_wall_slope_angle", "slice_closing_radius", "spiral_mode", "spiral_mode_smooth", "spiral_mode_max_xy_smoothing", "slicing_mode",
+    "layer_height", "initial_layer_print_height", "wall_loops", "painted_wall_loops", "extra_wall_slope_angle", "wall_internal_extension", "slice_closing_radius", "spiral_mode", "spiral_mode_smooth", "spiral_mode_max_xy_smoothing", "slicing_mode",
     "top_shell_layers", "top_shell_thickness", "bottom_shell_layers", "bottom_shell_thickness", "ensure_vertical_shell_thickness", "reduce_crossing_wall", "detect_thin_wall",
     "detect_overhang_wall", "top_color_penetration_layers", "bottom_color_penetration_layers",
     "infill_instead_top_bottom_surfaces",
