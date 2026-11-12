@@ -1196,6 +1196,14 @@ void sample_overhang_area(
  * \param move_bounds[out] Storage for the influence areas.
  * \param storage[in] Background storage, required for adding roofs.
  */
+// How far a tip may stand off the band of overhang it supports, where that band
+// is too close to the model for the tip itself, still covering the band.
+static coord_t organic_tip_outset(const TreeSupportSettings &config)
+{
+    const bool min_xy_dist = config.xy_distance > config.xy_min_distance;
+    return std::max(coord_t(0), config.min_radius - config.support_line_width / 2) + (min_xy_dist ? config.support_line_width / 2 : 0);
+}
+
 static coord_t organic_tip_connect_length(const TreeSupportSettings &config)
 {
     return (config.support_line_width * 100. / config.settings.support_tree_top_rate) +
@@ -1236,7 +1244,7 @@ static void generate_initial_areas_from_contacts(
     //FIXME Vojtech: This is not sufficient for support enforcers to work.
     //FIXME There is no account for the support overhang angle.
     //FIXME There is no account for the width of the collision regions.
-    const coord_t extra_outset = std::max(coord_t(0), config.min_radius - config.support_line_width / 2) + (min_xy_dist ? config.support_line_width / 2 : 0)
+    const coord_t extra_outset = organic_tip_outset(config)
         //FIXME this is a heuristic value for support enforcers to work.
 //        + 10 * mesh_config.support_line_width;
         ;
@@ -6239,10 +6247,14 @@ void organic_draw_branches(
             ++base;
         // A non-gracious root may have been extended down to the plate during
         // slicing. Classify its actual landing rather than a routing hint bit.
+        // A foot stepping down a painted slope rests on that slope's paint even
+        // where no layer has a placeable area of radius zero left under it.
         if (base <= LayerIndex(config.raft_layers.size()) ||
-            base >= tree.first_layer_id + LayerIndex(tree.slices.size()) ||
-            intersection(tree.slices[base - tree.first_layer_id].polygons,
-                         volumes.getPlaceableAreas(0, base, throw_on_cancel)).empty())
+            base >= tree.first_layer_id + LayerIndex(tree.slices.size()))
+            continue;
+        if (const Polygons &base_slice = tree.slices[base - tree.first_layer_id].polygons;
+            intersection(base_slice, volumes.getPlaceableAreas(0, base, throw_on_cancel)).empty() &&
+            (! config.painted_bases_only || intersection(base_slice, volumes.getPaintedBaseSurface(base)).empty()))
             continue;
         LayerIndex highest_tip = base;
         LayerIndex lowest_tip = std::numeric_limits<LayerIndex>::max();
@@ -6353,19 +6365,30 @@ void organic_draw_branches(
         std::vector<Polygons> landing_masks(height + 1), forbidden_centers(height + 1);
         std::vector<OrganicContactArea> foundation_areas;
         // A foundation starts with tip-sized contacts, not the trunk-sized
-        // center regions used to land an already-grown forward tree. Prepare
-        // the same raw contact masks as the upper generator and constrain only
-        // their permitted tip centers at the model/paint boundary.
+        // center regions used to land an already-grown forward tree. Its feet
+        // are sampled as tips are: a tip stands on its overhang's band however
+        // thin a slope makes it, or off it by up to the tip outset where the band
+        // is too close to the model, still covering it. A foot on painted bases
+        // likewise stands on the band of a base flatter than the support threshold
+        // angle, or off it.
+        const coord_t foot_outset = organic_tip_outset(config);
         for (LayerIndex physical = base; physical < seam - 1; ++physical) {
             throw_on_cancel();
             const LayerIndex reversed = seam - physical;
             Polygons &landing = landing_masks[reversed];
-            landing = intersection(volumes.getPlaceableAreas(0, physical, throw_on_cancel), volumes.m_bed_area);
+            landing = intersection(volumes.getBaseLandingAreas(physical, throw_on_cancel), volumes.m_bed_area);
             if (landing.empty())
                 continue;
-            const Polygons centers = offset(union_ex(landing),
-                -(config.getRadius(0) + (config.painted_bases_only ? coord_t(0) : config.xy_distance)), jtMiter, 1.2);
-            forbidden_centers[reversed] = diff(Polygons{volumes.m_bed_area}, centers);
+            if (config.painted_bases_only) {
+                const Polygons reach = offset(landing, float(foot_outset), jtMiter, 1.2);
+                forbidden_centers[reversed] = diff(Polygons{volumes.m_bed_area}, reach);
+                // A foot covering unpainted surface it would rest on is no foot on paint.
+                append(forbidden_centers[reversed], offset(volumes.getUnpaintedRestingAreas(physical, get_extents(reach)),
+                    float(config.getRadius(0)), jtMiter, 1.2));
+            } else
+                // Where support may rest anywhere on the model, a foot stands wholly
+                // on the surface, as it always has.
+                forbidden_centers[reversed] = diff(Polygons{volumes.m_bed_area}, offset(landing, - float(config.getRadius(0)), jtMiter, 1.2));
             foundation_areas.push_back({size_t(reversed), &landing, &forbidden_centers[reversed]});
         }
         generate_initial_areas_from_contacts(reverse_volumes, reverse_config, reverse_config.settings,
@@ -6474,9 +6497,12 @@ void organic_draw_branches(
                         // a reflected tip, just as forward tips stop at their contact.
                         if (branch.has_tip && physical < physical_tip)
                             continue;
+                        // A foot may stand off its thin landing band, covering it, as a
+                        // tip may stand off its overhang's band. Only what would rest on
+                        // unpainted surface within the bottom gap is cut away.
                         if (branch.has_tip && physical == physical_tip && !branch.path.back()->state.supports_roof)
-                            branch_slices[physical - base] = intersection(branch_slices[physical - base],
-                                volumes.getPlaceableAreas(0, physical, throw_on_cancel));
+                            branch_slices[physical - base] = diff(branch_slices[physical - base],
+                                volumes.getUnpaintedRestingAreas(physical, get_extents(branch_slices[physical - base])));
                         if (branch.has_root && !branch_slices[physical - base].empty())
                             result.trunk_first_layer = std::min(result.trunk_first_layer, physical);
                         // Validate the complete tilted tube, not only its center
@@ -6494,7 +6520,30 @@ void organic_draw_branches(
                         // A tip may now rest on a reflected interface. Only the
                         // portion at a real model landing is a direct contact.
                         append(tip_contacts[physical_tip - base], intersection(branch_slices[physical_tip - base],
-                            volumes.getPlaceableAreas(0, physical_tip, throw_on_cancel)));
+                            offset(volumes.getPlaceableAreas(0, physical_tip, throw_on_cancel), float(config.resolution))));
+                        // As a forward branch landing on a painted slope does, a foot
+                        // stands where it first touches the paint while the rest of it
+                        // still hangs over the slope: step that part down the slope one
+                        // layer at a time, over paint only, until less than a support
+                        // line is left. Each step rests on the paint where the next one
+                        // down does not continue.
+                        if (config.painted_bases_only && !branch.path.back()->state.supports_roof) {
+                            const Polygons &paint     = volumes.getPaintedBaseSurface(physical_tip);
+                            const double    printable = sqr(double(config.support_line_width));
+                            std::vector<Polygons> steps;
+                            for (LayerIndex physical = physical_tip - 1; physical >= base; -- physical) {
+                                Polygons step = intersection(diff_clipped(steps.empty() ? branch_slices[physical_tip - base] : steps.back(),
+                                    volumes.getCollision(0, physical, false)), paint);
+                                if (area(step) < printable)
+                                    break;
+                                steps.push_back(std::move(step));
+                            }
+                            for (size_t k = 0; k < steps.size(); ++ k) {
+                                const size_t i = size_t(physical_tip - 1 - LayerIndex(k) - base);
+                                append(tip_contacts[i], k + 1 < steps.size() ? diff(steps[k], steps[k + 1]) : steps[k]);
+                                append(candidate[i], std::move(steps[k]));
+                            }
+                        }
                     }
                 }
             }
@@ -6526,18 +6575,32 @@ void organic_draw_branches(
                 candidate[i] = intersection(diff_clipped(candidate[i], collision), volumes.m_bed_area);
                 branch_material[i] = intersection(diff_clipped(branch_material[i], collision), volumes.m_bed_area);
                 tip_contacts[i] = intersection_if_any(candidate[i], tip_contacts[i]);
-                // A tilted tip's sliced footprint must fit its permitted landing,
-                // not merely intersect it at the sampled center.
+                // A contact may reach past its thin landing band, over lower parts of
+                // a slope, but where it rests on the model within the bottom gap it
+                // must rest on paint. Clipped contacts may stray by the slice resolution.
                 if (! tip_contacts[i].empty())
-                    if (const double outside = area(diff(tip_contacts[i], volumes.getPlaceableAreas(0, physical, throw_on_cancel)));
-                        outside > tiny_area_threshold) {
+                    if (const double unpermitted = area(intersection(tip_contacts[i], offset(
+                            volumes.getUnpaintedRestingAreas(physical, get_extents(tip_contacts[i])), - float(config.resolution))));
+                        unpermitted > tiny_area_threshold) {
                         return false;
                     }
+                // Clipping can leave slivers no support line can print: drop those.
+                // Anything else growing from nothing rejects the foundation.
                 candidate_parts[i] = union_ex(candidate[i]);
-                for (const ExPolygon &part : candidate_parts[i]) {
-                    const Polygons polygon = to_polygons(part);
-                    if (polygons_disjoint(polygon, grounded_below) && polygons_disjoint(polygon, tip_contacts[i]))
-                        return false;
+                bool dropped = false;
+                for (auto part = candidate_parts[i].begin(); part != candidate_parts[i].end();) {
+                    const Polygons polygon = to_polygons(*part);
+                    if (polygons_disjoint(polygon, grounded_below) && polygons_disjoint(polygon, tip_contacts[i])) {
+                        if (! offset(*part, -0.5f * float(config.support_line_width)).empty())
+                            return false;
+                        part = candidate_parts[i].erase(part);
+                        dropped = true;
+                    } else
+                        ++ part;
+                }
+                if (dropped) {
+                    candidate[i] = to_polygons(candidate_parts[i]);
+                    branch_material[i] = intersection_if_any(branch_material[i], candidate[i]);
                 }
                 grounded_below = candidate[i];
                 throw_on_cancel();
@@ -6729,6 +6792,44 @@ void organic_draw_branches(
     }
     auto tree_movable = [&](const Tree &tree) { return ! movable.empty() && movable[&tree - trees.data()]; };
     // Lists the tips of the towers too slender for their anchor. Returns whether there are any.
+    // Where a tree rests on the model, given its section at each layer: on the
+    // placeable areas of those layers, and its root's foot on all of the paint
+    // below it, stepping down a slope. On a steep slope no layer's band of paint
+    // is wider than the XY distance, so no single layer has a placeable area there.
+    struct TreeAnchor {
+        Polygons   area;
+        LayerIndex bottom = std::numeric_limits<LayerIndex>::max();
+        LayerIndex top    = -1;
+    };
+    auto tree_anchor = [&](const Tree &tree, const std::function<const Polygons&(LayerIndex)> &section) {
+        TreeAnchor anchor;
+        for (size_t i = 0; i < tree.slices.size(); ++ i) {
+            const LayerIndex layer = tree.first_layer_id + LayerIndex(i);
+            const Polygons  &here  = section(layer);
+            if (here.empty())
+                continue;
+            anchor.top = layer;
+            BoundingBox window = get_extents(here);
+            window.offset(SCALED_EPSILON);
+            if (Polygons rests = intersection(here, ClipperUtils::clip_clipper_polygons_with_subject_bbox(
+                    volumes.getPlaceableAreas(0, layer, throw_on_cancel), window)); ! rests.empty()) {
+                append(anchor.area, std::move(rests));
+                anchor.bottom = std::min(anchor.bottom, layer);
+            }
+        }
+        const LayerIndex root_layer = tree.branches.front().path.front()->state.layer_idx;
+        if (root_layer >= tree.first_layer_id && root_layer < tree.first_layer_id + LayerIndex(tree.slices.size()))
+            if (Polygons rests = intersection(section(root_layer), volumes.getPaintedBaseSurface(root_layer)); ! rests.empty()) {
+                append(anchor.area, std::move(rests));
+                anchor.bottom = std::min(anchor.bottom, tree.first_layer_id);
+            }
+        return anchor;
+    };
+    // An anchor's span in X or in Y, whichever is wider.
+    auto anchor_span = [](const Polygons &anchor) {
+        const Point size = get_extents(anchor).size();
+        return std::max(size.x(), size.y());
+    };
     auto check_towers = [&]() {
         // A tree standing on the build plate widens toward its base by the
         // branch diameter angle, which keeps it standing while it prints. A
@@ -6739,34 +6840,12 @@ void organic_draw_branches(
             throw_on_cancel();
             if (! tree_movable(tree))
                 continue;
-            Polygons   anchor;
-            LayerIndex anchor_bottom = std::numeric_limits<LayerIndex>::max();
-            LayerIndex top           = -1;
-            for (size_t i = 0; i < tree.slices.size(); ++ i) {
-                if (tree.slices[i].polygons.empty())
-                    continue;
-                const LayerIndex layer = tree.first_layer_id + LayerIndex(i);
-                top = layer;
-                if (Polygons rests = intersection(tree.slices[i].polygons, volumes.getPlaceableAreas(0, layer, throw_on_cancel)); ! rests.empty()) {
-                    append(anchor, std::move(rests));
-                    anchor_bottom = std::min(anchor_bottom, layer);
-                }
-            }
-            // The root's foot rests on all of the paint below it, stepping down a
-            // slope. On a steep slope no layer's band of paint is wider than the
-            // XY distance, so no single layer has a placeable area there.
-            const LayerIndex root_layer = tree.branches.front().path.front()->state.layer_idx;
-            if (root_layer >= tree.first_layer_id && root_layer < tree.first_layer_id + LayerIndex(tree.slices.size()))
-                if (Polygons rests = intersection(tree.slices[root_layer - tree.first_layer_id].polygons, volumes.getPaintedBaseSurface(root_layer));
-                    ! rests.empty()) {
-                    append(anchor, std::move(rests));
-                    anchor_bottom = std::min(anchor_bottom, tree.first_layer_id);
-                }
-            if (anchor.empty())
+            const TreeAnchor anchor = tree_anchor(tree,
+                [&tree](LayerIndex layer) -> const Polygons & { return tree.slices[layer - tree.first_layer_id].polygons; });
+            if (anchor.area.empty())
                 continue;
-            const Point  span   = get_extents(anchor).size();
-            const double needed = 2. * double(top - anchor_bottom) * config.branch_radius_increase_per_layer;
-            if (double(std::max(span.x(), span.y())) >= needed)
+            const double needed = 2. * double(anchor.top - anchor.bottom) * config.branch_radius_increase_per_layer;
+            if (double(anchor_span(anchor.area)) >= needed)
                 continue;
             for (const Branch &branch : tree.branches)
                 if (branch.has_tip)
@@ -7060,6 +7139,23 @@ void organic_draw_branches(
         auto &upper_branch_counts = accepted->upper_branch_counts;
         const LayerIndex changed_upper_end = accepted->changed_upper_end;
         const auto &replacements = accepted->replacements;
+        // A foundation widens the base a tree stands on. One whose feet together
+        // span less of the model than the trunk it would replace, in X or in Y,
+        // would only weaken the tree: keep the trunk then.
+        {
+            auto current = [&tree](LayerIndex layer) -> const Polygons & {
+                return tree.slices[layer - tree.first_layer_id].polygons;
+            };
+            auto replaced = [&](LayerIndex layer) -> const Polygons & {
+                if (layer >= base && layer <= seam)
+                    return foundation[size_t(layer - base)];
+                if (! replacements.empty() && layer > seam && layer < changed_upper_end && size_t(layer - seam - 1) < upper_sections.size())
+                    return upper_sections[size_t(layer - seam - 1)];
+                return current(layer);
+            };
+            if (anchor_span(tree_anchor(tree, replaced).area) < anchor_span(tree_anchor(tree, current).area))
+                return;
+        }
         for (const Branch &branch : tree.branches)
             for (const SupportElement *node : branch.path)
                 if (node->state.layer_idx < seam)

@@ -173,6 +173,14 @@ TreeModelVolumes::TreeModelVolumes(
         }
     }
 
+    {
+        // The threshold of TreeSupport::detect_overhangs, which finds the
+        // overhangs Organic tips stand on; mirrored, the bases feet stand on.
+        const double threshold = print_object.config().support_threshold_angle.value;
+        const double angle     = std::min(threshold > EPSILON ? threshold + 1. : 30., 89.);
+        m_base_landing_step = coord_t(double(m_layer_outlines[m_current_outline_idx].first.layer_height) / std::tan(angle * M_PI / 180.));
+    }
+
     m_support_rests_on_model = m_painted_bases_only;
     m_min_resolution  = std::numeric_limits<coord_t>::max();
     for (auto data_pair : m_layer_outlines) {
@@ -190,6 +198,7 @@ TreeModelVolumes::TreeModelVolumes(
         const PrintObjectConfig &object_config = print_object.config();
         const float crack = float(m_min_resolution) + scaled<float>(
             std::abs(object_config.xy_contour_compensation.value) + std::abs(object_config.xy_hole_compensation.value));
+        m_painted_crack = crack;
         const std::vector<Polygons> &outlines = m_layer_outlines[m_current_outline_idx].second;
         m_painted_base_visible.assign(m_painted_base_areas.size(), Polygons{});
         Polygons visible;
@@ -1064,7 +1073,11 @@ Polygons TreeModelVolumes::calculatePaintedPlaceables(const coord_t footprint, c
     const LayerIndex base = layer_idx - m_painted_base_below;
     if (base < 0 || base >= LayerIndex(m_painted_base_areas.size()) || m_painted_base_areas[base].empty())
         return {};
-    const Polygons &band = m_painted_base_areas[base];
+    // Only where the paint is flatter than the support threshold angle can a
+    // base stand on it, as only overhangs flatter than it carry tips.
+    const Polygons band = intersection(m_painted_base_areas[base], calculateBaseBand(base, get_extents(m_painted_base_areas[base])));
+    if (band.empty())
+        return {};
     BoundingBox window = get_extents(band);
     window.offset(m_current_min_xy_dist + 2 * footprint + SCALED_EPSILON);
     // Where not even a branch of zero radius may stand at this layer: the routing
@@ -1091,6 +1104,61 @@ const Polygons& TreeModelVolumes::getPaintedBaseSurface(const LayerIndex layer_i
     const LayerIndex base = layer_idx - m_painted_base_below;
     return m_painted_bases_only && base >= 0 && base < LayerIndex(m_painted_base_visible.size()) ?
         m_painted_base_visible[base] : none;
+}
+
+Polygons TreeModelVolumes::getBaseLandingAreas(const LayerIndex layer_idx, std::function<void()> throw_on_cancel) const
+{
+    assert(m_reversed_source == nullptr);
+    const Polygons &placeable = getPlaceableAreas(0, layer_idx, throw_on_cancel);
+    if (placeable.empty())
+        return {};
+    const TreeSupportMeshGroupSettings &settings = m_layer_outlines[m_current_outline_idx].first;
+    const std::vector<Polygons>        &outlines = m_layer_outlines[m_current_outline_idx].second;
+    // The layer whose top the base is, under the bottom gap, as for the placeable areas.
+    const LayerIndex below = layer_idx - LayerIndex(round(double(settings.support_bottom_distance) / double(settings.layer_height))) - 1;
+    if (below < 0 || below + 1 >= LayerIndex(outlines.size()))
+        return {};
+    return intersection(placeable, calculateBaseBand(below, get_extents(placeable)));
+}
+
+Polygons TreeModelVolumes::getUnpaintedRestingAreas(const LayerIndex layer_idx, BoundingBox window) const
+{
+    assert(m_reversed_source == nullptr);
+    if (! m_painted_bases_only)
+        return {};
+    const std::vector<Polygons> &outlines = m_layer_outlines[m_current_outline_idx].second;
+    // The surface support at this layer rests on: the top of the layer under the
+    // bottom gap, where the layer above it does not cover it.
+    const LayerIndex below = layer_idx - m_painted_base_below;
+    if (below < 0 || below + 1 >= LayerIndex(outlines.size()))
+        return {};
+    // The opening below reaches twice the crack in from the window's edge.
+    window.offset(coord_t(2.f * m_painted_crack) + SCALED_EPSILON);
+    const Polygons surface = diff(ClipperUtils::clip_clipper_polygons_with_subject_bbox(outlines[below], window),
+                                  ClipperUtils::clip_clipper_polygons_with_subject_bbox(outlines[below + 1], window));
+    if (surface.empty())
+        return {};
+    Polygons permitted = below < LayerIndex(m_painted_base_areas.size()) ?
+        ClipperUtils::clip_clipper_polygons_with_subject_bbox(m_painted_base_areas[below], window) : Polygons{};
+    if (below < LayerIndex(m_anti_overhang.size()))
+        permitted = diff(permitted, m_anti_overhang[below]);
+    // The paint comes from the exact mesh and the surface from simplified, XY
+    // compensated slices: ignore unpainted slivers no wider than their cracks.
+    return opening(diff(surface, permitted), m_painted_crack);
+}
+
+Polygons TreeModelVolumes::calculateBaseBand(const LayerIndex layer_idx, BoundingBox window) const
+{
+    // The mirror image of TreeSupport::detect_overhangs: the part of this layer
+    // reaching beyond the layer above it by more than m_base_landing_step.
+    const std::vector<Polygons> &outlines = m_layer_outlines[m_current_outline_idx].second;
+    if (layer_idx < 0 || layer_idx + 1 >= LayerIndex(outlines.size()))
+        return {};
+    // Only the layer above within the step of the window can trim it.
+    window.offset(m_base_landing_step + SCALED_EPSILON);
+    return diff(
+        ClipperUtils::clip_clipper_polygons_with_subject_bbox(outlines[layer_idx], window),
+        offset(ClipperUtils::clip_clipper_polygons_with_subject_bbox(outlines[layer_idx + 1], window), float(m_base_landing_step), ClipperLib::jtSquare, 0.));
 }
 
 void TreeModelVolumes::calculateWallRestrictions(const std::vector<RadiusLayerPair> &keys, std::function<void()> throw_on_cancel)

@@ -81,6 +81,53 @@ Model foundation_model(bool painted = true, bool mixed = false, double roof_leve
     return model;
 }
 
+// The foundation fixture with its platform top tilted about its centre line,
+// rising along X. The paint stops short of the slope's upper edge, which has no
+// layer above it and so counts as flat whatever the slope.
+constexpr double sloped_paint_end_x = 24.;
+double sloped_platform_top(double x, double slope_deg) { return platform_z + std::tan(slope_deg * M_PI / 180.) * (x - 14.); }
+
+Model sloped_foundation_model(double slope_deg)
+{
+    const auto top = [slope_deg](double x) { return sloped_platform_top(x, slope_deg); };
+    Model model;
+    auto *object = model.add_object();
+    // Two blocks meeting at the paint's end, so a triangle edge lies there.
+    TriangleMesh mesh;
+    for (const auto &[from, to] : {std::make_pair(0., sloped_paint_end_x), std::make_pair(sloped_paint_end_x, 28.)}) {
+        indexed_triangle_set block = its_make_cube(to - from, 18., platform_z);
+        for (Vec3f &vertex : block.vertices) {
+            vertex.x() += float(from);
+            if (vertex.z() > 0.5f * float(platform_z))
+                vertex.z() = float(top(vertex.x()));
+        }
+        mesh.merge(TriangleMesh(std::move(block)));
+    }
+    TriangleMesh upright(its_make_cube(3., 18., roof_z + 1.));
+    mesh.merge(upright);
+    TriangleMesh roof(its_make_cube(28., 18., 1.));
+    roof.translate(0., 0., roof_z);
+    mesh.merge(roof);
+    auto *volume = object->add_volume(mesh);
+    object->add_instance()->set_offset(Vec3d(100., 100., 0.));
+    TriangleSelector selector(volume->mesh());
+    const auto &its = volume->mesh().its;
+    const auto transform = volume->get_matrix();
+    for (size_t i = 0; i < its.indices.size(); ++i) {
+        const auto &face = its.indices[i];
+        const Vec3f a = (transform * its.vertices[face[0]].cast<double>()).cast<float>();
+        const Vec3f b = (transform * its.vertices[face[1]].cast<double>()).cast<float>();
+        const Vec3f c = (transform * its.vertices[face[2]].cast<double>()).cast<float>();
+        const Vec3f center = (a + b + c) / 3.f;
+        if ((b - a).cross(c - a).z() > 0.f && std::abs(center.z() - float(top(center.x()))) < 0.001f &&
+            std::max({a.x(), b.x(), c.x()}) < float(sloped_paint_end_x) + 0.001f)
+            selector.set_facet(int(i), EnforcerBlockerType::ENFORCER);
+    }
+    volume->support_base_facets.set(selector);
+    REQUIRE_FALSE(volume->support_base_facets.empty());
+    return model;
+}
+
 void slice_foundation(Print &print, Model &model, const DynamicPrintConfig &config)
 {
     print.set_status_silent();
@@ -184,6 +231,44 @@ TEST_CASE("Model-root organic trees have separated foundation feet below their m
         if (!printed_section(object, *layer).empty())
             first_support_bottom = std::min(first_support_bottom, layer->bottom_z());
     CHECK(first_support_bottom == Approx(14.2).margin(0.01));
+}
+
+TEST_CASE("Painted slopes flatter than the support threshold angle carry foundation feet", "[OrganicFoundation][Slope]")
+{
+    // Tips stand on overhangs flatter than the support threshold angle, however
+    // thin a slope leaves each layer's band. Mirrored, so do the feet of a
+    // foundation on painted bases, on the slope itself. Steeper paint carries no
+    // support, as steeper overhangs get no tips. The fixture's 30 degrees count as 31.
+    const double slope = GENERATE(15., 25., 45.);
+    auto model = sloped_foundation_model(slope);
+    Print print;
+    slice_foundation(print, model, foundation_config());
+    const PrintObject &object = *print.get_object(size_t(0));
+    const Vec3d corner = object.trafo_centered() * Vec3d(0., 0., 0.);
+    // A foot is a support island with no support under it, starting just above
+    // the painted slope, clear of the slope's ends.
+    size_t feet = 0;
+    Polygons below;
+    for (const SupportLayer *layer : object.support_layers()) {
+        const Polygons here = layer->support_fills.polygons_covered_by_width();
+        for (const ExPolygon &island : union_ex(here)) {
+            if (island.area() * SCALING_FACTOR * SCALING_FACTOR <= 0.05 ||
+                ! intersection(to_polygons(island), offset(below, scaled<float>(0.01))).empty())
+                continue;
+            const Vec2d local = island.contour.centroid().cast<double>() * SCALING_FACTOR - corner.head<2>();
+            const double clearance = layer->bottom_z() - sloped_platform_top(local.x(), slope);
+            if (local.x() > 4. && local.x() < sloped_paint_end_x - 1. && local.y() > 1. && local.y() < 17. &&
+                clearance > 0. && clearance < 1.)
+                ++ feet;
+        }
+        below = here;
+    }
+    const size_t middle = branch_count_at(object, 32.);
+    CAPTURE(slope, feet, middle);
+    if (slope < 31.)
+        CHECK(feet > middle);
+    else
+        CHECK(feet == 0);
 }
 
 TEST_CASE("Organic foundation generation preserves build-plate trees in a mixed scene", "[OrganicFoundation][BuildPlate]")

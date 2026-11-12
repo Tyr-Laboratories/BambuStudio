@@ -189,6 +189,22 @@ public:
     // every lower layer it spans; empty unless paint lies at that branch's base.
     const Polygons& getPaintedBaseSurface(LayerIndex layer_idx) const;
 
+    // Where a foundation foot may stand at layer_idx: the mirror image of the
+    // overhangs tree tips support. TreeSupport::detect_overhangs counts the part
+    // of a layer that reaches beyond the layer below it by more than a layer
+    // height over the tangent of the support threshold angle. A base is the part
+    // of the layer under the bottom gap that reaches as far beyond the layer
+    // above it: a surface flatter than that angle. Like a tip on its overhang, a
+    // foot only has to stand on this band, however thin a slope makes it.
+    // Limited to the placeable areas of radius zero, so to paint where support
+    // bases are painted, and clear of support blockers. Not for reversed views.
+    Polygons getBaseLandingAreas(LayerIndex layer_idx, std::function<void()> throw_on_cancel) const;
+
+    // Where support at layer_idx would rest on the model, within the bottom gap,
+    // on surface that is not painted as a base: empty unless support bases are
+    // painted. Clipped to window. Not for reversed views.
+    Polygons getUnpaintedRestingAreas(LayerIndex layer_idx, BoundingBox window) const;
+
     Polygon m_bed_area;
 
 private:
@@ -458,6 +474,10 @@ private:
     // Centres where a branch with this footprint radius may end at layer_idx,
     // touching paint at its base layer and with all of its footprint over paint.
     Polygons calculatePaintedPlaceables(coord_t footprint, LayerIndex layer_idx) const;
+    // The part of layer_idx's top that reaches beyond the layer above it by more than
+    // m_base_landing_step, clipped to window: a surface flatter than the support
+    // threshold angle. Not for reversed views.
+    Polygons calculateBaseBand(LayerIndex layer_idx, BoundingBox window) const;
 
     /*!
      * \brief Creates the areas that can not be passed when expanding an area downwards. As such these areas are an somewhat abstract representation of a wall (as in a printed object).
@@ -553,6 +573,12 @@ private:
     std::vector<Polygons> m_painted_base_visible;
     // A branch ending at layer L rests on the surface of layer L - m_painted_base_below.
     LayerIndex m_painted_base_below { 1 };
+    // How far a base must reach beyond the layer above it, as an overhang must
+    // reach beyond the layer below it in TreeSupport::detect_overhangs.
+    coord_t m_base_landing_step { 0 };
+    // The widest hairline crack between bands of painted mesh surface and the
+    // simplified, XY compensated slices clipping them.
+    float m_painted_crack { 0.f };
     // Filled work domain used to seed model-only reachability below any paint.
     Polygons m_painted_route_domain;
     /*!
