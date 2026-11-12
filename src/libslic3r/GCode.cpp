@@ -6173,6 +6173,12 @@ double GCode::get_path_speed(const ExtrusionPath &path)
             new_speed        = get_overhang_degree_corr_speed(speed, path.overhang_degree);
             speed            = new_speed == 0.0 ? speed : new_speed;
         }
+    } else if (path.role() == erWallExtension) {
+        if (path.get_customize_flag() == CustomizeFlag::cfWallExtensionBridge) {
+            bool use_filament_bridge_speed = FILAMENT_CONFIG(override_process_overhang_speed);
+            speed = use_filament_bridge_speed ? FILAMENT_CONFIG(filament_bridge_speed) : NOZZLE_CONFIG(bridge_speed);
+        } else
+            speed = NOZZLE_CONFIG(inner_wall_speed);
     } else if (path.role() == erOverhangPerimeter && path.overhang_degree == 5 && is_enable_overhang_speed()) {
         bool use_filament_bridge_speed = FILAMENT_CONFIG(override_process_overhang_speed);
         speed = use_filament_bridge_speed ? FILAMENT_CONFIG(filament_overhang_totally_speed) : NOZZLE_CONFIG(overhang_totally_speed);
@@ -7125,11 +7131,25 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double 
     return res;
 }
 
+// Wall extension lines with only sparse infill below them are printed like bridges.
+static bool is_wall_extension_bridge(const ExtrusionPath &path)
+{
+    return path.role() == erWallExtension && path.get_customize_flag() == CustomizeFlag::cfWallExtensionBridge;
+}
+
+static bool prints_as_bridge(const ExtrusionPath &path) { return is_bridge(path.role()) || is_wall_extension_bridge(path); }
+
+// Inner walls, and wall extension lines that stand on something, share the inner wall motion settings.
+static bool prints_as_inner_wall(const ExtrusionPath &path)
+{
+    return path.role() == erPerimeter || (path.role() == erWallExtension && !is_wall_extension_bridge(path));
+}
+
 std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed, bool use_seperate_speed, bool is_first_slope)
 {
     std::string gcode;
 
-    if (is_bridge(path.role()))
+    if (prints_as_bridge(path))
         description += " (bridge)";
 
     const ExtrusionPathSloped *sloped = dynamic_cast<const ExtrusionPathSloped *>(&path);
@@ -7185,7 +7205,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
         } else if (this->object_layer_over_raft() && m_config.first_layer_acceleration_over_raft.value > 0) {
             acceleration = m_config.first_layer_acceleration_over_raft.value;
 #endif
-        } else if (NOZZLE_CONFIG(bridge_acceleration) > 0 && path.role() == erBridgeInfill) {
+        } else if (NOZZLE_CONFIG(bridge_acceleration) > 0 && (path.role() == erBridgeInfill || is_wall_extension_bridge(path))) {
             // Both external and internal bridge surfaces produce bridge infill.
             // Overhanging walls retain their existing wall acceleration.
             acceleration = NOZZLE_CONFIG(bridge_acceleration);
@@ -7196,7 +7216,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             acceleration = NOZZLE_CONFIG(outer_wall_acceleration);
         } else if (NOZZLE_CONFIG(top_surface_acceleration) > 0 && is_top_surface(path.role())) {
             acceleration = NOZZLE_CONFIG(top_surface_acceleration);
-        } else if (NOZZLE_CONFIG(inner_wall_acceleration) > 0 && path.role() == erPerimeter) {
+        } else if (NOZZLE_CONFIG(inner_wall_acceleration) > 0 && prints_as_inner_wall(path)) {
             acceleration = NOZZLE_CONFIG(inner_wall_acceleration);
         } else if (m_config.get_abs_value_at("sparse_infill_acceleration", get_nozzle_config_index(m_writer.filament()->id())) > 0 && (path.role() == erInternalInfill)) {
             acceleration = m_config.get_abs_value_at("sparse_infill_acceleration", get_nozzle_config_index(m_writer.filament()->id()));
@@ -7214,7 +7234,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             jerk = m_config.initial_layer_jerk.value;
         else if (m_config.outer_wall_jerk.value > 0 && path.role() == erExternalPerimeter)
             jerk = m_config.outer_wall_jerk.value;
-        else if (m_config.inner_wall_jerk.value > 0 && path.role() == erPerimeter)
+        else if (m_config.inner_wall_jerk.value > 0 && prints_as_inner_wall(path))
             jerk = m_config.inner_wall_jerk.value;
         else if (m_config.infill_jerk.value > 0 && is_infill(path.role()))
             jerk = m_config.infill_jerk.value;
@@ -7267,6 +7287,12 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
                 new_speed        = get_overhang_degree_corr_speed(speed, path.overhang_degree);
                 speed = new_speed == 0.0 ? speed : new_speed;
             }
+        } else if (path.role() == erWallExtension) {
+            if (is_wall_extension_bridge(path)) {
+                bool use_filament_bridge_speed = FILAMENT_CONFIG(override_process_overhang_speed);
+                speed = use_filament_bridge_speed ? FILAMENT_CONFIG(filament_bridge_speed) : NOZZLE_CONFIG(bridge_speed);
+            } else
+                speed = NOZZLE_CONFIG(inner_wall_speed);
         } else if (path.role() == erOverhangPerimeter && path.overhang_degree == 5 && is_enable_overhang_speed()) {
             bool use_filament_bridge_speed = FILAMENT_CONFIG(override_process_overhang_speed);
             speed = use_filament_bridge_speed ? FILAMENT_CONFIG(filament_overhang_totally_speed) : NOZZLE_CONFIG(overhang_totally_speed);
@@ -7459,7 +7485,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             int overhang_threshold = FILAMENT_CONFIG(overhang_fan_threshold) == Overhang_threshold_none ?
                 Overhang_threshold_none : FILAMENT_CONFIG(overhang_fan_threshold) - 1;
             if ((FILAMENT_CONFIG(overhang_fan_threshold) == Overhang_threshold_none && path.role() == erExternalPerimeter) || (path.get_overhang_degree() > overhang_threshold ||
-                is_bridge(path.role()))) {
+                prints_as_bridge(path))) {
                 gcode += ";_OVERHANG_FAN_START\n";
             }
         }
@@ -7473,7 +7499,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
 
         int overhang_boundary_for_cooling = EXTRUDER_CONFIG(overhang_threshold_participating_cooling);
 
-        if (!is_bridge(path.role()) && path.get_overhang_degree() <= overhang_boundary_for_cooling) {
+        if (!prints_as_bridge(path) && path.get_overhang_degree() <= overhang_boundary_for_cooling) {
             cooling_extrude = true;
             comment = ";_EXTRUDE_SET_SPEED";
         }
@@ -7618,7 +7644,7 @@ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, 
             int overhang_threshold = FILAMENT_CONFIG(overhang_fan_threshold) == Overhang_threshold_none ?
                 Overhang_threshold_none : FILAMENT_CONFIG(overhang_fan_threshold) - 1;
             if ((FILAMENT_CONFIG(overhang_fan_threshold) == Overhang_threshold_none && path.role() == erExternalPerimeter) || (path.get_overhang_degree() > overhang_threshold ||
-                is_bridge(path.role())))
+                prints_as_bridge(path)))
                 gcode += ";_OVERHANG_FAN_END\n";
         }
     }

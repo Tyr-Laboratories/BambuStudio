@@ -359,7 +359,8 @@ std::unordered_map<int, std::unordered_map<int, double>> PrintObject::calc_estim
 
     auto get_speed_from_role_with_filament = [](ExtrusionRole role, int filament_id, const PrintRegionConfig &region_config, const PrintConfig &print_config, int extruder_id) -> double {
         switch (role) {
-        case erPerimeter: return region_config.inner_wall_speed.values[extruder_id];
+        case erPerimeter:
+        case erWallExtension: return region_config.inner_wall_speed.values[extruder_id];
         case erExternalPerimeter: return region_config.outer_wall_speed.values[extruder_id];
         case erOverhangPerimeter:
         case erBridgeInfill:
@@ -441,7 +442,7 @@ std::unordered_map<int, std::unordered_map<int, double>> PrintObject::calc_estim
                     for (auto &entity : entities) {
                         auto   role              = entity->role();
                         int    filament          = 0;
-                        if (is_perimeter(role))
+                        if (is_perimeter(role) || role == erWallExtension)
                             filament = region.config().wall_filament - 1;
                         else if (is_solid_infill(role))
                             filament = region.config().solid_infill_filament - 1;

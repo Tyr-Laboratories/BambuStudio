@@ -635,6 +635,7 @@ std::string ExtrusionEntity::role_to_string(ExtrusionRole role)
         case erCustom                       : return L("Custom");
         case erMixed                        : return L("Multiple");
         case erFlush                        : return L("Flush");
+        case erWallExtension                : return L("Wall extension");
         default                             : assert(false);
     }
     return "";
@@ -684,6 +685,8 @@ ExtrusionRole ExtrusionEntity::string_to_role(const std::string_view role)
         return erMixed;
     else if (role == L("Flush"))
         return erFlush;
+    else if (role == L("Wall extension"))
+        return erWallExtension;
     else
         return erNone;
 }

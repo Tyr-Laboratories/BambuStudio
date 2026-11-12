@@ -64,6 +64,9 @@ enum ExtrusionRole : uint8_t {
     erWipeTower,
     erCustom,
     erFlush,
+    // Outer wall continued inside the part past a top/bottom surface, and its 45 degree chamfer
+    // (the "wall internal extension"). Appended after the printed roles so stored role numbers keep their values.
+    erWallExtension,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
     erCount
@@ -72,7 +75,8 @@ enum ExtrusionRole : uint8_t {
 enum CustomizeFlag : uint8_t {
     cfNone,
     cfCircleCompensation,   // shaft hole tolerance compensation
-    cfFloatingVerticalShell
+    cfFloatingVerticalShell,
+    cfWallExtensionBridge   // wall extension line with only sparse infill below it: printed like a bridge
 };
 
 // Special flags describing loop

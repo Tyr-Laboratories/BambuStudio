@@ -151,7 +151,8 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
     // use separate filament for different features only if the potion was open
     if (this->extruder_override == 0) {
         ExtrusionRole extrusions_role = extrusions.role();
-        if (is_perimeter(extrusions_role)) {
+        // Wall extension lines are printed with the walls they continue.
+        if (is_perimeter(extrusions_role) || extrusions_role == erWallExtension) {
             extruder = region.config().wall_filament.value;
         } else if (is_solid_infill(extrusions_role)) {
             extruder = region.config().solid_infill_filament.value;
@@ -166,7 +167,7 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
                         extruder      = region.config().solid_infill_filament.value;
                         curr_priority = 100;
                     }
-                } else if (is_perimeter(ee->role())) {
+                } else if (is_perimeter(ee->role()) || ee->role() == erWallExtension) {
                     if (curr_priority < 90) { // perimeter 2st priority
                         extruder      = region.config().wall_filament.value;
                         curr_priority = 90;
