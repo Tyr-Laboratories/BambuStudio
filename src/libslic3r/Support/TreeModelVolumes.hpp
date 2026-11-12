@@ -10,6 +10,8 @@
 #define slic3r_TreeModelVolumes_hpp
 
 #include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
@@ -183,6 +185,10 @@ public:
     // In this mode to_model avoidances describe routes to paint, not to the bed.
     bool painted_bases_only() const { return m_painted_bases_only; }
 
+    // The paint visible from above under a branch ending at layer_idx, across
+    // every lower layer it spans; empty unless paint lies at that branch's base.
+    const Polygons& getPaintedBaseSurface(LayerIndex layer_idx) const;
+
     Polygon m_bed_area;
 
 private:
@@ -221,35 +227,43 @@ private:
         using Layers = std::vector<LayerData>;
     public:
         RadiusLayerPolygonCache() = default;
-        RadiusLayerPolygonCache(RadiusLayerPolygonCache &&rhs) : m_data(std::move(rhs.m_data)) {}
-        RadiusLayerPolygonCache& operator=(RadiusLayerPolygonCache &&rhs) { m_data = std::move(rhs.m_data); return *this; }
+        RadiusLayerPolygonCache(RadiusLayerPolygonCache &&rhs) : m_data(std::move(rhs.m_data)), m_max_layer(std::move(rhs.m_max_layer)) {}
+        RadiusLayerPolygonCache& operator=(RadiusLayerPolygonCache &&rhs) { m_data = std::move(rhs.m_data); m_max_layer = std::move(rhs.m_max_layer); return *this; }
 
         RadiusLayerPolygonCache(const RadiusLayerPolygonCache&) = delete;
         RadiusLayerPolygonCache& operator=(const RadiusLayerPolygonCache&) = delete;
 
         void insert(std::vector<std::pair<RadiusLayerPair, Polygons>> &&in) {
             std::lock_guard<std::mutex> guard(m_mutex);
-            for (auto &d : in)
+            for (auto &d : in) {
                 this->get_allocate_layer_data(d.first.second).emplace(d.first.first, std::move(d.second));
+                this->note_layer(d.first.first, d.first.second);
+            }
         }
         // by layer
         void insert(std::vector<std::pair<coord_t, Polygons>> &&in, coord_t radius) {
             std::lock_guard<std::mutex> guard(m_mutex);
-            for (auto &d : in)
+            for (auto &d : in) {
                 this->get_allocate_layer_data(d.first).emplace(radius, std::move(d.second));
+                this->note_layer(radius, d.first);
+            }
         }
         void insert(std::vector<Polygons> &&in, coord_t first_layer_idx, coord_t radius) {
             std::lock_guard<std::mutex> guard(m_mutex);
             allocate_layers(first_layer_idx + in.size());
-            for (auto &d : in)
-                m_data[first_layer_idx ++].emplace(radius, std::move(d));
+            for (auto &d : in) {
+                m_data[first_layer_idx].emplace(radius, std::move(d));
+                this->note_layer(radius, first_layer_idx ++);
+            }
         }
         void insert(LayerPolygonCache &&in, coord_t radius) {
             std::lock_guard<std::mutex> guard(m_mutex);
             LayerIndex i = in.begin();
             allocate_layers(i + LayerIndex(in.size()));
-            for (auto &d : in.polygons_mutable())
-                m_data[i ++].emplace(radius, std::move(d));
+            for (auto &d : in.polygons_mutable()) {
+                m_data[i].emplace(radius, std::move(d));
+                this->note_layer(radius, i ++);
+            }
         }
         /*!
          * \brief Checks a cache for a given RadiusLayerPair and returns it if it is found
@@ -290,24 +304,24 @@ private:
          */
         LayerIndex getMaxCalculatedLayer(coord_t radius) const {
             std::lock_guard<std::mutex> guard(m_mutex);
-            auto layer_idx = LayerIndex(m_data.size()) - 1;
-            for (; layer_idx > 0; -- layer_idx)
-                if (const auto &layer = m_data[layer_idx]; layer.find(radius) != layer.end())
-                    break;
+            auto it = m_max_layer.find(radius);
             // The placeable on model areas do not exist on layer 0, as there can not be model below it. As such it may be possible that layer 1 is available, but layer 0 does not exist.
-            return layer_idx == 0 ? -1 : layer_idx;
+            return it == m_max_layer.end() || it->second == 0 ? -1 : it->second;
         }
 
         // For debugging purposes, sorted by layer index, then by radius.
         [[nodiscard]] std::vector<std::pair<RadiusLayerPair, std::reference_wrapper<const Polygons>>> sorted() const;
 
-        void clear() { m_data.clear(); }
+        void clear() { m_data.clear(); m_max_layer.clear(); }
         void clear_all_but_radius0() { 
+            m_max_layer.clear();
             for (LayerData &l : m_data) {
                 auto begin = l.begin();
                 auto end = l.end();
                 if (begin != end && ++ begin != end)
                     l.erase(begin, end);
+                if (! l.empty())
+                    this->note_layer(l.begin()->first, LayerIndex(&l - m_data.data()));
             }
         }
 
@@ -317,8 +331,15 @@ private:
             return m_data[layer_idx];
         }
         void                allocate_layers(size_t num_layers);
+        void                note_layer(coord_t radius, LayerIndex layer_idx) {
+            auto [it, inserted] = m_max_layer.emplace(radius, layer_idx);
+            if (! inserted && it->second < layer_idx)
+                it->second = layer_idx;
+        }
 
         Layers              m_data;
+        // Highest layer holding each radius, so getMaxCalculatedLayer() needs no scan.
+        std::map<coord_t, LayerIndex> m_max_layer;
         mutable std::mutex  m_mutex;
     };
 
@@ -336,6 +357,23 @@ private:
      * \return Polygons object
      */
     const Polygons& getCollisionHolefree(coord_t radius, LayerIndex layer_idx) const;
+
+    // Entries that are computed when first requested, possibly by many threads at
+    // once. Each of them would compute the same entries and only the first result
+    // would be kept: let one thread compute them while the others wait for it.
+    // A computation only ever waits for a later family in this order, never for
+    // its own family and radius: avoidance -> placeables -> hole-free collision
+    // -> collision, and wall restrictions -> collision. A reversed view waits
+    // only for its source's collision.
+    enum class LazyCache { Collision, CollisionHolefree, AvoidanceToBuildPlate, AvoidanceToModel, Placeables, WallRestrictions };
+    struct LazyLocks {
+        std::mutex mutex;
+        std::map<std::pair<int, coord_t>, std::unique_ptr<std::mutex>> locks;
+    };
+    std::unique_ptr<LazyLocks> m_lazy_locks { std::make_unique<LazyLocks>() };
+    // Run compute() unless done() holds, at most one thread at a time per cache and radius.
+    template<typename Done, typename Compute>
+    void compute_once(LazyCache cache, coord_t radius, Done &&done, Compute &&compute) const;
 
     // Internal avoidance reads may use rounded collision-cache keys, including
     // XY clearance. Only public physical-radius requests apply the seam limit.
@@ -416,6 +454,10 @@ private:
      * \param keys RadiusLayerPair of the requested areas. The radius will be calculated up to the provided layer.
      */
     void calculatePlaceables(const std::vector<RadiusLayerPair> &keys, std::function<void()> throw_on_cancel);
+
+    // Centres where a branch with this footprint radius may end at layer_idx,
+    // touching paint at its base layer and with all of its footprint over paint.
+    Polygons calculatePaintedPlaceables(coord_t footprint, LayerIndex layer_idx) const;
 
     /*!
      * \brief Creates the areas that can not be passed when expanding an area downwards. As such these areas are an somewhat abstract representation of a wall (as in a printed object).
@@ -505,6 +547,12 @@ private:
     bool m_painted_bases_only { false };
     // Actual painted surface footprints, indexed with the organic raft offset.
     std::vector<Polygons> m_painted_base_areas;
+    // At each layer holding painted surface: all paint visible from above there,
+    // including the uncovered paint of lower layers. A sloped base gives each
+    // layer only a thin band, so a branch foot on it spans several layers' bands.
+    std::vector<Polygons> m_painted_base_visible;
+    // A branch ending at layer L rests on the surface of layer L - m_painted_base_below.
+    LayerIndex m_painted_base_below { 1 };
     // Filled work domain used to seed model-only reachability below any paint.
     Polygons m_painted_route_domain;
     /*!

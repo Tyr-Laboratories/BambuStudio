@@ -717,7 +717,7 @@ void tree_supports_generate_paths(
                             }
                         }
                     }
-                if (d2min < sqr(flow.scaled_width() * 3.) && Slic3r::area(regions_to_draw_inner_wall) + scale_(EPSILON) > area && !shrink_ex({expoly}, -2.*flow.scaled_width()).empty()) {
+                if (d2min < sqr(flow.scaled_width() * 3.) && Slic3r::area(regions_to_draw_inner_wall) + scale_(EPSILON) > area) {
                     // Try to cut an anchor from the closest_contour.
                     // Both closest_contour and pl are CW oriented.
                     pl.points.emplace_back(closest_point.cast<coord_t>());
@@ -1501,6 +1501,41 @@ SupportGeneratorLayersPtr generate_support_layers(
     return layers_sorted;
 }
 
+// Bounding box of the area an extrusion entity covers by its width: its points grown
+// by its widest path. polygons_covered_by_width() offsets each path by half its width
+// with square joins, which stays within a full width of the path's points. False for
+// an entity of an unknown kind.
+static bool extrusion_covered_bbox(const ExtrusionEntity &entity, BoundingBox &bbox)
+{
+    float width = 0.f;
+    std::function<bool(const ExtrusionEntity &)> visit = [&bbox, &width, &visit](const ExtrusionEntity &e) {
+        auto add_path = [&bbox, &width](const ExtrusionPath &path) {
+            bbox.merge(get_extents(path.polyline));
+            width = std::max(width, path.width);
+        };
+        if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&e)) {
+            for (const ExtrusionEntity *child : collection->entities)
+                if (! visit(*child))
+                    return false;
+        } else if (const auto *path = dynamic_cast<const ExtrusionPath *>(&e))
+            add_path(*path);
+        else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&e))
+            for (const ExtrusionPath &p : multipath->paths)
+                add_path(p);
+        else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&e))
+            for (const ExtrusionPath &p : loop->paths)
+                add_path(p);
+        else
+            return false;
+        return true;
+    };
+    if (! visit(entity))
+        return false;
+    if (bbox.defined)
+        bbox.offset(coord_t(scale_(width)) + SCALED_EPSILON);
+    return true;
+}
+
 void generate_support_toolpaths(
     SupportLayerPtrs                    &support_layers,
     const PrintObjectConfig             &config,
@@ -1923,8 +1958,12 @@ void generate_support_toolpaths(
             }
 
             if (!cooldown_areas.empty() && !cooldown_areas[support_layer_id].empty()) {
+                const BoundingBox cooldown_bbox = get_extents(cooldown_areas[support_layer_id]);
                 std::function<void(ExtrusionEntitiesPtr &)> setOverhangDegreeImpl = [&](ExtrusionEntitiesPtr &entities) {
                     for (auto entityPtr : entities) {
+                        // Away from the cooldown areas, skip computing the area the extrusion covers.
+                        if (BoundingBox bbox; extrusion_covered_bbox(*entityPtr, bbox) && ! bbox.overlap(cooldown_bbox))
+                            continue;
                         if (overlaps(to_expolygons(entityPtr->polygons_covered_by_width()), cooldown_areas[support_layer_id])) {
                             if (ExtrusionEntityCollection *collection = dynamic_cast<ExtrusionEntityCollection *>(entityPtr)) {
                                 setOverhangDegreeImpl(collection->entities);

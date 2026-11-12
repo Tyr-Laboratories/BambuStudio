@@ -122,6 +122,12 @@ the UI thread. Post-processing scripts receive their own plate configuration in
 a child environment. Individual-plate slicing and imported-G-code previews keep
 their existing workflows.
 
+## Reproducible slicing
+
+Slicing the same plate again gives the same G-code with **Tree Organic** supports, normal supports, or none. Mesh slicing, the projections of support painting, and Organic support generation used to depend on the order in which parallel threads finished, so a plate sliced twice could differ in the start points and order of its paths and slightly in its supports. **Tree Slim**, **Tree Strong** and **Tree Hybrid** supports can still differ from one run to the next.
+
+Support generation is also faster. On a private 16-plate aircraft project with Organic supports, slicing took 11% fewer retired instructions than before these optimizations, and 31% fewer on its most support-heavy plate. Each optimization left the G-code byte-identical.
+
 ## Paint bases for Organic tree supports
 
 With **Tree Organic** selected and **On build plate only** enabled, select an object in Prepare, open **Supports Painting**, and choose **Support bases**. Paint an upward-facing surface below an overhang to allow trees to start there. This can replace a tall tower from the bed with a short tree on a raised part of the model.
@@ -133,6 +139,8 @@ With **Tree Organic** selected and **On build plate only** enabled, select an ob
 - **Support requirements:** return to ordinary support enforcement and red blockers. Those annotations remain independent.
 
 Base paint grants permission to anchor a tree; it does not itself create an overhang or force support generation. Organic routing prefers reachable painted bases while distant overhangs keep their build-plate routes. Unpainted surfaces remain prohibited as bases when **On build plate only** is enabled. Existing branch angle, branch size, model clearance, bottom contact gap, and bottom interface settings still apply. A patch must have enough room for the branch footprint, and a branch must be able to reach it without passing through the model. Downward-facing or vertical paint does not provide a base.
+
+Sloped and curved bases work like flat ones. A foot resting on a slope spans several layers of it; the whole foot must lie on paint, and its downhill part steps down the slope layer by layer. A branch stands on the first painted base it reaches rather than continuing to lower paint. A tower standing on paint must be as stable as a tree from the build plate: its anchor, all of its feet on paint together, must span in X or in Y at least the base that **Branch diameter angle** gives a tree of the tower's height. A tower that is too slender, such as one long branch on a small patch far below, is built from the build plate instead when all of its tips can reach the build plate; otherwise it stays on the paint. Paint a wider base nearer to an overhang to keep its support on the part.
 
 Use the ordinary brushes, Fill, Gap Fill, and Section view to select the intended surfaces. The angle filter applies to brush strokes and Fill, matching the ordinary support painter; Gap Fill retains its existing cleanup behavior. Each painting mode retains its own filter checkbox and angle. The automatic round-hole blocker command belongs to **Support requirements** and is hidden in base mode. Painting participates in Undo and is retained in this fork's **3MF** projects. Inspect both the markings and the generated support layers after changing the model's orientation or geometry.
 

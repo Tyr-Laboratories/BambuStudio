@@ -24,6 +24,7 @@
 #include <boost/log/trivial.hpp>
 
 #include <tbb/parallel_for.h>
+#include <tbb/task_arena.h>
 #include <tbb/task_group.h>
 
 namespace Slic3r::TreeSupport3D
@@ -49,6 +50,25 @@ static Polygons calculateMachineBorderCollision(Polygon machine_border)
     out.emplace_back(std::move(machine_border));
     return out;
 #endif
+}
+
+template<typename Done, typename Compute>
+void TreeModelVolumes::compute_once(const LazyCache cache, const coord_t radius, Done &&done, Compute &&compute) const
+{
+    std::mutex *lock;
+    {
+        std::lock_guard<std::mutex> guard(m_lazy_locks->mutex);
+        std::unique_ptr<std::mutex> &slot = m_lazy_locks->locks[{ int(cache), radius }];
+        if (! slot)
+            slot = std::make_unique<std::mutex>();
+        lock = slot.get();
+    }
+    std::lock_guard<std::mutex> guard(*lock);
+    // Another thread may have computed the entry while this one waited.
+    if (! done())
+        // Waiting for its nested loops, this thread must not pick up a task that
+        // requests the same entries: that task would wait for this very thread.
+        tbb::this_task_arena::isolate(std::forward<Compute>(compute));
 }
 
 TreeModelVolumes::TreeModelVolumes(
@@ -158,6 +178,40 @@ TreeModelVolumes::TreeModelVolumes(
     for (auto data_pair : m_layer_outlines) {
         m_support_rests_on_model |= ! data_pair.first.support_material_buildplate_only;
         m_min_resolution = std::min(m_min_resolution, data_pair.first.resolution);
+    }
+
+    if (m_painted_bases_only) {
+        const TreeSupportMeshGroupSettings &settings = m_layer_outlines[m_current_outline_idx].first;
+        // Same bottom gap as the placeable areas computed with the collisions.
+        m_painted_base_below = LayerIndex(round(double(settings.support_bottom_distance) / double(settings.layer_height))) + 1;
+        // Neighbouring bands of one sloped surface come from the exact mesh, but
+        // the slices clipping them are simplified and offset by the XY
+        // compensations. Close the hairline cracks this leaves between them.
+        const PrintObjectConfig &object_config = print_object.config();
+        const float crack = float(m_min_resolution) + scaled<float>(
+            std::abs(object_config.xy_contour_compensation.value) + std::abs(object_config.xy_hole_compensation.value));
+        const std::vector<Polygons> &outlines = m_layer_outlines[m_current_outline_idx].second;
+        m_painted_base_visible.assign(m_painted_base_areas.size(), Polygons{});
+        Polygons visible;
+        for (size_t layer = 0; layer < m_painted_base_areas.size(); ++ layer) {
+            if (! visible.empty() && layer > 0) {
+                // Paint stays visible until material appearing above it, an
+                // overhang, covers it. Material continuing from the layer below
+                // covers nothing new; testing only the overhang keeps adjacent
+                // bands of a slope from being trimmed by their shared boundary.
+                BoundingBox bbox = get_extents(visible);
+                bbox.offset(SCALED_EPSILON);
+                const Polygons overhang = diff(
+                    ClipperUtils::clip_clipper_polygons_with_subject_bbox(outlines[layer], bbox),
+                    ClipperUtils::clip_clipper_polygons_with_subject_bbox(outlines[layer - 1], bbox));
+                if (! overhang.empty())
+                    visible = diff(visible, overhang);
+            }
+            if (! m_painted_base_areas[layer].empty()) {
+                visible = closing(union_(visible, m_painted_base_areas[layer]), crack);
+                m_painted_base_visible[layer] = visible;
+            }
+        }
     }
 
 
@@ -367,8 +421,9 @@ const Polygons& TreeModelVolumes::getCollision(const coord_t orig_radius, LayerI
         if (m_reversed_throw_on_cancel) {
             const coord_t source_radius = m_reversed_source->ceilRadius(orig_radius, min_xy_dist);
             if (!m_reversed_source->m_collision_cache.getArea({source_radius, physical_layer})) {
-                const_cast<TreeModelVolumes*>(m_reversed_source)->calculateCollision(
-                    source_radius, physical_layer, m_reversed_throw_on_cancel);
+                m_reversed_source->compute_once(LazyCache::Collision, source_radius,
+                    [&] { return m_reversed_source->m_collision_cache.getArea({source_radius, physical_layer}).has_value(); },
+                    [&] { const_cast<TreeModelVolumes*>(m_reversed_source)->calculateCollision(source_radius, physical_layer, m_reversed_throw_on_cancel); });
                 m_reversed_throw_on_cancel();
             }
         }
@@ -398,7 +453,9 @@ const Polygons& TreeModelVolumes::getCollision(const coord_t orig_radius, LayerI
         BOOST_LOG_TRIVIAL(error_level_not_in_cache) << "Had to calculate collision at radius " << radius << " and layer " << layer_idx << ", but precalculate was called. Performance may suffer!";
         tree_supports_show_error("Not precalculated Collision requested."sv, false);
     }
-    const_cast<TreeModelVolumes*>(this)->calculateCollision(radius, layer_idx, []{});
+    compute_once(LazyCache::Collision, radius,
+        [&] { return m_collision_cache.getArea({ radius, layer_idx }).has_value(); },
+        [&] { const_cast<TreeModelVolumes*>(this)->calculateCollision(radius, layer_idx, []{}); });
     return getCollision(orig_radius, layer_idx, min_xy_dist);
 }
 
@@ -430,15 +487,19 @@ const Polygons& TreeModelVolumes::getCollisionHolefree(coord_t radius, LayerInde
         BOOST_LOG_TRIVIAL(error_level_not_in_cache) << "Had to calculate collision holefree at radius " << radius << " and layer " << layer_idx << ", but precalculate was called. Performance may suffer!";
         tree_supports_show_error("Not precalculated Holefree Collision requested."sv, false);
     }
-    if (m_reversed_source) {
-        const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree(
-            std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
-        // A nested TBB loop may return without filling its cache when a sibling
-        // throws. Observe cancellation before recursively requesting that entry.
-        if (m_reversed_throw_on_cancel)
-            m_reversed_throw_on_cancel();
-    } else
-        const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree({ radius, layer_idx });
+    compute_once(LazyCache::CollisionHolefree, radius,
+        [&] { return m_collision_cache_holefree.getArea({ radius, layer_idx }).has_value(); },
+        [&] {
+            if (m_reversed_source)
+                const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree(
+                    std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
+            else
+                const_cast<TreeModelVolumes*>(this)->calculateCollisionHolefree({ radius, layer_idx });
+        });
+    // A nested TBB loop may return without filling its cache when a sibling
+    // throws. Observe cancellation before recursively requesting that entry.
+    if (m_reversed_source && m_reversed_throw_on_cancel)
+        m_reversed_throw_on_cancel();
     return getCollisionHolefree(radius, layer_idx);
 }
 
@@ -499,13 +560,17 @@ const Polygons& TreeModelVolumes::getAvoidanceImpl(const coord_t orig_radius, La
             tree_supports_show_error("Not precalculated Avoidance(to buildplate) requested."sv, false);
         }
     }
-    if (m_reversed_source) {
-        const_cast<TreeModelVolumes*>(this)->calculateAvoidance(
-            std::vector<RadiusLayerPair>{{radius, layer_idx}}, !to_model, to_model, m_reversed_throw_on_cancel);
-        if (m_reversed_throw_on_cancel)
-            m_reversed_throw_on_cancel();
-    } else
-        const_cast<TreeModelVolumes*>(this)->calculateAvoidance({ radius, layer_idx }, ! to_model, to_model);
+    compute_once(to_model ? LazyCache::AvoidanceToModel : LazyCache::AvoidanceToBuildPlate, radius,
+        [&] { return this->avoidance_cache(type, to_model).getArea({ radius, layer_idx }).has_value(); },
+        [&] {
+            if (m_reversed_source)
+                const_cast<TreeModelVolumes*>(this)->calculateAvoidance(
+                    std::vector<RadiusLayerPair>{{radius, layer_idx}}, !to_model, to_model, m_reversed_throw_on_cancel);
+            else
+                const_cast<TreeModelVolumes*>(this)->calculateAvoidance({ radius, layer_idx }, ! to_model, to_model);
+        });
+    if (m_reversed_source && m_reversed_throw_on_cancel)
+        m_reversed_throw_on_cancel();
     // Retrive failed and correct result was calculated. Now it has to be retrived.
     return getAvoidanceImpl(orig_radius, layer_idx, type, to_model, min_xy_dist);
 }
@@ -532,7 +597,9 @@ const Polygons& TreeModelVolumes::getPlaceableAreas(const coord_t orig_radius, L
         static const Polygons no_model_contacts;
         return no_model_contacts;
     }
-    const_cast<TreeModelVolumes*>(this)->calculatePlaceables(radius, layer_idx, throw_on_cancel);
+    compute_once(LazyCache::Placeables, radius,
+        [&] { return m_placeable_areas_cache.getArea({ radius, layer_idx }).has_value(); },
+        [&] { const_cast<TreeModelVolumes*>(this)->calculatePlaceables(radius, layer_idx, throw_on_cancel); });
     return getPlaceableAreas(orig_radius, layer_idx, throw_on_cancel);
 }
 
@@ -559,13 +626,17 @@ const Polygons& TreeModelVolumes::getWallRestriction(const coord_t orig_radius, 
                 "Not precalculated Wall restriction requested )."sv
             , false);
     }
-    if (m_reversed_source) {
-        const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions(
-            std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
-        if (m_reversed_throw_on_cancel)
-            m_reversed_throw_on_cancel();
-    } else
-        const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions({ radius, layer_idx });
+    compute_once(LazyCache::WallRestrictions, radius,
+        [&] { return (min_xy_dist ? m_wall_restrictions_cache_min : m_wall_restrictions_cache).getArea({ radius, layer_idx }).has_value(); },
+        [&] {
+            if (m_reversed_source)
+                const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions(
+                    std::vector<RadiusLayerPair>{{radius, layer_idx}}, m_reversed_throw_on_cancel);
+            else
+                const_cast<TreeModelVolumes*>(this)->calculateWallRestrictions({ radius, layer_idx });
+        });
+    if (m_reversed_source && m_reversed_throw_on_cancel)
+        m_reversed_throw_on_cancel();
     return getWallRestriction(orig_radius, layer_idx, min_xy_dist); // Retrieve failed and correct result was calculated. Now it has to be retrieved.
 }
 
@@ -848,7 +919,10 @@ void TreeModelVolumes::calculateAvoidance(const std::vector<RadiusLayerPair> &ke
                 holefree_keys.push_back(key);
         if (!holefree_keys.empty()) {
             getCollision(m_increase_until_radius, 0, false);
-            calculateCollisionHolefree(holefree_keys, throw_on_cancel);
+            for (const RadiusLayerPair &key : holefree_keys)
+                compute_once(LazyCache::CollisionHolefree, key.first,
+                    [&] { return m_collision_cache_holefree.getArea(key).has_value(); },
+                    [&] { calculateCollisionHolefree(std::vector<RadiusLayerPair>{ key }, throw_on_cancel); });
         }
     }
 
@@ -950,17 +1024,21 @@ void TreeModelVolumes::calculatePlaceables(const coord_t radius, const LayerInde
     tbb::parallel_for(tbb::blocked_range<LayerIndex>(std::max(1, start_layer), max_required_layer + 1),
         [this, &data, radius, start_layer, &throw_on_cancel](const tbb::blocked_range<LayerIndex>& range) {
             for (LayerIndex layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
-                data[layer_idx - start_layer] = offset(
-                    union_ex(getPlaceableAreas(0, layer_idx, throw_on_cancel)),
-                    // As a placeable area is calculated by (collision of the layer below) - (collision of the current layer) and the collision is offset by xy_distance, 
-                    // it can happen that a small line is considered a flat area to place something onto, even though it is mostly 
-                    // xy_distance that cant support it. Making the area smaller by xy_distance fixes this.
-                    - (m_painted_bases_only ?
-                        // Organic may draw a branch up to this minimum radius
-                        // even while its collision radius is still smaller.
-                        std::max(radius, m_increase_until_radius) :
-                        radius + m_current_min_xy_dist + m_current_min_xy_dist_delta),
-                    jtMiter, 1.2);
+                data[layer_idx - start_layer] = m_painted_bases_only ?
+                    // Organic may draw a branch up to this minimum radius
+                    // even while its collision radius is still smaller, and a
+                    // branch keeping the regular XY distance lands with the
+                    // difference to the minimum one added. Its landing is checked
+                    // at that radius rounded up to the cache grid, so route with
+                    // the widest such foot as well.
+                    calculatePaintedPlaceables(std::max(radius, ceilRadius(m_increase_until_radius + m_current_min_xy_dist_delta)), layer_idx) :
+                    offset(
+                        union_ex(getPlaceableAreas(0, layer_idx, throw_on_cancel)),
+                        // As a placeable area is calculated by (collision of the layer below) - (collision of the current layer) and the collision is offset by xy_distance,
+                        // it can happen that a small line is considered a flat area to place something onto, even though it is mostly
+                        // xy_distance that cant support it. Making the area smaller by xy_distance fixes this.
+                        - (radius + m_current_min_xy_dist + m_current_min_xy_dist_delta),
+                        jtMiter, 1.2);
                 if(throw_on_cancel)
                     throw_on_cancel();
             }
@@ -975,6 +1053,44 @@ void TreeModelVolumes::calculatePlaceables(const coord_t radius, const LayerInde
     }
 #endif
     m_placeable_areas_cache.insert(std::move(data), start_layer, radius);
+}
+
+Polygons TreeModelVolumes::calculatePaintedPlaceables(const coord_t footprint, const LayerIndex layer_idx) const
+{
+    // Like a tip under a curved overhang, which only has to touch that layer's
+    // thin band of overhang, a branch ends where it touches paint at its base
+    // layer. A sloped base has only a thin band per layer, so its footprint
+    // rests on the bands of the lower layers as well. All of them must be paint.
+    const LayerIndex base = layer_idx - m_painted_base_below;
+    if (base < 0 || base >= LayerIndex(m_painted_base_areas.size()) || m_painted_base_areas[base].empty())
+        return {};
+    const Polygons &band = m_painted_base_areas[base];
+    BoundingBox window = get_extents(band);
+    window.offset(m_current_min_xy_dist + 2 * footprint + SCALED_EPSILON);
+    // Where not even a branch of zero radius may stand at this layer: the routing
+    // collision, which also keeps the bottom gap, and the blockers that native
+    // placeable areas exclude.
+    Polygons blocked = ClipperUtils::clip_clipper_polygons_with_subject_bbox(getCollision(0, layer_idx, true), window);
+    if (base < LayerIndex(m_anti_overhang.size()))
+        append(blocked, ClipperUtils::clip_clipper_polygons_with_subject_bbox(m_anti_overhang[base], window));
+    // The branch cannot descend further where its collision one layer down,
+    // which keeps the XY distance from the base layer's material, would overlap
+    // that layer's paint.
+    const Polygons contact = diff(offset(band, float(m_current_min_xy_dist), jtMiter, 1.2), blocked);
+    if (contact.empty())
+        return {};
+    const Polygons paint = diff(ClipperUtils::clip_clipper_polygons_with_subject_bbox(m_painted_base_visible[base], window), blocked);
+    return intersection(
+        offset(union_ex(paint), - float(footprint), jtMiter, 1.2),
+        offset(contact, float(footprint), jtMiter, 1.2));
+}
+
+const Polygons& TreeModelVolumes::getPaintedBaseSurface(const LayerIndex layer_idx) const
+{
+    static const Polygons none;
+    const LayerIndex base = layer_idx - m_painted_base_below;
+    return m_painted_bases_only && base >= 0 && base < LayerIndex(m_painted_base_visible.size()) ?
+        m_painted_base_visible[base] : none;
 }
 
 void TreeModelVolumes::calculateWallRestrictions(const std::vector<RadiusLayerPair> &keys, std::function<void()> throw_on_cancel)
