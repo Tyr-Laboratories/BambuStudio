@@ -70,12 +70,12 @@ The slope setting is optional reinforcement, not a blanket suppression of bridge
 
 In **Strength > Walls**, enable Advanced settings and set **Wall internal extension** (`wall_internal_extension`) in millimetres. The default is **1 mm**. **0** disables the feature.
 
-Where an outer wall rises out of a top surface, a single layer bond at the corner holds it to the surface. The same is true where a wall ends under a bottom surface. This setting prints the wall's line on the layers on the other side of the surface too, inside the part: through the top or bottom shell and this distance beyond it.
+Where an outer wall rises out of a top surface, a single layer bond at the corner holds it to the surface. The same is true where a wall ends under a bottom surface. This setting prints the wall's line on the layers on the other side of the surface too, inside the part: through the top or bottom shell and this distance beyond it. Above a bottom joint it starts on the layer after the bridge or overhang layer, so that bridge keeps its anchors on the part below.
 
 A 45° chamfer fills the corner between that buried wall and the inside face of the shell. Next to the shell it is as wide as the setting, and it narrows by one layer height per layer. Under a top surface the chamfer hangs below the shell. Above a bottom surface it sits on top of the shell.
 
 A joint qualifies when two things hold:
-- **The wall's line stands entirely on the surface.** For a top joint it does not overlap the outer wall of the layer below, or an inner wall there that continues further down; for a bottom joint, the same applies to the layer above. With two or more walls, **Only one wall on top surfaces** puts a single layer of inner wall under a part that rises from a top surface. That layer lies on the shell and does not stop the joint.
+- **The wall's line stands entirely on the surface.** For a top joint it does not overlap any wall line of the layer below; for a bottom joint, of the layer above. A wall line that only touches it, the way neighbouring lines of one layer overlap, does not count.
 - **The wall stays strictly steeper than 45°** (leaning in or out) for at least the setting's height.
 
 Vertical walls, walls leaning by less than 45°, the walls of pockets and one-line fins all qualify. 45° ramps, gently sloped skins and lips shorter than the setting do not.

@@ -112,6 +112,40 @@ TEST_CASE("Changing wall internal extension regenerates walls but keeps the slic
     CHECK_FALSE(object_after->is_step_done(posSupportMaterial));
 }
 
+TEST_CASE("Changing a shell thickness regenerates walls only where the extension is on", "[WallExtension][Config]")
+{
+    // The extension reaches through the shell, so its depth follows the shell thickness.
+    const std::string extension = GENERATE(as<std::string>{}, "1", "0");
+    const std::string key       = GENERATE(as<std::string>{}, "top_shell_thickness", "bottom_shell_thickness");
+    CAPTURE(extension, key);
+    DynamicPrintConfig config;
+    config.apply(static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
+    config.set_deserialize_strict({
+        {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
+        {"brim_type", "no_brim"}, {"enable_arc_fitting", "0"},
+        {"top_shell_thickness", "0.6"}, {"bottom_shell_thickness", "0.6"},
+        {"wall_internal_extension", extension}
+    });
+    Model model;
+    auto *object = model.add_object();
+    object->add_volume(TriangleMesh(its_make_cube(20., 20., 5.)));
+    object->add_instance()->set_offset(Vec3d(80., 80., 0.));
+
+    Print print;
+    print.set_status_silent();
+    print.auto_assign_extruders(model.objects.front());
+    print.apply(model, config);
+    print.process();
+    REQUIRE(print.get_object(size_t(0))->is_step_done(posPerimeters));
+
+    config.set_deserialize_strict({{key, std::string("1.6")}});
+    print.apply(model, config);
+    const auto *object_after = print.get_object(size_t(0));
+    CHECK(object_after->is_step_done(posSlice));
+    CHECK_FALSE(object_after->is_step_done(posPrepareInfill));
+    CHECK(object_after->is_step_done(posPerimeters) == (extension == "0"));
+}
+
 TEST_CASE("A modifier that only changes wall internal extension adds no walls", "[WallExtension][Config]")
 {
     DynamicPrintConfig config;

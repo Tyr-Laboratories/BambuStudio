@@ -99,25 +99,12 @@ Polylines clip(const Polylines &lines, const ExPolygons &area)
     return pieces;
 }
 
-// The walls of layers[n] that carry a wall line standing on them, so that it forms no joint: the outer walls, and the
-// inner walls continuing a wall of layers[n + beyond], the next layer away from the joint. An inner wall lying on fill
-// is part of the surface: "only one wall on top surfaces" puts one layer of such a wall around the area under a part
-// rising from a top surface, right under that part's outer wall.
-ExPolygons carrying_walls(const std::vector<LayerGeometry> &layers, size_t n, int beyond)
-{
-    const LayerGeometry &here = layers[n];
-    if (beyond < 0 ? n == 0 : n + 1 >= layers.size())
-        return here.outer_walls;
-    ExPolygons out = intersection_ex(diff_ex(here.walls, here.outer_walls), layers[beyond < 0 ? n - 1 : n + 1].walls);
-    append(out, here.outer_walls);
-    return union_ex(out);
-}
-
-// Pieces of `lines` whose whole line width stands over the inside of layers[n], clear of the walls that carry them.
-Polylines standing_on(const Polylines &lines, const std::vector<LayerGeometry> &layers, size_t n, int beyond, coord_t line_width)
+// Pieces of `lines` whose whole line width stands over the inside of `neighbour`, clear of its walls. A wall line that
+// only touches the line, overlapping it by no more than `allowance`, is beside it rather than under it.
+Polylines standing_on(const Polylines &lines, const LayerGeometry &neighbour, coord_t line_width, coord_t allowance)
 {
     const float half_width = float(line_width) / 2.f;
-    return clip(lines, diff_ex(offset_ex(layers[n].outline, -half_width), offset_ex(carrying_walls(layers, n, beyond), half_width)));
+    return clip(lines, diff_ex(offset_ex(neighbour.outline, -half_width), offset_ex(neighbour.walls, half_width - float(allowance))));
 }
 
 // Keeps the pieces of `lines`, an outer wall line at `layer`, where the wall continues strictly steeper than 45 degrees
@@ -169,8 +156,12 @@ std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t 
     if (outer.empty())
         return joints;
 
+    // Neighbouring lines of one layer overlap by their width less their spacing; a wall line below that overlaps the joint
+    // line no more than that (and the slicing tolerance) only touches it.
+    const coord_t allowance = (settings.line_spacing > 0 ? std::max<coord_t>(0, settings.line_width - settings.line_spacing) : 0) +
+                              settings.tolerance;
     if (layer >= 1) {
-        Polylines lines = steep_for_extension(standing_on(outer, layers, layer - 1, -1, settings.line_width), layers, layer, +1, settings);
+        Polylines lines = steep_for_extension(standing_on(outer, layers[layer - 1], settings.line_width, allowance), layers, layer, +1, settings);
         drop_shorter_than(lines, settings.line_width);
         if (!lines.empty())
             joints.push_back({ layer, JointSide::Top, std::move(lines),
@@ -178,7 +169,7 @@ std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t 
                                settings.extension, settings.line_width, settings.tolerance });
     }
     if (layer + 1 < layers.size()) {
-        Polylines lines = steep_for_extension(standing_on(outer, layers, layer + 1, +1, settings.line_width), layers, layer, -1, settings);
+        Polylines lines = steep_for_extension(standing_on(outer, layers[layer + 1], settings.line_width, allowance), layers, layer, -1, settings);
         drop_shorter_than(lines, settings.line_width);
         if (!lines.empty())
             joints.push_back({ layer, JointSide::Bottom, std::move(lines),
@@ -236,7 +227,9 @@ ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std
                 chamfer = std::clamp(target.print_z - (surface.bottom_z - reach), 0., joint.extension);
             deepest = target_layer == 0 || surface.bottom_z - layers[target_layer - 1].bottom_z > reach + EPSILON;
         } else {
-            if (target_layer <= joint.layer)
+            // The first layer above a bottom joint is its bridge or overhang layer. It stays as it is, so the bridge keeps
+            // its anchors on the lower part; the extension starts on the layer above.
+            if (target_layer <= joint.layer + 1)
                 continue;
             const double depth = target.print_z - surface.print_z;
             if (depth > reach + EPSILON)
@@ -306,18 +299,6 @@ template<typename Visit> void visit_path_runs(const ExtrusionEntity &entity, con
     } else if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
         visit(ExtrusionPaths{ *path }, false);
     }
-}
-
-// Area covered by the outer wall paths in `perimeters`.
-Polygons outer_wall_cover(const ExtrusionEntityCollection &perimeters)
-{
-    Polygons out;
-    visit_path_runs(perimeters, [&out](const ExtrusionPaths &paths, bool) {
-        for (const ExtrusionPath &path : paths)
-            if (is_outer_wall(path))
-                path.polygons_covered_by_width(out, 0.f);
-    });
-    return out;
 }
 
 } // namespace
@@ -418,13 +399,10 @@ void apply(PrintObject &object)
             g.bottom_z = layer.bottom_z();
             g.print_z  = layer.print_z;
             g.outline  = layer.lslices;
-            Polygons walls, outer_walls;
-            for (const LayerRegion *region : layer.regions()) {
+            Polygons walls;
+            for (const LayerRegion *region : layer.regions())
                 polygons_append(walls, region->perimeters.polygons_covered_by_width());
-                polygons_append(outer_walls, outer_wall_cover(region->perimeters));
-            }
-            g.walls       = union_ex(walls);
-            g.outer_walls = union_ex(outer_walls);
+            g.walls = union_ex(walls);
         }
     });
     throw_if_canceled();
@@ -454,6 +432,7 @@ void apply(PrintObject &object)
                 settings.bottom_shell_layers    = config.bottom_shell_layers.value;
                 settings.bottom_shell_thickness = config.bottom_shell_thickness.value;
                 settings.line_width             = region->flow(frExternalPerimeter).scaled_width();
+                settings.line_spacing           = region->flow(frExternalPerimeter).scaled_spacing();
                 settings.tolerance              = tolerance;
                 append(joints[i], find_joints(geometry, i, own, settings));
             }
@@ -517,9 +496,12 @@ void apply(PrintObject &object)
                 // Only a top joint's deepest layer can hang over the sparse infill.
                 const ExPolygons bridge_area = diff_ex(intersection_ex(hanging[l], area),
                                                        offset(support_below, float(flow.scaled_spacing()) / 2.f));
-                const size_t inset_count = size_t(std::ceil(double(flow.scaled_width() + scaled<coord_t>(extension_max)) /
-                                                            double(flow.scaled_spacing()))) + 1;
                 for (const ExPolygon &piece : area) {
+                    // Enough walls to fill the whole piece: the chamfers of close joints merge into areas much wider than
+                    // one extension, and the piece is cut out of the fill. No point lies deeper than half the piece's
+                    // narrower extent.
+                    const Point  size        = get_extents(piece.contour).size();
+                    const size_t inset_count = size_t(std::ceil(0.5 * double(std::min(size.x(), size.y())) / double(flow.scaled_spacing()))) + 1;
                     ExtrusionEntityCollection lines = extension_extrusions(piece, bridge_area, flow, bridge_flow, layers[l]->height,
                                                                            inset_count, params);
                     if (!lines.entities.empty())

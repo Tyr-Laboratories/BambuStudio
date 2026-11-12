@@ -137,6 +137,16 @@ double area_mm2(const ExPolygons &expolygons)
     return area * SCALING_FACTOR * SCALING_FACTOR;
 }
 
+double surface_area(const Layer &layer, SurfaceType type)
+{
+    double area = 0.;
+    for (const LayerRegion *region : layer.regions())
+        for (const Surface &surface : region->fill_surfaces.surfaces)
+            if (surface.surface_type == type)
+                area += surface.expolygon.area();
+    return area * SCALING_FACTOR * SCALING_FACTOR;
+}
+
 double solid_area(const Layer &layer)
 {
     double area = 0.;
@@ -179,12 +189,13 @@ TEST_CASE("A tower's outer wall continues 1.8 mm into the box", "[WallExtension]
     CHECK(result.print_statistics.used_filaments_per_role.at(erWallExtension).first > 0.);
 }
 
-TEST_CASE("A column's outer wall continues 1.8 mm into the slab", "[WallExtension][Print]")
+TEST_CASE("A column's outer wall continues into the slab above the bridge layer, to 1.8 mm", "[WallExtension][Print]")
 {
     Model model = overhang();
     Print print;
     slice(print, model, extension_config(1.));
-    CHECK(extension_layers(print) == tenths(62, 78));
+    // The bridge layer at 6.2 keeps its anchors on the column.
+    CHECK(extension_layers(print) == tenths(64, 78));
     for (const Layer *layer : print.get_object(size_t(0))->layers())
         for (const ExtrusionPath *path : extension_paths(*layer))
             CHECK(path->get_customize_flag() != CustomizeFlag::cfWallExtensionBridge);
@@ -192,7 +203,8 @@ TEST_CASE("A column's outer wall continues 1.8 mm into the slab", "[WallExtensio
 
 TEST_CASE("Fill never covers wall extension lines", "[WallExtension][Print]")
 {
-    for (Model model : { terrace(), overhang() }) {
+    // Nine layers under the tower; eight over the column, whose bridge layer has none.
+    for (auto [model, expected_layers] : { std::pair<Model, size_t>{ terrace(), 9 }, std::pair<Model, size_t>{ overhang(), 8 } }) {
         Print print;
         slice(print, model, extension_config(1.));
         size_t layers_with_area = 0;
@@ -205,7 +217,7 @@ TEST_CASE("Fill never covers wall extension lines", "[WallExtension][Print]")
                 CHECK(area_mm2(intersection_ex(region->fill_no_overlap_expolygons, region->wall_extension_area)) < 0.01);
                 CHECK(intersection_ex(region->fill_expolygons, offset_ex(region->wall_extension_area, -scale_(0.01))).empty());
             }
-        CHECK(layers_with_area == 9);
+        CHECK(layers_with_area == expected_layers);
     }
 }
 
@@ -395,6 +407,12 @@ TEST_CASE("With slope walls on, the wall extension still adds no solid infill", 
     for (size_t i = 0; i < layers_with.size(); ++i) {
         CAPTURE(layers_with[i]->print_z);
         CHECK(solid_area(*layers_with[i]) <= solid_area(*layers_without[i]) + 0.05);
+        // Slope-wall layers expand their top, bottom and bridge surfaces by the depth of their walls; the extension
+        // lines are not walls and must not make those surfaces spread over the solid infill.
+        for (SurfaceType type : { stTop, stBottom, stBottomBridge }) {
+            CAPTURE(int(type));
+            CHECK(surface_area(*layers_with[i], type) <= surface_area(*layers_without[i], type) + 0.05);
+        }
         both_on_one_layer |= !extension_paths(*layers_with[i]).empty() &&
             std::any_of(layers_with[i]->regions().begin(), layers_with[i]->regions().end(),
                         [](const LayerRegion *region) { return region->has_slope_wall_reinforcement; });
@@ -605,4 +623,99 @@ TEST_CASE("Extension 0 or spiral vase adds nothing", "[WallExtension][Print]")
         slice(print, model, config);
         CHECK(extension_layers(print).empty());
     }
+}
+
+TEST_CASE("Merged chamfers of close fins are printed through and not left hollow", "[WallExtension][Print]")
+{
+    // Ten one-line fins at 2 mm pitch on a box: their 1 mm chamfers merge into one block under the box's top shell.
+    TriangleMesh mesh(its_make_cube(30., 30., 6.));
+    for (int i = 0; i < 10; ++i) {
+        TriangleMesh fin(its_make_cube(0.6, 20., 5.));
+        fin.translate(float(5.7 + 2. * i), 5.f, 6.f);
+        mesh.merge(fin);
+    }
+    Model model = model_of(std::move(mesh));
+    Print print;
+    slice(print, model, extension_config(1.));
+    double widest = 0.;
+    for (const Layer *layer : print.get_object(size_t(0))->layers())
+        for (const LayerRegion *region : layer->regions()) {
+            if (region->wall_extension_area.empty())
+                continue;
+            // Everything cut out of the fill is printed by extension lines, but for the ends of open lines, which stop half a
+            // line short of the area's edge.
+            Polygons covered;
+            for (const ExtrusionPath *path : extension_paths(*layer))
+                path->polygons_covered_by_width(covered, scaled<float>(0.01));
+            const double area = area_mm2(region->wall_extension_area);
+            widest = std::max(widest, area);
+            CAPTURE(layer->print_z, area);
+            CHECK(area_mm2(diff_ex(offset_ex(region->wall_extension_area, -scale_(0.25)), union_(covered))) < 0.01 * area);
+        }
+    CHECK(widest > 300.);
+}
+
+TEST_CASE("A bridge over a bottom joint keeps its anchors and direction", "[WallExtension][Print]")
+{
+    // A tunnel 5 mm wide and 30 mm long under a 3 mm roof. The tunnel's walls end under the roof's first layer, a bridge
+    // that spans the 5 mm width anchored on the walls' tops.
+    Model model = boxes({ { { 30., 20., 2. }, { 0., 0., 0. } }, { { 30., 7.5, 3. }, { 0., 0., 2. } },
+                          { { 30., 7.5, 3. }, { 0., 12.5, 2. } }, { { 30., 20., 3. }, { 0., 0., 5. } } });
+    Print without, with;
+    slice(without, model, extension_config(0.));
+    slice(with, model, extension_config(1.));
+    // The tunnel's walls continue into the roof, starting on the layer above the bridge.
+    CHECK(extension_layers(with).count(54) == 1);
+    const Layer *bridge_without = layer_at(without, 5.2), *bridge_with = layer_at(with, 5.2);
+    REQUIRE(bridge_without != nullptr);
+    REQUIRE(bridge_with != nullptr);
+    CHECK(extension_paths(*bridge_with).empty());
+    const auto bridges = [](const Layer &layer) {
+        std::vector<std::pair<double, double>> out;
+        for (const LayerRegion *region : layer.regions())
+            for (const Surface &surface : region->fill_surfaces.surfaces)
+                if (surface.surface_type == stBottomBridge)
+                    out.emplace_back(surface.expolygon.area() * SCALING_FACTOR * SCALING_FACTOR, surface.bridge_angle);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    const auto expected = bridges(*bridge_without), actual = bridges(*bridge_with);
+    REQUIRE_FALSE(expected.empty());
+    REQUIRE(actual.size() == expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        CHECK(actual[i].first == Approx(expected[i].first).epsilon(0.01));
+        CHECK(actual[i].second == Approx(expected[i].second).margin(1e-3));
+    }
+}
+
+TEST_CASE("On slope-wall layers the extension lines do not widen top surfaces", "[WallExtension][Print]")
+{
+    // The terrace with a step on one side whose top lies in the box's top shell, among the extension layers, and beside it
+    // a ridge whose sloped faces put slope walls on those layers. Slope-wall layers expand their top surfaces into the
+    // neighbouring solid infill by the depth of their walls.
+    TriangleMesh mesh(its_make_cube(30., 30., 12.));
+    TriangleMesh step(its_make_cube(30., 10., 11.6));
+    step.translate(0.f, 30.f, 0.f);
+    mesh.merge(step);
+    TriangleMesh ridge(its_make_prism(10., 30., 14.));
+    ridge.translate(34.f, 15.f, 0.f);
+    mesh.merge(ridge);
+    TriangleMesh tower(its_make_cube(10., 10., 6.));
+    tower.translate(10.f, 10.f, 12.f);
+    mesh.merge(tower);
+    Model model = model_of(std::move(mesh));
+    DynamicPrintConfig config0 = extension_config(0.), config1 = extension_config(1.);
+    config0.set_deserialize_strict({ {"extra_wall_slope_angle", "15"} });
+    config1.set_deserialize_strict({ {"extra_wall_slope_angle", "15"} });
+    Print without, with;
+    slice(without, model, config0);
+    slice(with, model, config1);
+    const Layer *step_top_without = layer_at(without, 11.6), *step_top_with = layer_at(with, 11.6);
+    REQUIRE(step_top_without != nullptr);
+    REQUIRE(step_top_with != nullptr);
+    REQUIRE_FALSE(extension_paths(*step_top_with).empty());
+    REQUIRE(std::any_of(step_top_with->regions().begin(), step_top_with->regions().end(),
+                        [](const LayerRegion *region) { return region->has_slope_wall_reinforcement; }));
+    REQUIRE(surface_area(*step_top_without, stTop) > 100.);
+    CHECK(surface_area(*step_top_with, stTop) <= surface_area(*step_top_without, stTop) + 0.05);
 }

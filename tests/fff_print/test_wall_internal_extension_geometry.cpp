@@ -11,6 +11,8 @@ using namespace Slic3r::WallInternalExtension;
 
 namespace {
 constexpr double line_w = 0.45;
+// Spacing of 0.45 mm lines at 0.2 mm layers (Flow: width - height * (1 - pi / 4)).
+const double line_spacing_w = line_w - 0.2 * (1. - 0.25 * M_PI);
 
 ExPolygon rect(double x0, double y0, double x1, double y1)
 {
@@ -21,18 +23,16 @@ ExPolygon rect(double x0, double y0, double x1, double y1)
 
 ExPolygon centred_square(double cx, double cy, double half) { return rect(cx - half, cy - half, cx + half, cy + half); }
 
-// One LayerGeometry per outline, `h` mm thick, with walls covering the band within walls * line_w of the outline, the
-// outer wall the band within line_w.
+// One LayerGeometry per outline, `h` mm thick, with walls covering the band within walls * line_w of the outline.
 std::vector<LayerGeometry> stack(const std::vector<ExPolygons> &outlines, double h = 0.2, int walls = 1)
 {
     std::vector<LayerGeometry> layers;
     for (size_t i = 0; i < outlines.size(); ++i) {
         LayerGeometry g;
-        g.bottom_z    = h * double(i);
-        g.print_z     = h * double(i + 1);
-        g.outline     = outlines[i];
-        g.walls       = diff_ex(outlines[i], offset_ex(outlines[i], -scale_(walls * line_w)));
-        g.outer_walls = diff_ex(outlines[i], offset_ex(outlines[i], -scale_(line_w)));
+        g.bottom_z = h * double(i);
+        g.print_z  = h * double(i + 1);
+        g.outline  = outlines[i];
+        g.walls    = diff_ex(outlines[i], offset_ex(outlines[i], -scale_(walls * line_w)));
         layers.emplace_back(std::move(g));
     }
     return layers;
@@ -72,6 +72,7 @@ JointSettings settings(double extension = 1.)
     s.top_shell_layers     = 4;
     s.bottom_shell_layers  = 4;
     s.line_width           = scaled<coord_t>(line_w);
+    s.line_spacing         = scaled<coord_t>(line_spacing_w);
     s.tolerance            = scaled<coord_t>(0.012);
     return s;
 }
@@ -205,26 +206,35 @@ TEST_CASE("On a two-wall lower part a line standing on the inner wall is not a j
     const auto layers = stack(concat(repeat(box20, 15), repeat(offset_tower, 15)), 0.2, 2);
     const auto joints = find_joints(layers, 15, outer_lines(offset_tower), settings());
     REQUIRE(joints.size() == 1);
-    // The left side stands on the box's inner wall and is dropped; the rest stands on the infill.
-    const ExPolygons near_box_walls = diff_ex(box20, offset_ex(box20, -scale_(2. * line_w + line_w / 2. - 0.012)));
+    // The left side stands on the box's inner wall and is dropped; the rest stands on the infill. A line beside the inner
+    // wall may overlap it as neighbouring lines do.
+    const ExPolygons near_box_walls =
+        diff_ex(box20, offset_ex(box20, -scale_(2. * line_w + line_w / 2. - (line_w - line_spacing_w) - 0.012 - 0.012)));
     CHECK(intersection_pl(joints.front().lines, near_box_walls).empty());
     CHECK(length_mm(joints.front().lines) > 25.);
 }
 
-TEST_CASE("An inner wall lying on the shell under the joint line does not stop the joint", "[WallExtension][Joints]")
+TEST_CASE("A wall line below stops a joint only where it overlaps more than neighbouring lines do", "[WallExtension][Joints]")
 {
     // "Only one wall on top surfaces" leaves the box's top layer one wall at the box's edge and puts its second wall
-    // around the area under the tower, where nothing below continues it.
-    auto layers = stack(concat(repeat(box20, 15), repeat(tower10, 15)), 0.2, 2);
-    ExPolygons top_walls = layers[14].outer_walls;
-    append(top_walls, diff_ex(tower10, offset_ex(tower10, -scale_(line_w))));
-    layers[14].walls = union_ex(top_walls);
-    const auto joints = find_joints(layers, 15, outer_lines(tower10), settings());
+    // around the area under the tower; `inset` is how far inside the tower's side that wall's footprint starts.
+    const auto with_wall_under_tower = [](double inset) {
+        auto layers = stack(concat(repeat(box20, 15), repeat(tower10, 15)));
+        ExPolygons top_walls = layers[14].walls;
+        append(top_walls, diff_ex(offset_ex(tower10, -scale_(inset)), offset_ex(tower10, -scale_(inset + line_w))));
+        layers[14].walls = union_ex(top_walls);
+        return layers;
+    };
+    // Beside the tower's outer wall, overlapping its footprint as neighbouring lines of one layer do: the joint stands.
+    const auto beside = with_wall_under_tower(line_spacing_w);
+    const auto joints = find_joints(beside, 15, outer_lines(tower10), settings());
     REQUIRE(joints.size() == 1);
     CHECK(joints.front().side == JointSide::Top);
     CHECK(length_mm(joints.front().lines) == Approx(4. * (10. - line_w)).margin(0.5));
     // The tower's own first-layer wall still carries the wall above it.
-    CHECK(find_joints(layers, 16, outer_lines(tower10), settings()).empty());
+    CHECK(find_joints(beside, 16, outer_lines(tower10), settings()).empty());
+    // Right under the outer wall: the wall carries on and there is no joint.
+    CHECK(find_joints(with_wall_under_tower(0.), 15, outer_lines(tower10), settings()).empty());
 }
 
 TEST_CASE("Shell depth follows the shell settings in millimetres", "[WallExtension][Joints]")
@@ -291,7 +301,8 @@ TEST_CASE("Over a column the extension rises through the bottom shell and 1 mm a
     for (size_t l = 0; l < layers.size(); ++l) {
         CAPTURE(l);
         const ExtensionArea a = extension_area(layers, joints, l);
-        CHECK(a.all.empty() == (l < 30 || l > 38));
+        // Layer 30, the bridge layer, stays as it is so the bridge keeps its anchors on the column.
+        CHECK(a.all.empty() == (l < 31 || l > 38));
         CHECK(a.hanging.empty());
         if (a.all.empty())
             continue;

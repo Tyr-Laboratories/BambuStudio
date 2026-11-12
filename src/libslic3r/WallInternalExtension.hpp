@@ -27,8 +27,6 @@ struct LayerGeometry
     ExPolygons outline;
     // Area covered by every wall extrusion of the layer.
     ExPolygons walls;
-    // The part of `walls` covered by outer walls (erExternalPerimeter, erOverhangPerimeter).
-    ExPolygons outer_walls;
 };
 
 // Settings of the region whose outer wall forms a joint.
@@ -42,6 +40,8 @@ struct JointSettings
     double  bottom_shell_thickness = 0.;
     // Outer wall line width at the joint layer, scaled.
     coord_t line_width             = 0;
+    // Outer wall line spacing at the joint layer, scaled. Neighbouring lines of one layer overlap by line_width - line_spacing.
+    coord_t line_spacing           = 0;
     // Slicing tolerance (the G-code resolution), scaled.
     coord_t tolerance              = 0;
 };
@@ -78,10 +78,10 @@ double top_shell_depth(const std::vector<LayerGeometry> &layers, size_t surface_
 double bottom_shell_depth(const std::vector<LayerGeometry> &layers, size_t surface_layer, int shell_layers, double shell_thickness);
 
 // Joints formed by `outer_wall_lines`, the centrelines of one region's outer wall extrusions at `layer`. A piece of the
-// line is a top joint where its whole width stands over the inside of the layer below, away from that layer's outer
-// walls and from its inner walls that continue a wall of the layer under it, and the wall above it stays strictly
-// steeper than 45 degrees, leaning either way, until it is `extension` tall; a bottom joint is the mirror image. At most
-// one joint per side.
+// line is a top joint where its whole width stands over the inside of the layer below, away from that layer's walls (a
+// wall line overlapping it no more than neighbouring lines of one layer do only touches it), and the wall above it stays
+// strictly steeper than 45 degrees, leaning either way, until it is `extension` tall; a bottom joint is the mirror image.
+// At most one joint per side.
 std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t layer, const Polylines &outer_wall_lines,
                                const JointSettings &settings);
 
@@ -94,7 +94,8 @@ struct ExtensionArea
 };
 
 // Area at `target_layer` covered by the extension lines and 45 degree chamfers of `joints`. A top joint's extension
-// reaches down to shell_depth + extension below the surface, a bottom joint's up to the same distance above it. The
+// reaches down to shell_depth + extension below the surface, a bottom joint's up to the same distance above it, starting
+// above the bridge or overhang layer, which keeps its anchors on the lower part. The
 // chamfer lies on the layers beyond the shell, on the surface side only: as wide as the extension next to the shell,
 // narrowing by one layer height per layer to nothing at the extension's far end.
 ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std::vector<Joint> &joints, size_t target_layer);

@@ -22,7 +22,7 @@ The fix is a woodworking joint. The wall is started before it breaks out onto th
 4. **45° chamfer** on the surface side of the extension, in the corner between the extension and the inside face of the shell. For top joints it hangs under the top shell, widening going up (an inverted chamfer). For bottom joints it sits on top of the bottom shell, narrowing going up. It is E wide where it meets the shell.
 5. **Both top and bottom joints** are covered by the same setting.
 6. **Which joints qualify** (approved after the user reviewed six example joints):
-   - (a) The joint line stands entirely on the surface. For a top joint, it does not overlap the wall lines of the layer below; it sits over that layer's infill or solid fill. For a bottom joint, the layer above has no wall line over it. The wall lines that count are the outer walls, and the inner walls that continue a wall of the next layer away from the joint. An inner wall lying on fill is part of the surface *(ruling during implementation)*. With two or more walls, "Only one wall on top surfaces" (default "all top") gives the lower part's top layer its second wall only around the area under the part above, which is right under that part's outer wall.
+   - (a) The joint line stands entirely on the surface. For a top joint, it does not overlap the wall lines of the layer below; it sits over that layer's infill or solid fill. For a bottom joint, the layer above has no wall line over it. A wall line that only touches the joint line, overlapping it by no more than neighbouring lines of one layer overlap (the line's width less its spacing, plus the G-code `resolution`), is beside it, not under it *(ruling during implementation)*. With two or more walls, "Only one wall on top surfaces" (default "all top") gives the lower part's top layer its second wall around the area under the part above, touching that part's outer wall in this way.
    - (b) Moving away from the surface, the wall stays strictly steeper than 45° for at least E, leaning either way: at every height up to E above (or below) the joint, it has moved sideways less than that height. That means upward from a top joint and downward from a bottom joint. A wall at exactly 45° is left alone *(my call, settling a contradiction found by the builder check)*. The test is a 45° cone measured from the joint, not a check of each layer against the one below *(ruling during implementation)*: a short vertical lip that continues as a 30–40° ramp still qualifies. The comparison allows for the G-code `resolution`, the only setting that moves straight walls between layers.
 
    Extended: vertical walls; walls leaning in or out by less than 45° from vertical; pockets (a hole's walls rising from the pocket floor); thin fins printed as one or two lines.
@@ -63,7 +63,7 @@ The fix is a woodworking joint. The wall is started before it breaks out onto th
 
 ### Extension (bottom joint)
 
-The mirror image. Copies go on every layer from the first layer above the joint (the bridge or overhang layer) up to (bottom shell depth + E) above the surface. The same clipping applies; in particular, a copy is never printed where it would show on a top surface. Every copy stands on the line below it.
+The mirror image. Copies go on every layer from the second layer above the joint up to (bottom shell depth + E) above the surface. The first layer above the joint, the bridge or overhang layer, gets no copy: a copy there would part the bridge from the fill over the lower part, so BambuStudio's bridge detection would find no anchors and change the bridge, which is the outside of the part *(ruling during implementation)*. The same clipping applies; in particular, a copy is never printed where it would show on a top surface. Every copy stands on the line below it.
 
 ```
              upper part (inside)
@@ -75,7 +75,7 @@ The mirror image. Copies go on every layer from the first layer above the joint 
             |X|==================   bottom shell, 0.8 mm
             |X|==================
             |X|==================
-            |X|==================   bridge / overhang layer (over air)
+            ====================   bridge / overhang layer (over air), no copy
  -----------|W|
             |W|   lower part
 ```
@@ -96,7 +96,7 @@ The mirror image. Copies go on every layer from the first layer above the joint 
   - On each target layer, lines are printed only where the region at that spot also has E above 0.
   - They are printed by that region, with its wall filament, inner-wall and bridge settings and outer-wall line width. That way no tool change is added.
   - So E = 0 on a part or modifier is an off switch for that volume: no extension starts from its walls, and none is printed inside it.
-- **No other change.** The cut-outs must not trigger extra solid infill anywhere. The specific trap is "ensure vertical shell thickness" (on by default): it would treat the cut-out as a wall and add solid infill around and under it (`discover_vertical_shells`). Bridges in a bottom joint anchor against the extension line the way bridges anchor against walls.
+- **No other change.** The cut-outs must not trigger extra solid infill anywhere. The specific trap is "ensure vertical shell thickness" (on by default): it would treat the cut-out as a wall and add solid infill around and under it (`discover_vertical_shells`). Bridges in a bottom joint keep their anchors on the lower part: the extension starts on the layer above them.
 - What sits there today: under a rising wall, "ensure vertical shell thickness" can turn the footprint of the wall above into solid infill for up to three layers. Its regularisation step deletes regions narrower than about 0.65 of a solid line, so whether that band survives depends on the infill-wall overlap; this is unverified for the Heimdall preset. Wherever such a band exists, the extension takes its place. The added material is otherwise the extension lines plus the chamfer.
 
 ## Line type and printing

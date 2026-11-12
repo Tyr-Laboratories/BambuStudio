@@ -587,6 +587,9 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
             auto measure_walls=[&](const LayerRegion *region) {
                 const auto paths=region->perimeters.flatten();
                 for (const auto *path:paths.entities) {
+                    // Wall extension lines run deep inside the part; they are not walls bounding the surfaces.
+                    if (path->role()==erWallExtension)
+                        continue;
                     const float spacing=region->flow(frPerimeter).scaled_spacing();
                     expansion_min=std::max(expansion_min,spacing);
                     for (const Point &p:path->as_polyline().points)

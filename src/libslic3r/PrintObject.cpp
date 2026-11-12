@@ -1760,12 +1760,17 @@ bool PrintObject::invalidate_state_by_config_options(
                 steps.emplace_back(posSlice);
             }
 #endif
+        } else if (opt_key == "bottom_shell_thickness" || opt_key == "top_shell_thickness") {
+            // The wall internal extension reaches through the shell, so where it is on the walls follow these too.
+            const ConfigOption *old_extension = old_config.option("wall_internal_extension");
+            const ConfigOption *new_extension = new_config.option("wall_internal_extension");
+            const bool extension_on = (old_extension != nullptr && old_extension->getFloat() > 0.) ||
+                                      (new_extension != nullptr && new_extension->getFloat() > 0.);
+            steps.emplace_back(extension_on ? posPerimeters : posPrepareInfill);
         } else if (
                opt_key == "interface_shells"
             || opt_key == "fill_multiline"
             || opt_key == "infill_combination"
-            || opt_key == "bottom_shell_thickness"
-            || opt_key == "top_shell_thickness"
             || opt_key == "minimum_sparse_infill_area"
             || opt_key == "sparse_infill_filament"
             || opt_key == "solid_infill_filament"
