@@ -66,6 +66,34 @@ The associated toolpath corrections address three independent errors: Arachne wi
 
 The slope setting is optional reinforcement, not a blanket suppression of bridge infill. Existing bridge classification and infill overlap settings still apply. Enabling the setting can replace overlapping bridge infill beside a single outer wall with a proper inner wall, but it does not promise removal of every short bridge path in the model.
 
+## Wall internal extension
+
+In **Strength > Walls**, enable Advanced settings and set **Wall internal extension** (`wall_internal_extension`) in millimetres. The default is **1 mm**. **0** disables the feature.
+
+Where an outer wall rises out of a top surface, a single layer bond at the corner holds it to the surface. The same is true where a wall ends under a bottom surface. This setting prints the wall's line on the layers on the other side of the surface too, inside the part: through the top or bottom shell and this distance beyond it.
+
+A 45° chamfer fills the corner between that buried wall and the inside face of the shell. Next to the shell it is as wide as the setting, and it narrows by one layer height per layer. Under a top surface the chamfer hangs below the shell. Above a bottom surface it sits on top of the shell.
+
+A joint qualifies when two things hold:
+- **The wall's line stands entirely on the surface.** For a top joint it does not overlap the outer wall of the layer below, or an inner wall there that continues further down; for a bottom joint, the same applies to the layer above. With two or more walls, **Only one wall on top surfaces** puts a single layer of inner wall under a part that rises from a top surface. That layer lies on the shell and does not stop the joint.
+- **The wall stays strictly steeper than 45°** (leaning in or out) for at least the setting's height.
+
+Vertical walls, walls leaning by less than 45°, the walls of pockets and one-line fins all qualify. 45° ramps, gently sloped skins and lips shorter than the setting do not.
+
+Ribs standing on sloped or curved skins are extended piece by piece. Where the skin slopes more than about 15° along the rib, each layer's new piece of the rib's wall rests mostly on the wall below it, so no extension is added there.
+
+The extension and chamfer lines use the outer wall's line width and the inner wall's speed, acceleration and cooling. The lowest layer under a top surface has only sparse infill below it, so it is printed like an internal bridge.
+
+The extension stays inside the part:
+- it stops where the part ends;
+- it never prints on the first layer or on an exposed top or bottom surface;
+- fill meets its lines at normal line spacing;
+- it adds no other solid infill.
+
+In the preview these lines are the **Wall extension** line type, with their own colour and time and filament statistics. Older versions of Bambu Studio show this line type as undefined, so open sliced files in this version to see it.
+
+The setting follows normal process, object, part and modifier inheritance and is saved in process presets and 3MF projects. A part or modifier set to 0 is an off switch for its volume: no extension starts from its walls and none is printed inside it. Because the default is 1 mm, existing projects get the extension when they are sliced again. Set the value to 0 to keep their previous output.
+
 ## Block supports in round holes
 
 Select one object in Prepare, open **Supports Painting**, and click **Block supports in round holes**. The button paints red support blockers on hole ceilings using the current **Highlight overhang areas** angle. A larger angle selects more downward-facing surfaces; **0°** selects none and **90°** includes all downward-facing hole surfaces. Adjust the highlight angle to review the intended coverage before applying the button.

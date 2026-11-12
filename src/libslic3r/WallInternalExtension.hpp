@@ -27,6 +27,8 @@ struct LayerGeometry
     ExPolygons outline;
     // Area covered by every wall extrusion of the layer.
     ExPolygons walls;
+    // The part of `walls` covered by outer walls (erExternalPerimeter, erOverhangPerimeter).
+    ExPolygons outer_walls;
 };
 
 // Settings of the region whose outer wall forms a joint.
@@ -76,9 +78,10 @@ double top_shell_depth(const std::vector<LayerGeometry> &layers, size_t surface_
 double bottom_shell_depth(const std::vector<LayerGeometry> &layers, size_t surface_layer, int shell_layers, double shell_thickness);
 
 // Joints formed by `outer_wall_lines`, the centrelines of one region's outer wall extrusions at `layer`. A piece of the
-// line is a top joint where its whole width stands over the inside of the layer below, away from that layer's walls,
-// and the wall above it stays strictly steeper than 45 degrees, leaning either way, until it is `extension` tall; a
-// bottom joint is the mirror image. At most one joint per side.
+// line is a top joint where its whole width stands over the inside of the layer below, away from that layer's outer
+// walls and from its inner walls that continue a wall of the layer under it, and the wall above it stays strictly
+// steeper than 45 degrees, leaning either way, until it is `extension` tall; a bottom joint is the mirror image. At most
+// one joint per side.
 std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t layer, const Polylines &outer_wall_lines,
                                const JointSettings &settings);
 

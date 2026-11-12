@@ -99,11 +99,25 @@ Polylines clip(const Polylines &lines, const ExPolygons &area)
     return pieces;
 }
 
-// Pieces of `lines` whose whole line width stands over the inside of `neighbour`, clear of its walls.
-Polylines standing_on(const Polylines &lines, const LayerGeometry &neighbour, coord_t line_width)
+// The walls of layers[n] that carry a wall line standing on them, so that it forms no joint: the outer walls, and the
+// inner walls continuing a wall of layers[n + beyond], the next layer away from the joint. An inner wall lying on fill
+// is part of the surface: "only one wall on top surfaces" puts one layer of such a wall around the area under a part
+// rising from a top surface, right under that part's outer wall.
+ExPolygons carrying_walls(const std::vector<LayerGeometry> &layers, size_t n, int beyond)
+{
+    const LayerGeometry &here = layers[n];
+    if (beyond < 0 ? n == 0 : n + 1 >= layers.size())
+        return here.outer_walls;
+    ExPolygons out = intersection_ex(diff_ex(here.walls, here.outer_walls), layers[beyond < 0 ? n - 1 : n + 1].walls);
+    append(out, here.outer_walls);
+    return union_ex(out);
+}
+
+// Pieces of `lines` whose whole line width stands over the inside of layers[n], clear of the walls that carry them.
+Polylines standing_on(const Polylines &lines, const std::vector<LayerGeometry> &layers, size_t n, int beyond, coord_t line_width)
 {
     const float half_width = float(line_width) / 2.f;
-    return clip(lines, diff_ex(offset_ex(neighbour.outline, -half_width), offset_ex(neighbour.walls, half_width)));
+    return clip(lines, diff_ex(offset_ex(layers[n].outline, -half_width), offset_ex(carrying_walls(layers, n, beyond), half_width)));
 }
 
 // Keeps the pieces of `lines`, an outer wall line at `layer`, where the wall continues strictly steeper than 45 degrees
@@ -156,7 +170,7 @@ std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t 
         return joints;
 
     if (layer >= 1) {
-        Polylines lines = steep_for_extension(standing_on(outer, layers[layer - 1], settings.line_width), layers, layer, +1, settings);
+        Polylines lines = steep_for_extension(standing_on(outer, layers, layer - 1, -1, settings.line_width), layers, layer, +1, settings);
         drop_shorter_than(lines, settings.line_width);
         if (!lines.empty())
             joints.push_back({ layer, JointSide::Top, std::move(lines),
@@ -164,7 +178,7 @@ std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t 
                                settings.extension, settings.line_width, settings.tolerance });
     }
     if (layer + 1 < layers.size()) {
-        Polylines lines = steep_for_extension(standing_on(outer, layers[layer + 1], settings.line_width), layers, layer, -1, settings);
+        Polylines lines = steep_for_extension(standing_on(outer, layers, layer + 1, +1, settings.line_width), layers, layer, -1, settings);
         drop_shorter_than(lines, settings.line_width);
         if (!lines.empty())
             joints.push_back({ layer, JointSide::Bottom, std::move(lines),
@@ -279,19 +293,31 @@ void append_outer_wall_runs(const ExtrusionPaths &paths, bool closed, Polylines 
         out.emplace_back(std::move(run));
 }
 
-void collect_outer_wall_lines(const ExtrusionEntity &entity, Polylines &out)
+// Calls visit(paths, closed) for every loop (closed), multi-path and single path in `entity`, at any depth.
+template<typename Visit> void visit_path_runs(const ExtrusionEntity &entity, const Visit &visit)
 {
     if (const auto *collection = dynamic_cast<const ExtrusionEntityCollection *>(&entity)) {
         for (const ExtrusionEntity *child : collection->entities)
-            collect_outer_wall_lines(*child, out);
+            visit_path_runs(*child, visit);
     } else if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(&entity)) {
-        append_outer_wall_runs(loop->paths, true, out);
+        visit(loop->paths, true);
     } else if (const auto *multipath = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
-        append_outer_wall_runs(multipath->paths, false, out);
+        visit(multipath->paths, false);
     } else if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
-        if (is_outer_wall(*path) && path->polyline.points.size() >= 2)
-            out.push_back(path->polyline);
+        visit(ExtrusionPaths{ *path }, false);
     }
+}
+
+// Area covered by the outer wall paths in `perimeters`.
+Polygons outer_wall_cover(const ExtrusionEntityCollection &perimeters)
+{
+    Polygons out;
+    visit_path_runs(perimeters, [&out](const ExtrusionPaths &paths, bool) {
+        for (const ExtrusionPath &path : paths)
+            if (is_outer_wall(path))
+                path.polygons_covered_by_width(out, 0.f);
+    });
+    return out;
 }
 
 } // namespace
@@ -299,7 +325,7 @@ void collect_outer_wall_lines(const ExtrusionEntity &entity, Polylines &out)
 Polylines outer_wall_lines(const ExtrusionEntityCollection &perimeters)
 {
     Polylines out;
-    collect_outer_wall_lines(perimeters, out);
+    visit_path_runs(perimeters, [&out](const ExtrusionPaths &paths, bool closed) { append_outer_wall_runs(paths, closed, out); });
     return out;
 }
 
@@ -392,10 +418,13 @@ void apply(PrintObject &object)
             g.bottom_z = layer.bottom_z();
             g.print_z  = layer.print_z;
             g.outline  = layer.lslices;
-            Polygons walls;
-            for (const LayerRegion *region : layer.regions())
+            Polygons walls, outer_walls;
+            for (const LayerRegion *region : layer.regions()) {
                 polygons_append(walls, region->perimeters.polygons_covered_by_width());
-            g.walls = union_ex(walls);
+                polygons_append(outer_walls, outer_wall_cover(region->perimeters));
+            }
+            g.walls       = union_ex(walls);
+            g.outer_walls = union_ex(outer_walls);
         }
     });
     throw_if_canceled();

@@ -1,5 +1,6 @@
 #include <catch2/catch.hpp>
 
+#include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -399,6 +400,191 @@ TEST_CASE("With slope walls on, the wall extension still adds no solid infill", 
                         [](const LayerRegion *region) { return region->has_slope_wall_reinforcement; });
     }
     CHECK(both_on_one_layer);
+}
+
+namespace {
+Model model_of(TriangleMesh mesh)
+{
+    Model model;
+    auto *object = model.add_object();
+    object->add_volume(std::move(mesh));
+    object->add_instance()->set_offset(Vec3d(80., 80., 0.));
+    return model;
+}
+
+// A block along x whose top rises from `low` at x = 0 to `high` at x = length.
+TriangleMesh ramp(float length, float width, float low, float high)
+{
+    indexed_triangle_set its;
+    its.vertices = { { 0.f, 0.f, 0.f }, { length, 0.f, 0.f }, { length, width, 0.f }, { 0.f, width, 0.f },
+                     { 0.f, 0.f, low }, { length, 0.f, high }, { length, width, high }, { 0.f, width, low } };
+    its.indices  = { { 0, 2, 1 }, { 0, 3, 2 }, { 4, 5, 6 }, { 4, 6, 7 }, { 0, 1, 5 }, { 0, 5, 4 },
+                     { 3, 7, 6 }, { 3, 6, 2 }, { 0, 4, 7 }, { 0, 7, 3 }, { 1, 2, 6 }, { 1, 6, 5 } };
+    return TriangleMesh(its);
+}
+
+bool inside(const ExPolygons &area, const Point &point)
+{
+    return std::any_of(area.begin(), area.end(), [&point](const ExPolygon &e) { return e.contains(point); });
+}
+
+double heights_with_extension(const Print &print)
+{
+    double sum = 0.;
+    for (const Layer *layer : print.get_object(size_t(0))->layers())
+        if (!extension_paths(*layer).empty())
+            sum += layer->height;
+    return sum;
+}
+}
+
+TEST_CASE("A one-line fin is extended", "[WallExtension][Print]")
+{
+    Model model = boxes({ { { 30., 30., 6. }, { 0., 0., 0. } }, { { 0.6, 20., 5. }, { 14.7, 5., 6. } } });
+    Print print;
+    slice(print, model, extension_config(1.));
+    CHECK(extension_layers(print) == tenths(44, 60));
+}
+
+TEST_CASE("A rib standing on a sloped skin is extended along its base", "[WallExtension][Print]")
+{
+    // A 10 degree skin rising along the rib, from 1 mm to 1 + 30 tan(10) = 6.29 mm; the rib stands 15 mm tall through it.
+    TriangleMesh mesh = ramp(30.f, 30.f, 1.f, 6.29f);
+    TriangleMesh rib(its_make_cube(30., 1.2, 15.));
+    rib.translate(0.f, 14.4f, 0.f);
+    mesh.merge(rib);
+    Model model = model_of(std::move(mesh));
+    Print print;
+    slice(print, model, extension_config(1.));
+    CHECK(extension_layers(print).size() >= 10);
+    const Layer *rib_only = layer_at(print, 10.0);
+    REQUIRE(rib_only != nullptr);
+    const ExPolygons near_rib = offset_ex(rib_only->lslices, scale_(1.0 + 0.45 + 0.05));
+    for (const Layer *layer : print.get_object(size_t(0))->layers())
+        for (const ExtrusionPath *path : extension_paths(*layer)) {
+            CAPTURE(layer->print_z);
+            CHECK(layer->print_z < 6.4);
+            for (const Point &point : path->polyline.points)
+                CHECK(inside(near_rib, point));
+        }
+}
+
+TEST_CASE("Only the outer wall position is extended on two-wall parts", "[WallExtension][Print]")
+{
+    // "all top", the default, gives the box's top layer its second wall only around the area under the tower: one layer
+    // of inner wall right under the tower's outer wall, lying on the shell.
+    const std::string top_one_wall = GENERATE(as<std::string>{}, "all top", "not apply");
+    CAPTURE(top_one_wall);
+    Model model = terrace();
+    DynamicPrintConfig config = extension_config(1.);
+    config.set_deserialize_strict({ {"wall_loops", "2"}, {"top_one_wall_type", top_one_wall} });
+    Print print;
+    slice(print, model, config);
+    const Layer *tower_layer = layer_at(print, 12.2);
+    REQUIRE(tower_layer != nullptr);
+    const ExPolygons outer_wall_band = diff_ex(offset_ex(tower_layer->lslices, scale_(0.5)), offset_ex(tower_layer->lslices, -scale_(0.5)));
+    for (double z : { 11.4, 11.6, 11.8, 12.0 }) {
+        CAPTURE(z);
+        const Layer *layer = layer_at(print, z);
+        REQUIRE(layer != nullptr);
+        const std::vector<const ExtrusionPath *> paths = extension_paths(*layer);
+        // On the box's top layer that inner wall may already fill the extension's place.
+        if (z < 12.0 - EPSILON)
+            CHECK(!paths.empty());
+        for (const ExtrusionPath *path : paths)
+            for (const Point &point : path->polyline.points)
+                CHECK(inside(outer_wall_band, point));
+    }
+}
+
+TEST_CASE("The classic wall generator gets the same extension", "[WallExtension][Print]")
+{
+    Model model = terrace();
+    DynamicPrintConfig config = extension_config(1.);
+    config.set_deserialize_strict({ {"wall_generator", "classic"} });
+    Print print;
+    slice(print, model, config);
+    CHECK(extension_layers(print) == tenths(104, 120));
+}
+
+TEST_CASE("On a thin plate the extension stops above the bed", "[WallExtension][Print]")
+{
+    Model model = boxes({ { { 30., 30., 1. }, { 0., 0., 0. } }, { { 10., 10., 5. }, { 10., 10., 1. } } });
+    Print print;
+    slice(print, model, extension_config(1.));
+    CHECK(extension_layers(print) == std::set<int>{ 4, 6, 8, 10 });
+}
+
+TEST_CASE("Depth is measured in millimetres with variable layer heights", "[WallExtension][Print]")
+{
+    Model model = terrace();
+    model.objects.front()->layer_config_ranges[{ 9., 12. }].set("layer_height", 0.1);
+    Print print;
+    slice(print, model, extension_config(1.));
+    // Four 0.1 mm top layers make a 0.4 mm shell; the extension goes through it and 1 mm further.
+    CHECK(heights_with_extension(print) == Approx(0.4 + 1.0).margin(0.1));
+}
+
+TEST_CASE("Two close towers print their shared chamfer once", "[WallExtension][Print]")
+{
+    Model model = boxes({ { { 30., 30., 12. }, { 0., 0., 0. } }, { { 8., 8., 6. }, { 6., 11., 12. } }, { { 8., 8., 6. }, { 15., 11., 12. } } });
+    Print print;
+    slice(print, model, extension_config(1.));
+    REQUIRE_FALSE(extension_layers(print).empty());
+    for (const Layer *layer : print.get_object(size_t(0))->layers()) {
+        double   sum = 0.;
+        Polygons all;
+        for (const ExtrusionPath *path : extension_paths(*layer)) {
+            Polygons covered;
+            path->polygons_covered_by_spacing(covered, 0.f);
+            sum += area_mm2(union_ex(covered));
+            append(all, std::move(covered));
+        }
+        CAPTURE(layer->print_z);
+        CHECK(sum <= 1.05 * area_mm2(union_ex(all)) + 0.01);
+    }
+}
+
+TEST_CASE("A modifier with extension 0 is an off switch for its volume", "[WallExtension][Print]")
+{
+    Model model = terrace();
+    TriangleMesh left_half(its_make_cube(20., 40., 30.));
+    left_half.translate(-5.f, -5.f, -1.f);
+    auto *modifier = model.objects.front()->add_volume(std::move(left_half));
+    modifier->set_type(ModelVolumeType::PARAMETER_MODIFIER);
+    modifier->config.set("wall_internal_extension", 0.);
+    Print print;
+    slice(print, model, extension_config(1.));
+    const Layer *tower_layer = layer_at(print, 12.2);
+    REQUIRE(tower_layer != nullptr);
+    const coord_t centre = get_extents(tower_layer->lslices).center().x();
+    size_t right = 0;
+    for (const Layer *layer : print.get_object(size_t(0))->layers())
+        for (const ExtrusionPath *path : extension_paths(*layer))
+            for (const Point &point : path->polyline.points) {
+                CAPTURE(layer->print_z);
+                CHECK(point.x() >= centre - scale_(0.5));
+                right += point.x() > centre + scale_(0.5);
+            }
+    CHECK(right > 0);
+}
+
+TEST_CASE("Continuous outer-wall speed mode still exports", "[WallExtension][Print][GCode]")
+{
+    PrintWorkspace workspace;
+    Model model = terrace();
+    DynamicPrintConfig config = extension_config(1.);
+    config.set_deserialize_strict({ {"z_direction_outwall_speed_continuous", "1"} });
+    Print print;
+    slice(print, model, config);
+    const auto filename = (workspace.path / "continuous.gcode").string();
+    GCodeProcessorResult result;
+    print.export_gcode(filename, &result);
+    const auto &roles_times = result.print_statistics.modes[0].roles_times;
+    const auto  it = std::find_if(roles_times.begin(), roles_times.end(),
+                                  [](const std::pair<ExtrusionRole, float> &item) { return item.first == erWallExtension; });
+    REQUIRE(it != roles_times.end());
+    CHECK(it->second > 0.f);
 }
 
 TEST_CASE("Extension 0 or spiral vase adds nothing", "[WallExtension][Print]")

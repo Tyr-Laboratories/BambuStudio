@@ -21,16 +21,18 @@ ExPolygon rect(double x0, double y0, double x1, double y1)
 
 ExPolygon centred_square(double cx, double cy, double half) { return rect(cx - half, cy - half, cx + half, cy + half); }
 
-// One LayerGeometry per outline, `h` mm thick, with walls covering the band within walls * line_w of the outline.
+// One LayerGeometry per outline, `h` mm thick, with walls covering the band within walls * line_w of the outline, the
+// outer wall the band within line_w.
 std::vector<LayerGeometry> stack(const std::vector<ExPolygons> &outlines, double h = 0.2, int walls = 1)
 {
     std::vector<LayerGeometry> layers;
     for (size_t i = 0; i < outlines.size(); ++i) {
         LayerGeometry g;
-        g.bottom_z = h * double(i);
-        g.print_z  = h * double(i + 1);
-        g.outline  = outlines[i];
-        g.walls    = diff_ex(outlines[i], offset_ex(outlines[i], -scale_(walls * line_w)));
+        g.bottom_z    = h * double(i);
+        g.print_z     = h * double(i + 1);
+        g.outline     = outlines[i];
+        g.walls       = diff_ex(outlines[i], offset_ex(outlines[i], -scale_(walls * line_w)));
+        g.outer_walls = diff_ex(outlines[i], offset_ex(outlines[i], -scale_(line_w)));
         layers.emplace_back(std::move(g));
     }
     return layers;
@@ -207,6 +209,22 @@ TEST_CASE("On a two-wall lower part a line standing on the inner wall is not a j
     const ExPolygons near_box_walls = diff_ex(box20, offset_ex(box20, -scale_(2. * line_w + line_w / 2. - 0.012)));
     CHECK(intersection_pl(joints.front().lines, near_box_walls).empty());
     CHECK(length_mm(joints.front().lines) > 25.);
+}
+
+TEST_CASE("An inner wall lying on the shell under the joint line does not stop the joint", "[WallExtension][Joints]")
+{
+    // "Only one wall on top surfaces" leaves the box's top layer one wall at the box's edge and puts its second wall
+    // around the area under the tower, where nothing below continues it.
+    auto layers = stack(concat(repeat(box20, 15), repeat(tower10, 15)), 0.2, 2);
+    ExPolygons top_walls = layers[14].outer_walls;
+    append(top_walls, diff_ex(tower10, offset_ex(tower10, -scale_(line_w))));
+    layers[14].walls = union_ex(top_walls);
+    const auto joints = find_joints(layers, 15, outer_lines(tower10), settings());
+    REQUIRE(joints.size() == 1);
+    CHECK(joints.front().side == JointSide::Top);
+    CHECK(length_mm(joints.front().lines) == Approx(4. * (10. - line_w)).margin(0.5));
+    // The tower's own first-layer wall still carries the wall above it.
+    CHECK(find_joints(layers, 16, outer_lines(tower10), settings()).empty());
 }
 
 TEST_CASE("Shell depth follows the shell settings in millimetres", "[WallExtension][Joints]")
