@@ -29,7 +29,11 @@ bool RetractWhenCrossingPerimeters::travel_cross_perimeters(const Layer &layer, 
                     auto lines  = surface.expolygon.lines();
                     m_internal_islands_lines.insert(m_internal_islands_lines.end(), std::make_move_iterator(lines.begin()), std::make_move_iterator(lines.end()));
                 }
-            if (is_internal) layer_region_ptr->perimeters.collect_polylines(perimeters_polylines);
+            if (is_internal)
+                for (const ExtrusionEntity *island : layer_region_ptr->perimeters.entities)
+                    // Wall extension lines lie inside the part: crossing them leaves nothing to see.
+                    if (island->role() != erWallExtension)
+                        island->collect_polylines(perimeters_polylines);
         }
         for (const auto &perimeter_polyline : perimeters_polylines) {
             // Convert Polyline to Lines and add to m_internal_islands_lines.

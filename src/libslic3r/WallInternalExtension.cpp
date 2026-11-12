@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <optional>
 
 namespace Slic3r {
@@ -51,9 +52,51 @@ double bottom_shell_depth(const std::vector<LayerGeometry> &layers, size_t surfa
 
 namespace {
 
+// Joins pieces whose ends meet: clipping a closed line also cuts it at its first point, and a wall arrives as several
+// paths sharing their ends, so a run of the wall across such a point would otherwise come back in parts.
+void join_touching_pieces(Polylines &pieces)
+{
+    if (pieces.size() < 2)
+        return;
+    auto key = [](const Point &p) { return std::make_pair(p.x(), p.y()); };
+    std::map<std::pair<coord_t, coord_t>, size_t> by_start;
+    for (size_t i = 0; i < pieces.size(); ++i)
+        by_start.emplace(key(pieces[i].first_point()), i);
+    std::vector<bool> has_predecessor(pieces.size(), false), used(pieces.size(), false);
+    for (size_t i = 0; i < pieces.size(); ++i)
+        if (auto it = by_start.find(key(pieces[i].last_point())); it != by_start.end() && it->second != i)
+            has_predecessor[it->second] = true;
+    Polylines joined;
+    auto chain_from = [&](size_t i) {
+        Polyline chain = std::move(pieces[i]);
+        used[i]        = true;
+        for (;;) {
+            auto it = by_start.find(key(chain.last_point()));
+            if (it == by_start.end() || used[it->second])
+                break;
+            used[it->second] = true;
+            const Polyline &next = pieces[it->second];
+            chain.points.insert(chain.points.end(), next.points.begin() + 1, next.points.end());
+        }
+        joined.emplace_back(std::move(chain));
+    };
+    // Open chains first, from pieces nothing leads into; whatever is left forms closed chains.
+    for (size_t i = 0; i < pieces.size(); ++i)
+        if (!used[i] && !has_predecessor[i])
+            chain_from(i);
+    for (size_t i = 0; i < pieces.size(); ++i)
+        if (!used[i])
+            chain_from(i);
+    pieces = std::move(joined);
+}
+
 Polylines clip(const Polylines &lines, const ExPolygons &area)
 {
-    return lines.empty() || area.empty() ? Polylines() : intersection_pl(lines, area);
+    if (lines.empty() || area.empty())
+        return {};
+    Polylines pieces = intersection_pl(lines, area);
+    join_touching_pieces(pieces);
+    return pieces;
 }
 
 // Pieces of `lines` whose whole line width stands over the inside of `neighbour`, clear of its walls.
@@ -76,7 +119,8 @@ Polylines steep_for_extension(Polylines lines, const std::vector<LayerGeometry> 
     for (size_t j = 1; !lines.empty(); ++j) {
         const double height = direction > 0 ? layers[layer + j - 1].print_z - joint.bottom_z :
                                               joint.print_z - layers[layer - j + 1].bottom_z;
-        if (height >= settings.extension - EPSILON)
+        // Even an extension of one layer needs the wall to go on steeply: a gently sloped skin steps in on every layer.
+        if (j > 1 && height >= settings.extension - EPSILON)
             return lines;
         if (direction > 0 ? layer + j >= layers.size() : j > layer)
             return {};
@@ -195,7 +239,9 @@ ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std
             const float    reach_out = half_width + float(scale_(chamfer));
             const Polygons outer     = joint.tolerance > 0 ? band(joint.lines, reach_out, ClipperLib::jtRound, double(joint.tolerance)) :
                                                              band(joint.lines, reach_out, ClipperLib::jtMiter, 3.);
-            append(piece, diff(outer, to_polygons(surface.outline)));
+            // Measured from the line itself rather than the outline, so the chamfer always joins the line's footprint,
+            // also where a one-line fin's line sits deeper than half a line width.
+            append(piece, diff(outer, offset(surface.outline, -half_width)));
         }
         if (deepest)
             append(hanging, piece);
@@ -333,7 +379,9 @@ void apply(PrintObject &object)
         extension_max = std::max(extension_max, object.printing_region(region_id).config().wall_internal_extension.value);
     if (extension_max <= 0.)
         return;
-    const coord_t tolerance = scaled<coord_t>(std::max(print.config().resolution.value, object.config().slice_closing_radius.value));
+    // Straight walls move between layers only by contour simplification, so the steepness test allows for the G-code
+    // resolution. slice_closing_radius closes gaps without moving straight walls.
+    const coord_t tolerance = scaled<coord_t>(print.config().resolution.value);
 
     // Every layer's outline and walls, read before any layer is changed.
     std::vector<LayerGeometry> geometry(layers.size());

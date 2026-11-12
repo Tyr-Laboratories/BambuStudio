@@ -40,7 +40,7 @@ struct JointSettings
     double  bottom_shell_thickness = 0.;
     // Outer wall line width at the joint layer, scaled.
     coord_t line_width             = 0;
-    // Slicing tolerance, max(resolution, slice_closing_radius), scaled.
+    // Slicing tolerance (the G-code resolution), scaled.
     coord_t tolerance              = 0;
 };
 

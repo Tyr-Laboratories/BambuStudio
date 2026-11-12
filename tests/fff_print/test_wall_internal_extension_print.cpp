@@ -3,10 +3,13 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/ClipperUtils.hpp"
+#include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/RetractWhenCrossingPerimeters.hpp"
 
 #include <boost/filesystem.hpp>
 #include <cmath>
+#include <map>
 #include <set>
 
 using namespace Slic3r;
@@ -218,6 +221,184 @@ TEST_CASE("The wall extension adds no solid infill", "[WallExtension][Print]")
         CAPTURE(layers_with[i]->print_z);
         CHECK(solid_area(*layers_with[i]) <= solid_area(*layers_without[i]) + 0.05);
     }
+}
+
+namespace {
+// F (mm/min) of every extruding move under " FEATURE: <feature>", by layer print_z in tenths of a millimetre.
+std::map<int, std::set<int>> feature_speeds(const std::string &file, const DynamicPrintConfig &config, const std::string &feature)
+{
+    std::map<int, std::set<int>> out;
+    GCodeReader reader;
+    reader.apply_config(config);
+    std::string current;
+    double      z = 0.;
+    REQUIRE(reader.parse_file(file, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.rfind(" Z_HEIGHT: ", 0) == 0)
+            z = std::stod(std::string(comment.substr(11)));
+        if (const auto tag = comment.find(" FEATURE: "); tag != std::string_view::npos)
+            current = std::string(comment.substr(tag + 10));
+        if (current == feature && line.extruding(self) && line.dist_XY(self) > 0.)
+            out[int(std::lround(z * 10.))].insert(int(std::lround(line.new_F(self))));
+    }));
+    return out;
+}
+
+// Start of every outer wall, by layer print_z in tenths of a millimetre, rounded to 0.01 mm.
+std::map<int, std::set<std::pair<long, long>>> outer_wall_starts(const std::string &file, const DynamicPrintConfig &config)
+{
+    std::map<int, std::set<std::pair<long, long>>> out;
+    GCodeReader reader;
+    reader.apply_config(config);
+    std::string current;
+    bool        started = false;
+    double      z       = 0.;
+    REQUIRE(reader.parse_file(file, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.rfind(" Z_HEIGHT: ", 0) == 0)
+            z = std::stod(std::string(comment.substr(11)));
+        if (const auto tag = comment.find(" FEATURE: "); tag != std::string_view::npos) {
+            current = std::string(comment.substr(tag + 10));
+            started = false;
+        }
+        if (current == "Outer wall" && !started && line.extruding(self) && line.dist_XY(self) > 0.) {
+            out[int(std::lround(z * 10.))].insert({ std::lround(self.x() * 100.), std::lround(self.y() * 100.) });
+            started = true;
+        }
+    }));
+    return out;
+}
+
+DynamicPrintConfig gcode_config(double extension)
+{
+    DynamicPrintConfig config = extension_config(extension);
+    config.set_deserialize_strict({ {"inner_wall_speed", "77"}, {"bridge_speed", "23"}, {"filament_max_volumetric_speed", "100"},
+                                    {"slow_down_for_layer_cooling", "0"} });
+    return config;
+}
+}
+
+TEST_CASE("Fine layers still get the extension", "[WallExtension][Print]")
+{
+    Model model = boxes({ { { 30., 30., 4. }, { 0., 0., 0. } }, { { 10., 10., 2. }, { 10., 10., 4. } } });
+    DynamicPrintConfig config = extension_config(1.);
+    config.set_deserialize_strict({ {"layer_height", "0.04"} });
+    Print print;
+    slice(print, model, config);
+    CHECK_FALSE(extension_layers(print).empty());
+}
+
+TEST_CASE("The lowest extension layer prints at bridge speed in the G-code", "[WallExtension][Print][GCode]")
+{
+    PrintWorkspace workspace;
+    Model model = terrace();
+    const DynamicPrintConfig config = gcode_config(1.);
+    Print print;
+    slice(print, model, config);
+    const auto filename = (workspace.path / "bridge.gcode").string();
+    GCodeProcessorResult result;
+    print.export_gcode(filename, &result);
+    const auto speeds = feature_speeds(filename, config, "Wall extension");
+    REQUIRE(speeds.count(104) == 1);
+    CHECK(speeds.at(104) == std::set<int>{ 23 * 60 });
+    for (const auto &[z, f] : speeds)
+        if (z != 104) {
+            CAPTURE(z);
+            CHECK(f == std::set<int>{ 77 * 60 });
+        }
+}
+
+TEST_CASE("Wall extension lines slow down with height like the walls", "[WallExtension][Print][GCode]")
+{
+    PrintWorkspace workspace;
+    Model model = terrace();
+    DynamicPrintConfig config = gcode_config(1.);
+    config.set_deserialize_strict({ {"enable_height_slowdown", "1"}, {"slowdown_start_height", "1"}, {"slowdown_end_height", "2"},
+                                    {"slowdown_start_speed", "1000"}, {"slowdown_end_speed", "20"},
+                                    {"slowdown_start_acc", "100000"}, {"slowdown_end_acc", "100000"} });
+    Print print;
+    slice(print, model, config);
+    const auto filename = (workspace.path / "slowdown.gcode").string();
+    GCodeProcessorResult result;
+    print.export_gcode(filename, &result);
+    const auto speeds = feature_speeds(filename, config, "Wall extension");
+    REQUIRE_FALSE(speeds.empty());
+    for (const auto &[z, f] : speeds) {
+        CAPTURE(z);
+        CHECK(*f.rbegin() <= 20 * 60);
+    }
+}
+
+TEST_CASE("The wall extension does not move outer wall seams", "[WallExtension][Print][GCode]")
+{
+    PrintWorkspace workspace;
+    Model model = terrace();
+    std::map<int, std::set<std::pair<long, long>>> starts[2];
+    for (int e = 0; e < 2; ++e) {
+        const DynamicPrintConfig config = gcode_config(double(e));
+        Print print;
+        slice(print, model, config);
+        const auto filename = (workspace.path / ("seams" + std::to_string(e) + ".gcode")).string();
+        GCodeProcessorResult result;
+        print.export_gcode(filename, &result);
+        starts[e] = outer_wall_starts(filename, config);
+    }
+    CHECK(starts[0] == starts[1]);
+}
+
+TEST_CASE("Travel across wall extension lines does not count as crossing a wall", "[WallExtension][Print]")
+{
+    Model model = terrace();
+    Print print;
+    slice(print, model, extension_config(1.));
+    const Layer *layer = layer_at(print, 11.0), *tower_layer = layer_at(print, 12.2);
+    REQUIRE(layer != nullptr);
+    REQUIRE(tower_layer != nullptr);
+    REQUIRE_FALSE(extension_paths(*layer).empty());
+    // From the middle of the tower's footprint to 9 mm off it: across the extension and its chamfer, inside the box.
+    const Point centre = get_extents(tower_layer->lslices).center();
+    Polyline travel;
+    travel.points = { centre, centre + Point::new_scale(9., 0.) };
+    RetractWhenCrossingPerimeters checker;
+    CHECK(checker.travel_inside_internal_regions_no_wall_crossing(*layer, travel, 0, 0));
+}
+
+TEST_CASE("With slope walls on, the wall extension still adds no solid infill", "[WallExtension][Print]")
+{
+    // The box, a ridge beside it whose sloped faces get slope walls up to the box's top, and the tower.
+    auto ridge_terrace = [] {
+        TriangleMesh mesh(its_make_cube(30., 30., 12.));
+        TriangleMesh ridge(its_make_prism(10., 30., 14.));
+        ridge.translate(34., 15., 0.);
+        mesh.merge(ridge);
+        TriangleMesh tower(its_make_cube(10., 10., 6.));
+        tower.translate(10., 10., 12.);
+        mesh.merge(tower);
+        Model model;
+        auto *object = model.add_object();
+        object->add_volume(std::move(mesh));
+        object->add_instance()->set_offset(Vec3d(80., 80., 0.));
+        return model;
+    };
+    Model model = ridge_terrace();
+    Print without, with;
+    DynamicPrintConfig config0 = extension_config(0.), config1 = extension_config(1.);
+    config0.set_deserialize_strict({ {"extra_wall_slope_angle", "15"} });
+    config1.set_deserialize_strict({ {"extra_wall_slope_angle", "15"} });
+    slice(without, model, config0);
+    slice(with, model, config1);
+    const auto &layers_without = without.get_object(size_t(0))->layers();
+    const auto &layers_with    = with.get_object(size_t(0))->layers();
+    REQUIRE(layers_without.size() == layers_with.size());
+    bool both_on_one_layer = false;
+    for (size_t i = 0; i < layers_with.size(); ++i) {
+        CAPTURE(layers_with[i]->print_z);
+        CHECK(solid_area(*layers_with[i]) <= solid_area(*layers_without[i]) + 0.05);
+        both_on_one_layer |= !extension_paths(*layers_with[i]).empty() &&
+            std::any_of(layers_with[i]->regions().begin(), layers_with[i]->regions().end(),
+                        [](const LayerRegion *region) { return region->has_slope_wall_reinforcement; });
+    }
+    CHECK(both_on_one_layer);
 }
 
 TEST_CASE("Extension 0 or spiral vase adds nothing", "[WallExtension][Print]")

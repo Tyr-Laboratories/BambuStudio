@@ -128,6 +128,7 @@ TEST_CASE("Only walls strictly steeper than 45 degrees and at least E tall quali
         { -0.2,    15, false },   // 45 degree ramp above the step
         { -0.55,   15, false },   // 20 degree slope: every layer steps in again
         { 0.,      2,  false },   // 0.4 mm lip
+        { 0.,      4,  false },   // 0.8 mm: one layer short of E
         { 0.,      5,  true  },   // exactly 1.0 mm tall
     }));
     CAPTURE(step, count, expected);
@@ -136,6 +137,57 @@ TEST_CASE("Only walls strictly steeper than 45 degrees and at least E tall quali
         outlines.push_back({ centred_square(10., 10., 5. + step * k) });
     const auto layers = stack(outlines);
     CHECK(find_joints(layers, 15, outer_lines(outlines[15]), settings()).empty() != expected);
+}
+
+TEST_CASE("An extension of one layer still needs the wall above to be steep", "[WallExtension][Joints]")
+{
+    // A 15 degree skin: every layer steps in by 0.2 / tan(15) = 0.746 mm, so every layer's wall stands on the one below.
+    std::vector<ExPolygons> skin;
+    for (int k = 0; k < 20; ++k)
+        skin.push_back({ centred_square(15., 15., 15. - 0.746 * k) });
+    const auto layers = stack(skin);
+    for (size_t l = 1; l + 1 < layers.size(); ++l) {
+        CAPTURE(l);
+        CHECK(find_joints(layers, l, outer_lines(skin[l]), settings(0.2)).empty());
+    }
+    // A vertical tower is still a joint with such a short extension.
+    const auto tower = stack(concat(repeat(box20, 15), repeat(tower10, 15)));
+    CHECK(find_joints(tower, 15, outer_lines(tower10), settings(0.2)).size() == 1);
+}
+
+TEST_CASE("A loop that only partly qualifies stays one line across its seam", "[WallExtension][Joints]")
+{
+    // The tower is flush with the box's left side, so only its other three sides stand on the box's top surface.
+    const ExPolygons flush_tower { rect(0., 5., 10., 15.) };
+    const auto layers = stack(concat(repeat(box20, 15), repeat(flush_tower, 15)));
+    // The loop starts at a corner inside the qualifying part, as a wall's seam often does.
+    Polyline loop;
+    loop.points = { Point::new_scale(9.775, 5.225), Point::new_scale(9.775, 14.775), Point::new_scale(0.225, 14.775),
+                    Point::new_scale(0.225, 5.225), Point::new_scale(9.775, 5.225) };
+    const auto joints = find_joints(layers, 15, Polylines{ loop }, settings());
+    REQUIRE(joints.size() == 1);
+    CHECK(joints.front().lines.size() == 1);
+}
+
+TEST_CASE("A one-line fin gets its extension and both chamfers as one area", "[WallExtension][Joints]")
+{
+    // A 0.6 mm fin printed as one line along its middle.
+    const ExPolygons fin { rect(9.7, 5., 10.3, 15.) };
+    const auto layers = stack(concat(repeat(box20, 30), repeat(fin, 15)));
+    Polyline middle;
+    middle.points = { Point::new_scale(10., 5.3), Point::new_scale(10., 14.7) };
+    const auto joints = find_joints(layers, 30, Polylines{ middle }, settings());
+    REQUIRE(joints.size() == 1);
+    // Layer 25 is just under the shell: a 1 mm chamfer on each side of the 0.45 mm line, with nothing between them.
+    const ExPolygons area = extension_area(layers, joints, 25).all;
+    CHECK(area.size() == 1);
+    const double across = [&] {
+        double a = 0.;
+        for (const ExPolygon &e : intersection_ex(area, ExPolygons{ rect(5., 9.9, 15., 10.1) }))
+            a += e.area();
+        return a * SCALING_FACTOR * SCALING_FACTOR / 0.2;
+    }();
+    CHECK(across == Approx(line_w + 2. * 1.0).margin(0.03));
 }
 
 TEST_CASE("A wall line deep inside the outline is not an outer wall", "[WallExtension][Joints]")

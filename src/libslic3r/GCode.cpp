@@ -7063,7 +7063,8 @@ bool GCode::slowDownByHeight(double& maxSpeed, double& maxAcc, const ExtrusionPa
     double currentHeight = this->m_layer->print_z;
     bool do_slowdown_by_height = NOZZLE_CONFIG(enable_height_slowdown);
 
-    if (path.role() > erNone && path.role() <= erGapFill) {}
+    // Wall extension lines are walls, but their role comes after the range.
+    if ((path.role() > erNone && path.role() <= erGapFill) || path.role() == erWallExtension) {}
     else do_slowdown_by_height = false;
 
     if (do_slowdown_by_height) {
