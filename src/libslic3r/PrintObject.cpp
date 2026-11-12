@@ -1628,6 +1628,9 @@ bool PrintObject::invalidate_state_by_config_options(
                 steps.emplace_back(posSupportMaterial);
                 steps.emplace_back(posDetectOverhangsForLift);
             }
+            if (opt_key == "wall_internal_extension")
+                // The extension's cut-outs change the bridge areas support reads.
+                steps.emplace_back(posSupportMaterial);
         } else if (opt_key == "gap_infill_speed" || opt_key == "filter_out_gap_fill") {
             // Return true if gap-fill speed has changed from zero value to non-zero or from non-zero value to zero.
             auto is_gap_fill_changed_state_due_to_speed = [&opt_key, &old_config, &new_config]() -> bool {

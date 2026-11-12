@@ -1,6 +1,7 @@
 #include <catch2/catch.hpp>
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
+#include "libslic3r/Layer.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -8,6 +9,7 @@
 #include <boost/filesystem.hpp>
 
 #include <algorithm>
+#include <cmath>
 
 using namespace Slic3r;
 
@@ -99,9 +101,55 @@ TEST_CASE("Changing wall internal extension regenerates walls but keeps the slic
     print.process();
     REQUIRE(print.get_object(size_t(0))->is_step_done(posPerimeters));
 
+    REQUIRE(print.get_object(size_t(0))->is_step_done(posSupportMaterial));
+
     config.set_deserialize_strict({{"wall_internal_extension", "2"}});
     print.apply(model, config);
     const auto *object_after = print.get_object(size_t(0));
     CHECK(object_after->is_step_done(posSlice));
     CHECK_FALSE(object_after->is_step_done(posPerimeters));
+    // Support reads bridge areas, which the extension's cut-outs can change.
+    CHECK_FALSE(object_after->is_step_done(posSupportMaterial));
+}
+
+TEST_CASE("A modifier that only changes wall internal extension adds no walls", "[WallExtension][Config]")
+{
+    DynamicPrintConfig config;
+    config.apply(static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
+    config.set_deserialize_strict({
+        {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"}, {"wall_loops", "1"},
+        {"wall_generator", "classic"}, {"brim_type", "no_brim"}, {"enable_arc_fitting", "0"},
+        {"wall_internal_extension", "1"}
+    });
+    Model model;
+    auto *object = model.add_object();
+    object->add_volume(TriangleMesh(its_make_cube(20., 20., 5.)));
+    // Covers the left half of the box; differs from the box only in wall_internal_extension.
+    TriangleMesh left_half(its_make_cube(12., 24., 7.));
+    left_half.translate(-2., -2., -1.);
+    auto *modifier = object->add_volume(std::move(left_half));
+    modifier->set_type(ModelVolumeType::PARAMETER_MODIFIER);
+    modifier->config.set("wall_internal_extension", 0.);
+    object->add_instance()->set_offset(Vec3d(80., 80., 0.));
+
+    Print print;
+    print.set_status_silent();
+    print.auto_assign_extruders(model.objects.front());
+    print.apply(model, config);
+    print.process();
+
+    // One outer wall around the box: the modifier's border gets no walls and the outer wall is not split there.
+    for (const Layer *layer : print.get_object(size_t(0))->layers()) {
+        if (std::abs(layer->print_z - 2.4) > EPSILON)
+            continue;
+        double outer_wall = 0.;
+        for (const LayerRegion *region : layer->regions())
+            for (const ExtrusionEntity *island : region->perimeters.entities)
+                for (const ExtrusionEntity *entity : static_cast<const ExtrusionEntityCollection *>(island)->entities)
+                    if (const auto *loop = dynamic_cast<const ExtrusionLoop *>(entity))
+                        for (const ExtrusionPath &path : loop->paths)
+                            if (path.role() == erExternalPerimeter)
+                                outer_wall += unscale<double>(path.polyline.length());
+        CHECK(outer_wall == Approx(4. * (20. - 0.45)).margin(1.));
+    }
 }
