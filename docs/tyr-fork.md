@@ -70,7 +70,7 @@ The slope setting is optional reinforcement, not a blanket suppression of bridge
 
 In **Strength > Walls**, enable Advanced settings and set **Wall internal extension** (`wall_internal_extension`) in millimetres. The default is **1 mm**. **0** disables the feature.
 
-Where an outer wall rises out of a top surface, a single layer bond at the corner holds it to the surface. The same is true where a wall ends under a bottom surface. This setting prints the wall's line on the layers on the other side of the surface too, inside the part: through the top or bottom shell and this distance beyond it. Above a bottom joint it starts on the layer after the bridge or overhang layer, so that bridge keeps its anchors on the part below.
+Where an outer wall rises out of a top surface, a single layer bond at the corner holds it to the surface. The same is true where a wall ends under a bottom surface. This setting prints the wall's line on the layers on the other side of the surface too, inside the part: through the top or bottom shell and this distance beyond it. It keeps out of the zone where a layer's exposed surfaces spread their fill into the part. So the top layer around the wall keeps its normal top surface, and a bridge or overhang keeps its anchors on the part below.
 
 A 45° chamfer fills the corner between that buried wall and the inside face of the shell. Next to the shell it is as wide as the setting, and it narrows by one layer height per layer. Under a top surface the chamfer hangs below the shell. Above a bottom surface it sits on top of the shell.
 

@@ -165,7 +165,8 @@ TEST_CASE("A tower's outer wall continues 1.8 mm into the box", "[WallExtension]
     Model model = terrace();
     Print print;
     slice(print, model, extension_config(1.));
-    CHECK(extension_layers(print) == tenths(104, 120));
+    // Down to 1.8 mm below the box's top; the top layer itself keeps its stock top surface.
+    CHECK(extension_layers(print) == tenths(104, 118));
 
     const Layer *box_layer = layer_at(print, 6.0), *tower_layer = layer_at(print, 12.2);
     REQUIRE(box_layer != nullptr);
@@ -203,8 +204,8 @@ TEST_CASE("A column's outer wall continues into the slab above the bridge layer,
 
 TEST_CASE("Fill never covers wall extension lines", "[WallExtension][Print]")
 {
-    // Nine layers under the tower; eight over the column, whose bridge layer has none.
-    for (auto [model, expected_layers] : { std::pair<Model, size_t>{ terrace(), 9 }, std::pair<Model, size_t>{ overhang(), 8 } }) {
+    // Eight layers under the tower, whose surface layer has none; eight over the column, whose bridge layer has none.
+    for (auto [model, expected_layers] : { std::pair<Model, size_t>{ terrace(), 8 }, std::pair<Model, size_t>{ overhang(), 8 } }) {
         Print print;
         slice(print, model, extension_config(1.));
         size_t layers_with_area = 0;
@@ -461,7 +462,7 @@ TEST_CASE("A one-line fin is extended", "[WallExtension][Print]")
     Model model = boxes({ { { 30., 30., 6. }, { 0., 0., 0. } }, { { 0.6, 20., 5. }, { 14.7, 5., 6. } } });
     Print print;
     slice(print, model, extension_config(1.));
-    CHECK(extension_layers(print) == tenths(44, 60));
+    CHECK(extension_layers(print) == tenths(44, 58));
 }
 
 TEST_CASE("A rib standing on a sloped skin is extended along its base", "[WallExtension][Print]")
@@ -522,7 +523,7 @@ TEST_CASE("The classic wall generator gets the same extension", "[WallExtension]
     config.set_deserialize_strict({ {"wall_generator", "classic"} });
     Print print;
     slice(print, model, config);
-    CHECK(extension_layers(print) == tenths(104, 120));
+    CHECK(extension_layers(print) == tenths(104, 118));
 }
 
 TEST_CASE("On a thin plate the extension stops above the bed", "[WallExtension][Print]")
@@ -530,7 +531,8 @@ TEST_CASE("On a thin plate the extension stops above the bed", "[WallExtension][
     Model model = boxes({ { { 30., 30., 1. }, { 0., 0., 0. } }, { { 10., 10., 5. }, { 10., 10., 1. } } });
     Print print;
     slice(print, model, extension_config(1.));
-    CHECK(extension_layers(print) == std::set<int>{ 4, 6, 8, 10 });
+    // The plate's top layer (1.0) keeps its top surface; layer 0.2 is the first layer.
+    CHECK(extension_layers(print) == std::set<int>{ 4, 6, 8 });
 }
 
 TEST_CASE("Depth is measured in millimetres with variable layer heights", "[WallExtension][Print]")
@@ -539,8 +541,9 @@ TEST_CASE("Depth is measured in millimetres with variable layer heights", "[Wall
     model.objects.front()->layer_config_ranges[{ 9., 12. }].set("layer_height", 0.1);
     Print print;
     slice(print, model, extension_config(1.));
-    // Four 0.1 mm top layers make a 0.4 mm shell; the extension goes through it and 1 mm further.
-    CHECK(heights_with_extension(print) == Approx(0.4 + 1.0).margin(0.1));
+    // Four 0.1 mm top layers make a 0.4 mm shell; the extension goes through it, but for its top layer, which keeps its
+    // top surface, and 1 mm further.
+    CHECK(heights_with_extension(print) == Approx(0.4 - 0.1 + 1.0).margin(0.05));
 }
 
 TEST_CASE("Two close towers print their shared chamfer once", "[WallExtension][Print]")
@@ -686,6 +689,39 @@ TEST_CASE("A bridge over a bottom joint keeps its anchors and direction", "[Wall
         CHECK(actual[i].first == Approx(expected[i].first).epsilon(0.01));
         CHECK(actual[i].second == Approx(expected[i].second).margin(1e-3));
     }
+}
+
+TEST_CASE("A tube through a thin flange keeps the flange's bridge anchors", "[WallExtension][Print]")
+{
+    // A 10 x 10 column through a 30 x 30 flange 1 mm thick: the column's wall rising above the flange is a top joint
+    // whose extension reaches the flange's first layer, a bridge anchored on the column.
+    Model model = boxes({ { { 10., 10., 12. }, { 10., 10., 0. } }, { { 30., 30., 1. }, { 0., 0., 6. } } });
+    Print without, with;
+    slice(without, model, extension_config(0.));
+    slice(with, model, extension_config(1.));
+    REQUIRE_FALSE(extension_layers(with).empty());
+    const Layer *bridge_without = layer_at(without, 6.2), *bridge_with = layer_at(with, 6.2);
+    REQUIRE(bridge_without != nullptr);
+    REQUIRE(bridge_with != nullptr);
+    CHECK(extension_paths(*bridge_with).empty());
+    REQUIRE(surface_area(*bridge_without, stBottomBridge) > 100.);
+    CHECK(surface_area(*bridge_with, stBottomBridge) == Approx(surface_area(*bridge_without, stBottomBridge)).epsilon(0.005));
+}
+
+TEST_CASE("The top surface around a tower is the same as without the extension", "[WallExtension][Print]")
+{
+    // The box's top surface runs a little under the tower's wall, as top surfaces do; the extension starts below it.
+    Model model = terrace();
+    Print without, with;
+    slice(without, model, extension_config(0.));
+    slice(with, model, extension_config(1.));
+    const Layer *top_without = layer_at(without, 12.0), *top_with = layer_at(with, 12.0);
+    REQUIRE(top_without != nullptr);
+    REQUIRE(top_with != nullptr);
+    CHECK(extension_paths(*top_with).empty());
+    REQUIRE(surface_area(*top_without, stTop) > 100.);
+    CHECK(surface_area(*top_with, stTop) == Approx(surface_area(*top_without, stTop)).epsilon(0.005));
+    CHECK_FALSE(extension_paths(*layer_at(with, 11.8)).empty());
 }
 
 TEST_CASE("On slope-wall layers the extension lines do not widen top surfaces", "[WallExtension][Print]")

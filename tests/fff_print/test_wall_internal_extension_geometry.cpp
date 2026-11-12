@@ -301,8 +301,8 @@ TEST_CASE("Over a column the extension rises through the bottom shell and 1 mm a
     for (size_t l = 0; l < layers.size(); ++l) {
         CAPTURE(l);
         const ExtensionArea a = extension_area(layers, joints, l);
-        // Layer 30, the bridge layer, stays as it is so the bridge keeps its anchors on the column.
-        CHECK(a.all.empty() == (l < 31 || l > 38));
+        // The area reaches layer 30, the bridge layer; apply() keeps it out of the bridge's anchor zone there.
+        CHECK(a.all.empty() == (l < 30 || l > 38));
         CHECK(a.hanging.empty());
         if (a.all.empty())
             continue;

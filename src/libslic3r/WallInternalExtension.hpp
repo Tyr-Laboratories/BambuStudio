@@ -102,8 +102,7 @@ struct ExtensionArea
 };
 
 // Area at `target_layer` covered by the extension lines and 45 degree chamfers of `joints`. A top joint's extension
-// reaches down to shell_depth + extension below the surface, a bottom joint's up to the same distance above it, starting
-// above the bridge or overhang layer, which keeps its anchors on the lower part. The
+// reaches down to shell_depth + extension below the surface, a bottom joint's up to the same distance above it. The
 // chamfer lies on the layers beyond the shell, on the surface side only: as wide as the extension next to the shell,
 // narrowing by one layer height per layer to nothing at the extension's far end.
 ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std::vector<Joint> &joints, size_t target_layer);

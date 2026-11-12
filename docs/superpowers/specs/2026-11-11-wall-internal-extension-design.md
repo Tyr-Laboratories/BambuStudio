@@ -52,7 +52,7 @@ The fix is a woodworking joint. The wall is started before it breaks out onto th
               lower part (inside)
 ```
 
-- Copies of the qualifying part of the joint line go on every layer from the surface layer down to (shell depth + E) below the surface, at the same XY position.
+- Copies of the qualifying part of the joint line go on every layer from the surface layer down to (shell depth + E) below the surface, at the same XY position. On the surface layer the exposed-surface rule (under "Extension (bottom joint)") keeps the top surface's stock fill beside the wall, so in practice the copies start one layer below it.
 - On each layer a copy is kept only where it is inside the part. It is clipped:
   - to that layer's slice;
   - so it does not overlap that layer's own wall lines (it stops where it meets them);
@@ -63,7 +63,9 @@ The fix is a woodworking joint. The wall is started before it breaks out onto th
 
 ### Extension (bottom joint)
 
-The mirror image. Copies go on every layer from the second layer above the joint up to (bottom shell depth + E) above the surface. The first layer above the joint, the bridge or overhang layer, gets no copy: a copy there would part the bridge from the fill over the lower part, so BambuStudio's bridge detection would find no anchors and change the bridge, which is the outside of the part *(ruling during implementation)*. The same clipping applies; in particular, a copy is never printed where it would show on a top surface. Every copy stands on the line below it.
+The mirror image. Copies go on every layer from the first layer above the joint (the bridge or overhang layer) up to (bottom shell depth + E) above the surface, subject to the exposed-surface rule below, which keeps them off the bridge or overhang layer.
+
+**Exposed surfaces keep their stock fill** *(ruling during implementation)*. On every layer, a copy stays out of the zone where that layer's exposed top surfaces (nothing above) and bridges or overhangs (nothing below) spread their fill into the part: within the stock expansion of external surfaces (the walls' width × √2, as `process_external_surfaces` expands them) of those surfaces. So the surface layer of a top joint keeps its top surface running a little under the wall, a bottom joint's bridge or overhang layer keeps its anchors on the lower part, and so does the bridge layer of a thin plate that a top joint's extension reaches. Without this, the fill stopped at the copy: visible notches in the top surface along the wall, and bridges that BambuStudio's bridge detection found unanchored. The same clipping applies; in particular, a copy is never printed where it would show on a top surface. Every copy stands on the line below it.
 
 ```
              upper part (inside)
@@ -75,7 +77,7 @@ The mirror image. Copies go on every layer from the second layer above the joint
             |X|==================   bottom shell, 0.8 mm
             |X|==================
             |X|==================
-            ====================   bridge / overhang layer (over air), no copy
+            ====================   bridge / overhang layer (over air): no copy in its anchor zone
  -----------|W|
             |W|   lower part
 ```
@@ -96,7 +98,7 @@ The mirror image. Copies go on every layer from the second layer above the joint
   - On each target layer, lines are printed only where the region at that spot also has E above 0.
   - They are printed by that region, with its wall filament, inner-wall and bridge settings and outer-wall line width. That way no tool change is added.
   - So E = 0 on a part or modifier is an off switch for that volume: no extension starts from its walls, and none is printed inside it.
-- **No other change.** The cut-outs must not trigger extra solid infill anywhere. The specific trap is "ensure vertical shell thickness" (on by default): it would treat the cut-out as a wall and add solid infill around and under it (`discover_vertical_shells`). Bridges in a bottom joint keep their anchors on the lower part: the extension starts on the layer above them.
+- **No other change.** The cut-outs must not trigger extra solid infill anywhere. The specific trap is "ensure vertical shell thickness" (on by default): it would treat the cut-out as a wall and add solid infill around and under it (`discover_vertical_shells`). Exposed top surfaces, bridges and overhangs keep their stock fill (see the exposed-surface rule).
 - What sits there today: under a rising wall, "ensure vertical shell thickness" can turn the footprint of the wall above into solid infill for up to three layers. Its regularisation step deletes regions narrower than about 0.65 of a solid line, so whether that band survives depends on the infill-wall overlap; this is unverified for the Heimdall preset. Wherever such a band exists, the extension takes its place. The added material is otherwise the extension lines plus the chamfer.
 
 ## Line type and printing

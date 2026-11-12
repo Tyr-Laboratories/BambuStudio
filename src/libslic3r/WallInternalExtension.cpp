@@ -247,9 +247,7 @@ ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std
                 chamfer = std::clamp(target.print_z - (surface.bottom_z - reach), 0., joint.extension);
             deepest = target_layer == 0 || surface.bottom_z - layers[target_layer - 1].bottom_z > reach + EPSILON;
         } else {
-            // The first layer above a bottom joint is its bridge or overhang layer. It stays as it is, so the bridge keeps
-            // its anchors on the lower part; the extension starts on the layer above.
-            if (target_layer <= joint.layer + 1)
+            if (target_layer <= joint.layer)
                 continue;
             const double depth = target.print_z - surface.print_z;
             if (depth > reach + EPSILON)
@@ -387,6 +385,23 @@ ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const ExPo
     return out;
 }
 
+namespace {
+
+// How far the fill of an exposed top or bottom surface or of a bridge spreads into the part, as
+// LayerRegion::process_external_surfaces() expands it: the width of the region's walls, times sqrt(2).
+float external_surface_expansion(const LayerRegion &region)
+{
+    const int loops = region.region().config().wall_loops.value;
+    if (loops <= 0)
+        return float(SCALED_EPSILON);
+    const Flow  external    = region.flow(frExternalPerimeter);
+    const Flow  perimeter   = region.flow(frPerimeter);
+    const float shell_width = 0.5f * external.scaled_width() + external.scaled_spacing() + perimeter.scaled_spacing() * float(loops - 1);
+    return shell_width * float(std::sqrt(2.));
+}
+
+} // namespace
+
 void apply(PrintObject &object)
 {
     LayerPtrs &layers = object.layers();
@@ -497,11 +512,25 @@ void apply(PrintObject &object)
             if (area.all.empty())
                 continue;
             area.all = intersection_ex(area.all, intersection_ex(layers[l - 1]->lslices, layers[l + 1]->lslices));
+            if (area.all.empty())
+                continue;
+            // This layer's exposed surfaces: top surfaces, with nothing above, and bridges and overhangs, with nothing
+            // below. Their fill spreads into the part by the stock expansion of external surfaces, to run under the wall
+            // above or to anchor a bridge on what carries it. The extension stays out of that zone, so these surfaces
+            // print as they do without it.
+            Polygons exposed = to_polygons(diff_ex(layers[l]->lslices, layers[l + 1]->lslices));
+            polygons_append(exposed, to_polygons(diff_ex(layers[l]->lslices, layers[l - 1]->lslices)));
             const LayerRegionPtrs &regions = layers[l]->regions();
             areas[l].assign(regions.size(), ExPolygons());
-            for (size_t r = 0; r < regions.size(); ++r)
-                if (regions[r]->region().config().wall_internal_extension.value > 0.)
-                    areas[l][r] = intersection_ex(area.all, regions[r]->fill_no_overlap_expolygons);
+            for (size_t r = 0; r < regions.size(); ++r) {
+                const LayerRegion &region = *regions[r];
+                if (region.region().config().wall_internal_extension.value <= 0.)
+                    continue;
+                ExPolygons own = intersection_ex(area.all, region.fill_no_overlap_expolygons);
+                if (!own.empty() && !exposed.empty())
+                    own = diff_ex(own, offset(exposed, external_surface_expansion(region)));
+                areas[l][r] = std::move(own);
+            }
             hanging[l] = std::move(area.hanging);
         }
     });
