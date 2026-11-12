@@ -23,14 +23,14 @@ The fix is a woodworking joint. The wall is started before it breaks out onto th
 5. **Both top and bottom joints** are covered by the same setting.
 6. **Which joints qualify** (approved after the user reviewed six example joints):
    - (a) The joint line stands entirely on the surface. For a top joint, it does not overlap the wall lines of the layer below; it sits over that layer's infill or solid fill. For a bottom joint, the layer above has no wall line over it.
-   - (b) Moving away from the surface, the wall stays strictly steeper than 45° for at least E: less than one layer height of sideways movement per layer, leaning either way. That means upward from a top joint and downward from a bottom joint. A wall at exactly 45° is left alone *(my call, settling a contradiction found by the builder check)*.
+   - (b) Moving away from the surface, the wall stays strictly steeper than 45° for at least E, leaning either way: at every height up to E above (or below) the joint, it has moved sideways less than that height. That means upward from a top joint and downward from a bottom joint. A wall at exactly 45° is left alone *(my call, settling a contradiction found by the builder check)*. The test is a 45° cone measured from the joint, not a check of each layer against the one below *(ruling during implementation)*: a short vertical lip that continues as a 30–40° ramp still qualifies. The comparison allows for the G-code `resolution`, the only setting that moves straight walls between layers.
 
    Extended: vertical walls; walls leaning in or out by less than 45° from vertical; pockets (a hole's walls rising from the pocket floor); thin fins printed as one or two lines.
    Left alone: 45° ramps; gently sloped skins where every layer steps in (each layer's wall stands on the surface, but nothing rises straight up); lips and raised text shorter than E.
    Pieces of a joint line shorter than one outer-wall line width are dropped *(my call)*.
 7. **One new preview line type covers both the extension lines and the chamfer lines.** It has its own colour, visibility toggle, and time and filament statistics in the preview legend, like the existing line types.
 8. **The lowest extension layer under a top surface is printed like an internal bridge.** At that layer the extension and chamfer lines have only sparse infill below them; at 3% cubic, the infill lines are up to ~46 mm apart. So the lines there use bridge flow, speed, acceleration and fan, the way internal bridges over sparse infill are printed. They still show as "Wall extension". Every line that stands on a wall or extension line below prints normally. This is the case for all bottom-joint extension layers and all top-joint layers above the lowest.
-9. **Walls rising out of curved or sloped skins count too.** A rib or fin standing on a curved fuselage or wing skin is extended piece by piece, on every layer where part of its outer wall line stands on the skin and the wall rises steeper than 45°. Material is added only along such wall bases, never under bare skin. There is no separate flatness test.
+9. **Walls rising out of curved or sloped skins count too.** A rib or fin standing on a curved fuselage or wing skin is extended piece by piece, on every layer where part of its outer wall line stands on the skin and the wall rises steeper than 45°. Material is added only along such wall bases, never under bare skin. There is no separate flatness test. **Limit** *(ruling during implementation)*: where the skin slopes more than about 15° along the rib, each layer's new piece of the rib's wall is shorter than the wall corner below it. It therefore rests mostly on that wall, does not stand on the surface, and is not extended.
 
 ## Geometry
 
@@ -114,7 +114,7 @@ The mirror image. Copies go on every layer from the first layer above the joint 
 
 - Key `wall_internal_extension`, label "Wall internal extension", millimetres, range 0–10 *(range is my call)*; **0 turns the feature off**.
 - Tooltip in plain words: it starts outer walls that rise out of (or end under) flat surfaces inside the part, through the shell and this far beyond it, with a 45° chamfer, to strengthen the joint.
-- A per-region setting (`PrintRegionConfig`), like `wall_loops`: in the process preset under **Strength → Walls**, and overridable per object, part and modifier. It is saved in presets and 3MF projects. Regions with different values must not be merged into one perimeter group.
+- A per-region setting (`PrintRegionConfig`), like `wall_loops`: in the process preset under **Strength → Walls**, and overridable per object, part and modifier. It is saved in presets and 3MF projects. Regions that differ only in this setting still share one perimeter group, so a modifier that only changes it adds no walls at its border. The extension assigns joint lines to regions by the regions' slices *(changed after review)*.
 - Disabled in spiral vase mode *(my call, as for other wall features)*.
 - **Consequence of the 1 mm default (the user's decision):** every new and existing project gets the extension when sliced, because projects saved without the key load the default.
 
