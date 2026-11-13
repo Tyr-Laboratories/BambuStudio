@@ -728,10 +728,13 @@ coord_t SkeletalTrapezoidation::boundaryBeadCount(node_t *node, coord_t thicknes
             });
             // Keep enough candidates for short painted patches even if no
             // Voronoi node projects onto the patch itself.
-            auto [cached, inserted] = m_source_segment_count.try_emplace(std::make_pair(source.a, source.b), 0);
-            if (inserted)
-                for (const auto &span : wall_policy->split(source)) cached->second = std::max(cached->second, span.second);
-            const int count = cached->second;
+            int count = 0;
+            if (auto cached = m_source_segment_count.find(std::make_pair(source.a, source.b)); cached != m_source_segment_count.end())
+                count = cached->second;
+            else {
+                for (const auto &span : wall_policy->split(source)) count = std::max(count, span.second);
+                m_source_segment_count.emplace(std::make_pair(source.a, source.b), count);
+            }
             if (known == sources.end()) sources.emplace_back(source, count);
             else known->second = std::max(known->second, count);
         }

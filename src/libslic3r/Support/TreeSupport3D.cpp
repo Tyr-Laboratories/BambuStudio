@@ -5712,6 +5712,39 @@ static Polygons intersection_if_any(const Polygons &a, const Polygons &b)
     return a.empty() || b.empty() ? Polygons{} : intersection(a, b);
 }
 
+static const Polygons no_polygons;
+
+// Helpers of the foundation walks that keep the parts of a layer overlapping what the next layer kept.
+// The polygons of all parts, in their order: what a layer keeps when it keeps every part.
+static Polygons polygons_of_parts(const ExPolygons &parts)
+{
+    Polygons out;
+    for (const ExPolygon &part : parts)
+        append(out, to_polygons(part));
+    return out;
+}
+// Whether each part overlaps `next`.
+static std::vector<char> parts_overlapping(const ExPolygons &parts, const Polygons &next)
+{
+    std::vector<char> keep(parts.size());
+    for (size_t j = 0; j < parts.size(); ++j)
+        keep[j] = ! polygons_disjoint(to_polygons(parts[j]), next);
+    return keep;
+}
+static bool all_parts_kept(const std::vector<char> &keep)
+{
+    return std::all_of(keep.begin(), keep.end(), [](char k) { return k != 0; });
+}
+// The polygons of the kept parts, in their order.
+static Polygons polygons_of_kept_parts(const ExPolygons &parts, const std::vector<char> &keep)
+{
+    Polygons out;
+    for (size_t j = 0; j < parts.size(); ++j)
+        if (keep[j])
+            append(out, to_polygons(parts[j]));
+    return out;
+}
+
 // Validate physical stems rather than individual graph nodes: neighboring seam
 // sections may join into one stem, while isolated stems need their own feet.
 static bool foundation_components_have_multiple_feet(
@@ -6604,8 +6637,16 @@ void organic_draw_branches(
             // The decisions, the order they are taken in and the first failure are those of the serial walk.
             std::vector<char> unpermitted_contact(num_layers, 0);
             std::vector<std::vector<char>> unsupported(num_layers);
+            // The walk below fails at the latest on the lowest layer with an unpermitted contact: layers above
+            // it are never read, so they are not clipped or tested.
+            std::atomic<size_t> first_unpermitted{ num_layers };
+            // Fill the collision cache in order first, so the parallel clipping below only reads it.
+            for (LayerIndex physical = base; physical <= seam; ++physical)
+                reverse_volumes.getCollision(0, seam - physical, true);
             tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
                 for (size_t i = range.begin(); i < range.end(); ++i) {
+                    if (i > first_unpermitted.load(std::memory_order_relaxed))
+                        continue;
                     const LayerIndex physical = base + LayerIndex(i);
                     const Polygons &collision = reverse_volumes.getCollision(0, seam - physical, true);
                     candidate[i] = intersection(diff_clipped(candidate[i], collision), volumes.m_bed_area);
@@ -6617,8 +6658,11 @@ void organic_draw_branches(
                     if (! tip_contacts[i].empty())
                         if (const double unpermitted = area(intersection(tip_contacts[i], offset(
                                 volumes.getUnpaintedRestingAreas(physical, get_extents(tip_contacts[i])), - float(config.resolution))));
-                            unpermitted > tiny_area_threshold)
+                            unpermitted > tiny_area_threshold) {
                             unpermitted_contact[i] = 1;
+                            for (size_t first = first_unpermitted.load(); i < first && ! first_unpermitted.compare_exchange_weak(first, i);)
+                                ;
+                        }
                     candidate_parts[i] = union_ex(candidate[i]);
                     throw_on_cancel();
                 }
@@ -6633,8 +6677,9 @@ void organic_draw_branches(
             };
             tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
                 for (size_t i = range.begin(); i < range.end(); ++i) {
-                    static const Polygons nothing;
-                    unsupported[i] = unsupported_parts(i, i == 0 ? nothing : candidate[i - 1]);
+                    if (i >= first_unpermitted.load(std::memory_order_relaxed))
+                        continue;
+                    unsupported[i] = unsupported_parts(i, i == 0 ? no_polygons : candidate[i - 1]);
                     throw_on_cancel();
                 }
             });
@@ -6674,54 +6719,34 @@ void organic_draw_branches(
             // layer that dropped a part. Kept parts are appended in their order either way.
             Polygons connected_feet;
             {
-                auto all_of_parts = [](const ExPolygons &parts) {
-                    Polygons out;
-                    for (const ExPolygon &part : parts)
-                        append(out, to_polygons(part));
-                    return out;
-                };
-                auto keep_flags = [](const ExPolygons &parts, const Polygons &above) {
-                    std::vector<char> keep(parts.size());
-                    for (size_t j = 0; j < parts.size(); ++j)
-                        keep[j] = ! polygons_disjoint(to_polygons(parts[j]), above);
-                    return keep;
-                };
-                auto all_kept = [](const std::vector<char> &flags) { return std::all_of(flags.begin(), flags.end(), [](char f) { return f != 0; }); };
-                auto kept_of  = [](const ExPolygons &parts, const std::vector<char> &flags) {
-                    Polygons out;
-                    for (size_t j = 0; j < parts.size(); ++j)
-                        if (flags[j])
-                            append(out, to_polygons(parts[j]));
-                    return out;
-                };
                 std::vector<ExPolygons>        branch_parts(num_layers);
                 std::vector<Polygons>          all_parts(num_layers), all_branch_parts(num_layers);
                 std::vector<std::vector<char>> keep(num_layers), keep_branch(num_layers);
                 tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
                     for (size_t i = range.begin(); i < range.end(); ++i) {
-                        all_parts[i]        = all_of_parts(candidate_parts[i]);
+                        all_parts[i]        = polygons_of_parts(candidate_parts[i]);
                         branch_parts[i]     = union_ex(branch_material[i]);
-                        all_branch_parts[i] = all_of_parts(branch_parts[i]);
+                        all_branch_parts[i] = polygons_of_parts(branch_parts[i]);
                         throw_on_cancel();
                     }
                 });
                 tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
                     for (size_t i = range.begin(); i < range.end(); ++i) {
-                        keep[i]        = keep_flags(candidate_parts[i], i + 1 == num_layers ? join_centers : all_parts[i + 1]);
-                        keep_branch[i] = keep_flags(branch_parts[i], i + 1 == num_layers ? join_centers : all_branch_parts[i + 1]);
+                        keep[i]        = parts_overlapping(candidate_parts[i], i + 1 == num_layers ? join_centers : all_parts[i + 1]);
+                        keep_branch[i] = parts_overlapping(branch_parts[i], i + 1 == num_layers ? join_centers : all_branch_parts[i + 1]);
                         throw_on_cancel();
                     }
                 });
                 bool above_as_assumed = true, above_branches_as_assumed = true;
                 for (size_t i = num_layers; i-- > 0;) {
                     if (! above_as_assumed)
-                        keep[i] = keep_flags(candidate_parts[i], candidate[i + 1]);
+                        keep[i] = parts_overlapping(candidate_parts[i], candidate[i + 1]);
                     if (! above_branches_as_assumed)
-                        keep_branch[i] = keep_flags(branch_parts[i], branch_material[i + 1]);
-                    above_as_assumed          = all_kept(keep[i]);
-                    above_branches_as_assumed = all_kept(keep_branch[i]);
-                    candidate[i]       = above_as_assumed ? all_parts[i] : kept_of(candidate_parts[i], keep[i]);
-                    branch_material[i] = above_branches_as_assumed ? all_branch_parts[i] : kept_of(branch_parts[i], keep_branch[i]);
+                        keep_branch[i] = parts_overlapping(branch_parts[i], branch_material[i + 1]);
+                    above_as_assumed          = all_parts_kept(keep[i]);
+                    above_branches_as_assumed = all_parts_kept(keep_branch[i]);
+                    candidate[i]       = above_as_assumed ? all_parts[i] : polygons_of_kept_parts(candidate_parts[i], keep[i]);
+                    branch_material[i] = above_branches_as_assumed ? all_branch_parts[i] : polygons_of_kept_parts(branch_parts[i], keep_branch[i]);
                     throw_on_cancel();
                 }
                 // The contacts and feet follow what each layer kept; nothing above reads them.
@@ -7161,8 +7186,7 @@ void organic_draw_branches(
                     for (size_t i = range.begin(); i < range.end() && ! failed.load(std::memory_order_relaxed); ++i) {
                         throw_on_cancel();
                         foundation_parts[i] = union_ex(foundation[i]);
-                        static const Polygons nothing;
-                        const Polygons &below = i == 0 ? nothing : foundation[i - 1];
+                        const Polygons &below = i == 0 ? no_polygons : foundation[i - 1];
                         for (const ExPolygon &part : foundation_parts[i]) {
                             const Polygons polygon = to_polygons(part);
                             if (polygons_disjoint(polygon, below) && polygons_disjoint(polygon, foundation_contacts[i])) {
@@ -7181,63 +7205,43 @@ void organic_draw_branches(
                 // below a layer that did drop a part. Kept parts are appended in their order either way.
                 const size_t n     = foundation.size();
                 const Polygons top = foundation.back();
-                auto all_of_parts = [](const ExPolygons &parts) {
-                    Polygons out;
-                    for (const ExPolygon &part : parts)
-                        append(out, to_polygons(part));
-                    return out;
-                };
-                auto keep_flags = [](const ExPolygons &parts, const Polygons &above) {
-                    std::vector<char> keep(parts.size());
-                    for (size_t j = 0; j < parts.size(); ++j)
-                        keep[j] = ! polygons_disjoint(to_polygons(parts[j]), above);
-                    return keep;
-                };
                 std::vector<Polygons>          all_parts(n), all_branch_parts(n);
                 std::vector<ExPolygons>        branch_parts(n);
                 std::vector<std::vector<char>> keep(n), keep_branch(n);
                 tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t> &range) {
                     for (size_t i = range.begin(); i < range.end(); ++i) {
                         throw_on_cancel();
-                        all_parts[i]        = all_of_parts(foundation_parts[i]);
+                        all_parts[i]        = polygons_of_parts(foundation_parts[i]);
                         branch_parts[i]     = union_ex(intersection_if_any(foundation_branches[i], all_parts[i]));
-                        all_branch_parts[i] = all_of_parts(branch_parts[i]);
+                        all_branch_parts[i] = polygons_of_parts(branch_parts[i]);
                     }
                 });
                 tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t> &range) {
                     for (size_t i = range.begin(); i < range.end(); ++i) {
                         throw_on_cancel();
-                        keep[i]        = keep_flags(foundation_parts[i], i + 1 == n ? top : all_parts[i + 1]);
-                        keep_branch[i] = keep_flags(branch_parts[i], i + 1 == n ? top : all_branch_parts[i + 1]);
+                        keep[i]        = parts_overlapping(foundation_parts[i], i + 1 == n ? top : all_parts[i + 1]);
+                        keep_branch[i] = parts_overlapping(branch_parts[i], i + 1 == n ? top : all_branch_parts[i + 1]);
                     }
                 });
-                auto all_kept = [](const std::vector<char> &flags) { return std::all_of(flags.begin(), flags.end(), [](char f) { return f != 0; }); };
-                auto kept_of  = [](const ExPolygons &parts, const std::vector<char> &flags) {
-                    Polygons out;
-                    for (size_t j = 0; j < parts.size(); ++j)
-                        if (flags[j])
-                            append(out, to_polygons(parts[j]));
-                    return out;
-                };
                 // Whether what the layer above kept is what the speculative tests assumed.
                 bool     above_as_assumed = true, above_branches_as_assumed = true;
                 Polygons connected = top, connected_branches = top;
                 for (size_t i = n; i-- > 0;) {
                     throw_on_cancel();
                     if (! above_as_assumed)
-                        keep[i] = keep_flags(foundation_parts[i], connected);
-                    const bool all_parts_kept = all_kept(keep[i]);
-                    foundation[i] = all_parts_kept ? all_parts[i] : kept_of(foundation_parts[i], keep[i]);
-                    if (! all_parts_kept)
+                        keep[i] = parts_overlapping(foundation_parts[i], connected);
+                    const bool kept_all_parts = all_parts_kept(keep[i]);
+                    foundation[i] = kept_all_parts ? all_parts[i] : polygons_of_kept_parts(foundation_parts[i], keep[i]);
+                    if (! kept_all_parts)
                         branch_parts[i] = union_ex(intersection_if_any(foundation_branches[i], foundation[i]));
-                    if (! all_parts_kept || ! above_branches_as_assumed)
-                        keep_branch[i] = keep_flags(branch_parts[i], connected_branches);
-                    const bool all_branches_kept = all_kept(keep_branch[i]);
-                    foundation_branches[i] = all_parts_kept && all_branches_kept ? all_branch_parts[i] : kept_of(branch_parts[i], keep_branch[i]);
+                    if (! kept_all_parts || ! above_branches_as_assumed)
+                        keep_branch[i] = parts_overlapping(branch_parts[i], connected_branches);
+                    const bool kept_all_branches = all_parts_kept(keep_branch[i]);
+                    foundation_branches[i] = kept_all_parts && kept_all_branches ? all_branch_parts[i] : polygons_of_kept_parts(branch_parts[i], keep_branch[i]);
                     connected_branches = foundation_branches[i];
                     connected = foundation[i];
-                    above_as_assumed          = all_parts_kept;
-                    above_branches_as_assumed = all_parts_kept && all_branches_kept;
+                    above_as_assumed          = kept_all_parts;
+                    above_branches_as_assumed = kept_all_parts && kept_all_branches;
                 }
                 // The contacts and feet follow what each layer kept; nothing above reads them.
                 tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t> &range) {
