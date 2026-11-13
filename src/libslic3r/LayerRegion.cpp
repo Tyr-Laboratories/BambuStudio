@@ -582,9 +582,11 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
             shell_width=float(SCALED_EPSILON);
             expansion_min=float(SCALED_EPSILON);
             // shell_width keeps only the largest distance. The distance to any one border line bounds the
-            // distance to the nearest one from above, so a point whose distance to the line nearest the last
-            // measured point stays more than a unit (far more than the rounding of either distance) below
-            // what it would need to raise shell_width is not looked up in the tree: shell_width is unchanged.
+            // distance to the nearest one from above (the tree's leaves use the same distance function and
+            // its exact integer boxes only prune lines no nearer than the result), so a point whose distance
+            // to the line nearest the last measured point stays a unit below what would raise shell_width is
+            // not looked up in the tree. float(d) of such a point rounds to at most shell_width, which only
+            // grows, so shell_width is unchanged.
             size_t last_nearest=size_t(-1);
             // Compatible regions share their emitted perimeter collection on
             // one owner. A modifier can enable slope walls while that owner's

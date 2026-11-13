@@ -5690,10 +5690,11 @@ static void smooth_organic_forest(
 }
 
 // intersection(a, b).empty(), without running Clipper where the answer is plain: when one of
-// them is empty, or no polygon of b has a bounding box touching a's. The polygons must have points.
-// Clipper sweeps along Y. A polygon of b that lies wholly above or below a never shares a scanbeam
-// with a and puts no scanbeam boundary inside a's Y range, so it cannot add or remove any part of
-// the intersection: Clipper runs only on the polygons of b that reach a's Y range.
+// them is empty, or no polygon of b has a bounding box touching a's. Then no edge of a meets an
+// edge of b and Clipper's result is empty too. get_extents(a) leaves out polygons with a zero
+// width or height box; that is safe only because Clipper drops such collinear paths as well.
+// Otherwise Clipper runs on all of a and b: leaving out polygons of b far from a is NOT exact,
+// as it can reorder Clipper's local minima at equal Y and so decide zero-area contacts differently.
 static bool polygons_disjoint(const Polygons &a, const Polygons &b)
 {
     if (a.empty() || b.empty())
