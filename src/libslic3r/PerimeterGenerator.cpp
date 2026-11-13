@@ -1616,7 +1616,10 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
     for (ExPolygon &ex : infill_contour)
         ex.simplify_p(m_scaled_resolution, &inner_pp);
 
-    ExPolygons fill = offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.), float(insert + min_perimeter_infill_spacing / 2.));
+    // offset2_ex(E, d1, d2) is offset_ex(offset(E, d1), d2). All the offsets below start from the same union
+    // shrunk by the same d1, so that first offset is done once.
+    const Polygons inner_shrunk = offset(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.));
+    ExPolygons fill = offset_ex(inner_shrunk, float(insert + min_perimeter_infill_spacing / 2.));
     if (material != nullptr)
         fill = intersection_ex(fill, ExPolygons{*material});
     this->fill_surfaces->append(fill, stInternal);
@@ -1624,8 +1627,7 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
         if (bridge_insert == insert)
             append(*this->bridge_fill, fill);
         else {
-            ExPolygons bridge_exp = offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.),
-                float(bridge_insert + min_perimeter_infill_spacing / 2.));
+            ExPolygons bridge_exp = offset_ex(inner_shrunk, float(bridge_insert + min_perimeter_infill_spacing / 2.));
             if (material != nullptr)
                 bridge_exp = intersection_ex(bridge_exp, ExPolygons{*material});
             append(*this->bridge_fill, std::move(bridge_exp));
@@ -1633,7 +1635,7 @@ void PerimeterGenerator::add_infill_contour_for_arachne( ExPolygons        infil
         }
     }
 
-    append(*this->fill_no_overlap, offset2_ex(union_ex(inner_pp), float(-min_perimeter_infill_spacing / 2.), float(+min_perimeter_infill_spacing / 2.)));
+    append(*this->fill_no_overlap, offset_ex(inner_shrunk, float(+min_perimeter_infill_spacing / 2.)));
 }
 
 Arachne::WallToolPathsParams make_wall_tool_paths_params(const PrintObjectConfig &object_config, const PrintConfig &print_config)
