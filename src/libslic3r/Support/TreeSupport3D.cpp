@@ -5698,25 +5698,10 @@ static bool polygons_disjoint(const Polygons &a, const Polygons &b)
 {
     if (a.empty() || b.empty())
         return true;
-    const BoundingBox   box_a = get_extents(a);
-    std::vector<size_t> in_band;
-    bool                touches = false;
-    for (size_t i = 0; i < b.size(); ++ i) {
-        const BoundingBox box = get_extents(b[i]);
-        if (box.max.y() >= box_a.min.y() && box.min.y() <= box_a.max.y()) {
-            in_band.emplace_back(i);
-            touches |= box.max.x() >= box_a.min.x() && box.min.x() <= box_a.max.x();
-        }
-    }
-    if (! touches)
+    const BoundingBox box_a = get_extents(a);
+    if (std::none_of(b.begin(), b.end(), [&box_a](const Polygon &polygon) { return get_extents(polygon).overlap(box_a); }))
         return true;
-    if (in_band.size() == b.size())
-        return intersection(a, b).empty();
-    Polygons b_in_band;
-    b_in_band.reserve(in_band.size());
-    for (size_t i : in_band)
-        b_in_band.emplace_back(b[i]);
-    return intersection(a, b_in_band).empty();
+    return intersection(a, b).empty();
 }
 
 // intersection(a, b), without running Clipper when one of them is empty.
