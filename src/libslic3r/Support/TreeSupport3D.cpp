@@ -6906,17 +6906,27 @@ void organic_draw_branches(
     };
     auto tree_anchor = [&](const Tree &tree, const std::function<const Polygons&(LayerIndex)> &section) {
         TreeAnchor anchor;
+        // Each layer's rest is found on its own, in parallel, then gathered in layer order.
+        std::vector<Polygons> layer_rests(tree.slices.size());
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, tree.slices.size()), [&](const tbb::blocked_range<size_t> &range) {
+            for (size_t i = range.begin(); i < range.end(); ++ i) {
+                const LayerIndex layer = tree.first_layer_id + LayerIndex(i);
+                const Polygons  &here  = section(layer);
+                if (here.empty())
+                    continue;
+                BoundingBox window = get_extents(here);
+                window.offset(SCALED_EPSILON);
+                layer_rests[i] = intersection(here, ClipperUtils::clip_clipper_polygons_with_subject_bbox(
+                    volumes.getPlaceableAreas(0, layer, throw_on_cancel), window));
+            }
+        });
         for (size_t i = 0; i < tree.slices.size(); ++ i) {
             const LayerIndex layer = tree.first_layer_id + LayerIndex(i);
-            const Polygons  &here  = section(layer);
-            if (here.empty())
+            if (section(layer).empty())
                 continue;
             anchor.top = layer;
-            BoundingBox window = get_extents(here);
-            window.offset(SCALED_EPSILON);
-            if (Polygons rests = intersection(here, ClipperUtils::clip_clipper_polygons_with_subject_bbox(
-                    volumes.getPlaceableAreas(0, layer, throw_on_cancel), window)); ! rests.empty()) {
-                append(anchor.area, std::move(rests));
+            if (! layer_rests[i].empty()) {
+                append(anchor.area, std::move(layer_rests[i]));
                 anchor.bottom = std::min(anchor.bottom, layer);
             }
         }
