@@ -31,6 +31,7 @@
 #include "TreeSupport.hpp"
 #include "I18N.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <mutex>
@@ -6281,8 +6282,8 @@ void organic_draw_branches(
             base >= tree.first_layer_id + LayerIndex(tree.slices.size()))
             continue;
         if (const Polygons &base_slice = tree.slices[base - tree.first_layer_id].polygons;
-            intersection(base_slice, volumes.getPlaceableAreas(0, base, throw_on_cancel)).empty() &&
-            (! config.painted_bases_only || intersection(base_slice, volumes.getPaintedBaseSurface(base)).empty()))
+            polygons_disjoint(base_slice, volumes.getPlaceableAreas(0, base, throw_on_cancel)) &&
+            (! config.painted_bases_only || polygons_disjoint(base_slice, volumes.getPaintedBaseSurface(base))))
             continue;
         LayerIndex highest_tip = base;
         LayerIndex lowest_tip = std::numeric_limits<LayerIndex>::max();
@@ -6594,31 +6595,61 @@ void organic_draw_branches(
             // Validate the actual clipped material, not just graph connectivity.
             // Every component must grow from a permitted foot or overlap material in
             // the preceding physical layer. A failed candidate leaves the old tree.
-            Polygons grounded_below;
             // The parts of each layer, kept for the walk back from the seam.
             std::vector<ExPolygons> candidate_parts(candidate.size());
-            for (LayerIndex physical = base; physical <= seam; ++physical) {
-                const size_t i = size_t(physical - base);
-                const Polygons &collision = reverse_volumes.getCollision(0, seam - physical, true);
-                candidate[i] = intersection(diff_clipped(candidate[i], collision), volumes.m_bed_area);
-                branch_material[i] = intersection(diff_clipped(branch_material[i], collision), volumes.m_bed_area);
-                tip_contacts[i] = intersection_if_any(candidate[i], tip_contacts[i]);
-                // A contact may reach past its thin landing band, over lower parts of
-                // a slope, but where it rests on the model within the bottom gap it
-                // must rest on paint. Clipped contacts may stray by the slice resolution.
-                if (! tip_contacts[i].empty())
-                    if (const double unpermitted = area(intersection(tip_contacts[i], offset(
-                            volumes.getUnpaintedRestingAreas(physical, get_extents(tip_contacts[i])), - float(config.resolution))));
-                        unpermitted > tiny_area_threshold) {
-                        return false;
-                    }
+            const size_t num_layers = size_t(seam - base + 1);
+            // Each layer is clipped on its own, so all layers are clipped in parallel. Each part is then tested
+            // against the layer below, which only changes where a sliver was dropped from it: the tests run in
+            // parallel against the layers as clipped, and again in order only above a layer that dropped one.
+            // The decisions, the order they are taken in and the first failure are those of the serial walk.
+            std::vector<char> unpermitted_contact(num_layers, 0);
+            std::vector<std::vector<char>> unsupported(num_layers);
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t i = range.begin(); i < range.end(); ++i) {
+                    const LayerIndex physical = base + LayerIndex(i);
+                    const Polygons &collision = reverse_volumes.getCollision(0, seam - physical, true);
+                    candidate[i] = intersection(diff_clipped(candidate[i], collision), volumes.m_bed_area);
+                    branch_material[i] = intersection(diff_clipped(branch_material[i], collision), volumes.m_bed_area);
+                    tip_contacts[i] = intersection_if_any(candidate[i], tip_contacts[i]);
+                    // A contact may reach past its thin landing band, over lower parts of
+                    // a slope, but where it rests on the model within the bottom gap it
+                    // must rest on paint. Clipped contacts may stray by the slice resolution.
+                    if (! tip_contacts[i].empty())
+                        if (const double unpermitted = area(intersection(tip_contacts[i], offset(
+                                volumes.getUnpaintedRestingAreas(physical, get_extents(tip_contacts[i])), - float(config.resolution))));
+                            unpermitted > tiny_area_threshold)
+                            unpermitted_contact[i] = 1;
+                    candidate_parts[i] = union_ex(candidate[i]);
+                    throw_on_cancel();
+                }
+            });
+            auto unsupported_parts = [&](size_t i, const Polygons &below) {
+                std::vector<char> out(candidate_parts[i].size());
+                for (size_t j = 0; j < candidate_parts[i].size(); ++j) {
+                    const Polygons polygon = to_polygons(candidate_parts[i][j]);
+                    out[j] = polygons_disjoint(polygon, below) && polygons_disjoint(polygon, tip_contacts[i]);
+                }
+                return out;
+            };
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t i = range.begin(); i < range.end(); ++i) {
+                    static const Polygons nothing;
+                    unsupported[i] = unsupported_parts(i, i == 0 ? nothing : candidate[i - 1]);
+                    throw_on_cancel();
+                }
+            });
+            bool below_dropped = false;
+            for (size_t i = 0; i < num_layers; ++i) {
+                if (unpermitted_contact[i])
+                    return false;
+                if (below_dropped)
+                    unsupported[i] = unsupported_parts(i, candidate[i - 1]);
                 // Clipping can leave slivers no support line can print: drop those.
                 // Anything else growing from nothing rejects the foundation.
-                candidate_parts[i] = union_ex(candidate[i]);
                 bool dropped = false;
-                for (auto part = candidate_parts[i].begin(); part != candidate_parts[i].end();) {
-                    const Polygons polygon = to_polygons(*part);
-                    if (polygons_disjoint(polygon, grounded_below) && polygons_disjoint(polygon, tip_contacts[i])) {
+                size_t j = 0;
+                for (auto part = candidate_parts[i].begin(); part != candidate_parts[i].end(); ++j) {
+                    if (unsupported[i][j]) {
                         if (! offset(*part, -0.5f * float(config.support_line_width)).empty())
                             return false;
                         part = candidate_parts[i].erase(part);
@@ -6630,34 +6661,78 @@ void organic_draw_branches(
                     candidate[i] = to_polygons(candidate_parts[i]);
                     branch_material[i] = intersection_if_any(branch_material[i], candidate[i]);
                 }
-                grounded_below = candidate[i];
+                below_dropped = dropped;
                 throw_on_cancel();
             }
             // A foot that terminates in a clipped dead end cannot brace the seam.
             // Walk back from the seam and retain/count only its connected material.
-            Polygons connected_above = join_centers, branches_above = join_centers;
+            // A continuous interface band must not make a clipped-away stem
+            // count as a second foundation branch. Trace the branch material
+            // independently of interfaces back to the midpoint.
+            // Each layer keeps the parts overlapping what the layer above kept. That rarely drops anything, so
+            // every layer is tested in parallel against all of the layer above, and again in order only below a
+            // layer that dropped a part. Kept parts are appended in their order either way.
             Polygons connected_feet;
-            for (LayerIndex physical = seam; physical >= base; --physical) {
-                const size_t i = size_t(physical - base);
-                Polygons connected;
-                for (const ExPolygon &part : candidate_parts[i])
-                    if (! polygons_disjoint(to_polygons(part), connected_above))
-                        append(connected, to_polygons(part));
-                candidate[i] = std::move(connected);
-                tip_contacts[i] = intersection_if_any(tip_contacts[i], candidate[i]);
-                // A continuous interface band must not make a clipped-away stem
-                // count as a second foundation branch. Trace the branch material
-                // independently of interfaces back to the midpoint.
-                Polygons connected_branches;
-                for (const ExPolygon &part : union_ex(branch_material[i]))
-                    if (! polygons_disjoint(to_polygons(part), branches_above))
-                        append(connected_branches, to_polygons(part));
-                branch_feet[i] = intersection_if_any(branch_feet[i], connected_branches);
-                append(connected_feet, branch_feet[i]);
-                branch_material[i] = connected_branches;
-                branches_above = std::move(connected_branches);
-                connected_above = candidate[i];
-                throw_on_cancel();
+            {
+                auto all_of_parts = [](const ExPolygons &parts) {
+                    Polygons out;
+                    for (const ExPolygon &part : parts)
+                        append(out, to_polygons(part));
+                    return out;
+                };
+                auto keep_flags = [](const ExPolygons &parts, const Polygons &above) {
+                    std::vector<char> keep(parts.size());
+                    for (size_t j = 0; j < parts.size(); ++j)
+                        keep[j] = ! polygons_disjoint(to_polygons(parts[j]), above);
+                    return keep;
+                };
+                auto all_kept = [](const std::vector<char> &flags) { return std::all_of(flags.begin(), flags.end(), [](char f) { return f != 0; }); };
+                auto kept_of  = [](const ExPolygons &parts, const std::vector<char> &flags) {
+                    Polygons out;
+                    for (size_t j = 0; j < parts.size(); ++j)
+                        if (flags[j])
+                            append(out, to_polygons(parts[j]));
+                    return out;
+                };
+                std::vector<ExPolygons>        branch_parts(num_layers);
+                std::vector<Polygons>          all_parts(num_layers), all_branch_parts(num_layers);
+                std::vector<std::vector<char>> keep(num_layers), keep_branch(num_layers);
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++i) {
+                        all_parts[i]        = all_of_parts(candidate_parts[i]);
+                        branch_parts[i]     = union_ex(branch_material[i]);
+                        all_branch_parts[i] = all_of_parts(branch_parts[i]);
+                        throw_on_cancel();
+                    }
+                });
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++i) {
+                        keep[i]        = keep_flags(candidate_parts[i], i + 1 == num_layers ? join_centers : all_parts[i + 1]);
+                        keep_branch[i] = keep_flags(branch_parts[i], i + 1 == num_layers ? join_centers : all_branch_parts[i + 1]);
+                        throw_on_cancel();
+                    }
+                });
+                bool above_as_assumed = true, above_branches_as_assumed = true;
+                for (size_t i = num_layers; i-- > 0;) {
+                    if (! above_as_assumed)
+                        keep[i] = keep_flags(candidate_parts[i], candidate[i + 1]);
+                    if (! above_branches_as_assumed)
+                        keep_branch[i] = keep_flags(branch_parts[i], branch_material[i + 1]);
+                    above_as_assumed          = all_kept(keep[i]);
+                    above_branches_as_assumed = all_kept(keep_branch[i]);
+                    candidate[i]       = above_as_assumed ? all_parts[i] : kept_of(candidate_parts[i], keep[i]);
+                    branch_material[i] = above_branches_as_assumed ? all_branch_parts[i] : kept_of(branch_parts[i], keep_branch[i]);
+                    throw_on_cancel();
+                }
+                // The contacts and feet follow what each layer kept; nothing above reads them.
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++i) {
+                        tip_contacts[i] = intersection_if_any(tip_contacts[i], candidate[i]);
+                        branch_feet[i]  = intersection_if_any(branch_feet[i], branch_material[i]);
+                    }
+                });
+                for (size_t i = num_layers; i-- > 0;)
+                    append(connected_feet, branch_feet[i]);
             }
             // A graph seam node may contribute a single foot to a larger physical
             // stem. Count separated feet per connected stem after all contributions
@@ -7066,39 +7141,101 @@ void organic_draw_branches(
                 return std::nullopt;
             // Recheck ground-to-seam connectivity. Material
             // outside the connected foundation cannot count as a stabilizing foot.
-            Polygons connected;
             // The parts of each layer, kept for the walk back from the seam.
             std::vector<ExPolygons> foundation_parts(foundation.size());
-            for (size_t i = 0; valid && i < foundation.size(); ++i) {
-                throw_on_cancel();
-                foundation_parts[i] = union_ex(foundation[i]);
-                for (const ExPolygon &part : foundation_parts[i]) {
-                    const Polygons polygon = to_polygons(part);
-                    if (polygons_disjoint(polygon, connected) && polygons_disjoint(polygon, foundation_contacts[i])) {
-                        valid = false;
-                        break;
+            {
+                // Every part must overlap the layer below or a contact. Neither changes here, so the layers
+                // are checked in parallel; any failing layer fails the foundation, as the first one did.
+                std::atomic<bool> failed{ false };
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, foundation.size()), [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end() && ! failed.load(std::memory_order_relaxed); ++i) {
+                        throw_on_cancel();
+                        foundation_parts[i] = union_ex(foundation[i]);
+                        static const Polygons nothing;
+                        const Polygons &below = i == 0 ? nothing : foundation[i - 1];
+                        for (const ExPolygon &part : foundation_parts[i]) {
+                            const Polygons polygon = to_polygons(part);
+                            if (polygons_disjoint(polygon, below) && polygons_disjoint(polygon, foundation_contacts[i])) {
+                                failed = true;
+                                break;
+                            }
+                        }
                     }
-                }
-                connected = foundation[i];
+                });
+                valid = ! failed;
             }
-            connected = foundation.back();
-            Polygons connected_branches = foundation.back();
-            for (size_t i = foundation.size(); valid && i-- > 0;) {
-                throw_on_cancel();
-                Polygons kept;
-                for (const ExPolygon &part : foundation_parts[i])
-                    if (! polygons_disjoint(to_polygons(part), connected))
-                        append(kept, to_polygons(part));
-                foundation[i] = std::move(kept);
-                foundation_contacts[i] = intersection_if_any(foundation_contacts[i], foundation[i]);
-                Polygons kept_branches;
-                for (const ExPolygon &part : union_ex(intersection_if_any(foundation_branches[i], foundation[i])))
-                    if (! polygons_disjoint(to_polygons(part), connected_branches))
-                        append(kept_branches, to_polygons(part));
-                foundation_feet[i] = intersection_if_any(foundation_feet[i], kept_branches);
-                foundation_branches[i] = kept_branches;
-                connected_branches = std::move(kept_branches);
-                connected = foundation[i];
+            if (valid) {
+                // Walk back from the seam: a part is kept only where it overlaps what the layer above kept, and
+                // the same for the branches. The layer above rarely drops anything, so each layer is first
+                // tested in parallel against everything the layer above has, and tested again in order only
+                // below a layer that did drop a part. Kept parts are appended in their order either way.
+                const size_t n     = foundation.size();
+                const Polygons top = foundation.back();
+                auto all_of_parts = [](const ExPolygons &parts) {
+                    Polygons out;
+                    for (const ExPolygon &part : parts)
+                        append(out, to_polygons(part));
+                    return out;
+                };
+                auto keep_flags = [](const ExPolygons &parts, const Polygons &above) {
+                    std::vector<char> keep(parts.size());
+                    for (size_t j = 0; j < parts.size(); ++j)
+                        keep[j] = ! polygons_disjoint(to_polygons(parts[j]), above);
+                    return keep;
+                };
+                std::vector<Polygons>          all_parts(n), all_branch_parts(n);
+                std::vector<ExPolygons>        branch_parts(n);
+                std::vector<std::vector<char>> keep(n), keep_branch(n);
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++i) {
+                        throw_on_cancel();
+                        all_parts[i]        = all_of_parts(foundation_parts[i]);
+                        branch_parts[i]     = union_ex(intersection_if_any(foundation_branches[i], all_parts[i]));
+                        all_branch_parts[i] = all_of_parts(branch_parts[i]);
+                    }
+                });
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++i) {
+                        throw_on_cancel();
+                        keep[i]        = keep_flags(foundation_parts[i], i + 1 == n ? top : all_parts[i + 1]);
+                        keep_branch[i] = keep_flags(branch_parts[i], i + 1 == n ? top : all_branch_parts[i + 1]);
+                    }
+                });
+                auto all_kept = [](const std::vector<char> &flags) { return std::all_of(flags.begin(), flags.end(), [](char f) { return f != 0; }); };
+                auto kept_of  = [](const ExPolygons &parts, const std::vector<char> &flags) {
+                    Polygons out;
+                    for (size_t j = 0; j < parts.size(); ++j)
+                        if (flags[j])
+                            append(out, to_polygons(parts[j]));
+                    return out;
+                };
+                // Whether what the layer above kept is what the speculative tests assumed.
+                bool     above_as_assumed = true, above_branches_as_assumed = true;
+                Polygons connected = top, connected_branches = top;
+                for (size_t i = n; i-- > 0;) {
+                    throw_on_cancel();
+                    if (! above_as_assumed)
+                        keep[i] = keep_flags(foundation_parts[i], connected);
+                    const bool all_parts_kept = all_kept(keep[i]);
+                    foundation[i] = all_parts_kept ? all_parts[i] : kept_of(foundation_parts[i], keep[i]);
+                    if (! all_parts_kept)
+                        branch_parts[i] = union_ex(intersection_if_any(foundation_branches[i], foundation[i]));
+                    if (! all_parts_kept || ! above_branches_as_assumed)
+                        keep_branch[i] = keep_flags(branch_parts[i], connected_branches);
+                    const bool all_branches_kept = all_kept(keep_branch[i]);
+                    foundation_branches[i] = all_parts_kept && all_branches_kept ? all_branch_parts[i] : kept_of(branch_parts[i], keep_branch[i]);
+                    connected_branches = foundation_branches[i];
+                    connected = foundation[i];
+                    above_as_assumed          = all_parts_kept;
+                    above_branches_as_assumed = all_parts_kept && all_branches_kept;
+                }
+                // The contacts and feet follow what each layer kept; nothing above reads them.
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, n), [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++i) {
+                        foundation_contacts[i] = intersection_if_any(foundation_contacts[i], foundation[i]);
+                        foundation_feet[i]     = intersection_if_any(foundation_feet[i], foundation_branches[i]);
+                    }
+                });
             }
             if (!valid || !foundation_components_have_multiple_feet(foundation_branches, foundation_feet, throw_on_cancel))
                 return std::nullopt;
