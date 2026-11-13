@@ -82,6 +82,19 @@ class SkeletalTrapezoidation
     const BeadingStrategy& beading_strategy;
     const WallPainting::BoundaryPolicy *wall_policy;
 
+    // Largest wall count wall_policy->split() gives along a boundary source segment, by the segment's end
+    // points. The policy does not change during one trapezoidation, while every Voronoi node along an input
+    // edge asks for the same segment, so boundaryBeadCount() splits each segment once.
+    struct SourceSegmentHash {
+        size_t operator()(const std::pair<Point, Point> &s) const {
+            uint64_t h = 14695981039346656037ull;
+            for (coord_t v : { s.first.x(), s.first.y(), s.second.x(), s.second.y() })
+                h = (h ^ uint64_t(uint32_t(v))) * 1099511628211ull;
+            return size_t(h);
+        }
+    };
+    mutable ankerl::unordered_dense::map<std::pair<Point, Point>, int, SourceSegmentHash> m_source_segment_count;
+
 public:
     using Segment  = PolygonsSegmentIndex;
     using NodeSet = ankerl::unordered_dense::set<node_t *>;
