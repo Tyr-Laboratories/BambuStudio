@@ -33,6 +33,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <mutex>
 #include <optional>
 #include <stdio.h>
 #include <string>
@@ -4481,11 +4482,13 @@ static void organic_lightning_infill(
     // contours[L] carries the outer boundary and the hole rims, so a hole-interior overhang sample
     // grounds onto the surrounding support ring (Layer::getBestGroundingLocation scans every ring).
     std::vector<ExPolygons> support_ex(num_layers);
-    for (size_t layer_idx = 0; layer_idx < num_layers; ++ layer_idx) {
-        support_ex[layer_idx] = support_at(layer_idx);
-        contours[layer_idx]   = to_polygons(support_ex[layer_idx]);
-        throw_on_cancel();
-    }
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+            support_ex[layer_idx] = support_at(layer_idx);
+            contours[layer_idx]   = to_polygons(support_ex[layer_idx]);
+            throw_on_cancel();
+        }
+    });
 
     // ---- Internal-void ("floating") detection -------------------------------------------------------
     // Organic trunks print a sheath only (outer contour + hole rims). The filled support_ex is a lie
@@ -4519,22 +4522,26 @@ static void organic_lightning_infill(
     auto to_mm2 = [](double a) -> double { return a * 1e-10; };
     double dbg_feed_area = 0.; int dbg_feed_layers = 0;
 #endif
-    // sheath[L] is sheath_below for layer L+1; keep the previous result instead of recomputing.
-    Polygons sheath_below;
-    for (size_t layer_idx = 1; layer_idx < num_layers; ++ layer_idx) {
-        throw_on_cancel();
-        Polygons sheath_here = sheath_of(support_ex[layer_idx]);
-        if (sheath_here.empty()) {
-            sheath_below.clear();
-            continue;
+    // Every layer's sheath is computed once; layer L reads its own and the one of layer L - 1, so the
+    // layers are independent and are detected in parallel.
+    std::vector<Polygons> sheaths(num_layers);
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+            throw_on_cancel();
+            sheaths[layer_idx] = sheath_of(support_ex[layer_idx]);
         }
-        if (layer_idx == 1 || sheath_below.empty())
-            sheath_below = sheath_of(support_ex[layer_idx - 1]);
+    });
+    tbb::parallel_for(tbb::blocked_range<size_t>(1, std::max<size_t>(num_layers, 1)), [&](const tbb::blocked_range<size_t> &range) {
+      for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+        throw_on_cancel();
+        const Polygons &sheath_here  = sheaths[layer_idx];
+        if (sheath_here.empty())
+            continue;
+        const Polygons &sheath_below = sheaths[layer_idx - 1];
         const float support_tolerance = layer_support_tolerance(layer_idx);
         Polygons floating = sheath_below.empty()
             ? sheath_here
             : diff(sheath_here, offset(sheath_below, support_tolerance));
-        sheath_below = std::move(sheath_here);
         if (floating.empty())
             continue;
 
@@ -4588,17 +4595,18 @@ static void organic_lightning_infill(
         if (filtered.empty())
             continue;
         lightning_overhangs[layer_idx] = std::move(filtered);
-#ifdef LIGHTNING_INFILL_DEBUG
-        dbg_feed_area += area(lightning_overhangs[layer_idx]); ++ dbg_feed_layers;
-        LIGHTNING_DBG("[LIGHTNING-DETECT] layer=" << layer_idx
-            << " z=" << (intermediate_layers[layer_idx] ? intermediate_layers[layer_idx]->print_z : 0.)
-            << " floating_sheath(mm2)=" << to_mm2(area(floating))
-            << " fed(mm2)=" << to_mm2(area(lightning_overhangs[layer_idx]))
-            << " status=FED");
-#endif
-    }
+      }
+    });
 
 #ifdef LIGHTNING_INFILL_DEBUG
+    for (size_t layer_idx = 1; layer_idx < num_layers; ++ layer_idx)
+        if (! lightning_overhangs[layer_idx].empty()) {
+            dbg_feed_area += area(lightning_overhangs[layer_idx]); ++ dbg_feed_layers;
+            LIGHTNING_DBG("[LIGHTNING-DETECT] layer=" << layer_idx
+                << " z=" << (intermediate_layers[layer_idx] ? intermediate_layers[layer_idx]->print_z : 0.)
+                << " fed(mm2)=" << to_mm2(area(lightning_overhangs[layer_idx]))
+                << " status=FED");
+        }
     LIGHTNING_DBG("Lightning infill floating-sheath detection done. num_layers=" << num_layers
         << " feed_area_window(mm2)=[" << to_mm2(min_feed_area) << "," << to_mm2(max_feed_area) << "]"
         << " feed_layers=" << dbg_feed_layers << " feed_area(mm2)=" << to_mm2(dbg_feed_area));
@@ -4611,19 +4619,20 @@ static void organic_lightning_infill(
     // returning it forever and generateNewTrees would loop indefinitely. The detected voids already lie
     // inside the cross-section, but clip every fed overhang to its own layer's contour bounding box as a
     // defensive guarantee that the field always terminates.
-    int fed_layers = 0;
-    for (size_t layer_idx = 0; layer_idx < num_layers; ++ layer_idx) {
-        if (lightning_overhangs[layer_idx].empty())
-            continue;
-        const BoundingBox cb = get_extents(contours[layer_idx]);
-        if (contours[layer_idx].empty() || ! cb.defined) {
-            lightning_overhangs[layer_idx].clear();
-            continue;
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+            if (lightning_overhangs[layer_idx].empty())
+                continue;
+            const BoundingBox cb = get_extents(contours[layer_idx]);
+            if (contours[layer_idx].empty() || ! cb.defined) {
+                lightning_overhangs[layer_idx].clear();
+                continue;
+            }
+            lightning_overhangs[layer_idx] = intersection(lightning_overhangs[layer_idx], Polygons{ cb.polygon() });
         }
-        lightning_overhangs[layer_idx] = intersection(lightning_overhangs[layer_idx], Polygons{ cb.polygon() });
-        if (! lightning_overhangs[layer_idx].empty())
-            ++ fed_layers;
-    }
+    });
+    const int fed_layers = int(std::count_if(lightning_overhangs.begin(), lightning_overhangs.end(),
+        [](const Polygons &overhangs) { return ! overhangs.empty(); }));
 
 #ifdef LIGHTNING_INFILL_DEBUG
     {
@@ -4679,8 +4688,11 @@ static void organic_lightning_infill(
     int    dbg_line_layers = 0, dbg_kept_layers = 0;
     size_t dbg_total_lines = 0, dbg_kept_lines = 0;
     double dbg_kept_length = 0.;
+    std::mutex dbg_mutex;
 #endif
-    for (size_t layer_idx = 0; layer_idx < num_layers; ++ layer_idx) {
+    // Each layer's lines depend only on that layer's trees and footprint.
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, num_layers), [&](const tbb::blocked_range<size_t> &range) {
+      for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
         throw_on_cancel();
         // Clip to this layer's filled branch footprint minus the model. Filling the holes is required:
         // that is where the grounding network has to run, and clipping against the holed cross-section
@@ -4710,7 +4722,10 @@ static void organic_lightning_infill(
             continue;
         }
 #ifdef LIGHTNING_INFILL_DEBUG
-        ++ dbg_line_layers; dbg_total_lines += lines.size();
+        {
+            std::lock_guard<std::mutex> dbg_lock(dbg_mutex);
+            ++ dbg_line_layers; dbg_total_lines += lines.size();
+        }
 #endif
         lines.erase(std::remove_if(lines.begin(), lines.end(),
                                    [min_line_length](const Polyline &pl) { return pl.length() < min_line_length; }),
@@ -4720,6 +4735,7 @@ static void organic_lightning_infill(
 
         lightning_infill_lines[layer_idx] = chain_polylines(std::move(lines));
 #ifdef LIGHTNING_INFILL_DEBUG
+        std::lock_guard<std::mutex> dbg_lock(dbg_mutex);
         ++ dbg_kept_layers; dbg_kept_lines += lightning_infill_lines[layer_idx].size();
         double len = 0.;
         for (const Polyline &pl : lightning_infill_lines[layer_idx])
@@ -4736,7 +4752,8 @@ static void organic_lightning_infill(
             { union_ex(offset(lightning_infill_lines[layer_idx], half_line_width)), { "fill", "blue", 0.5f } }
         });
 #endif
-    }
+      }
+    });
 #ifdef LIGHTNING_INFILL_DEBUG
     LIGHTNING_DBG("Lightning infill generation done. line_layers=" << dbg_line_layers
         << " total_lines=" << dbg_total_lines
@@ -4794,6 +4811,8 @@ static void organic_lightning_infill(
     }
 #endif
 }
+
+static bool polygons_disjoint(const Polygons &a, const Polygons &b);
 
 /*!
  * \brief Close floating organic support faces left by model intrusion.
@@ -4941,7 +4960,7 @@ static void organic_support_floating_faces(
         // The model punched through the trunk, so the branch wraps around it and carries on:
         // base is still there above the top Z gap. An ordinary branch tip has nothing above.
         const size_t probe_idx = layer_idx + config.z_distance_top_layers + 2;
-        if (probe_idx >= num_layers || intersection(offset(foot, line_w), base_at(probe_idx)).empty())
+        if (probe_idx >= num_layers || polygons_disjoint(offset(foot, line_w), base_at(probe_idx)))
             continue;
 
         // Drop until every piece of the footprint has landed on a pipe / bottom contact /
@@ -6985,13 +7004,13 @@ void organic_draw_branches(
             std::vector<Polygons> &foundation_feet = combined.feet, &foundation_branches = combined.branches;
             bool valid = true;
             const Polygons &upper_section = upper_sections.front();
-            if (upper_section.empty() || intersection(foundation.back(), upper_section).empty())
+            if (upper_section.empty() || polygons_disjoint(foundation.back(), upper_section))
                 return std::nullopt;
             auto supported_sheath = [&](const Polygons &above, const Polygons &below) {
                 const Polygons &above_shell = section_shell(above).shell;
                 const Polygons &below_shell = section_shell(below).shell;
                 for (const ExPolygon &part : union_ex(above_shell))
-                    if (intersection(to_polygons(part), below_shell).empty())
+                    if (polygons_disjoint(to_polygons(part), below_shell))
                         return false;
                 const coord_t growth = config.maximum_move_distance + coord_t(std::ceil(config.branch_radius_increase_per_layer)) +
                     2 * config.resolution;
@@ -7340,7 +7359,7 @@ void organic_draw_branches(
                             if (neighbor_polys.empty())
                                 continue;
                             for (size_t j = 0; j < parts[i].size(); ++j)
-                                if (!keep[i][j] && !intersection(to_polygons(parts[i][j]), neighbor_polys).empty()) {
+                                if (!keep[i][j] && !polygons_disjoint(to_polygons(parts[i][j]), neighbor_polys)) {
                                     keep[i][j]     = 1;
                                     cache_dirty[i] = 1;
                                     changed        = true;
