@@ -1067,12 +1067,15 @@ void Clipper::Reset()
 {
   CLIPPERLIB_PROFILE_FUNC();
   ClipperBase::Reset();
-  m_Scanbeam = std::priority_queue<cInt>();
+  // ClipperBase::Reset() sorted the local minima by Y ascending.
+  std::vector<cInt> minima_ys;
+  minima_ys.reserve(m_MinimaList.size());
+  for (const LocalMinimum &lm : m_MinimaList)
+    minima_ys.push_back(lm.Y);
+  m_Scanbeam.reset(std::move(minima_ys));
   m_Maxima.clear();
   m_ActiveEdges = 0;
   m_SortedEdges = 0;
-  for (auto lm = m_MinimaList.rbegin(); lm != m_MinimaList.rend(); ++lm)
-    m_Scanbeam.push(lm->Y);
 }
 
 //------------------------------------------------------------------------------

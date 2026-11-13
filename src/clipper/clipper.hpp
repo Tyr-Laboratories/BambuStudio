@@ -50,6 +50,8 @@
 //use_deprecated: Enables temporary support for the obsolete functions
 //#define use_deprecated  
 
+#include <algorithm>
+#include <queue>
 #include <vector>
 #include <deque>
 #include <stdexcept>
@@ -385,6 +387,31 @@ protected:
 };
 //------------------------------------------------------------------------------
 
+// The Y coordinates of the scanbeams still to sweep, popped from the largest, duplicates included: a max priority
+// queue. The local minima's Ys are all known, sorted, when the sweep starts, so they are read from a sorted array;
+// only the edge tops pushed during the sweep go through a binary heap, which therefore stays small. top() and pop()
+// see the same multiset of Ys as one priority queue holding all of them would.
+class ScanbeamList
+{
+public:
+  // sorted_minima must be sorted ascending.
+  void reset(std::vector<cInt> &&sorted_minima) { m_minima = std::move(sorted_minima); m_heap = std::priority_queue<cInt>(); }
+  void push(const cInt y) { m_heap.push(y); }
+  bool empty() const { return m_minima.empty() && m_heap.empty(); }
+  cInt top() const { return m_minima.empty() ? m_heap.top() : m_heap.empty() ? m_minima.back() : std::max(m_minima.back(), m_heap.top()); }
+  void pop() {
+    if (! m_minima.empty() && (m_heap.empty() || m_minima.back() >= m_heap.top()))
+      m_minima.pop_back();
+    else
+      m_heap.pop();
+  }
+private:
+  // Ascending: the largest is at the back.
+  std::vector<cInt>         m_minima;
+  std::priority_queue<cInt> m_heap;
+};
+//------------------------------------------------------------------------------
+
 class Clipper : public ClipperBase
 {
 public:
@@ -433,8 +460,8 @@ private:
   std::vector<Join>     m_GhostJoins;
   std::vector<IntersectNode> m_IntersectList;
   ClipType              m_ClipType;
-  // A priority queue (a binary heap) of Y coordinates.
-  std::priority_queue<cInt> m_Scanbeam;
+  // A max priority queue of Y coordinates.
+  ScanbeamList          m_Scanbeam;
   // Maxima are collected by ProcessEdgesAtTopOfScanbeam(), consumed by ProcessHorizontal().
   std::vector<cInt>     m_Maxima;
   TEdge                *m_ActiveEdges;
