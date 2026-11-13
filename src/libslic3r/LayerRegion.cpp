@@ -581,6 +581,11 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
             AABBTreeLines::LinesDistancer<Line> distance(borders);
             shell_width=float(SCALED_EPSILON);
             expansion_min=float(SCALED_EPSILON);
+            // shell_width keeps only the largest distance. The distance to any one border line bounds the
+            // distance to the nearest one from above, so a point whose distance to the line nearest the last
+            // measured point stays more than a unit (far more than the rounding of either distance) below
+            // what it would need to raise shell_width is not looked up in the tree: shell_width is unchanged.
+            size_t last_nearest=size_t(-1);
             // Compatible regions share their emitted perimeter collection on
             // one owner. A modifier can enable slope walls while that owner's
             // own threshold is disabled, so examine the merged layer geometry.
@@ -592,8 +597,14 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
                         continue;
                     const float spacing=region->flow(frPerimeter).scaled_spacing();
                     expansion_min=std::max(expansion_min,spacing);
-                    for (const Point &p:path->as_polyline().points)
-                        shell_width=std::max(shell_width,float(distance.distance_from_lines<false>(p))+spacing);
+                    for (const Point &p:path->as_polyline().points) {
+                        if (last_nearest!=size_t(-1) &&
+                            std::sqrt(line_alg::distance_to_squared(borders[last_nearest],p))+double(spacing)+1.<double(shell_width))
+                            continue;
+                        const auto [d,nearest,nearest_point]=distance.distance_from_lines_extra<false>(p);
+                        last_nearest=nearest;
+                        shell_width=std::max(shell_width,float(d)+spacing);
+                    }
                 }
             };
             if (slope_walls)
