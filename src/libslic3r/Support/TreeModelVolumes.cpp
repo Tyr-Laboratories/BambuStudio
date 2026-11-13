@@ -19,6 +19,7 @@
 #include "../Utils.hpp"
 #include "../format.hpp"
 
+#include <optional>
 #include <string_view>
 
 #include <boost/log/trivial.hpp>
@@ -704,17 +705,25 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             collision_areas_offsetted.allocate(
                 std::max<LayerIndex>(0, data.begin() - z_distance_bottom_layers),
                 std::min<LayerIndex>(outlines.size(), data.end() + z_distance_top_layers));
+            // union_ex(machine border + outline) of each layer depends on neither the radius nor the layer it is
+            // summed into: 1) keeps it for the top range of 2), which unions the same polygons again.
+            const LayerIndex        unions_begin = collision_areas_offsetted.begin();
+            std::vector<ExPolygons> collision_unions(size_t(std::max<LayerIndex>(0, collision_areas_offsetted.end() - unions_begin)));
             tbb::parallel_for(tbb::blocked_range<LayerIndex>(collision_areas_offsetted.begin(), collision_areas_offsetted.end()),
-                [&outlines, &machine_border = std::as_const(m_machine_border), offset_value = radius + xy_distance, &collision_areas_offsetted, &throw_on_cancel]
+                [&outlines, &machine_border = std::as_const(m_machine_border), offset_value = radius + xy_distance, &collision_areas_offsetted, &throw_on_cancel,
+                 &collision_unions, unions_begin, first_top = data.begin() + 1, z_distance_top_layers]
                 (const tbb::blocked_range<LayerIndex> &range) {
                 for (LayerIndex layer_idx = range.begin(); layer_idx != range.end(); ++ layer_idx) {
                     Polygons collision_areas = machine_border;
                     append(collision_areas, outlines[layer_idx]);
+                    ExPolygons &collision_union = collision_unions[size_t(layer_idx - unions_begin)];
+                    if (offset_value != 0 || (z_distance_top_layers > 0 && layer_idx >= first_top))
+                        collision_union = union_ex(collision_areas);
                     // jtRound is not needed here, as the overshoot can not cause errors in the algorithm, because no assumptions are made about the model.
                     // if a key does not exist when it is accessed it is added!
                     collision_areas_offsetted[layer_idx] = offset_value == 0 ?
                             union_(collision_areas) :
-                            offset(union_ex(collision_areas), offset_value, ClipperLib::jtMiter, 1.2);
+                            offset(collision_union, offset_value, ClipperLib::jtMiter, 1.2);
                     if(throw_on_cancel)
                         throw_on_cancel();
                 }
@@ -723,7 +732,7 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
             // 2) Sum over top / bottom ranges.
             const bool processing_last_mesh = outline_idx == layer_outline_indices.size();
             tbb::parallel_for(tbb::blocked_range<LayerIndex>(data.begin(), data.end()),
-                [&collision_areas_offsetted, &outlines, &machine_border = m_machine_border, &anti_overhang = m_anti_overhang, radius, 
+                [&collision_areas_offsetted, &outlines, &collision_unions, unions_begin, &anti_overhang = m_anti_overhang, radius,
                     xy_distance, z_distance_bottom_layers, z_distance_top_layers, min_resolution = m_min_resolution, &data, processing_last_mesh, &throw_on_cancel]
             (const tbb::blocked_range<LayerIndex>& range) {
                     for (LayerIndex layer_idx = range.begin(); layer_idx != range.end(); ++layer_idx) {
@@ -733,8 +742,8 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                                 append(collisions, collision_areas_offsetted[j]);
                         for (int i = 1; i <= z_distance_top_layers; ++ i)
                             if (int j = layer_idx + i; j < int(outlines.size())) {
-                                Polygons collision_areas_original = machine_border;
-                                append(collision_areas_original, outlines[j]);
+                                // union_ex(machine border + outlines[j]), kept by 1).
+                                const ExPolygons &collision_areas_original = collision_unions[size_t(j - unions_begin)];
 
                                 // If just the collision (including the xy distance) of the layers above is accumulated, it leads to the
                                 // following issue:
@@ -767,7 +776,7 @@ void TreeModelVolumes::calculateCollision(const coord_t radius, const LayerIndex
                                     // the conditional -0.5 ensures that plastic can never touch on the diagonal
                                     // downward when the z_distance_top_layers = 1. It is assumed to be better to
                                     // not support an overhang<90 degree than to risk fusing to it.
-                                append(collisions, offset(union_ex(collision_areas_original), radius + required_range_x, ClipperLib::jtMiter, 1.2));
+                                append(collisions, offset(collision_areas_original, radius + required_range_x, ClipperLib::jtMiter, 1.2));
                         }
                         collisions = processing_last_mesh && layer_idx < int(anti_overhang.size()) ? 
                                 union_(collisions, offset(union_ex(anti_overhang[layer_idx]), radius, ClipperLib::jtMiter, 1.2)) : 
@@ -852,6 +861,8 @@ void TreeModelVolumes::calculateCollisionHolefree(const std::vector<RadiusLayerP
         std::vector<std::pair<RadiusLayerPair, Polygons>> data;
         data.reserve(range.size() * keys.size());
         for (LayerIndex layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
+            // The collision unioned below is the same for every key: union it once per layer.
+            std::optional<ExPolygons> collision_union;
             for (RadiusLayerPair key : keys)
                 if (layer_idx <= key.second && !m_collision_cache_holefree.getArea({key.first, layer_idx})) {
                     // Forward trees precompute this table in one batch. A
@@ -866,9 +877,10 @@ void TreeModelVolumes::calculateCollisionHolefree(const std::vector<RadiusLayerP
                     coord_t increase_radius_ceil = ceilRadius(m_increase_until_radius, false) - radius;
                     assert(increase_radius_ceil > 0);
                     // this union is important as otherwise holes(in form of lines that will increase to holes in a later step) can get unioned onto the area.
+                    if (! collision_union)
+                        collision_union = union_ex(this->getCollision(m_increase_until_radius, layer_idx, false));
                     data.emplace_back(RadiusLayerPair(radius, layer_idx), polygons_simplify(
-                        offset(union_ex(this->getCollision(m_increase_until_radius, layer_idx, false)),
-                            5 - increase_radius_ceil, ClipperLib::jtRound, m_min_resolution),
+                        offset(*collision_union, 5 - increase_radius_ceil, ClipperLib::jtRound, m_min_resolution),
                         m_min_resolution));
                     if (throw_on_cancel)
                         throw_on_cancel();

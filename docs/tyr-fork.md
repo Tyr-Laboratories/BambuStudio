@@ -130,6 +130,18 @@ The overhang detection of all tree supports no longer depends on time either. It
 
 Support generation is also faster. On a private 16-plate aircraft project with Organic supports, slicing took 11% fewer retired instructions than before these optimizations, and 31% fewer on its most support-heavy plate. Each optimization left the G-code byte-identical.
 
+## Faster slicing
+
+The steps before G-code export are faster, most of all on plates with painted walls or with Organic supports on painted bases. These steps now run on all CPU cores; each used to run on one core per object:
+
+- the projection of wall painting;
+- the checks of foundations on painted bases;
+- several other Organic support steps.
+
+Wall painting no longer repeats the same boundary lookups inside Arachne or while preparing solid infill, and the polygon library skips work that cannot change its results.
+
+On a private 16-plate aircraft project these steps took 12% fewer retired instructions. The 15 plates that pass the G-code conflict check sliced in 278 s instead of 390 s on the same Mac, and the most support-heavy plate in 30 s instead of 54 s. Each change left the G-code byte-identical. Times depend on the computer and its load. The [measurements](performance/2026-11-12-pre-gcode-slicing.md) give the details, stage by stage.
+
 ## Paint bases for Organic tree supports
 
 With **Tree Organic** selected and **On build plate only** enabled, select an object in Prepare, open **Supports Painting**, and choose **Support bases**. Paint an upward-facing surface below an overhang to allow trees to start there. This can replace a tall tower from the bed with a short tree on a raised part of the model.

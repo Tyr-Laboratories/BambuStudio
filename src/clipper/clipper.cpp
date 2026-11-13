@@ -1067,12 +1067,15 @@ void Clipper::Reset()
 {
   CLIPPERLIB_PROFILE_FUNC();
   ClipperBase::Reset();
-  m_Scanbeam = std::priority_queue<cInt>();
+  // ClipperBase::Reset() sorted the local minima by Y ascending.
+  std::vector<cInt> minima_ys;
+  minima_ys.reserve(m_MinimaList.size());
+  for (const LocalMinimum &lm : m_MinimaList)
+    minima_ys.push_back(lm.Y);
+  m_Scanbeam.reset(std::move(minima_ys));
   m_Maxima.clear();
   m_ActiveEdges = 0;
   m_SortedEdges = 0;
-  for (auto lm = m_MinimaList.rbegin(); lm != m_MinimaList.rend(); ++lm)
-    m_Scanbeam.push(lm->Y);
 }
 
 //------------------------------------------------------------------------------
@@ -2453,14 +2456,32 @@ void Clipper::BuildIntersectList(const cInt topY)
 {
   if ( !m_ActiveEdges ) return;
 
-  //prepare for sorting ...
+  // Move the edges to the top of the scanbeam. When no neighbours are out of order there, no edges
+  // cross inside the scanbeam: the first pass of the bubble sort below would swap nothing and leave
+  // the intersection list empty, so the sort list is not built at all.
+  // (ProcessEdgesAtTopOfScanbeam() relies on Curr.x() being set here for every active edge.)
   TEdge* e = m_ActiveEdges;
+  e->Curr.x() = TopX( *e, topY );
+  bool sorted = true;
+  for (TEdge *eNext = e->NextInAEL; eNext; e = eNext, eNext = e->NextInAEL)
+  {
+    eNext->Curr.x() = TopX( *eNext, topY );
+    if (e->Curr.x() > eNext->Curr.x())
+      sorted = false;
+  }
+  if (sorted)
+  {
+    m_SortedEdges = 0;
+    return;
+  }
+
+  //prepare for sorting ...
+  e = m_ActiveEdges;
   m_SortedEdges = e;
   while( e )
   {
     e->PrevInSEL = e->PrevInAEL;
     e->NextInSEL = e->NextInAEL;
-    e->Curr.x() = TopX( *e, topY );
     e = e->NextInAEL;
   }
 
@@ -2612,7 +2633,9 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
       } 
       else
       {
-        e->Curr.x() = TopX( *e, topY );
+        // Curr.x() already holds TopX(*e, topY): BuildIntersectList() set it for every edge active in
+        // this scanbeam, and processing the intersections only reorders the edges.
+        assert(e->Curr.x() == TopX( *e, topY ));
         e->Curr.y() = topY;
       }
 
