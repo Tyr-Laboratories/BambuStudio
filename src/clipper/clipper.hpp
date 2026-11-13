@@ -51,7 +51,7 @@
 //#define use_deprecated  
 
 #include <algorithm>
-#include <queue>
+#include <cassert>
 #include <vector>
 #include <deque>
 #include <stdexcept>
@@ -394,8 +394,12 @@ protected:
 class ScanbeamList
 {
 public:
-  // sorted_minima must be sorted ascending.
-  void reset(std::vector<cInt> &&sorted_minima) { m_minima = std::move(sorted_minima); m_heap = std::priority_queue<cInt>(); }
+  // sorted_minima must be sorted ascending (ClipperBase::Reset() sorts the local minima).
+  void reset(std::vector<cInt> &&sorted_minima) {
+    assert(std::is_sorted(sorted_minima.begin(), sorted_minima.end()));
+    m_minima = std::move(sorted_minima);
+    m_heap = std::priority_queue<cInt>();
+  }
   void push(const cInt y) { m_heap.push(y); }
   bool empty() const { return m_minima.empty() && m_heap.empty(); }
   cInt top() const { return m_minima.empty() ? m_heap.top() : m_heap.empty() ? m_minima.back() : std::max(m_minima.back(), m_heap.top()); }
