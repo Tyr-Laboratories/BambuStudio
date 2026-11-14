@@ -75,8 +75,7 @@ enum ExtrusionRole : uint8_t {
 enum CustomizeFlag : uint8_t {
     cfNone,
     cfCircleCompensation,   // shaft hole tolerance compensation
-    cfFloatingVerticalShell,
-    cfWallExtensionBridge   // wall extension line with only sparse infill below it: printed like a bridge
+    cfFloatingVerticalShell
 };
 
 // Special flags describing loop

@@ -30,14 +30,12 @@ struct RoleWorkspace {
 };
 
 // A closed square loop of role erWallExtension with the given flow, centred on `centre`.
-ExtrusionLoop square_loop(const Point &centre, double size_mm, const Flow &flow, bool as_bridge)
+ExtrusionLoop square_loop(const Point &centre, double size_mm, const Flow &flow)
 {
     const coord_t h = scaled<coord_t>(size_mm / 2.);
     ExtrusionPath path(erWallExtension, flow.mm3_per_mm(), flow.width(), flow.height());
     path.polyline.points = { centre + Point(-h, -h), centre + Point(h, -h), centre + Point(h, h),
                              centre + Point(-h, h), centre + Point(-h, -h) };
-    if (as_bridge)
-        path.set_customize_flag(CustomizeFlag::cfWallExtensionBridge);
     ExtrusionLoop loop;
     loop.paths.emplace_back(std::move(path));
     return loop;
@@ -56,7 +54,7 @@ TEST_CASE("Wall extension is its own line type", "[WallExtension][Role]")
     CHECK(int(erMixed) == int(erWallExtension) + 1);
 }
 
-TEST_CASE("Wall extension lines print at inner-wall settings, or like a bridge when flagged", "[WallExtension][Role][GCode]")
+TEST_CASE("Wall extension lines print at inner-wall settings", "[WallExtension][Role][GCode]")
 {
     RoleWorkspace workspace;
     DynamicPrintConfig config;
@@ -89,10 +87,8 @@ TEST_CASE("Wall extension lines print at inner-wall settings, or like a bridge w
     LayerRegion *region = layer->get_region(0);
     const Point centre = get_extents(layer->lslices).center();
     const Flow flow = region->flow(frExternalPerimeter);
-    const Flow bridge_flow = region->bridging_flow(frPerimeter, print_object->config().thick_bridges);
     ExtrusionEntityCollection extension;
-    extension.append(square_loop(centre, 8., flow, false));
-    extension.append(square_loop(centre, 4., bridge_flow, true));
+    extension.append(square_loop(centre, 8., flow));
     region->perimeters.append(extension);
 
     const auto filename = (workspace.path / "wall-extension.gcode").string();
@@ -118,8 +114,8 @@ TEST_CASE("Wall extension lines print at inner-wall settings, or like a bridge w
         speeds.insert(int(std::lround(line.new_F(self))));
         accelerations.insert(acceleration);
     }));
-    CHECK(speeds == std::set<int>{ 77 * 60, 23 * 60 });
-    CHECK(accelerations == std::set<int>{ 900, 450 });
+    CHECK(speeds == std::set<int>{ 77 * 60 });
+    CHECK(accelerations == std::set<int>{ 900 });
 
     const auto &roles_times = result.print_statistics.modes[0].roles_times;
     const auto  it = std::find_if(roles_times.begin(), roles_times.end(),

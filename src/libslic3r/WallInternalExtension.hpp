@@ -117,16 +117,15 @@ ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std
 // The consecutive outer wall paths of a loop are joined back into one closed line.
 Polylines outer_wall_lines(const ExtrusionEntityCollection &perimeters);
 
-// Lines of role erWallExtension filling `area`: variable width Arachne walls of `flow`'s spacing. A line with more than
-// half its length inside `bridge_area` is printed like a bridge: one constant width path of `bridge_flow`, flagged
-// cfWallExtensionBridge.
-ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const ExPolygons &bridge_area, const Flow &flow,
-                                               const Flow &bridge_flow, double layer_height, size_t inset_count,
+// Lines of role erWallExtension filling `area`: variable width Arachne walls of `flow`'s spacing.
+ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const Flow &flow, double layer_height, size_t inset_count,
                                                const Arachne::WallToolPathsParams &params);
 
 // Runs the wall internal extension on an object whose walls are generated: adds the extension lines to the regions'
-// perimeters, cuts their area out of the fill sets and records it in LayerRegion::wall_extension_area. Does nothing in
-// spiral vase mode or when no region has wall_internal_extension above 0.
+// perimeters, cuts their area out of the fill sets and records it in LayerRegion::wall_extension_area. Where a top
+// joint's deepest layer has nothing printed below it, that part is left in the fill and recorded in
+// LayerRegion::wall_extension_bridge_base instead (see make_bridge_bases_solid()). Does nothing in spiral vase mode or
+// when no region has wall_internal_extension above 0.
 void apply(PrintObject &object);
 
 // Turns the sparse fill surfaces inside each region's LayerRegion::wall_extension_bridge_base into internal solid, so

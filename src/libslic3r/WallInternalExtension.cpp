@@ -328,8 +328,7 @@ Polylines outer_wall_lines(const ExtrusionEntityCollection &perimeters)
     return out;
 }
 
-ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const ExPolygons &bridge_area, const Flow &flow,
-                                               const Flow &bridge_flow, double layer_height, size_t inset_count,
+ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const Flow &flow, double layer_height, size_t inset_count,
                                                const Arachne::WallToolPathsParams &params)
 {
     ExtrusionEntityCollection out;
@@ -351,18 +350,6 @@ ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const ExPo
             const double length = centreline.length();
             if (length <= 0.)
                 continue;
-            if (!bridge_area.empty() && total_length(intersection_pl(Polylines{ centreline }, bridge_area)) > 0.5 * length) {
-                ExtrusionPath path(erWallExtension, bridge_flow.mm3_per_mm(), bridge_flow.width(), bridge_flow.height());
-                path.polyline = std::move(centreline);
-                path.set_customize_flag(CustomizeFlag::cfWallExtensionBridge);
-                if (line.is_closed) {
-                    ExtrusionLoop loop;
-                    loop.paths.emplace_back(std::move(path));
-                    out.append(std::move(loop));
-                } else
-                    out.append(std::move(path));
-                continue;
-            }
             ExtrusionPaths paths;
             extrusion_paths_append(paths, line, erWallExtension, flow);
             if (paths.empty())
@@ -554,24 +541,27 @@ void apply(PrintObject &object)
             for (size_t r = 0; r < regions.size() && r < areas[l].size(); ++r) {
                 if (areas[l][r].empty())
                     continue;
-                LayerRegion &region      = *regions[r];
-                const Flow   flow        = region.flow(frExternalPerimeter);
-                const Flow   bridge_flow = region.bridging_flow(frPerimeter, object.config().thick_bridges);
+                LayerRegion &region = *regions[r];
+                const Flow   flow   = region.flow(frExternalPerimeter);
                 // Only a top joint's deepest layer can start with nothing printed below it. That part is not printed as
                 // lines: it stays in the fill as the base of an internal bridge (see wall_extension_bridge_base).
-                const ExPolygons base = diff_ex(intersection_ex(hanging[l], areas[l][r]),
-                                                offset(support_below, float(flow.scaled_spacing()) / 2.f));
-                const ExPolygons area = base.empty() ? areas[l][r] : diff_ex(areas[l][r], base);
-                region.wall_extension_bridge_base = base;
-                const ExPolygons bridge_area;
+                const ExPolygons hanging_lines = diff_ex(intersection_ex(hanging[l], areas[l][r]),
+                                                         offset(support_below, float(flow.scaled_spacing()) / 2.f));
+                const ExPolygons area = hanging_lines.empty() ? areas[l][r] : diff_ex(areas[l][r], hanging_lines);
+                // The base reaches as far around the lines' footprint as bridge_over_infill() looks for what carries a
+                // solid surface, four solid infill spacings: a footprint one line wide is narrower than anything it
+                // expects. So the solid either reaches what carries it, or is large enough to be bridged and anchored.
+                if (!hanging_lines.empty())
+                    region.wall_extension_bridge_base = diff_ex(
+                        intersection_ex(offset_ex(hanging_lines, 4.f * float(region.flow(frSolidInfill).scaled_spacing())), region.fill_expolygons),
+                        area);
                 for (const ExPolygon &piece : area) {
                     // Enough walls to fill the whole piece: the chamfers of close joints merge into areas much wider than
                     // one extension, and the piece is cut out of the fill. No point lies deeper than half the piece's
                     // narrower extent.
                     const Point  size        = get_extents(piece.contour).size();
                     const size_t inset_count = size_t(std::ceil(0.5 * double(std::min(size.x(), size.y())) / double(flow.scaled_spacing()))) + 1;
-                    ExtrusionEntityCollection lines = extension_extrusions(piece, bridge_area, flow, bridge_flow, layers[l]->height,
-                                                                           inset_count, params);
+                    ExtrusionEntityCollection lines = extension_extrusions(piece, flow, layers[l]->height, inset_count, params);
                     if (!lines.entities.empty())
                         region.perimeters.append(std::move(lines));
                 }
