@@ -74,6 +74,8 @@ JointSettings settings(double extension = 1.)
     s.line_width           = scaled<coord_t>(line_w);
     s.line_spacing         = scaled<coord_t>(line_spacing_w);
     s.tolerance            = scaled<coord_t>(0.012);
+    // These cases build the chamfer; the setting itself is off by default.
+    s.chamfer              = true;
     return s;
 }
 
@@ -289,6 +291,27 @@ TEST_CASE("Under a tower the extension goes through the shell and 1 mm below wit
         CHECK(width_across_right_side(a.all) == Approx(line_w + chamfer).margin(0.02));
         if (l == 21)
             CHECK(area_mm2(a.hanging) == Approx(area_mm2(a.all)));
+    }
+}
+
+TEST_CASE("Without the chamfer the extension stays one line wide", "[WallExtension][Area]")
+{
+    const auto layers = stack(concat(repeat(box20, 30), repeat(tower10, 15)));
+    JointSettings without_chamfer = settings();
+    without_chamfer.chamfer = false;
+    const auto joints = find_joints(layers, 30, outer_lines(tower10), without_chamfer);
+    REQUIRE(joints.size() == 1);
+    for (size_t l = 0; l < layers.size(); ++l) {
+        CAPTURE(l);
+        const ExtensionArea a = extension_area(layers, joints, l);
+        // The same reach as with the chamfer: through the shell and 1 mm below it, the lowest layer hanging.
+        CHECK(a.all.empty() == (l < 21 || l > 29));
+        CHECK(a.hanging.empty() == (l != 21));
+        if (a.all.empty())
+            continue;
+        // Only the line, right under the wall, on every layer.
+        CHECK(width_across_right_side(a.all) == Approx(line_w).margin(0.02));
+        CHECK(area_mm2(diff_ex(a.all, tower10)) < 0.01);
     }
 }
 

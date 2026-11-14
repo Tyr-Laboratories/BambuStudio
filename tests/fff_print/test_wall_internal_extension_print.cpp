@@ -33,7 +33,8 @@ struct PrintWorkspace {
     }
 };
 
-DynamicPrintConfig extension_config(double extension)
+// Most cases here build the chamfer, which is off by default.
+DynamicPrintConfig extension_config(double extension, bool chamfer = true)
 {
     DynamicPrintConfig config;
     config.apply(static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
@@ -45,6 +46,7 @@ DynamicPrintConfig extension_config(double extension)
         {"wall_generator", "arachne"}, {"brim_type", "no_brim"}, {"enable_arc_fitting", "0"}
     });
     config.set("wall_internal_extension", extension);
+    config.set("wall_internal_extension_chamfer", chamfer);
     return config;
 }
 
@@ -455,6 +457,25 @@ double heights_with_extension(const Print &print)
             sum += layer->height;
     return sum;
 }
+}
+
+TEST_CASE("With the chamfer off the tower's extension stays under its wall", "[WallExtension][Print]")
+{
+    Model model = terrace();
+    Print print;
+    slice(print, model, extension_config(1., false));
+    // As deep as with the chamfer: down to 1.8 mm below the box's top.
+    CHECK(extension_layers(print) == tenths(104, 118));
+    const Layer *tower_layer = layer_at(print, 12.2);
+    REQUIRE(tower_layer != nullptr);
+    // Every line runs right under the tower's wall: inside its outline, within one line width of it.
+    const ExPolygons under_wall = diff_ex(tower_layer->lslices, offset_ex(tower_layer->lslices, -scale_(0.45 + 0.05)));
+    for (const Layer *layer : print.get_object(size_t(0))->layers())
+        for (const ExtrusionPath *path : extension_paths(*layer)) {
+            CAPTURE(layer->print_z);
+            for (const Point &point : path->polyline.points)
+                CHECK(inside(under_wall, point));
+        }
 }
 
 TEST_CASE("A one-line fin is extended", "[WallExtension][Print]")

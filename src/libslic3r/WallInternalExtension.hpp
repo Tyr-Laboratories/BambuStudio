@@ -3,7 +3,8 @@
 
 // Wall internal extension: where an outer wall rises out of a top surface, or ends under a bottom surface, the wall
 // line is continued inside the part, through the shell and `wall_internal_extension` mm beyond it, with a 45 degree
-// chamfer on the surface side. See docs/superpowers/specs/2026-11-11-wall-internal-extension-design.md.
+// chamfer on the surface side when `wall_internal_extension_chamfer` is on (off by default).
+// See docs/superpowers/specs/2026-11-11-wall-internal-extension-design.md.
 
 #include "ExPolygon.hpp"
 #include "ExtrusionEntityCollection.hpp"
@@ -48,6 +49,8 @@ struct JointSettings
     coord_t line_spacing           = 0;
     // Slicing tolerance (the G-code resolution), scaled.
     coord_t tolerance              = 0;
+    // wall_internal_extension_chamfer: add the 45 degree chamfer on the surface side.
+    bool    chamfer                = false;
 };
 
 enum class JointSide {
@@ -72,6 +75,8 @@ struct Joint
     coord_t   line_width  = 0;
     // Slicing tolerance, scaled (JointSettings::tolerance).
     coord_t   tolerance   = 0;
+    // Whether the extension gets its chamfer (JointSettings::chamfer).
+    bool      chamfer     = false;
 };
 
 // Depth in mm of the top shell under a top surface on `surface_layer`, built as discover_vertical_shells() builds it:
@@ -102,9 +107,10 @@ struct ExtensionArea
 };
 
 // Area at `target_layer` covered by the extension lines and 45 degree chamfers of `joints`. A top joint's extension
-// reaches down to shell_depth + extension below the surface, a bottom joint's up to the same distance above it. The
-// chamfer lies on the layers beyond the shell, on the surface side only: as wide as the extension next to the shell,
-// narrowing by one layer height per layer to nothing at the extension's far end.
+// reaches down to shell_depth + extension below the surface, a bottom joint's up to the same distance above it. A
+// joint with `chamfer` set adds the chamfer on the layers beyond the shell, on the surface side only: as wide as the
+// extension next to the shell, narrowing by one layer height per layer to nothing at the extension's far end. Without
+// it the extension is the line's own footprint on every layer.
 ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std::vector<Joint> &joints, size_t target_layer);
 
 // Centrelines of the outer wall extrusions (erExternalPerimeter, erOverhangPerimeter) in `perimeters`, at any depth.

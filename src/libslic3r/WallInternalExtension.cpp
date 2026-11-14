@@ -186,7 +186,7 @@ std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t 
         if (!lines.empty())
             joints.push_back({ layer, JointSide::Top, std::move(lines),
                                top_shell_depth(layers, layer - 1, settings.top_shell_layers, settings.top_shell_thickness),
-                               settings.extension, settings.line_width, settings.tolerance });
+                               settings.extension, settings.line_width, settings.tolerance, settings.chamfer });
     }
     if (layer + 1 < layers.size()) {
         Polylines lines = steep_for_extension(standing_on(layers[layer + 1]), layers, layer, -1, settings);
@@ -194,7 +194,7 @@ std::vector<Joint> find_joints(const std::vector<LayerGeometry> &layers, size_t 
         if (!lines.empty())
             joints.push_back({ layer, JointSide::Bottom, std::move(lines),
                                bottom_shell_depth(layers, layer + 1, settings.bottom_shell_layers, settings.bottom_shell_thickness),
-                               settings.extension, settings.line_width, settings.tolerance });
+                               settings.extension, settings.line_width, settings.tolerance, settings.chamfer });
     }
     return joints;
 }
@@ -243,7 +243,7 @@ ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std
             const double depth = surface.bottom_z - target.bottom_z;
             if (depth > reach + EPSILON)
                 continue;
-            if (depth > joint.shell_depth + EPSILON)
+            if (joint.chamfer && depth > joint.shell_depth + EPSILON)
                 chamfer = std::clamp(target.print_z - (surface.bottom_z - reach), 0., joint.extension);
             deepest = target_layer == 0 || surface.bottom_z - layers[target_layer - 1].bottom_z > reach + EPSILON;
         } else {
@@ -252,7 +252,7 @@ ExtensionArea extension_area(const std::vector<LayerGeometry> &layers, const std
             const double depth = target.print_z - surface.print_z;
             if (depth > reach + EPSILON)
                 continue;
-            if (depth > joint.shell_depth + EPSILON)
+            if (joint.chamfer && depth > joint.shell_depth + EPSILON)
                 chamfer = std::clamp(surface.print_z + reach - target.bottom_z, 0., joint.extension);
         }
         const float half_width = float(joint.line_width) / 2.f;
@@ -482,6 +482,7 @@ void apply(PrintObject &object)
                 settings.line_width             = region->flow(frExternalPerimeter).scaled_width();
                 settings.line_spacing           = region->flow(frExternalPerimeter).scaled_spacing();
                 settings.tolerance              = tolerance;
+                settings.chamfer                = config.wall_internal_extension_chamfer.value;
                 append(joints[i], find_joints(geometry, i, own, settings));
             }
         }

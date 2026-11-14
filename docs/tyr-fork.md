@@ -72,7 +72,7 @@ In **Strength > Walls**, enable Advanced settings and set **Wall internal extens
 
 Where an outer wall rises out of a top surface, a single layer bond at the corner holds it to the surface. The same is true where a wall ends under a bottom surface. This setting prints the wall's line on the layers on the other side of the surface too, inside the part: through the top or bottom shell and this distance beyond it. It keeps out of the zone where a layer's exposed surfaces spread their fill into the part. So the top layer around the wall keeps its normal top surface, and a bridge or overhang keeps its anchors on the part below.
 
-A 45° chamfer fills the corner between that buried wall and the inside face of the shell. Next to the shell it is as wide as the setting, and it narrows by one layer height per layer. Under a top surface the chamfer hangs below the shell. Above a bottom surface it sits on top of the shell.
+**Wall extension chamfer** (`wall_internal_extension_chamfer`), the checkbox under it, adds a 45° chamfer in the corner between that buried wall and the inside face of the shell. Next to the shell it is as wide as the setting, and it narrows by one layer height per layer. Under a top surface the chamfer hangs below the shell. Above a bottom surface it sits on top of the shell. The chamfer is **off by default**: under a top surface its lower layers are printed over sparse infill with no bridging under them, so it does not print reliably yet. With it off, the buried wall is still extended to the same depth.
 
 A joint qualifies when two things hold:
 - **The wall's line stands entirely on the surface.** For a top joint it does not overlap any wall line of the layer below; for a bottom joint, of the layer above. A wall line that only touches it, the way neighbouring lines of one layer overlap, does not count.
@@ -82,7 +82,7 @@ Vertical walls, walls leaning by less than 45°, the walls of pockets and one-li
 
 Ribs standing on sloped or curved skins are extended piece by piece. Where the skin slopes more than about 15° along the rib, each layer's new piece of the rib's wall rests mostly on the wall below it, so no extension is added there.
 
-The extension and chamfer lines use the outer wall's line width and the inner wall's speed, acceleration and cooling. The lowest layer under a top surface has only sparse infill below it, so it is printed like an internal bridge.
+The extension and chamfer lines use the outer wall's line width and the inner wall's speed, acceleration and cooling. The lowest layer under a top surface has only sparse infill below it. It is printed with bridge speed and flow, but only the sparse infill lines it crosses hold it up.
 
 The extension stays inside the part:
 - it stops where the part ends;

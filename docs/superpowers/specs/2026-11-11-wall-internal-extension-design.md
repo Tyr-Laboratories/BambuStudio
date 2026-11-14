@@ -84,6 +84,7 @@ The mirror image. Copies go on every layer from the first layer above the joint 
 
 ### Chamfer
 
+- **Optional, off by default** *(user decision, 2026-11-13)*: a separate per-region checkbox, `wall_internal_extension_chamfer` ("Wall extension chamfer"), turns the chamfer on. As built, under a top surface the chamfer's lower layers are printed over sparse infill with no internal bridging under them, which the user found physically unprintable. So it stays off as an interim until that is fixed. With it off, the extension line still reaches the same depth.
 - The chamfer sits on the surface side of each extended line: the side where the top or bottom surface is. A pocket gets it on the pocket side; a thin fin with surface on both sides gets one on each side.
 - It occupies the layers between the shell and the end of the extension. Its width, measured from the extension line, grows by one layer height per layer of distance from the extension's end. It is 0 at the end and E next to the shell.
 - It is printed as lines parallel to the extension line, adding lines as the band widens. In a top joint each chamfer layer overhangs the one below it. No chamfer line may overhang the line below it by more than half its width, which a 45° chamfer at the normal layer height and line width satisfies.

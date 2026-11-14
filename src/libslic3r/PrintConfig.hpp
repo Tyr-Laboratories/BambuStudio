@@ -1174,6 +1174,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat, extra_wall_slope_angle))
     // Distance in mm an outer wall rising out of (or ending under) a flat surface continues inside the part beyond the shell.
     ((ConfigOptionFloat, wall_internal_extension))
+    ((ConfigOptionBool, wall_internal_extension_chamfer))
     // Modifier-only: apply this modifier for m layers, then skip it for n layers.
     ((ConfigOptionBool, periodic_modifier))
     ((ConfigOptionInt, periodic_modifier_skip_layers))

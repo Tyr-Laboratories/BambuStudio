@@ -57,7 +57,7 @@ static SettingsFactory::Bundle FREQ_SETTINGS_BUNDLE_FFF =
 {
     //BBS
     { L("Quality"), { "layer_height" } },
-    { L("Shell"), { "wall_loops", "painted_wall_loops", "extra_wall_slope_angle", "wall_internal_extension", "top_shell_layers", "bottom_shell_layers"} },
+    { L("Shell"), { "wall_loops", "painted_wall_loops", "extra_wall_slope_angle", "wall_internal_extension", "wall_internal_extension_chamfer", "top_shell_layers", "bottom_shell_layers"} },
     { L("Infill")               , { "sparse_infill_density", "sparse_infill_pattern", "conformal_infill", "conformal_stagger", "conformal_link_keep_layers", "conformal_link_flip_layers", "conformal_pole", "conformal_ray_count", "conformal_hub_radius" } },
     // BBS
     { L("Support")     , { "enable_support", "support_type", "support_threshold_angle",
@@ -104,7 +104,7 @@ std::map<std::string, std::vector<SimpleSettingData>>  SettingsFactory::PART_CAT
     {{L("Quality"), {{"ironing_type", "", 8}, {"ironing_flow", "", 9}, {"ironing_spacing", "", 10}, {"ironing_inset", "", 11}, {"ironing_speed", "", 12}, {"ironing_direction", "",13},
                     {"bridge_layer_density", "",14}, {"bridge_line_travel_extend", "",15}, {"internal_bridge_layers", "",16}, {"flow_above_internal_bridges", "",17}
                     }},
-    { L("Strength"), {{"wall_loops", "",1},{"painted_wall_loops", "",1},{"extra_wall_slope_angle", "",1},{"wall_internal_extension", "",1},{"top_shell_layers", "",1},{"top_shell_thickness", "",1},
+    { L("Strength"), {{"wall_loops", "",1},{"painted_wall_loops", "",1},{"extra_wall_slope_angle", "",1},{"wall_internal_extension", "",1},{"wall_internal_extension_chamfer", "",1},{"top_shell_layers", "",1},{"top_shell_thickness", "",1},
                     {"bottom_shell_layers", "",1}, {"bottom_shell_thickness", "",1}, {"sparse_infill_density", "",1},
                     {"sparse_infill_pattern", "",1},{"bridge_aware_cubic_density", "",1},{"conformal_infill", "",1},{"conformal_stagger", "",1},{"conformal_link_keep_layers", "",1},{"conformal_link_flip_layers", "",1},{"conformal_pole", "",1},{"conformal_ray_count", "",1},{"conformal_hub_radius", "",1},{"sparse_infill_anchor", "",1},{"sparse_infill_anchor_max", "",1}, {"sparse_infill_lattice_angle_1", "",1},{"sparse_infill_lattice_angle_2", "",1},
                     {"top_surface_pattern", "",1},{"top_surface_density", "",1},{"monotonic_travel_into_wall", "",1},

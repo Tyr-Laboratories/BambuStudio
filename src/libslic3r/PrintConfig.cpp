@@ -4857,15 +4857,24 @@ void PrintConfigDef::init_fff_params()
     def->label    = L("Wall internal extension");
     def->category = L("Strength");
     def->tooltip  = L("Start outer walls that rise out of a top surface, or end under a bottom surface, inside the part: "
-                      "through the top or bottom shell and this far beyond it, with a 45° chamfer on the surface side, "
-                      "so the wall is anchored like a tenon in a mortise. Applies where the wall stands entirely on the "
-                      "surface and stays steeper than 45° for at least this height. 0 disables this feature. "
-                      "Spiral vase mode is excluded.");
+                      "through the top or bottom shell and this far beyond it, so the wall is anchored like a tenon in "
+                      "a mortise. Applies where the wall stands entirely on the surface and stays steeper than 45° for "
+                      "at least this height. \"Wall extension chamfer\" adds a 45° chamfer on the surface side. "
+                      "0 disables this feature. Spiral vase mode is excluded.");
     def->sidetext = L("mm");
     def->min = 0;
     def->max = 10;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(1.));
+
+    def = this->add("wall_internal_extension_chamfer", coBool);
+    def->label    = L("Wall extension chamfer");
+    def->category = L("Strength");
+    def->tooltip  = L("Add a 45° chamfer between the wall internal extension and the inside face of the top or bottom "
+                      "shell. Under a top surface the chamfer's lower layers are printed over sparse infill with no "
+                      "bridging under them, so it is off by default.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
 
     def = this->add("embedding_wall_into_infill", coBool);
     def->label = L("Embedding the wall into the infill");

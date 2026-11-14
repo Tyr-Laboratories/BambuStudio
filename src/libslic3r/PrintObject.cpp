@@ -1619,6 +1619,7 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "painted_wall_loops"
             || opt_key == "extra_wall_slope_angle"
             || opt_key == "wall_internal_extension"
+            || opt_key == "wall_internal_extension_chamfer"
             || opt_key == "top_one_wall_type"
             || opt_key == "top_area_threshold"
             || opt_key == "only_one_wall_first_layer"
@@ -1634,7 +1635,7 @@ bool PrintObject::invalidate_state_by_config_options(
                 steps.emplace_back(posSupportMaterial);
                 steps.emplace_back(posDetectOverhangsForLift);
             }
-            if (opt_key == "wall_internal_extension")
+            if (opt_key == "wall_internal_extension" || opt_key == "wall_internal_extension_chamfer")
                 // The extension's cut-outs change the bridge areas support reads.
                 steps.emplace_back(posSupportMaterial);
         } else if (opt_key == "gap_infill_speed" || opt_key == "filter_out_gap_fill") {

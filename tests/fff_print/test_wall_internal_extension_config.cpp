@@ -80,6 +80,57 @@ TEST_CASE("Wall internal extension defaults to 1 mm and persists in presets and 
     CHECK(reopened.objects.front()->volumes.front()->config.opt_float("wall_internal_extension") == 0.);
 }
 
+TEST_CASE("Wall extension chamfer defaults to off and persists in presets", "[WallExtension][Config]")
+{
+    Workspace workspace;
+    DynamicPrintConfig config;
+    config.apply(static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
+    REQUIRE(config.has("wall_internal_extension_chamfer"));
+    CHECK_FALSE(config.opt_bool("wall_internal_extension_chamfer"));
+    REQUIRE(std::count(Preset::print_options().begin(), Preset::print_options().end(), "wall_internal_extension_chamfer") == 1);
+
+    config.set_deserialize_strict({{"wall_internal_extension_chamfer", "1"}});
+    Preset preset(Preset::TYPE_PRINT, "Wall extension chamfer test");
+    preset.file = (workspace.path / "process.json").string();
+    preset.config = config;
+    REQUIRE(preset.save(nullptr));
+    Preset reopened_preset(Preset::TYPE_PRINT, preset.name);
+    reopened_preset.file = preset.file;
+    reopened_preset.reload(Preset(Preset::TYPE_PRINT, "Default"));
+    CHECK(reopened_preset.config.opt_bool("wall_internal_extension_chamfer"));
+}
+
+TEST_CASE("Changing the wall extension chamfer regenerates walls but keeps the slices", "[WallExtension][Config]")
+{
+    DynamicPrintConfig config;
+    config.apply(static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults()));
+    config.set_deserialize_strict({
+        {"layer_height", "0.2"}, {"initial_layer_print_height", "0.2"},
+        {"brim_type", "no_brim"}, {"enable_arc_fitting", "0"},
+        {"wall_internal_extension", "1"}, {"wall_internal_extension_chamfer", "0"}
+    });
+    Model model;
+    auto *object = model.add_object();
+    object->add_volume(TriangleMesh(its_make_cube(20., 20., 5.)));
+    object->add_instance()->set_offset(Vec3d(80., 80., 0.));
+
+    Print print;
+    print.set_status_silent();
+    print.auto_assign_extruders(model.objects.front());
+    print.apply(model, config);
+    print.process();
+    REQUIRE(print.get_object(size_t(0))->is_step_done(posPerimeters));
+    REQUIRE(print.get_object(size_t(0))->is_step_done(posSupportMaterial));
+
+    config.set_deserialize_strict({{"wall_internal_extension_chamfer", "1"}});
+    print.apply(model, config);
+    const auto *object_after = print.get_object(size_t(0));
+    CHECK(object_after->is_step_done(posSlice));
+    CHECK_FALSE(object_after->is_step_done(posPerimeters));
+    // Support reads bridge areas, which the extension's cut-outs can change.
+    CHECK_FALSE(object_after->is_step_done(posSupportMaterial));
+}
+
 TEST_CASE("Changing wall internal extension regenerates walls but keeps the slices", "[WallExtension][Config]")
 {
     DynamicPrintConfig config;
