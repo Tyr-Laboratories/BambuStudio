@@ -107,7 +107,10 @@ SCENARIO("PrintObject: Periodic modifier on a 20mm cube", "[PrintObject][Periodi
                 { "top_one_wall_type", "not apply" },
                 { "ensure_vertical_shell_thickness", "enabled" },
                 { "layer_height", 0.2 },
-                { "wall_generator", wall_generator }
+                { "wall_generator", wall_generator },
+                // With no walls on skip layers, each apply layer's wall rises out of the layer below like a wall out of a
+                // top surface, and the wall internal extension would start an internal bridge under it.
+                { "wall_internal_extension", 0. }
             });
         const PrintObject &object = *print.objects().front();
         REQUIRE(object.layers().size() > 4);

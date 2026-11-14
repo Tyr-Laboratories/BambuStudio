@@ -159,6 +159,123 @@ double solid_area(const Layer &layer)
                 area += surface.expolygon.area();
     return area * SCALING_FACTOR * SCALING_FACTOR;
 }
+
+// Solid fill area of `layer` other than the internal bridges the wall extension stands on and the stock strips of solid
+// infill that bridge_over_infill() adds under their ends, on the layer below a bridge.
+double solid_area_besides_extension_bridges(const Layer &layer)
+{
+    const auto extension_bridges = [](const Layer &on) {
+        ExPolygons bases, out;
+        for (const LayerRegion *region : on.regions())
+            append(bases, region->wall_extension_bridge_base);
+        if (!bases.empty())
+            for (const LayerRegion *region : on.regions())
+                for (const Surface &surface : region->fill_surfaces.surfaces)
+                    if (surface.surface_type == stInternalBridge && !intersection_ex({ surface.expolygon }, bases).empty())
+                        out.push_back(surface.expolygon);
+        return out;
+    };
+    const ExPolygons here  = extension_bridges(layer);
+    const ExPolygons above = layer.upper_layer ? extension_bridges(*layer.upper_layer) : ExPolygons{};
+    double           area  = solid_area(layer);
+    for (const LayerRegion *region : layer.regions())
+        for (const Surface &surface : region->fill_surfaces.surfaces)
+            if (surface.surface_type == stInternalBridge)
+                area -= area_mm2(intersection_ex({ surface.expolygon }, here));
+            else if (surface.surface_type == stInternalSolid)
+                area -= area_mm2(intersection_ex({ surface.expolygon }, above));
+    return area;
+}
+
+// Internal bridges of `layer` resting on the layer below (not follow-ups) that overlap `near`.
+ExPolygons internal_bridges(const Layer &layer, const ExPolygons &near)
+{
+    ExPolygons out;
+    for (const LayerRegion *region : layer.regions())
+        for (const Surface &surface : region->fill_surfaces.surfaces)
+            if (surface.surface_type == stInternalBridge && !surface.bridge_followup && !intersection_ex({ surface.expolygon }, near).empty())
+                out.push_back(surface.expolygon);
+    return out;
+}
+
+// Ends of the bridge strands of `layer`'s internal bridges overlapping `near`, and how many of them rest on an extrusion
+// of the layer below: {anchored, total}. A strand runs along its surface's bridge direction; the short connectors
+// between strands do not. An end rests when the last bead, up to two widths of it, overlaps what is printed below.
+std::pair<size_t, size_t> anchored_bridge_ends(const Layer &layer, const ExPolygons &near)
+{
+    Polygons deposited;
+    for (const LayerRegion *region : layer.lower_layer->regions()) {
+        region->perimeters.polygons_covered_by_width(deposited, float(SCALED_EPSILON));
+        region->fills.polygons_covered_by_width(deposited, float(SCALED_EPSILON));
+    }
+    deposited = union_(deposited);
+    size_t anchored = 0, total = 0;
+    for (const LayerRegion *region : layer.regions()) {
+        std::vector<const ExtrusionPath *> paths;
+        collect_paths(region->fills, paths);
+        for (const ExtrusionPath *path : paths) {
+            if (path->role() != erBridgeInfill)
+                continue;
+            for (const Line &line : path->polyline.lines()) {
+                const Vec2d direction = (line.b - line.a).cast<double>().normalized();
+                bool        strand    = false;
+                for (const Surface &surface : region->fill_surfaces.surfaces)
+                    if (surface.surface_type == stInternalBridge && !surface.bridge_followup && surface.expolygon.contains(line.midpoint()) &&
+                        !intersection_ex({ surface.expolygon }, near).empty())
+                        strand |= std::abs(direction.dot(Vec2d(std::cos(surface.bridge_angle), std::sin(surface.bridge_angle)))) > 0.9999;
+                if (!strand)
+                    continue;
+                const Point delta = (direction * std::min(line.length() * 0.49, scale_(2. * path->width))).cast<coord_t>();
+                const auto  rests = [&](const Point &a, const Point &b) {
+                    return area(intersection_ex(offset(Polyline{ a, b }, float(scale_(0.5 * path->width))), deposited)) >
+                           double(SCALED_EPSILON) * SCALED_EPSILON;
+                };
+                anchored += size_t(rests(line.a, line.a + delta)) + size_t(rests(line.b - delta, line.b));
+                total += 2;
+            }
+        }
+    }
+    return { anchored, total };
+}
+}
+
+TEST_CASE("Under a top surface the extension stands on an internal bridge anchored like the shell's", "[WallExtension][Print]")
+{
+    // Bridge Aware Cubic builds its lattice where internal bridges need it, so it must see this bridge as one too.
+    const std::string pattern = GENERATE(as<std::string>{}, "grid", "bridgeawarecubic");
+    CAPTURE(pattern);
+    DynamicPrintConfig config_without = extension_config(0., false), config_with = extension_config(1., false);
+    config_without.set_deserialize_strict({ {"sparse_infill_pattern", pattern} });
+    config_with.set_deserialize_strict({ {"sparse_infill_pattern", pattern} });
+    Model model = terrace();
+    Print without, with;
+    slice(without, model, config_without);
+    slice(with, model, config_with);
+    const Layer *bridge_layer = layer_at(with, 10.4), *first_lines = layer_at(with, 10.6), *tower_layer = layer_at(with, 12.2);
+    REQUIRE(bridge_layer != nullptr);
+    REQUIRE(first_lines != nullptr);
+    REQUIRE(tower_layer != nullptr);
+    // The deepest layer, 1.8 mm below the box's top, has only the sparse infill below it. Like any solid that starts over
+    // sparse infill, it is an internal bridge, and the extension lines start on the layer above it.
+    const ExPolygons under_wall = diff_ex(tower_layer->lslices, offset_ex(tower_layer->lslices, -scale_(0.45 + 0.05)));
+    const ExPolygons bridges    = internal_bridges(*bridge_layer, under_wall);
+    REQUIRE_FALSE(bridges.empty());
+    CHECK(extension_paths(*bridge_layer).empty());
+    Polylines first;
+    for (const ExtrusionPath *path : extension_paths(*first_lines))
+        first.push_back(path->polyline);
+    REQUIRE_FALSE(first.empty());
+    CHECK(total_length(diff_pl(first, offset_ex(bridges, float(SCALED_EPSILON)))) < scale_(with.config().resolution.value));
+    // The bridge's strands rest at both ends on what is printed below, as well as those of the box's own internal bridge
+    // under its top shell, which the same machinery anchors.
+    const Layer *shell_bridge_layer = layer_at(without, 11.4);
+    REQUIRE(shell_bridge_layer != nullptr);
+    const auto [anchored, ends]             = anchored_bridge_ends(*bridge_layer, under_wall);
+    const auto [shell_anchored, shell_ends] = anchored_bridge_ends(*shell_bridge_layer, shell_bridge_layer->lslices);
+    CAPTURE(anchored, ends, shell_anchored, shell_ends);
+    REQUIRE(ends > 0);
+    REQUIRE(shell_ends > 0);
+    CHECK(double(anchored) / double(ends) >= double(shell_anchored) / double(shell_ends));
 }
 
 TEST_CASE("A tower's outer wall continues 1.8 mm into the box", "[WallExtension][Print]")
@@ -167,8 +284,9 @@ TEST_CASE("A tower's outer wall continues 1.8 mm into the box", "[WallExtension]
     Model model = terrace();
     Print print;
     slice(print, model, extension_config(1.));
-    // Down to 1.8 mm below the box's top; the top layer itself keeps its stock top surface.
-    CHECK(extension_layers(print) == tenths(104, 118));
+    // Down to 1.8 mm below the box's top, whose deepest layer is the internal bridge the lines stand on; the top layer
+    // itself keeps its stock top surface.
+    CHECK(extension_layers(print) == tenths(106, 118));
 
     const Layer *box_layer = layer_at(print, 6.0), *tower_layer = layer_at(print, 12.2);
     REQUIRE(box_layer != nullptr);
@@ -181,8 +299,6 @@ TEST_CASE("A tower's outer wall continues 1.8 mm into the box", "[WallExtension]
                 CHECK(std::any_of(box_layer->lslices.begin(), box_layer->lslices.end(), [&](const ExPolygon &e) { return e.contains(point); }));
                 CHECK(std::any_of(near_tower.begin(), near_tower.end(), [&](const ExPolygon &e) { return e.contains(point); }));
             }
-            // Only the lowest layer hangs over the sparse infill and is printed like a bridge.
-            CHECK((path->get_customize_flag() == CustomizeFlag::cfWallExtensionBridge) == (std::abs(layer->print_z - 10.4) < EPSILON));
         }
 
     const auto filename = (workspace.path / "terrace.gcode").string();
@@ -206,8 +322,9 @@ TEST_CASE("A column's outer wall continues into the slab above the bridge layer,
 
 TEST_CASE("Fill never covers wall extension lines", "[WallExtension][Print]")
 {
-    // Eight layers under the tower, whose surface layer has none; eight over the column, whose bridge layer has none.
-    for (auto [model, expected_layers] : { std::pair<Model, size_t>{ terrace(), 8 }, std::pair<Model, size_t>{ overhang(), 8 } }) {
+    // Seven layers under the tower, whose surface layer has none and whose deepest layer is a bridge; eight over the
+    // column, whose bridge layer has none.
+    for (auto [model, expected_layers] : { std::pair<Model, size_t>{ terrace(), 7 }, std::pair<Model, size_t>{ overhang(), 8 } }) {
         Print print;
         slice(print, model, extension_config(1.));
         size_t layers_with_area = 0;
@@ -224,7 +341,7 @@ TEST_CASE("Fill never covers wall extension lines", "[WallExtension][Print]")
     }
 }
 
-TEST_CASE("The wall extension adds no solid infill", "[WallExtension][Print]")
+TEST_CASE("The wall extension adds no solid infill besides the bridge it stands on", "[WallExtension][Print]")
 {
     Model model = terrace();
     Print without, with;
@@ -235,7 +352,7 @@ TEST_CASE("The wall extension adds no solid infill", "[WallExtension][Print]")
     REQUIRE(layers_without.size() == layers_with.size());
     for (size_t i = 0; i < layers_with.size(); ++i) {
         CAPTURE(layers_with[i]->print_z);
-        CHECK(solid_area(*layers_with[i]) <= solid_area(*layers_without[i]) + 0.05);
+        CHECK(solid_area_besides_extension_bridges(*layers_with[i]) <= solid_area(*layers_without[i]) + 0.05);
     }
 }
 
@@ -304,24 +421,24 @@ TEST_CASE("Fine layers still get the extension", "[WallExtension][Print]")
     CHECK_FALSE(extension_layers(print).empty());
 }
 
-TEST_CASE("The lowest extension layer prints at bridge speed in the G-code", "[WallExtension][Print][GCode]")
+TEST_CASE("Every wall extension line prints at inner wall speed in the G-code", "[WallExtension][Print][GCode]")
 {
     PrintWorkspace workspace;
     Model model = terrace();
     const DynamicPrintConfig config = gcode_config(1.);
     Print print;
     slice(print, model, config);
-    const auto filename = (workspace.path / "bridge.gcode").string();
+    const auto filename = (workspace.path / "speeds.gcode").string();
     GCodeProcessorResult result;
     print.export_gcode(filename, &result);
     const auto speeds = feature_speeds(filename, config, "Wall extension");
-    REQUIRE(speeds.count(104) == 1);
-    CHECK(speeds.at(104) == std::set<int>{ 23 * 60 });
-    for (const auto &[z, f] : speeds)
-        if (z != 104) {
-            CAPTURE(z);
-            CHECK(f == std::set<int>{ 77 * 60 });
-        }
+    // The lines start on the bridge at 10.4, which prints as the internal bridge it is.
+    CHECK(speeds.count(104) == 0);
+    REQUIRE(speeds.count(106) == 1);
+    for (const auto &[z, f] : speeds) {
+        CAPTURE(z);
+        CHECK(f == std::set<int>{ 77 * 60 });
+    }
 }
 
 TEST_CASE("Wall extension lines slow down with height like the walls", "[WallExtension][Print][GCode]")
@@ -409,7 +526,7 @@ TEST_CASE("With slope walls on, the wall extension still adds no solid infill", 
     bool both_on_one_layer = false;
     for (size_t i = 0; i < layers_with.size(); ++i) {
         CAPTURE(layers_with[i]->print_z);
-        CHECK(solid_area(*layers_with[i]) <= solid_area(*layers_without[i]) + 0.05);
+        CHECK(solid_area_besides_extension_bridges(*layers_with[i]) <= solid_area(*layers_without[i]) + 0.05);
         // Slope-wall layers expand their top, bottom and bridge surfaces by the depth of their walls; the extension
         // lines are not walls and must not make those surfaces spread over the solid infill.
         for (SurfaceType type : { stTop, stBottom, stBottomBridge }) {
@@ -449,11 +566,13 @@ bool inside(const ExPolygons &area, const Point &point)
     return std::any_of(area.begin(), area.end(), [&point](const ExPolygon &e) { return e.contains(point); });
 }
 
+// Total height of the layers holding wall extension lines or the internal bridge the extension starts on.
 double heights_with_extension(const Print &print)
 {
     double sum = 0.;
     for (const Layer *layer : print.get_object(size_t(0))->layers())
-        if (!extension_paths(*layer).empty())
+        if (!extension_paths(*layer).empty() ||
+            std::any_of(layer->regions().begin(), layer->regions().end(), [](const LayerRegion *region) { return !region->wall_extension_bridge_base.empty(); }))
             sum += layer->height;
     return sum;
 }
@@ -464,8 +583,8 @@ TEST_CASE("With the chamfer off the tower's extension stays under its wall", "[W
     Model model = terrace();
     Print print;
     slice(print, model, extension_config(1., false));
-    // As deep as with the chamfer: down to 1.8 mm below the box's top.
-    CHECK(extension_layers(print) == tenths(104, 118));
+    // As deep as with the chamfer: down to 1.8 mm below the box's top, whose deepest layer is the bridge.
+    CHECK(extension_layers(print) == tenths(106, 118));
     const Layer *tower_layer = layer_at(print, 12.2);
     REQUIRE(tower_layer != nullptr);
     // Every line runs right under the tower's wall: inside its outline, within one line width of it.
@@ -483,7 +602,8 @@ TEST_CASE("A one-line fin is extended", "[WallExtension][Print]")
     Model model = boxes({ { { 30., 30., 6. }, { 0., 0., 0. } }, { { 0.6, 20., 5. }, { 14.7, 5., 6. } } });
     Print print;
     slice(print, model, extension_config(1.));
-    CHECK(extension_layers(print) == tenths(44, 58));
+    // Down to 1.8 mm below the box's top, whose deepest layer is the bridge the lines stand on.
+    CHECK(extension_layers(print) == tenths(46, 58));
 }
 
 TEST_CASE("A rib standing on a sloped skin is extended along its base", "[WallExtension][Print]")
@@ -544,7 +664,7 @@ TEST_CASE("The classic wall generator gets the same extension", "[WallExtension]
     config.set_deserialize_strict({ {"wall_generator", "classic"} });
     Print print;
     slice(print, model, config);
-    CHECK(extension_layers(print) == tenths(104, 118));
+    CHECK(extension_layers(print) == tenths(106, 118));
 }
 
 TEST_CASE("On a thin plate the extension stops above the bed", "[WallExtension][Print]")
@@ -563,7 +683,7 @@ TEST_CASE("Depth is measured in millimetres with variable layer heights", "[Wall
     Print print;
     slice(print, model, extension_config(1.));
     // Four 0.1 mm top layers make a 0.4 mm shell; the extension goes through it, but for its top layer, which keeps its
-    // top surface, and 1 mm further.
+    // top surface, and 1 mm further, its deepest layer being the bridge it stands on.
     CHECK(heights_with_extension(print) == Approx(0.4 - 0.1 + 1.0).margin(0.05));
 }
 

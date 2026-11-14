@@ -983,6 +983,11 @@ void PrintObject::prepare_infill()
     this->clip_fill_surfaces();
     m_print->throw_if_canceled();
 
+    // A wall extension starting over sparse infill starts with solid, which bridge_over_infill() below turns into an
+    // anchored internal bridge, and which the sparse infill generators support like any other internal bridge.
+    WallInternalExtension::make_bridge_bases_solid(*this);
+    m_print->throw_if_canceled();
+
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
         for (const Layer *layer : m_layers) {

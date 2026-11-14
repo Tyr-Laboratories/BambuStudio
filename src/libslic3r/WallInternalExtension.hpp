@@ -129,6 +129,11 @@ ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const ExPo
 // spiral vase mode or when no region has wall_internal_extension above 0.
 void apply(PrintObject &object);
 
+// Turns the sparse fill surfaces inside each region's LayerRegion::wall_extension_bridge_base into internal solid, so
+// that bridge_over_infill() makes them internal bridges anchored on the infill below and the sparse infill generators
+// support them, as they do for any solid starting over sparse infill. Run after the fill surfaces are classified.
+void make_bridge_bases_solid(PrintObject &object);
+
 } // namespace WallInternalExtension
 } // namespace Slic3r
 

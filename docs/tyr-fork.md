@@ -82,13 +82,15 @@ Vertical walls, walls leaning by less than 45°, the walls of pockets and one-li
 
 Ribs standing on sloped or curved skins are extended piece by piece. Where the skin slopes more than about 15° along the rib, each layer's new piece of the rib's wall rests mostly on the wall below it, so no extension is added there.
 
-The extension and chamfer lines use the outer wall's line width and the inner wall's speed, acceleration and cooling. The lowest layer under a top surface has only sparse infill below it. It is printed with bridge speed and flow, but only the sparse infill lines it crosses hold it up.
+The extension and chamfer lines use the outer wall's line width and the inner wall's speed, acceleration and cooling.
+
+Under a top surface the extension reaches into the sparse infill, so its deepest layer has nothing printed below it. Like any solid that starts over sparse infill, that layer is an **internal bridge**: Bambu Studio's own internal bridge detection anchors its strands on the infill below, and the sparse infill (Bridge Aware Cubic, Support Cubic, Adaptive Cubic or Lightning) is built to support it as it is for any internal bridge. The extension's lines start on the layer above the bridge. Above a bottom surface the extension starts on the surface's own bridge layer.
 
 The extension stays inside the part:
 - it stops where the part ends;
 - it never prints on the first layer or on an exposed top or bottom surface;
 - fill meets its lines at normal line spacing;
-- it adds no other solid infill.
+- it adds no other solid infill than the internal bridge it stands on.
 
 In the preview these lines are the **Wall extension** line type, with their own colour and time and filament statistics. Older versions of Bambu Studio show this line type as undefined, so open sliced files in this version to see it.
 

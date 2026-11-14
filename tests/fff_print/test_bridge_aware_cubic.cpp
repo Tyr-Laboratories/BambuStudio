@@ -25,7 +25,10 @@ DynamicPrintConfig sparse_infill_config(const std::string &pattern, const std::s
         {"bottom_shell_layers", "3"}, {"bottom_shell_thickness", "0"},
         // Without anchors, each infill line is printed as cut from the lattice.
         {"sparse_infill_anchor", "0"}, {"sparse_infill_anchor_max", "0"},
-        {"brim_type", "no_brim"}, {"enable_arc_fitting", "0"}, {"wall_generator", "classic"}
+        {"brim_type", "no_brim"}, {"enable_arc_fitting", "0"}, {"wall_generator", "classic"},
+        // The tower and the hole wall rise out of top surfaces, so the wall internal extension would add its own internal
+        // bridges under them; these cases check the lattice under the stock roofs and floors only.
+        {"wall_internal_extension", "0"}
     });
     return config;
 }

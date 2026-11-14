@@ -406,8 +406,10 @@ void apply(PrintObject &object)
 {
     LayerPtrs &layers = object.layers();
     for (Layer *layer : layers)
-        for (LayerRegion *region : layer->regions())
+        for (LayerRegion *region : layer->regions()) {
             region->wall_extension_area.clear();
+            region->wall_extension_bridge_base.clear();
+        }
 
     const Print &print = *object.print();
     const auto throw_if_canceled = [&print]() {
@@ -550,15 +552,18 @@ void apply(PrintObject &object)
                 polygons_append(support_below, to_polygons(below));
             const LayerRegionPtrs &regions = layers[l]->regions();
             for (size_t r = 0; r < regions.size() && r < areas[l].size(); ++r) {
-                const ExPolygons &area = areas[l][r];
-                if (area.empty())
+                if (areas[l][r].empty())
                     continue;
                 LayerRegion &region      = *regions[r];
                 const Flow   flow        = region.flow(frExternalPerimeter);
                 const Flow   bridge_flow = region.bridging_flow(frPerimeter, object.config().thick_bridges);
-                // Only a top joint's deepest layer can hang over the sparse infill.
-                const ExPolygons bridge_area = diff_ex(intersection_ex(hanging[l], area),
-                                                       offset(support_below, float(flow.scaled_spacing()) / 2.f));
+                // Only a top joint's deepest layer can start with nothing printed below it. That part is not printed as
+                // lines: it stays in the fill as the base of an internal bridge (see wall_extension_bridge_base).
+                const ExPolygons base = diff_ex(intersection_ex(hanging[l], areas[l][r]),
+                                                offset(support_below, float(flow.scaled_spacing()) / 2.f));
+                const ExPolygons area = base.empty() ? areas[l][r] : diff_ex(areas[l][r], base);
+                region.wall_extension_bridge_base = base;
+                const ExPolygons bridge_area;
                 for (const ExPolygon &piece : area) {
                     // Enough walls to fill the whole piece: the chamfers of close joints merge into areas much wider than
                     // one extension, and the piece is cut out of the fill. No point lies deeper than half the piece's
@@ -570,6 +575,8 @@ void apply(PrintObject &object)
                     if (!lines.entities.empty())
                         region.perimeters.append(std::move(lines));
                 }
+                if (area.empty())
+                    continue;
                 // Fill meets the extension lines at normal line spacing, as neighbouring solid lines meet.
                 region.fill_expolygons            = diff_ex(region.fill_expolygons, area);
                 region.fill_no_overlap_expolygons = diff_ex(region.fill_no_overlap_expolygons, area);
@@ -580,6 +587,38 @@ void apply(PrintObject &object)
         }
     });
     throw_if_canceled();
+}
+
+void make_bridge_bases_solid(PrintObject &object)
+{
+    LayerPtrs &layers = object.layers();
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, layers.size()), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t i = range.begin(); i < range.end(); ++i)
+            for (LayerRegion *region : layers[i]->regions()) {
+                const ExPolygons &base = region->wall_extension_bridge_base;
+                if (base.empty())
+                    continue;
+                Surfaces surfaces;
+                for (Surface &surface : region->fill_surfaces.surfaces) {
+                    if (surface.surface_type != stInternal && surface.surface_type != stInternalVoid) {
+                        surfaces.push_back(std::move(surface));
+                        continue;
+                    }
+                    const ExPolygons inside = intersection_ex(ExPolygons{ surface.expolygon }, base);
+                    if (inside.empty()) {
+                        surfaces.push_back(std::move(surface));
+                        continue;
+                    }
+                    for (const ExPolygon &rest : diff_ex(ExPolygons{ surface.expolygon }, base))
+                        surfaces.emplace_back(surface, rest);
+                    for (const ExPolygon &solid : inside) {
+                        surfaces.emplace_back(surface, solid);
+                        surfaces.back().surface_type = stInternalSolid;
+                    }
+                }
+                region->fill_surfaces.surfaces = std::move(surfaces);
+            }
+    });
 }
 
 } // namespace WallInternalExtension

@@ -4203,6 +4203,7 @@ std::string PrintStatistics::finalize_output_path(const std::string &path_in) co
 #define JSON_LAYER_REGION_FILL_SURFACES               "fill_surfaces"
 #define JSON_LAYER_REGION_FILL_NO_OVERLAP             "fill_no_overlap_expolygons"
 #define JSON_LAYER_REGION_WALL_EXTENSION_AREA         "wall_extension_area"
+#define JSON_LAYER_REGION_WALL_EXTENSION_BRIDGE_BASE  "wall_extension_bridge_base"
 #define JSON_LAYER_REGION_UNSUPPORTED_BRIDGE_EDGES    "unsupported_bridge_edges"
 #define JSON_LAYER_REGION_PERIMETERS                  "perimeters"
 #define JSON_LAYER_REGION_FILLS                  "fills"
@@ -4465,6 +4466,7 @@ static void to_json(json& j, const LayerRegion& layer_region) {
     j[JSON_LAYER_REGION_BRIDGE_FILL_EXPOLYGONS] = layer_region.bridge_fill_expolygons;
     j[JSON_LAYER_REGION_BRIDGE_FILL_OVERLAP_DELTA] = layer_region.bridge_fill_overlap_delta;
     j[JSON_LAYER_REGION_WALL_EXTENSION_AREA] = layer_region.wall_extension_area;
+    j[JSON_LAYER_REGION_WALL_EXTENSION_BRIDGE_BASE] = layer_region.wall_extension_bridge_base;
 
     //fill_surfaces
     for (const Surface& fill_surface : layer_region.fill_surfaces.surfaces) {
@@ -4768,6 +4770,9 @@ static void convert_layer_region_from_json(const json& j, LayerRegion& layer_reg
     layer_region.bridge_fill_overlap_delta = j.value(JSON_LAYER_REGION_BRIDGE_FILL_OVERLAP_DELTA, coord_t(0));
     layer_region.wall_extension_area = j.contains(JSON_LAYER_REGION_WALL_EXTENSION_AREA)
         ? j[JSON_LAYER_REGION_WALL_EXTENSION_AREA].get<ExPolygons>()
+        : ExPolygons{};
+    layer_region.wall_extension_bridge_base = j.contains(JSON_LAYER_REGION_WALL_EXTENSION_BRIDGE_BASE)
+        ? j[JSON_LAYER_REGION_WALL_EXTENSION_BRIDGE_BASE].get<ExPolygons>()
         : ExPolygons{};
 
     //fill_surfaces

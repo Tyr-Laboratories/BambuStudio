@@ -69,6 +69,10 @@ public:
     // Area of this region's wall extension lines on this layer (wall_internal_extension), cut out of the fill sets above.
     // Treated as interior when ensuring vertical shell thickness. Empty when there are none.
     ExPolygons                  wall_extension_area;
+    // Where this region's wall extension starts with nothing printed below it: a top joint's deepest layer, over sparse
+    // infill. Left in the fill and made internal solid before bridge_over_infill(), which makes it the anchored internal
+    // bridge the extension lines of the layer above stand on, as for any solid starting over sparse infill.
+    ExPolygons                  wall_extension_bridge_base;
 
     // collection of expolygons representing the bridged areas (thus not
     // needing support material)
