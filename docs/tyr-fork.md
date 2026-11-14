@@ -84,7 +84,7 @@ Ribs standing on sloped or curved skins are extended piece by piece. Where the s
 
 The extension and chamfer lines use the outer wall's line width and the inner wall's speed, acceleration and cooling.
 
-Under a top surface the extension reaches into the sparse infill, so its deepest layer has nothing printed below it. Like any solid that starts over sparse infill, that layer is an **internal bridge**: Bambu Studio's own internal bridge detection anchors its strands on the infill below, and the sparse infill (Bridge Aware Cubic, Support Cubic, Adaptive Cubic or Lightning) is built to support it as it is for any internal bridge. The extension's lines start on the layer above the bridge. Above a bottom surface the extension starts on the surface's own bridge layer.
+Under a top surface the extension reaches into the sparse infill, so its deepest layer has nothing printed below it. Like any solid that starts over sparse infill, that layer is solid infill that becomes an **internal bridge**: Bambu Studio's own internal bridge detection anchors its strands on the infill below, and the sparse infill (Bridge Aware Cubic, Support Cubic, Adaptive Cubic or Lightning) is built to support it as it is for any internal bridge. The solid covers four solid infill spacings around the line, the distance within which bridge detection looks for walls or solid that carry a solid layer: close to them it reaches them, elsewhere it is wide enough to be bridged. The extension's lines start on the layer above it. Above a bottom surface the extension starts on the surface's own bridge layer.
 
 The extension stays inside the part:
 - it stops where the part ends;
