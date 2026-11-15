@@ -16,12 +16,23 @@
 #include <thread>
 #include <vector>
 
+#ifdef __APPLE__
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
+
 namespace {
 
 class JobTestApp final : public wxApp
 {
 public:
     bool OnInit() override { return true; }
+#ifdef __WXOSX__
+    // The suite runs unattended. Without this, wxWidgets turns an application outside an .app bundle into a
+    // foreground one and activates it at launch, taking the desktop focus from whatever the user is working in on
+    // every run.
+    bool OSXIsGUIApplication() override { return false; }
+#endif
 };
 
 struct ProgressCall {
@@ -144,6 +155,19 @@ int main(int argc, char** argv)
     wxEntryCleanup();
     return result;
 }
+
+#ifdef __APPLE__
+TEST_CASE("The test application never takes the desktop focus", "[GUIJob][macOS]")
+{
+    wxTheApp->ProcessPendingEvents();
+    id application = reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(reinterpret_cast<id>(objc_getClass("NSRunningApplication")),
+                                                                     sel_registerName("currentApplication"));
+    REQUIRE(application != nullptr);
+    // NSApplicationActivationPolicyRegular is 0: a foreground application with a Dock icon.
+    CHECK(reinterpret_cast<long (*)(id, SEL)>(objc_msgSend)(application, sel_registerName("activationPolicy")) != 0);
+    CHECK_FALSE(reinterpret_cast<BOOL (*)(id, SEL)>(objc_msgSend)(application, sel_registerName("isActive")));
+}
+#endif
 
 TEST_CASE("Worker errors wait for the GUI thread and retain their payload", "[GUIJob]")
 {

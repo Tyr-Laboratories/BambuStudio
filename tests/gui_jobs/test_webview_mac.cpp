@@ -2,12 +2,24 @@
 #include "slic3r/GUI/Widgets/WebView.hpp"
 
 #include <wx/app.h>
+#include <wx/display.h>
 #include <wx/evtloop.h>
 #include <wx/frame.h>
 #include <wx/osx/webview_webkit.h>
 #include <wx/timer.h>
 
 namespace {
+// The frames below are shown, so that their views load as visible ones do, but off every display and without a title
+// bar (macOS keeps a titled window on screen): the suite puts no window in front of the user.
+wxPoint off_screen()
+{
+    wxRect displays;
+    for (unsigned i = 0; i < wxDisplay::GetCount(); ++i)
+        displays.Union(wxDisplay(i).GetGeometry());
+    return wxPoint(displays.GetLeft() - 10000, displays.GetTop() - 10000);
+}
+constexpr long off_screen_style = wxBORDER_NONE | wxFRAME_NO_TASKBAR;
+
 // Keep native WebKit handler registration and document injection real. Trap
 // only its synchronous script boundary: a regression must fail an assertion,
 // rather than hanging the test runner when an off-screen WebContent is paused.
@@ -25,7 +37,7 @@ public:
 
 TEST_CASE("A hidden Mac webview registers its message bridge without waiting for JavaScript", "[WebView][macOS]")
 {
-    wxFrame frame(nullptr, wxID_ANY, "Local webview regression test", wxDefaultPosition, wxSize(240, 120));
+    wxFrame frame(nullptr, wxID_ANY, "Local webview regression test", off_screen(), wxSize(240, 120), off_screen_style);
     auto* view = new ObservedWebKit;
     view->SetNonPersistentWebsiteDataStore(true);
     REQUIRE(view->Create(&frame, wxID_ANY, "about:blank"));
@@ -55,11 +67,12 @@ TEST_CASE("A hidden Mac webview registers its message bridge without waiting for
     timeout.Stop();
     CHECK(received);
     CHECK(view->synchronous_scripts == 0);
+    CHECK(wxDisplay::GetFromWindow(&frame) == wxNOT_FOUND);
 }
 
 TEST_CASE("A Mac webview exposes its message bridge to an already loaded document", "[WebView][macOS]")
 {
-    wxFrame frame(nullptr, wxID_ANY, "Local webview regression test", wxDefaultPosition, wxSize(240, 120));
+    wxFrame frame(nullptr, wxID_ANY, "Local webview regression test", off_screen(), wxSize(240, 120), off_screen_style);
     auto* view = new ObservedWebKit;
     view->SetNonPersistentWebsiteDataStore(true);
     REQUIRE(view->Create(&frame, wxID_ANY, "about:blank"));
@@ -100,4 +113,5 @@ TEST_CASE("A Mac webview exposes its message bridge to an already loaded documen
     CHECK(registered);
     CHECK(received);
     CHECK(view->synchronous_scripts == 0);
+    CHECK(wxDisplay::GetFromWindow(&frame) == wxNOT_FOUND);
 }
