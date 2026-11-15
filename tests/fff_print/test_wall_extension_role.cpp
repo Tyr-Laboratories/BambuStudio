@@ -3,6 +3,7 @@
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/ToolOrdering.hpp"
 
 #include <boost/filesystem.hpp>
 #include <algorithm>
@@ -124,4 +125,21 @@ TEST_CASE("Wall extension lines print at inner-wall settings", "[WallExtension][
     CHECK(it->second > 0.f);
     REQUIRE(result.print_statistics.used_filaments_per_role.count(erWallExtension) == 1);
     CHECK(result.print_statistics.used_filaments_per_role.at(erWallExtension).first > 0.);
+}
+
+TEST_CASE("Wall extension lines printed into a bridge take the bridge's filament", "[WallExtension][Role]")
+{
+    // With walls and infill in different filaments, lines printed into a bridge go with the bridge's (solid infill)
+    // filament, so they print in its pass, after it; elsewhere they print with the walls they continue.
+    PrintRegionConfig config = static_cast<const PrintRegionConfig &>(FullPrintConfig::defaults());
+    config.wall_filament.value          = 1;
+    config.sparse_infill_filament.value = 2;
+    config.solid_infill_filament.value  = 3;
+    const PrintRegion region(config);
+    ExtrusionEntityCollection lines;
+    lines.append(square_loop(Point(0, 0), 10., Flow(0.42f, 0.2f, 0.4f)));
+    const LayerTools tools(1.);
+    CHECK(tools.extruder(lines, region) == 0);
+    lines.print_after_fill = true;
+    CHECK(tools.extruder(lines, region) == 2);
 }

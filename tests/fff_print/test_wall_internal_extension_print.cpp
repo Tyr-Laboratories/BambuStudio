@@ -70,6 +70,13 @@ Model boxes(std::initializer_list<std::pair<Vec3d, Vec3d>> parts)
 Model terrace() { return boxes({ { { 30., 30., 12. }, { 0., 0., 0. } }, { { 10., 10., 6. }, { 10., 10., 12. } } }); }
 // A 10x10x6 column carrying a 30x30x4 slab.
 Model overhang() { return boxes({ { { 10., 10., 6. }, { 10., 10., 0. } }, { { 30., 30., 4. }, { 0., 0., 6. } } }); }
+// A tunnel 5 mm wide and 30 mm long under a 3 mm roof. The tunnel's walls end under the roof's first layer at 5.2, a
+// bridge that spans the 5 mm width anchored on the walls' tops.
+Model tunnel()
+{
+    return boxes({ { { 30., 20., 2. }, { 0., 0., 0. } }, { { 30., 7.5, 3. }, { 0., 0., 2. } }, { { 30., 7.5, 3. }, { 0., 12.5, 2. } },
+                   { { 30., 20., 3. }, { 0., 0., 5. } } });
+}
 
 void slice(Print &print, Model &model, const DynamicPrintConfig &config)
 {
@@ -693,6 +700,15 @@ std::vector<std::string> feature_runs(const std::string &file, const DynamicPrin
     }));
     return out;
 }
+
+// Whether in `runs` (see feature_runs()) `first` and `second` both occur, every run of `first` before every run of
+// `second`.
+bool printed_before(const std::vector<std::string> &runs, const std::string &first, const std::string &second)
+{
+    const auto last  = std::find(runs.rbegin(), runs.rend(), first);
+    const auto start = std::find(runs.begin(), runs.end(), second);
+    return last != runs.rend() && start != runs.end() && size_t(runs.rend() - last) <= size_t(start - runs.begin());
+}
 }
 
 TEST_CASE("Fine layers still get the extension", "[WallExtension][Print]")
@@ -1101,10 +1117,7 @@ TEST_CASE("Merged chamfers of close fins are printed through and not left hollow
 TEST_CASE("Over a bottom joint the extension prints into the bridge after it, which keeps its anchors and direction", "[WallExtension][Print][GCode]")
 {
     PrintWorkspace workspace;
-    // A tunnel 5 mm wide and 30 mm long under a 3 mm roof. The tunnel's walls end under the roof's first layer, a bridge
-    // that spans the 5 mm width anchored on the walls' tops.
-    Model model = boxes({ { { 30., 20., 2. }, { 0., 0., 0. } }, { { 30., 7.5, 3. }, { 0., 0., 2. } },
-                          { { 30., 7.5, 3. }, { 0., 12.5, 2. } }, { { 30., 20., 3. }, { 0., 0., 5. } } });
+    Model model = tunnel();
     Print without, with;
     slice(without, model, gcode_config(0.));
     slice(with, model, gcode_config(1.));
@@ -1119,12 +1132,7 @@ TEST_CASE("Over a bottom joint the extension prints into the bridge after it, wh
     with.export_gcode(filename, &result);
     const std::vector<std::string> runs = feature_runs(filename, gcode_config(1.), 52);
     CAPTURE(runs);
-    const auto bridge = std::find(runs.rbegin(), runs.rend(), "Bridge");
-    const auto line   = std::find(runs.begin(), runs.end(), "Wall extension");
-    REQUIRE(bridge != runs.rend());
-    REQUIRE(line != runs.end());
-    const auto last_bridge = runs.size() - 1 - size_t(bridge - runs.rbegin()), first_line = size_t(line - runs.begin());
-    CHECK(last_bridge < first_line);
+    CHECK(printed_before(runs, "Bridge", "Wall extension"));
     const auto bridges = [](const Layer &layer) {
         std::vector<std::pair<double, double>> out;
         for (const LayerRegion *region : layer.regions())
@@ -1141,6 +1149,44 @@ TEST_CASE("Over a bottom joint the extension prints into the bridge after it, wh
         CHECK(actual[i].first == Approx(expected[i].first).epsilon(0.01));
         CHECK(actual[i].second == Approx(expected[i].second).margin(1e-3));
     }
+}
+
+TEST_CASE("Where an outline only leans out under its walls, the fill overlaps the lines as walls", "[WallExtension][Print]")
+{
+    // The terrace's box leans out 0.03 mm a layer over its top 2 mm: each layer overhangs the one below by less than
+    // its outer wall, so no layer there has a bridge or overhang fill. The tower stands 0.5 mm in from the box's
+    // bottom outline, its extension within the stock expansion of those overhangs.
+    std::vector<std::pair<Vec3d, Vec3d>> parts{ { { 30., 30., 10. }, { 0., 0., 0. } }, { { 10., 10., 6. }, { 0.5, 10., 12. } } };
+    for (int k = 0; k < 10; ++k) {
+        const double out = 0.03 * (k + 1);
+        parts.push_back({ { 30. + 2. * out, 30. + 2. * out, 0.2 }, { -out, -out, 10. + 0.2 * k } });
+    }
+    TriangleMesh mesh;
+    for (const auto &[size, origin] : parts) {
+        TriangleMesh box(its_make_cube(size.x(), size.y(), size.z()));
+        box.translate(float(origin.x()), float(origin.y()), float(origin.z()));
+        mesh.merge(box);
+    }
+    Model model;
+    model.add_object()->add_volume(std::move(mesh));
+    model.objects.front()->add_instance()->set_offset(Vec3d(80., 80., 0.));
+    Print print;
+    slice(print, model, extension_config(1., false));
+    const float half_resolution = float(scale_(print.config().resolution.value / 2.));
+    size_t layers_with_lines = 0;
+    for (const Layer *layer : print.get_object(size_t(0))->layers()) {
+        const Polylines lines = extension_lines(*layer);
+        if (lines.empty())
+            continue;
+        ++layers_with_lines;
+        CAPTURE(layer->print_z);
+        for (const LayerRegion *region : layer->regions()) {
+            CHECK(intersection_ex(region->fill_expolygons, offset(lines, half_resolution)).empty());
+            for (const ExtrusionEntity *entity : region->perimeters.entities)
+                CHECK_FALSE(static_cast<const ExtrusionEntityCollection *>(entity)->print_after_fill);
+        }
+    }
+    CHECK(layers_with_lines >= 8);
 }
 
 TEST_CASE("A tube through a thin flange keeps the flange's bridge anchors, the extension printing into the bridge", "[WallExtension][Print]")

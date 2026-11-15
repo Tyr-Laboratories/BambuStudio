@@ -151,8 +151,11 @@ unsigned int LayerTools::extruder(const ExtrusionEntityCollection &extrusions, c
     // use separate filament for different features only if the potion was open
     if (this->extruder_override == 0) {
         ExtrusionRole extrusions_role = extrusions.role();
-        // Wall extension lines are printed with the walls they continue.
-        if (is_perimeter(extrusions_role) || extrusions_role == erWallExtension) {
+        // Wall extension lines printed into a bridge go with the bridge, in its pass after it; the others are printed
+        // with the walls they continue.
+        if (extrusions.print_after_fill) {
+            extruder = region.config().solid_infill_filament.value;
+        } else if (is_perimeter(extrusions_role) || extrusions_role == erWallExtension) {
             extruder = region.config().wall_filament.value;
         } else if (is_solid_infill(extrusions_role)) {
             extruder = region.config().solid_infill_filament.value;
@@ -789,6 +792,11 @@ void ToolOrdering::collect_extruders(const PrintObject &object, const std::vecto
                         firstLayerExtruders.emplace_back((extruder_override == 0) ? region.config().wall_filament.value : extruder_override);
                     }
                 }
+                // Wall extension lines printed into a bridge go with its filament (see LayerTools::extruder()).
+                if (std::any_of(layerm->perimeters.entities.begin(), layerm->perimeters.entities.end(), [](const ExtrusionEntity *eec) {
+                        return static_cast<const ExtrusionEntityCollection *>(eec)->print_after_fill;
+                    }))
+                    layer_tools.extruders.emplace_back((extruder_override == 0) ? region.config().solid_infill_filament.value : extruder_override);
 
                 layer_tools.has_object = true;
             }
@@ -3031,6 +3039,10 @@ int WipingExtrusions::last_nonsoluble_extruder_on_layer(const PrintConfig& print
 // Decides whether this entity could be overridden
 bool WipingExtrusions::is_overriddable(const ExtrusionEntityCollection& eec, const PrintConfig& print_config, const PrintObject& object, const PrintRegion& region) const
 {
+    // Printed into a bridge, after it: never moved to another filament's pass to purge into.
+    if (eec.print_after_fill)
+        return false;
+
     if (print_config.filament_soluble.get_at(m_layer_tools->extruder(eec, region)))
         return false;
 
@@ -3044,6 +3056,9 @@ bool WipingExtrusions::is_overriddable(const ExtrusionEntityCollection& eec, con
 }
 bool WipingExtrusions::is_obj_overriddable(const ExtrusionEntityCollection &eec, const PrintObject &object) const
 {
+    if (eec.print_after_fill)
+        return false;
+
     if (object.config().flush_into_objects)
         return true;
 

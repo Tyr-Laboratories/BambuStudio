@@ -387,6 +387,25 @@ float external_surface_expansion(const LayerRegion &region)
     return shell_width * float(std::sqrt(2.));
 }
 
+// Where `region`'s bridges and overhangs on its layer anchor, near its extension area `own`: the bottom surfaces found
+// as detect_surfaces_type() finds them, in `exposed` (the layer less the layer below) less slivers, where they have
+// fill, grown by the stock expansion of external surfaces within the fill pieces holding them. An overhang under the
+// walls has no fill, and the fill spreads neither across walls nor across holes.
+Polygons bridge_zone(const LayerRegion &region, const ExPolygons &exposed, const ExPolygons &own)
+{
+    const float      line_width = float(region.flow(frExternalPerimeter).scaled_width());
+    const ExPolygons bridged    = intersection_ex(opening_ex(exposed, line_width / 10.f), region.fill_expolygons);
+    if (bridged.empty())
+        return {};
+    const BoundingBox bridged_box = get_extents(bridged);
+    ExPolygons        pieces;
+    for (const ExPolygon &piece : region.fill_expolygons)
+        if (get_extents(piece).overlap(bridged_box) && !intersection_ex(piece, bridged).empty())
+            pieces.push_back(piece);
+    // The fill cuts lie within a line width of the area.
+    return to_polygons(intersection_ex(intersection_ex(offset_ex(bridged, external_surface_expansion(region)), pieces), offset(own, line_width)));
+}
+
 // How near, scaled, fill comes to the centre of one of `region`'s wall extension lines: as far past the line's spacing
 // as it overlaps a one-loop wall of the line's flow, by `overlap` (Infill/Wall overlap, or Bridge line travel extend for
 // bridges) measured as the object's wall generator measures it. Fill lies on both sides of an extension line, so from
@@ -567,7 +586,7 @@ void apply(PrintObject &object)
             // prints first, as it does without the extension, and the extension lines print into it after it, so the wall
             // continues through the layer. A top surface is no such exception: the wall above stands on the extension
             // line, and the top surface's fill stops at it as at a wall.
-            const Polygons exposed = to_polygons(diff_ex(layers[l]->lslices, layers[l - 1]->lslices));
+            const ExPolygons exposed = diff_ex(layers[l]->lslices, layers[l - 1]->lslices, ApplySafetyOffset::Yes);
             const LayerRegionPtrs &regions = layers[l]->regions();
             areas[l].assign(regions.size(), ExPolygons());
             bridge_zones[l].assign(regions.size(), Polygons());
@@ -576,10 +595,8 @@ void apply(PrintObject &object)
                 if (region.region().config().wall_internal_extension.value <= 0.)
                     continue;
                 ExPolygons own = intersection_ex(area.all, region.fill_no_overlap_expolygons);
-                // The fill cuts lie within a line width of the area.
                 if (!own.empty() && !exposed.empty())
-                    bridge_zones[l][r] = intersection(offset(exposed, external_surface_expansion(region)),
-                                                      offset(own, float(region.flow(frExternalPerimeter).scaled_width())));
+                    bridge_zones[l][r] = bridge_zone(region, exposed, own);
                 areas[l][r] = std::move(own);
             }
             hanging[l] = std::move(area.hanging);
