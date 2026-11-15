@@ -403,13 +403,13 @@ TEST_CASE("A tower's outer wall continues 1.8 mm into the box", "[WallExtension]
     CHECK(result.print_statistics.used_filaments_per_role.at(erWallExtension).first > 0.);
 }
 
-TEST_CASE("A column's outer wall continues into the slab above the bridge layer, to 1.8 mm", "[WallExtension][Print]")
+TEST_CASE("A column's outer wall continues 1.8 mm into the slab, through its bridge layer", "[WallExtension][Print]")
 {
     Model model = overhang();
     Print print;
     slice(print, model, extension_config(1.));
-    // The bridge layer at 6.2 keeps its anchors on the column. The lines start on it, so they need no bridge of their own.
-    CHECK(extension_layers(print) == tenths(64, 78));
+    // From the slab's bridge layer at 6.2, whose lines stand on the column's wall, so they need no bridge of their own.
+    CHECK(extension_layers(print) == tenths(62, 78));
     for (const Layer *layer : print.get_object(size_t(0))->layers())
         for (const LayerRegion *region : layer->regions())
             CHECK(region->wall_extension_bridge_base.empty());
@@ -426,8 +426,8 @@ TEST_CASE("Fill overlaps wall extension lines as it overlaps walls, from each si
     CAPTURE(generator, overlap);
     DynamicPrintConfig config = extension_config(1., false);
     config.set_deserialize_strict({ {"wall_generator", generator}, {"infill_wall_overlap", std::to_string(overlap) + "%"} });
-    // Eight layers under the tower, from its surface layer down, the deepest being a bridge; eight over the column,
-    // whose bridge layer has none.
+    // Eight layers under the tower, from its surface layer down, the deepest being a bridge; eight over the column above
+    // its bridge layer, whose fill is not cut: the lines there print into the bridge.
     for (auto [model, expected_layers] : { std::pair<Model, size_t>{ terrace(), 8 }, std::pair<Model, size_t>{ overhang(), 8 } }) {
         Print print;
         slice(print, model, config);
@@ -543,9 +543,13 @@ TEST_CASE("No fill line crosses extension lines clipped to a wedge", "[WallExten
             continue;
         ++layers_with_lines;
         CAPTURE(layer->print_z);
-        CHECK(total_length(intersection_pl(fill_lines(*layer), offset(extension, half_resolution))) == 0.);
         for (const LayerRegion *region : layer->regions()) {
-            CHECK(intersection_ex(region->fill_expolygons, offset(extension, half_resolution)).empty());
+            // But for where they print into a bridge (the cavity's roof at 11.2), whose fill is not cut: the fill there
+            // reaches the edge of the cut part, so that edge is left out.
+            const Polylines cut_lines = intersection_pl(extension, region->wall_extension_area);
+            CHECK(total_length(intersection_pl(fill_lines(*layer), offset(cut_lines, half_resolution))) == 0.);
+            CHECK(intersection_ex(intersection_ex(region->fill_expolygons, offset(cut_lines, half_resolution)),
+                                  offset_ex(region->wall_extension_area, -float(SCALED_EPSILON))).empty());
             // Footprint less what a band 0.8 lines wide fits in: where it is narrower than a line.
             const float width = region->flow(frExternalPerimeter).scaled_width();
             narrower_than_a_line += area_mm2(diff_ex(region->wall_extension_area, opening_ex(region->wall_extension_area, 0.4f * width)));
@@ -667,6 +671,27 @@ DynamicPrintConfig gcode_config(double extension)
     config.set_deserialize_strict({ {"inner_wall_speed", "77"}, {"bridge_speed", "23"}, {"filament_max_volumetric_speed", "100"},
                                     {"slow_down_for_layer_cooling", "0"} });
     return config;
+}
+
+// The features of the extruding moves of the layer at print_z `tenths` / 10, in printing order, each run of one feature
+// once.
+std::vector<std::string> feature_runs(const std::string &file, const DynamicPrintConfig &config, int tenths)
+{
+    std::vector<std::string> out;
+    GCodeReader reader;
+    reader.apply_config(config);
+    std::string current;
+    double      z = 0.;
+    REQUIRE(reader.parse_file(file, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.rfind(" Z_HEIGHT: ", 0) == 0)
+            z = std::stod(std::string(comment.substr(11)));
+        if (const auto tag = comment.find(" FEATURE: "); tag != std::string_view::npos)
+            current = std::string(comment.substr(tag + 10));
+        if (int(std::lround(z * 10.)) == tenths && line.extruding(self) && line.dist_XY(self) > 0. && (out.empty() || out.back() != current))
+            out.push_back(current);
+    }));
+    return out;
 }
 }
 
@@ -1073,21 +1098,33 @@ TEST_CASE("Merged chamfers of close fins are printed through and not left hollow
     CHECK(widest > 300.);
 }
 
-TEST_CASE("A bridge over a bottom joint keeps its anchors and direction", "[WallExtension][Print]")
+TEST_CASE("Over a bottom joint the extension prints into the bridge after it, which keeps its anchors and direction", "[WallExtension][Print][GCode]")
 {
+    PrintWorkspace workspace;
     // A tunnel 5 mm wide and 30 mm long under a 3 mm roof. The tunnel's walls end under the roof's first layer, a bridge
     // that spans the 5 mm width anchored on the walls' tops.
     Model model = boxes({ { { 30., 20., 2. }, { 0., 0., 0. } }, { { 30., 7.5, 3. }, { 0., 0., 2. } },
                           { { 30., 7.5, 3. }, { 0., 12.5, 2. } }, { { 30., 20., 3. }, { 0., 0., 5. } } });
     Print without, with;
-    slice(without, model, extension_config(0.));
-    slice(with, model, extension_config(1.));
-    // The tunnel's walls continue into the roof, starting on the layer above the bridge.
-    CHECK(extension_layers(with).count(54) == 1);
+    slice(without, model, gcode_config(0.));
+    slice(with, model, gcode_config(1.));
+    // The tunnel's walls continue into the roof through the bridge layer: the bridge prints first, as it does without
+    // the extension, and the lines print into it.
     const Layer *bridge_without = layer_at(without, 5.2), *bridge_with = layer_at(with, 5.2);
     REQUIRE(bridge_without != nullptr);
     REQUIRE(bridge_with != nullptr);
-    CHECK(extension_paths(*bridge_with).empty());
+    REQUIRE_FALSE(extension_paths(*bridge_with).empty());
+    const auto filename = (workspace.path / "tunnel.gcode").string();
+    GCodeProcessorResult result;
+    with.export_gcode(filename, &result);
+    const std::vector<std::string> runs = feature_runs(filename, gcode_config(1.), 52);
+    CAPTURE(runs);
+    const auto bridge = std::find(runs.rbegin(), runs.rend(), "Bridge");
+    const auto line   = std::find(runs.begin(), runs.end(), "Wall extension");
+    REQUIRE(bridge != runs.rend());
+    REQUIRE(line != runs.end());
+    const auto last_bridge = runs.size() - 1 - size_t(bridge - runs.rbegin()), first_line = size_t(line - runs.begin());
+    CHECK(last_bridge < first_line);
     const auto bridges = [](const Layer &layer) {
         std::vector<std::pair<double, double>> out;
         for (const LayerRegion *region : layer.regions())
@@ -1106,19 +1143,18 @@ TEST_CASE("A bridge over a bottom joint keeps its anchors and direction", "[Wall
     }
 }
 
-TEST_CASE("A tube through a thin flange keeps the flange's bridge anchors", "[WallExtension][Print]")
+TEST_CASE("A tube through a thin flange keeps the flange's bridge anchors, the extension printing into the bridge", "[WallExtension][Print]")
 {
-    // A 10 x 10 column through a 30 x 30 flange 1 mm thick: the column's wall rising above the flange is a top joint
-    // whose extension reaches the flange's first layer, a bridge anchored on the column.
+    // A 10 x 10 column through a 30 x 30 flange 1 mm thick: the column's wall runs through the flange as extension
+    // lines, also on the flange's first layer, a bridge anchored on the column.
     Model model = boxes({ { { 10., 10., 12. }, { 10., 10., 0. } }, { { 30., 30., 1. }, { 0., 0., 6. } } });
     Print without, with;
     slice(without, model, extension_config(0.));
     slice(with, model, extension_config(1.));
-    REQUIRE_FALSE(extension_layers(with).empty());
     const Layer *bridge_without = layer_at(without, 6.2), *bridge_with = layer_at(with, 6.2);
     REQUIRE(bridge_without != nullptr);
     REQUIRE(bridge_with != nullptr);
-    CHECK(extension_paths(*bridge_with).empty());
+    CHECK_FALSE(extension_paths(*bridge_with).empty());
     REQUIRE(surface_area(*bridge_without, stBottomBridge) > 100.);
     CHECK(surface_area(*bridge_with, stBottomBridge) == Approx(surface_area(*bridge_without, stBottomBridge)).epsilon(0.005));
 }

@@ -4237,6 +4237,7 @@ std::string PrintStatistics::finalize_output_path(const std::string &path_in) co
 //extrusions
 #define JSON_EXTRUSION_ENTITY_TYPE             "entity_type"
 #define JSON_EXTRUSION_NO_SORT                 "no_sort"
+#define JSON_EXTRUSION_PRINT_AFTER_FILL        "print_after_fill"
 #define JSON_EXTRUSION_PATHS                   "paths"
 #define JSON_EXTRUSION_ENTITIES                "entities"
 #define JSON_EXTRUSION_TYPE_PATH               "path"
@@ -4403,6 +4404,8 @@ static bool convert_extrusion_to_json(json& entity_json, json& entity_paths_json
     else {
         //recursive collections
         entity_json[JSON_EXTRUSION_NO_SORT] = collection->no_sort;
+        if (collection->print_after_fill)
+            entity_json[JSON_EXTRUSION_PRINT_AFTER_FILL] = true;
         for (const ExtrusionEntity* recursive_extrusion_entity : collection->entities) {
             json recursive_entity_json, recursive_entity_paths_json = json::array();
             bool ret = convert_extrusion_to_json(recursive_entity_json, recursive_entity_paths_json, recursive_extrusion_entity);
@@ -4698,6 +4701,7 @@ static bool convert_extrusion_from_json(const json& entity_json, ExtrusionEntity
             return false;
         }
         collection->no_sort = entity_json[JSON_EXTRUSION_NO_SORT];
+        collection->print_after_fill = entity_json.contains(JSON_EXTRUSION_PRINT_AFTER_FILL) && entity_json[JSON_EXTRUSION_PRINT_AFTER_FILL].get<bool>();
         int entities_count = entity_json[JSON_EXTRUSION_ENTITIES].size();
         for (int entity_index = 0; entity_index < entities_count; entity_index++)
         {

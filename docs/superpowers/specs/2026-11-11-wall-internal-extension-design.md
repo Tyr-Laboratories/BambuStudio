@@ -63,9 +63,9 @@ The fix is a woodworking joint. The wall is started before it breaks out onto th
 
 ### Extension (bottom joint)
 
-The mirror image. Copies go on every layer from the first layer above the joint (the bridge or overhang layer) up to (bottom shell depth + E) above the surface, subject to the exposed-surface rule below, which keeps them off the bridge or overhang layer.
+The mirror image. Copies go on every layer from the first layer above the joint (the bridge or overhang layer) up to (bottom shell depth + E) above the surface. On the bridge or overhang layer they print into the bridge, after it (rule below).
 
-**Bridges and overhangs keep their stock fill** *(ruling during implementation; top surfaces removed from it 2026-11-14, user decision)*. On every layer, a copy stays out of the zone where that layer's bridges or overhangs (nothing below) spread their fill into the part: within the stock expansion of external surfaces (the walls' width × √2, as `process_external_surfaces` expands them) of those surfaces. So a bottom joint's bridge or overhang layer keeps its anchors on the lower part, and so does the bridge layer of a thin plate that a top joint's extension reaches. Without this, bridges that BambuStudio's bridge detection found unanchored. Exposed top surfaces were in this rule at first, which kept the copies off a top joint's surface layer; they no longer are (see "Extension (top joint)"). The same clipping applies; in particular, a copy is never printed where it would show on a top surface. Every copy stands on the line below it.
+**Bridges and overhangs keep their stock fill; the copies print into it** *(ruling during implementation; top surfaces removed from it 2026-11-14; copies printed into the bridge 2026-11-14, user decision)*. On every layer, the fill is not cut in the zone where that layer's bridges or overhangs (nothing below) spread their fill into the part: within the stock expansion of external surfaces (the walls' width × √2, as `process_external_surfaces` expands them) of those surfaces. So a bottom joint's bridge or overhang layer keeps its anchors on the lower part, and so does the bridge layer of a thin plate that a top joint's extension reaches: cut there, bridges that BambuStudio's bridge detection found unanchored. The copies are still printed there, and the G-code prints them after the island's fill (`ExtrusionEntityCollection::print_after_fill`): "I want bridge infill to print first (exactly as it does today), then the wall extension to print right … into it. 100% overlap per-say, but for a single layer in a isolated place this won't cause issues." At first the copies stayed out of that zone, which left the wall's line interrupted by the bridge on the bottom joint's first layer, the same break as a top surface crossing it. Exposed top surfaces were in this rule at first, which kept the copies off a top joint's surface layer; they no longer are (see "Extension (top joint)"). The same clipping applies; in particular, a copy is never printed where it would show on a top surface. Every copy stands on the line below it.
 
 ```
              upper part (inside)
@@ -77,7 +77,7 @@ The mirror image. Copies go on every layer from the first layer above the joint 
             |X|==================   bottom shell, 0.8 mm
             |X|==================
             |X|==================
-            ====================   bridge / overhang layer (over air): no copy in its anchor zone
+            |X|=================   bridge / overhang layer (over air): bridge first, then the copy into it
  -----------|W|
             |W|   lower part
 ```

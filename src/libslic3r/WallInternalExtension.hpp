@@ -124,10 +124,13 @@ ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const Flow
 // Runs the wall internal extension on an object whose walls are generated: adds the extension lines to the regions'
 // perimeters, records their area in LayerRegion::wall_extension_area and cuts it out of the fill sets as walls are cut
 // out of them: the fill overlaps the lines by Infill/Wall overlap (the bridge fill by Bridge line travel extend), from
-// each side at most up to the slicing tolerance from the line's centre. The lines run through top surface layers; only
-// bridges and overhangs keep their stock anchoring zone free of them. Where a top joint's deepest layer has nothing
-// printed below it, that part is left in the fill and recorded in LayerRegion::wall_extension_bridge_base instead (see
-// apply_to_fill_surfaces()). Does nothing in spiral vase mode or when no region has wall_internal_extension above 0.
+// each side at most up to the slicing tolerance from the line's centre. The lines run through top surface layers and
+// through bridge layers. In the stock anchoring zone of a layer's bridges and overhangs the fill is not cut: the bridge
+// prints as it does without the extension, and the lines meeting it are marked
+// ExtrusionEntityCollection::print_after_fill, so they print into it after it. Where a top joint's deepest layer has
+// nothing printed below it, that part is left in the fill and recorded in LayerRegion::wall_extension_bridge_base
+// instead (see apply_to_fill_surfaces()). Does nothing in spiral vase mode or when no region has
+// wall_internal_extension above 0.
 void apply(PrintObject &object);
 
 // Run after the fill surfaces are classified. Cuts LayerRegion::wall_extension_fill_cut, recorded by apply(), out of the

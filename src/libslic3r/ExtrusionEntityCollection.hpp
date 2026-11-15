@@ -31,18 +31,27 @@ public:
 
     ExtrusionEntitiesPtr entities;     // we own these entities
     bool no_sort;
+    // A top-level collection of LayerRegion::perimeters printed in the infill pass, after the island's fill: wall
+    // extension lines printed into a bridge (see WallInternalExtension::apply()).
+    bool print_after_fill = false;
 
     std::pair<int, int> loop_node_range;
     ExtrusionEntityCollection(): no_sort(false) {}
-    ExtrusionEntityCollection(const ExtrusionEntityCollection &other) : no_sort(other.no_sort), is_reverse(other.is_reverse), loop_node_range(other.loop_node_range) { this->append(other.entities); }
+    ExtrusionEntityCollection(const ExtrusionEntityCollection &other)
+        : no_sort(other.no_sort), print_after_fill(other.print_after_fill), is_reverse(other.is_reverse), loop_node_range(other.loop_node_range)
+    {
+        this->append(other.entities);
+    }
     ExtrusionEntityCollection(ExtrusionEntityCollection &&other)
-        : entities(std::move(other.entities)), no_sort(other.no_sort), is_reverse(other.is_reverse), loop_node_range(other.loop_node_range) {}
+        : entities(std::move(other.entities)), no_sort(other.no_sort), print_after_fill(other.print_after_fill), is_reverse(other.is_reverse),
+          loop_node_range(other.loop_node_range) {}
     explicit ExtrusionEntityCollection(const ExtrusionPaths &paths);
     ExtrusionEntityCollection& operator=(const ExtrusionEntityCollection &other);
     ExtrusionEntityCollection& operator=(ExtrusionEntityCollection &&other)
     {
         this->entities = std::move(other.entities);
         this->no_sort  = other.no_sort;
+        this->print_after_fill = other.print_after_fill;
         is_reverse     = other.is_reverse;
         loop_node_range = other.loop_node_range;
         return *this;

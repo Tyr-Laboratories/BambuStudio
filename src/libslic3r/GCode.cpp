@@ -5080,7 +5080,9 @@ GCode::LayerResult GCode::process_layer(
                                     point_inside_surface(island_idx, extrusions->first_point())) {
                                     if (islands[island_idx].by_region.empty())
                                         islands[island_idx].by_region.assign(print.num_print_regions(), ObjectByExtruder::Island::Region());
-                                    islands[island_idx].by_region[region.print_region_id()].append(entity_type, extrusions, entity_overrides);
+                                    // Wall extension lines printed into a bridge go with the fill, after it (see extrude_infill()).
+                                    islands[island_idx].by_region[region.print_region_id()].append(
+                                        extrusions->print_after_fill ? ObjectByExtruder::Island::Region::INFILL : entity_type, extrusions, entity_overrides);
                                     break;
                                 }
                             }
@@ -6527,27 +6529,33 @@ std::string GCode::extrude_infill(const Print &print, const std::vector<ObjectBy
 {
     std::string 		 gcode;
     ExtrusionEntitiesPtr extrusions;
-    const char*          extrusion_name = ironing ? "ironing" : "infill";
-    for (const ObjectByExtruder::Island::Region &region : by_region)
-        if (! region.infills.empty()) {
-            extrusions.clear();
-            extrusions.reserve(region.infills.size());
-            for (ExtrusionEntity *ee : region.infills)
-                if ((ee->role() == erIroning) == ironing)
-                    extrusions.emplace_back(ee);
-            if (! extrusions.empty()) {
-                m_config.apply(print.get_print_region(&region - &by_region.front()).config());
-                chain_and_reorder_extrusion_entities(extrusions, &m_last_pos);
-                for (const ExtrusionEntity *fill : extrusions) {
-                    auto *eec = dynamic_cast<const ExtrusionEntityCollection*>(fill);
-                    if (eec) {
-                        for (ExtrusionEntity *ee : eec->chained_path_from(m_last_pos).entities)
-                            gcode += this->extrude_entity(*ee, extrusion_name);
-                    } else
-                        gcode += this->extrude_entity(*fill, extrusion_name);
+    // The infill pass also prints the wall extension lines that go into a bridge
+    // (ExtrusionEntityCollection::print_after_fill): after all the island's fill, as the walls they continue.
+    for (const bool extension : { false, true }) {
+        if (extension && ironing)
+            break;
+        const char *extrusion_name = extension ? "perimeter" : ironing ? "ironing" : "infill";
+        for (const ObjectByExtruder::Island::Region &region : by_region)
+            if (! region.infills.empty()) {
+                extrusions.clear();
+                extrusions.reserve(region.infills.size());
+                for (ExtrusionEntity *ee : region.infills)
+                    if ((ee->role() == erIroning) == ironing && (ee->role() == erWallExtension) == extension)
+                        extrusions.emplace_back(ee);
+                if (! extrusions.empty()) {
+                    m_config.apply(print.get_print_region(&region - &by_region.front()).config());
+                    chain_and_reorder_extrusion_entities(extrusions, &m_last_pos);
+                    for (const ExtrusionEntity *fill : extrusions) {
+                        auto *eec = dynamic_cast<const ExtrusionEntityCollection*>(fill);
+                        if (eec) {
+                            for (ExtrusionEntity *ee : eec->chained_path_from(m_last_pos).entities)
+                                gcode += this->extrude_entity(*ee, extrusion_name);
+                        } else
+                            gcode += this->extrude_entity(*fill, extrusion_name);
+                    }
                 }
             }
-        }
+    }
     return gcode;
 }
 
