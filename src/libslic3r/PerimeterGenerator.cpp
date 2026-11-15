@@ -292,17 +292,6 @@ static bool fuzzy_skin_allows_overhang_slowdown(const PerimeterGenerator &pg)
     });
 }
 
-// Keep the candidate inner wall available where slope reinforcement overrides
-// the one-wall top-surface mask. The policy still clips its exact boundary span.
-static ExPolygons slope_wall_region(const WallPainting::BoundaryPolicy &policy, const ExPolygon &material, coord_t radius)
-{
-    Polygons coverage;
-    for (const auto &span:policy.spans())
-        if (span.slope_reinforced)
-            WallPainting::append_coverage(coverage,span.line,2*radius,2*radius);
-    return coverage.empty() ? ExPolygons{} : intersection_ex(coverage,ExPolygons{material});
-}
-
 // A clipped perimeter is open, but still has a stack depth for wall sequencing.
 class PartialPerimeterPath final : public ExtrusionMultiPath
 {
@@ -1033,7 +1022,10 @@ void PerimeterGenerator::process_classic()
         wall_policy = wall_policy.adjusted(extra_walls).reinforce_slopes(config->extra_wall_slope_angle.value,force_one_wall);
         if (!wall_policy.empty()) loop_number = wall_policy.maximum()-1;
         active_wall_policy = !wall_policy.empty() && !wall_policy.uniform_count() ? &wall_policy : nullptr;
-        const ExPolygons slope_walls = slope_wall_region(wall_policy,surface.expolygon,ext_perimeter_width+perimeter_spacing);
+        // Keep the candidate inner wall available where slope reinforcement overrides the one-wall top-surface mask. The
+        // policy still clips its exact boundary span.
+        const ExPolygons slope_walls = WallPainting::slope_coverage(wall_policy,surface.expolygon,ext_perimeter_width+perimeter_spacing,
+                                                                    coord_t(m_scaled_resolution));
         has_slope_wall_reinforcement |= !slope_walls.empty();
         bool counter_circle_compensation = surface.counter_circle_compensation;
         std::vector<Point> compensation_holes_centers;
@@ -1726,7 +1718,10 @@ void PerimeterGenerator::process_arachne()
         wall_policy = wall_policy.adjusted(extra_walls).reinforce_slopes(config->extra_wall_slope_angle.value,force_one_wall);
         if (!wall_policy.empty()) loop_number = wall_policy.maximum()-1;
         active_wall_policy = !wall_policy.empty() && !wall_policy.uniform_count() ? &wall_policy : nullptr;
-        const ExPolygons slope_walls = slope_wall_region(wall_policy,surface.expolygon,ext_perimeter_width+perimeter_spacing);
+        // Keep the candidate inner wall available where slope reinforcement overrides the one-wall top-surface mask. The
+        // policy still clips its exact boundary span.
+        const ExPolygons slope_walls = WallPainting::slope_coverage(wall_policy,surface.expolygon,ext_perimeter_width+perimeter_spacing,
+                                                                    coord_t(m_scaled_resolution));
         has_slope_wall_reinforcement |= !slope_walls.empty();
         bool apply_circle_compensation = true;
         // Orca: properly adjust offset for the outer wall if precise_outer_wall is enabled.

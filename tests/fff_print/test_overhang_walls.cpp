@@ -8,8 +8,10 @@
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Algorithm/LineSegmentation/LineSegmentation.hpp"
+#include "libslic3r/WallPainting.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <sstream>
 #include <iomanip>
@@ -260,6 +262,85 @@ std::vector<SlopeWallLayer> slice_sloped_box(bool arachne, double slope, double 
     }
     return result;
 }
+}
+
+TEST_CASE("Slope wall coverage of a long, finely divided face takes moments", "[SlopeWalls][Perimeters]")
+{
+    // A sloped skin sliced into many tiny boundary segments along a nearly level run, every one reinforced: what the
+    // coverage costs must grow with the number of spans, not with its square.
+    const coord_t radius = scaled<coord_t>(0.9), tolerance = scaled<coord_t>(0.01);
+    const int     segments = 3000;
+    Points face;
+    for (int i = 0; i <= segments; ++i)
+        face.emplace_back(scaled<coord_t>(100. * i / segments), scaled<coord_t>(2. * i / segments + (i % 2 ? 0.001 : 0.)));
+    ExPolygon material;
+    material.contour.points = face;
+    material.contour.points.emplace_back(scaled<coord_t>(100.), scaled<coord_t>(12.));
+    material.contour.points.emplace_back(scaled<coord_t>(0.), scaled<coord_t>(10.));
+    std::vector<WallPainting::BoundarySpan> spans;
+    const Points &contour = material.contour.points;
+    for (size_t i = 0; i < contour.size(); ++i) {
+        WallPainting::BoundarySpan span;
+        span.line = Line(contour[i], contour[(i + 1) % contour.size()]);
+        // The other three sides stand upright.
+        span.slope_reinforced = i < face.size() - 1;
+        span.count = span.slope_reinforced ? 2 : 1;
+        spans.push_back(span);
+    }
+    const WallPainting::BoundaryPolicy policy(std::move(spans));
+    const auto       start   = std::chrono::steady_clock::now();
+    const ExPolygons covered = WallPainting::slope_coverage(policy, material, radius, tolerance);
+    CHECK(std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < 2.);
+    // The material within the radius of the sloped face, to the tolerance, and nothing else. The face is measured as the
+    // straight line it wobbles about.
+    const auto mm2 = [](const ExPolygons &area) {
+        double sum = 0.;
+        for (const ExPolygon &expolygon : area)
+            sum += expolygon.area();
+        return sum * SCALING_FACTOR * SCALING_FACTOR;
+    };
+    const Polylines  line{ Polyline(face.front(), face.back()) };
+    const coord_t    wobble = scaled<coord_t>(0.001);
+    const ExPolygons near   = intersection_ex(offset(line, float(radius - 2 * tolerance - wobble), ClipperLib::jtRound, double(tolerance),
+                                                     ClipperLib::etOpenRound), ExPolygons{ material });
+    const Polygons   reach  = offset(line, float(radius + 2 * tolerance + wobble), ClipperLib::jtRound, double(tolerance), ClipperLib::etOpenRound);
+    REQUIRE(mm2(near) > 80.);
+    CHECK(mm2(diff_ex(near, covered)) < 0.01);
+    CHECK(mm2(diff_ex(covered, reach)) < 0.01);
+
+    // Runs broken by upright spans, a run round a contour's first point and a fully reinforced hole: the same region as
+    // a swept piece per reinforced span, whose round ends are 16-gons inside their circles, to the tolerance.
+    ExPolygon square;
+    square.contour.points = { Point(0, 0), Point(scaled<coord_t>(20.), 0), Point(scaled<coord_t>(20.), scaled<coord_t>(20.)),
+                              Point(0, scaled<coord_t>(20.)) };
+    square.holes.emplace_back(Points{ Point(scaled<coord_t>(6.), scaled<coord_t>(6.)), Point(scaled<coord_t>(6.), scaled<coord_t>(14.)),
+                                      Point(scaled<coord_t>(14.), scaled<coord_t>(14.)), Point(scaled<coord_t>(14.), scaled<coord_t>(6.)) });
+    std::vector<WallPainting::BoundarySpan> pieces;
+    for (const Polygon &polygon : to_polygons(square))
+        for (size_t i = 0; i < polygon.size(); ++i) {
+            const Point &a = polygon[i], &b = polygon[(i + 1) % polygon.size()];
+            for (int k = 0; k < 5; ++k) {
+                WallPainting::BoundarySpan span;
+                span.line = Line(Point(a.x() + (b.x() - a.x()) * k / 5, a.y() + (b.y() - a.y()) * k / 5),
+                                 Point(a.x() + (b.x() - a.x()) * (k + 1) / 5, a.y() + (b.y() - a.y()) * (k + 1) / 5));
+                // The contour's 20 spans: runs of four between two upright ones, the last run crossing its first point.
+                span.slope_reinforced = pieces.size() >= 20 || pieces.size() % 6 < 4;
+                span.count = span.slope_reinforced ? 2 : 1;
+                pieces.push_back(span);
+            }
+        }
+    REQUIRE(pieces[0].slope_reinforced);
+    REQUIRE(pieces[19].slope_reinforced);
+    Polygons swept;
+    for (const WallPainting::BoundarySpan &span : pieces)
+        if (span.slope_reinforced)
+            WallPainting::append_coverage(swept, span.line, 2 * radius, 2 * radius);
+    const ExPolygons old_region = intersection_ex(swept, ExPolygons{ square });
+    const ExPolygons new_region = WallPainting::slope_coverage(WallPainting::BoundaryPolicy(pieces), square, radius, tolerance);
+    const float      sixteen_gon = float(double(radius) * (1. - std::cos(PI / 16.)));
+    REQUIRE(mm2(old_region) > 50.);
+    CHECK(mm2(diff_ex(new_region, offset(old_region, sixteen_gon + float(tolerance + SCALED_EPSILON)))) < 0.001);
+    CHECK(mm2(diff_ex(old_region, offset(new_region, float(2 * tolerance + SCALED_EPSILON)))) < 0.001);
 }
 
 TEST_CASE("Slope threshold adds an inner wall on both leaning faces only", "[SlopeWalls][Perimeters]")

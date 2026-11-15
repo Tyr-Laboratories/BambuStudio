@@ -275,3 +275,27 @@ void append_coverage(Polygons &out, const Line &line, coord_t width_a, coord_t w
     }
 }
 }
+
+namespace Slic3r::WallPainting {
+ExPolygons slope_coverage(const BoundaryPolicy &policy, const ExPolygon &material, coord_t radius, coord_t tolerance)
+{
+    // Consecutive reinforced spans are joined into runs along the boundary, each offset as one line. A separate swept
+    // piece per span puts thousands of overlapping polygons into a single clipping operation where a finely divided
+    // face runs nearly level, and that operation's cost grows with the square of their number: minutes for one layer.
+    Polylines runs;
+    for (const BoundarySpan &span : policy.spans()) {
+        if (!span.slope_reinforced || span.line.a == span.line.b)
+            continue;
+        if (!runs.empty() && runs.back().last_point() == span.line.a)
+            runs.back().points.push_back(span.line.b);
+        else
+            runs.emplace_back(span.line.a, span.line.b);
+    }
+    if (runs.empty())
+        return {};
+    const coord_t accuracy = std::max<coord_t>(tolerance, SCALED_EPSILON);
+    for (Polyline &run : runs)
+        run.simplify(double(accuracy));
+    return intersection_ex(offset(runs, float(radius), ClipperLib::jtRound, double(accuracy), ClipperLib::etOpenRound), ExPolygons{ material });
+}
+} // namespace Slic3r::WallPainting

@@ -73,6 +73,10 @@ private:
     struct Index;
     std::shared_ptr<const Index> m_index;
 };
+
+// The part of `material` within `radius` of the spans of `policy` that reinforce a slope: where the slope
+// reinforcement's inner wall may run. The edge lies between radius - 2 * tolerance and radius + tolerance from the spans.
+ExPolygons slope_coverage(const BoundaryPolicy &policy, const ExPolygon &material, coord_t radius, coord_t tolerance);
 } // namespace WallPainting
 } // namespace Slic3r
 #endif
