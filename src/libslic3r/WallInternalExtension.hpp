@@ -122,16 +122,20 @@ ExtrusionEntityCollection extension_extrusions(const ExPolygon &area, const Flow
                                                const Arachne::WallToolPathsParams &params);
 
 // Runs the wall internal extension on an object whose walls are generated: adds the extension lines to the regions'
-// perimeters, cuts their area out of the fill sets and records it in LayerRegion::wall_extension_area. Where a top
-// joint's deepest layer has nothing printed below it, that part is left in the fill and recorded in
-// LayerRegion::wall_extension_bridge_base instead (see make_bridge_bases_solid()). Does nothing in spiral vase mode or
-// when no region has wall_internal_extension above 0.
+// perimeters, records their area in LayerRegion::wall_extension_area and cuts it out of the fill sets as walls are cut
+// out of them: the fill overlaps the lines by Infill/Wall overlap (the bridge fill by Bridge line travel extend), from
+// each side at most up to the slicing tolerance from the line's centre. The lines run through top surface layers; only
+// bridges and overhangs keep their stock anchoring zone free of them. Where a top joint's deepest layer has nothing
+// printed below it, that part is left in the fill and recorded in LayerRegion::wall_extension_bridge_base instead (see
+// apply_to_fill_surfaces()). Does nothing in spiral vase mode or when no region has wall_internal_extension above 0.
 void apply(PrintObject &object);
 
-// Turns the sparse fill surfaces inside each region's LayerRegion::wall_extension_bridge_base into internal solid, so
-// that bridge_over_infill() makes them internal bridges anchored on the infill below and the sparse infill generators
-// support them, as they do for any solid starting over sparse infill. Run after the fill surfaces are classified.
-void make_bridge_bases_solid(PrintObject &object);
+// Run after the fill surfaces are classified. Cuts LayerRegion::wall_extension_fill_cut, recorded by apply(), out of the
+// fill surfaces again, where expanding the external surfaces closed over the lines, and turns the sparse fill surfaces inside each region's
+// LayerRegion::wall_extension_bridge_base into internal solid, so that bridge_over_infill() makes them internal bridges
+// anchored on the infill below and the sparse infill generators support them, as they do for any solid starting over
+// sparse infill.
+void apply_to_fill_surfaces(PrintObject &object);
 
 } // namespace WallInternalExtension
 } // namespace Slic3r

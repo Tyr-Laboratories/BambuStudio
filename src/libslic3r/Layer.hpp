@@ -66,9 +66,13 @@ public:
     SurfaceCollection           fill_surfaces;
     // BBS: Unspecified fill polygons, used for interecting when we don't want the infill/perimeter overlap
     ExPolygons                  fill_no_overlap_expolygons;
-    // Area of this region's wall extension lines on this layer (wall_internal_extension), cut out of the fill sets above.
-    // Treated as interior when ensuring vertical shell thickness. Empty when there are none.
+    // Area of this region's wall extension lines on this layer (wall_internal_extension). The fill sets above overlap it
+    // as they overlap walls, from each side short of the lines' centre. Treated as interior when ensuring vertical shell
+    // thickness. Empty when there are none.
     ExPolygons                  wall_extension_area;
+    // The part of wall_extension_area the fill keeps out of, made with the lines (before the walls are simplified), so
+    // that the fill surfaces are cut by the same area however often the infill is prepared again.
+    ExPolygons                  wall_extension_fill_cut;
     // Where this region's wall extension starts with nothing printed below it: a top joint's deepest layer, over sparse
     // infill. Left in the fill and made internal solid before bridge_over_infill(), which makes it the anchored internal
     // bridge the extension lines of the layer above stand on, as for any solid starting over sparse infill.

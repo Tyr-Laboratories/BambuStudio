@@ -387,6 +387,61 @@ float external_surface_expansion(const LayerRegion &region)
     return shell_width * float(std::sqrt(2.));
 }
 
+// How near, scaled, fill comes to the centre of one of `region`'s wall extension lines: as far past the line's spacing
+// as it overlaps a one-loop wall of the line's flow, by `overlap` (Infill/Wall overlap, or Bridge line travel extend for
+// bridges) measured as the object's wall generator measures it. Fill lies on both sides of an extension line, so from
+// either side it stops `tolerance` short of the line's centre, however large the overlap: the two sides never join over
+// the line.
+float fill_from_centre(const LayerRegion &region, const ConfigOptionPercent &overlap, coord_t tolerance)
+{
+    const float spacing = float(region.flow(frExternalPerimeter).scaled_spacing());
+    // As PerimeterGenerator: Arachne takes the share of the wall's spacing, the classic generator of half of it plus
+    // half the solid infill spacing.
+    const float basis = region.layer()->object()->config().wall_generator.value == PerimeterGeneratorType::Arachne ?
+                            spacing :
+                            0.5f * spacing + 0.5f * float(region.flow(frSolidInfill).scaled_spacing());
+    const float past_spacing = float(scale_(overlap.get_abs_value(unscale<double>(basis))));
+    return std::max(float(std::max<coord_t>(tolerance, SCALED_EPSILON)), 0.5f * spacing - past_spacing);
+}
+
+// A printed wall extension line: its centreline and half its width, scaled.
+struct Centre
+{
+    Polyline line;
+    float    half_width;
+};
+
+void append_centres(const ExtrusionEntityCollection &lines, std::vector<Centre> &out)
+{
+    visit_path_runs(lines, [&out](const ExtrusionPaths &paths, bool) {
+        for (const ExtrusionPath &path : paths)
+            if (path.role() == erWallExtension && path.polyline.size() >= 2)
+                out.push_back({ path.polyline, 0.5f * float(scale_(path.width)) });
+    });
+}
+
+// The part of a region's wall extension that its fill keeps out of, the fill coming `from_centre` near to the lines'
+// centres: the footprints `area` of lines `half_width` wide, less the width the fill overlaps, and around every printed
+// line in `centres` a band `from_centre` wide on each side (or as wide as the line, where it is narrower). So the cut
+// neither vanishes where a footprint is clipped narrower than a line, nor breaks up where it is thin.
+ExPolygons fill_cut(const ExPolygons &area, const std::vector<Centre> &centres, float half_width, float from_centre)
+{
+    if (area.empty())
+        return {};
+    Polygons  cut = offset(area, -(half_width - from_centre));
+    Polylines regular;
+    for (const Centre &centre : centres) {
+        if (centre.half_width >= from_centre)
+            regular.push_back(centre.line);
+        else if (centre.half_width > float(SCALED_EPSILON))
+            append(cut, offset(centre.line, centre.half_width, ClipperLib::jtRound, std::max(0.25 * centre.half_width, double(SCALED_EPSILON)),
+                               ClipperLib::etOpenRound));
+    }
+    if (!regular.empty())
+        append(cut, offset(regular, from_centre, ClipperLib::jtRound, std::max(0.25 * from_centre, double(SCALED_EPSILON)), ClipperLib::etOpenRound));
+    return union_ex(cut);
+}
+
 } // namespace
 
 void apply(PrintObject &object)
@@ -395,6 +450,7 @@ void apply(PrintObject &object)
     for (Layer *layer : layers)
         for (LayerRegion *region : layer->regions()) {
             region->wall_extension_area.clear();
+            region->wall_extension_fill_cut.clear();
             region->wall_extension_bridge_base.clear();
         }
 
@@ -504,12 +560,11 @@ void apply(PrintObject &object)
             area.all = intersection_ex(area.all, intersection_ex(layers[l - 1]->lslices, layers[l + 1]->lslices));
             if (area.all.empty())
                 continue;
-            // This layer's exposed surfaces: top surfaces, with nothing above, and bridges and overhangs, with nothing
-            // below. Their fill spreads into the part by the stock expansion of external surfaces, to run under the wall
-            // above or to anchor a bridge on what carries it. The extension stays out of that zone, so these surfaces
-            // print as they do without it.
-            Polygons exposed = to_polygons(diff_ex(layers[l]->lslices, layers[l + 1]->lslices));
-            polygons_append(exposed, to_polygons(diff_ex(layers[l]->lslices, layers[l - 1]->lslices)));
+            // This layer's bridges and overhangs, with nothing below. Their fill spreads into the part by the stock
+            // expansion of external surfaces, to anchor on what carries it; the extension stays out of that zone, so they
+            // print as they do without it. A top surface is no such exception: the wall above stands on the extension
+            // line, and the top surface's fill stops at it as at a wall.
+            const Polygons exposed = to_polygons(diff_ex(layers[l]->lslices, layers[l - 1]->lslices));
             const LayerRegionPtrs &regions = layers[l]->regions();
             areas[l].assign(regions.size(), ExPolygons());
             for (size_t r = 0; r < regions.size(); ++r) {
@@ -548,13 +603,7 @@ void apply(PrintObject &object)
                 const ExPolygons hanging_lines = diff_ex(intersection_ex(hanging[l], areas[l][r]),
                                                          offset(support_below, float(flow.scaled_spacing()) / 2.f));
                 const ExPolygons area = hanging_lines.empty() ? areas[l][r] : diff_ex(areas[l][r], hanging_lines);
-                // The base reaches as far around the lines' footprint as bridge_over_infill() looks for what carries a
-                // solid surface, four solid infill spacings: a footprint one line wide is narrower than anything it
-                // expects. So the solid either reaches what carries it, or is large enough to be bridged and anchored.
-                if (!hanging_lines.empty())
-                    region.wall_extension_bridge_base = diff_ex(
-                        intersection_ex(offset_ex(hanging_lines, 4.f * float(region.flow(frSolidInfill).scaled_spacing())), region.fill_expolygons),
-                        area);
+                std::vector<Centre> centres;
                 for (const ExPolygon &piece : area) {
                     // Enough walls to fill the whole piece: the chamfers of close joints merge into areas much wider than
                     // one extension, and the piece is cut out of the fill. No point lies deeper than half the piece's
@@ -562,48 +611,77 @@ void apply(PrintObject &object)
                     const Point  size        = get_extents(piece.contour).size();
                     const size_t inset_count = size_t(std::ceil(0.5 * double(std::min(size.x(), size.y())) / double(flow.scaled_spacing()))) + 1;
                     ExtrusionEntityCollection lines = extension_extrusions(piece, flow, layers[l]->height, inset_count, params);
-                    if (!lines.entities.empty())
+                    if (!lines.entities.empty()) {
+                        append_centres(lines, centres);
                         region.perimeters.append(std::move(lines));
+                    }
                 }
+                // Fill overlaps the extension lines as the wall generator lets it overlap walls: the fill by Infill/Wall
+                // overlap, the bridge fill by its own; the fill without overlap stops at the lines' spacing.
+                const PrintRegionConfig &config         = region.region().config();
+                const float              half_width     = 0.5f * float(flow.scaled_width());
+                const float              fill_near      = fill_from_centre(region, config.infill_wall_overlap, tolerance);
+                const float              bridge_near    = fill_from_centre(region, config.bridge_line_travel_extend, tolerance);
+                const ExPolygons         cut            = fill_cut(area, centres, half_width, fill_near);
+                // The base reaches as far around the lines' footprint as bridge_over_infill() looks for what carries a
+                // solid surface, four solid infill spacings: a footprint one line wide is narrower than anything it
+                // expects. So the solid either reaches what carries it, or is large enough to be bridged and anchored.
+                if (!hanging_lines.empty())
+                    region.wall_extension_bridge_base = diff_ex(
+                        intersection_ex(offset_ex(hanging_lines, 4.f * float(region.flow(frSolidInfill).scaled_spacing())), region.fill_expolygons),
+                        cut);
                 if (area.empty())
                     continue;
-                // Fill meets the extension lines at normal line spacing, as neighbouring solid lines meet.
-                region.fill_expolygons            = diff_ex(region.fill_expolygons, area);
-                region.fill_no_overlap_expolygons = diff_ex(region.fill_no_overlap_expolygons, area);
-                region.bridge_fill_expolygons     = diff_ex(region.bridge_fill_expolygons, area);
+                region.fill_expolygons            = diff_ex(region.fill_expolygons, cut);
+                region.fill_no_overlap_expolygons = diff_ex(region.fill_no_overlap_expolygons,
+                                                            fill_cut(area, centres, half_width, 0.5f * float(flow.scaled_spacing())));
+                region.bridge_fill_expolygons     = diff_ex(region.bridge_fill_expolygons, fill_cut(area, centres, half_width, bridge_near));
+                region.bridge_fill_overlap_delta  = std::max(region.bridge_fill_overlap_delta, coord_t(std::ceil(std::abs(fill_near - bridge_near))));
                 region.fill_surfaces.set(region.fill_expolygons, stInternal);
                 region.wall_extension_area        = area;
+                region.wall_extension_fill_cut    = cut;
             }
         }
     });
     throw_if_canceled();
 }
 
-void make_bridge_bases_solid(PrintObject &object)
+void apply_to_fill_surfaces(PrintObject &object)
 {
     LayerPtrs &layers = object.layers();
     tbb::parallel_for(tbb::blocked_range<size_t>(0, layers.size()), [&](const tbb::blocked_range<size_t> &range) {
         for (size_t i = range.begin(); i < range.end(); ++i)
             for (LayerRegion *region : layers[i]->regions()) {
                 const ExPolygons &base = region->wall_extension_bridge_base;
-                if (base.empty())
+                // process_external_surfaces() closes narrow gaps in the surfaces it expands, which joins a top surface
+                // reaching an extension line from both sides over the line.
+                const ExPolygons &cut  = region->wall_extension_fill_cut;
+                if (cut.empty() && base.empty())
                     continue;
-                Surfaces surfaces;
+                const BoundingBox cut_box = get_extents(cut);
+                Surfaces          surfaces;
                 for (Surface &surface : region->fill_surfaces.surfaces) {
-                    if (surface.surface_type != stInternal && surface.surface_type != stInternalVoid) {
-                        surfaces.push_back(std::move(surface));
-                        continue;
-                    }
-                    const ExPolygons inside = intersection_ex(ExPolygons{ surface.expolygon }, base);
-                    if (inside.empty()) {
-                        surfaces.push_back(std::move(surface));
-                        continue;
-                    }
-                    for (const ExPolygon &rest : diff_ex(ExPolygons{ surface.expolygon }, base))
-                        surfaces.emplace_back(surface, rest);
-                    for (const ExPolygon &solid : inside) {
-                        surfaces.emplace_back(surface, solid);
-                        surfaces.back().surface_type = stInternalSolid;
+                    ExPolygons pieces{ surface.expolygon };
+                    // Only surfaces that reach into the cut are rebuilt; the others keep their exact outlines.
+                    if (!cut.empty() && get_extents(surface.expolygon).overlap(cut_box) && !intersection(pieces, cut).empty())
+                        pieces = diff_ex(pieces, cut);
+                    const bool sparse = surface.surface_type == stInternal || surface.surface_type == stInternalVoid;
+                    for (ExPolygon &piece : pieces) {
+                        if (!sparse || base.empty()) {
+                            surfaces.emplace_back(surface, std::move(piece));
+                            continue;
+                        }
+                        const ExPolygons inside = intersection_ex(ExPolygons{ piece }, base);
+                        if (inside.empty()) {
+                            surfaces.emplace_back(surface, std::move(piece));
+                            continue;
+                        }
+                        for (ExPolygon &rest : diff_ex(ExPolygons{ piece }, base))
+                            surfaces.emplace_back(surface, std::move(rest));
+                        for (const ExPolygon &solid : inside) {
+                            surfaces.emplace_back(surface, solid);
+                            surfaces.back().surface_type = stInternalSolid;
+                        }
                     }
                 }
                 region->fill_surfaces.surfaces = std::move(surfaces);

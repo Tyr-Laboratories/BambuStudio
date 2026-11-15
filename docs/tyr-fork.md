@@ -70,7 +70,7 @@ The slope setting is optional reinforcement, not a blanket suppression of bridge
 
 In **Strength > Walls**, enable Advanced settings and set **Wall internal extension** (`wall_internal_extension`) in millimetres. The default is **1 mm**. **0** disables the feature.
 
-Where an outer wall rises out of a top surface, a single layer bond at the corner holds it to the surface. The same is true where a wall ends under a bottom surface. This setting prints the wall's line on the layers on the other side of the surface too, inside the part: through the top or bottom shell and this distance beyond it. It keeps out of the zone where a layer's exposed surfaces spread their fill into the part. So the top layer around the wall keeps its normal top surface, and a bridge or overhang keeps its anchors on the part below.
+Where an outer wall rises out of a top surface, a single layer bond at the corner holds it to the surface. The same is true where a wall ends under a bottom surface. This setting prints the wall's line on the layers on the other side of the surface too, inside the part: through the top or bottom shell and this distance beyond it. Under a top surface it starts on the surface's own layer, so the wall above stands on its line and the top surface's fill stops at the line as it stops at a wall. It keeps out of the zone where a bridge or overhang spreads its fill into the part, so they keep their anchors on the part below.
 
 **Wall extension chamfer** (`wall_internal_extension_chamfer`), the checkbox under it, adds a 45° chamfer in the corner between that buried wall and the inside face of the shell. Next to the shell it is as wide as the setting, and it narrows by one layer height per layer. Under a top surface the chamfer hangs below the shell. Above a bottom surface it sits on top of the shell. The chamfer is **off by default**: under a top surface its lower layers are printed over sparse infill with no bridging under them, so it does not print reliably yet. With it off, the buried wall is still extended to the same depth.
 
@@ -89,7 +89,7 @@ Under a top surface the extension reaches into the sparse infill, so its deepest
 The extension stays inside the part:
 - it stops where the part ends;
 - it never prints on the first layer or on an exposed top or bottom surface;
-- fill meets its lines at normal line spacing;
+- fill overlaps its lines as it overlaps a wall, by **Infill/Wall overlap** (bridges by **Bridge line travel extend**). Fill lies on both sides of the line, so from each side it stops just short of the line's centre, at the G-code resolution, however large the overlap: fill from the two sides never joins over the line;
 - it adds no other solid infill than the internal bridge it stands on.
 
 In the preview these lines are the **Wall extension** line type, with their own colour and time and filament statistics. Older versions of Bambu Studio show this line type as undefined, so open sliced files in this version to see it.

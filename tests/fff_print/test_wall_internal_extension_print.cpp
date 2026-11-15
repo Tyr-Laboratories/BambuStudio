@@ -105,6 +105,51 @@ std::vector<const ExtrusionPath *> extension_paths(const Layer &layer)
     return out;
 }
 
+Polylines extension_lines(const Layer &layer)
+{
+    Polylines out;
+    for (const ExtrusionPath *path : extension_paths(layer))
+        out.push_back(path->polyline);
+    return out;
+}
+
+// Squares `size` across centred on the points of `lines` where they turn by more than 10 degrees, and at their ends.
+Polygons corners(const Polylines &lines, float size)
+{
+    Polygons out;
+    const auto square = [&out, half = coord_t(size / 2.f)](const Point &p) {
+        out.push_back(Polygon{ { p.x() - half, p.y() - half }, { p.x() + half, p.y() - half }, { p.x() + half, p.y() + half }, { p.x() - half, p.y() + half } });
+    };
+    for (const Polyline &line : lines) {
+        const Points &points = line.points;
+        const bool    closed = points.size() > 2 && points.front() == points.back();
+        const size_t  count  = closed ? points.size() - 1 : points.size();
+        for (size_t i = 0; i < count; ++i) {
+            if (!closed && (i == 0 || i + 1 == count)) {
+                square(points[i]);
+                continue;
+            }
+            const Point &previous = points[i == 0 ? count - 1 : i - 1], &next = points[i + 1 == count && closed ? 0 : i + 1];
+            const Vec2d  in = (points[i] - previous).cast<double>(), on = (next - points[i]).cast<double>();
+            if (in.norm() > 0. && on.norm() > 0. && in.normalized().dot(on.normalized()) < std::cos(10. * M_PI / 180.))
+                square(points[i]);
+        }
+    }
+    return out;
+}
+
+// Centrelines of every fill extrusion of `layer`.
+Polylines fill_lines(const Layer &layer)
+{
+    std::vector<const ExtrusionPath *> paths;
+    for (const LayerRegion *region : layer.regions())
+        collect_paths(region->fills, paths);
+    Polylines out;
+    for (const ExtrusionPath *path : paths)
+        out.push_back(path->polyline);
+    return out;
+}
+
 // print_z in tenths of a millimetre of every layer holding wall extension lines.
 std::set<int> extension_layers(const Print &print)
 {
@@ -334,9 +379,9 @@ TEST_CASE("A tower's outer wall continues 1.8 mm into the box", "[WallExtension]
     Model model = terrace();
     Print print;
     slice(print, model, extension_config(1.));
-    // Down to 1.8 mm below the box's top, whose deepest layer is the internal bridge the lines stand on; the top layer
-    // itself keeps its stock top surface.
-    CHECK(extension_layers(print) == tenths(106, 118));
+    // From the box's top layer down to 1.8 mm below the box's top, whose deepest layer is the internal bridge the lines
+    // stand on.
+    CHECK(extension_layers(print) == tenths(106, 120));
 
     const Layer *box_layer = layer_at(print, 6.0), *tower_layer = layer_at(print, 12.2);
     REQUIRE(box_layer != nullptr);
@@ -370,13 +415,23 @@ TEST_CASE("A column's outer wall continues into the slab above the bridge layer,
             CHECK(region->wall_extension_bridge_base.empty());
 }
 
-TEST_CASE("Fill never covers wall extension lines", "[WallExtension][Print]")
+TEST_CASE("Fill overlaps wall extension lines as it overlaps walls, from each side up to their centre", "[WallExtension][Print]")
 {
-    // Seven layers under the tower, whose surface layer has none and whose deepest layer is a bridge; eight over the
-    // column, whose bridge layer has none.
-    for (auto [model, expected_layers] : { std::pair<Model, size_t>{ terrace(), 7 }, std::pair<Model, size_t>{ overhang(), 8 } }) {
+    // As against a one-loop wall, the fill reaches past the line's spacing by Infill/Wall overlap and the bridge fill by
+    // Bridge line travel extend (15%), each a share of the line's spacing (Arachne) or of half of it plus half the solid
+    // infill spacing (classic). Fill lies on both sides of an extension line, so each side stops short of the line's
+    // centre by the resolution, however large the overlap: the two sides never join over the line.
+    const std::string generator = GENERATE(as<std::string>{}, "arachne", "classic");
+    const int         overlap   = GENERATE(15, 75);
+    CAPTURE(generator, overlap);
+    DynamicPrintConfig config = extension_config(1., false);
+    config.set_deserialize_strict({ {"wall_generator", generator}, {"infill_wall_overlap", std::to_string(overlap) + "%"} });
+    // Eight layers under the tower, from its surface layer down, the deepest being a bridge; eight over the column,
+    // whose bridge layer has none.
+    for (auto [model, expected_layers] : { std::pair<Model, size_t>{ terrace(), 8 }, std::pair<Model, size_t>{ overhang(), 8 } }) {
         Print print;
-        slice(print, model, extension_config(1.));
+        slice(print, model, config);
+        const double resolution = print.config().resolution.value;
         size_t layers_with_area = 0;
         for (const Layer *layer : print.get_object(size_t(0))->layers())
             for (const LayerRegion *region : layer->regions()) {
@@ -384,11 +439,165 @@ TEST_CASE("Fill never covers wall extension lines", "[WallExtension][Print]")
                     continue;
                 ++layers_with_area;
                 CAPTURE(layer->print_z);
-                CHECK(area_mm2(intersection_ex(region->fill_no_overlap_expolygons, region->wall_extension_area)) < 0.01);
-                CHECK(intersection_ex(region->fill_expolygons, offset_ex(region->wall_extension_area, -scale_(0.01))).empty());
+                const Polylines centre  = intersection_pl(extension_lines(*layer), region->wall_extension_area);
+                const double    spacing = region->flow(frExternalPerimeter).spacing();
+                const double    basis   = generator == "arachne" ? spacing : 0.5 * spacing + 0.5 * region->flow(frSolidInfill).spacing();
+                const auto      reach   = [&](int percent) { return std::max(resolution, 0.5 * spacing - 0.01 * percent * basis); };
+                const double    fill_reach = reach(overlap), bridge_reach = reach(15);
+                CAPTURE(fill_reach, bridge_reach);
+                REQUIRE_FALSE(centre.empty());
+                // Measured along the runs of the lines: a band around a centreline turns its corners differently from
+                // the footprint, whose corners are mitred like the wall's.
+                const float      width = region->flow(frExternalPerimeter).scaled_width();
+                const ExPolygons runs  = diff_ex(offset_ex(region->wall_extension_area, float(SCALED_EPSILON)), corners(centre, 2.f * width));
+                const auto reaches = [&](const ExPolygons &fill, double near) {
+                    CHECK(intersection_ex(intersection_ex(fill, runs), offset(centre, float(scale_(near - resolution / 2.)))).empty());
+                    CHECK(area_mm2(diff_ex(diff_ex(intersection_ex(region->wall_extension_area, runs), offset(centre, float(scale_(near + resolution)))),
+                                           fill)) < 0.01);
+                };
+                reaches(region->fill_expolygons, fill_reach);
+                reaches(region->bridge_fill_expolygons, bridge_reach);
+                CHECK(region->bridge_fill_overlap_delta >= coord_t(scale_(std::abs(fill_reach - bridge_reach))) - 1);
+                CHECK(intersection_ex(intersection_ex(region->fill_no_overlap_expolygons, runs),
+                                      offset(centre, float(scale_(0.5 * spacing - resolution)))).empty());
+                for (const Surface &surface : region->fill_surfaces.surfaces)
+                    CHECK(intersection_pl(intersection_pl(centre, runs), offset_ex(surface.expolygon, -float(scale_(resolution / 2.)))).empty());
             }
         CHECK(layers_with_area == expected_layers);
     }
+}
+
+TEST_CASE("Re-slicing after an infill-only change gives the fill of a fresh slice", "[WallExtension][Print]")
+{
+    // A ring one line wide stands on the box: its top surface lies on both sides of a curved extension line, which the
+    // walls' simplification (here fitting arcs) moves after the fill is cut. Changing only the infill direction re-runs
+    // the infill preparation on the simplified walls.
+    Model model;
+    {
+        ModelObject *object = model.add_object();
+        TriangleMesh mesh(its_make_cube(30., 30., 6.));
+        TriangleMesh ring(its_make_cylinder(5., 4., 2. * PI / 360.));
+        ring.translate(15.f, 15.f, 6.f);
+        mesh.merge(ring);
+        object->add_volume(std::move(mesh));
+        TriangleMesh hole(its_make_cylinder(4.4, 4., 2. * PI / 360.));
+        hole.translate(15.f, 15.f, 6.f);
+        object->add_volume(std::move(hole))->set_type(ModelVolumeType::NEGATIVE_VOLUME);
+        object->add_instance()->set_offset(Vec3d(80., 80., 0.));
+    }
+    DynamicPrintConfig first = extension_config(1., false);
+    first.set_deserialize_strict({ {"infill_wall_overlap", "75%"}, {"enable_arc_fitting", "1"} });
+    DynamicPrintConfig second = first;
+    second.set_deserialize_strict({ {"infill_direction", "30"} });
+    Print resliced, fresh;
+    slice(resliced, model, first);
+    resliced.apply(model, second);
+    resliced.process();
+    slice(fresh, model, second);
+    const auto &layers_resliced = resliced.get_object(size_t(0))->layers();
+    const auto &layers_fresh    = fresh.get_object(size_t(0))->layers();
+    REQUIRE(layers_resliced.size() == layers_fresh.size());
+    REQUIRE_FALSE(extension_paths(*layer_at(fresh, 6.0)).empty());
+    for (size_t i = 0; i < layers_fresh.size(); ++i)
+        for (size_t r = 0; r < layers_fresh[i]->regions().size(); ++r) {
+            CAPTURE(layers_fresh[i]->print_z);
+            const LayerRegion &a = *layers_resliced[i]->regions()[r], &b = *layers_fresh[i]->regions()[r];
+            for (SurfaceType type : { stTop, stBottom, stBottomBridge, stInternal, stInternalSolid, stInternalBridge, stInternalVoid }) {
+                CAPTURE(int(type));
+                const auto of_type = [type](const LayerRegion &region) {
+                    ExPolygons out;
+                    for (const Surface &surface : region.fill_surfaces.surfaces)
+                        if (surface.surface_type == type)
+                            out.push_back(surface.expolygon);
+                    return union_ex(out);
+                };
+                const ExPolygons in_a = of_type(a), in_b = of_type(b);
+                CHECK(area_mm2(diff_ex(in_a, in_b)) + area_mm2(diff_ex(in_b, in_a)) < 1e-4);
+            }
+        }
+}
+
+TEST_CASE("No fill line crosses extension lines clipped to a wedge", "[WallExtension][Print]")
+{
+    // With a large overlap the fill comes almost to the lines' centre from both sides. Under the tower's wall the edge of
+    // a cavity crosses the extension at 5 degrees and clips it to a long wedge, narrower than a line: the cut between
+    // the two sides must hold there too.
+    Model model = terrace();
+    {
+        TriangleMesh cavity(its_make_cube(6., 24., 3.));
+        cavity.translate(-6.f, -12.f, 0.f);
+        cavity.rotate_z(float(5. * PI / 180.));
+        cavity.translate(10.2f, 15.f, 8.f);
+        model.objects.front()->add_volume(std::move(cavity))->set_type(ModelVolumeType::NEGATIVE_VOLUME);
+    }
+    DynamicPrintConfig config = extension_config(1., false);
+    config.set_deserialize_strict({ {"infill_wall_overlap", "75%"} });
+    Print print;
+    slice(print, model, config);
+    const float half_resolution = float(scale_(print.config().resolution.value / 2.));
+    size_t layers_with_lines = 0;
+    double narrower_than_a_line = 0.;
+    for (const Layer *layer : print.get_object(size_t(0))->layers()) {
+        const Polylines extension = extension_lines(*layer);
+        if (extension.empty())
+            continue;
+        ++layers_with_lines;
+        CAPTURE(layer->print_z);
+        CHECK(total_length(intersection_pl(fill_lines(*layer), offset(extension, half_resolution))) == 0.);
+        for (const LayerRegion *region : layer->regions()) {
+            CHECK(intersection_ex(region->fill_expolygons, offset(extension, half_resolution)).empty());
+            // Footprint less what a band 0.8 lines wide fits in: where it is narrower than a line.
+            const float width = region->flow(frExternalPerimeter).scaled_width();
+            narrower_than_a_line += area_mm2(diff_ex(region->wall_extension_area, opening_ex(region->wall_extension_area, 0.4f * width)));
+        }
+    }
+    CHECK(layers_with_lines > 0);
+    CHECK(narrower_than_a_line > 0.01);
+}
+
+TEST_CASE("The extension runs through the top surface layer, under the tower's wall", "[WallExtension][Print]")
+{
+    // The box's top surface is where a wall splits off: its fill stops at the extension as it stops at a wall.
+    Model model = terrace();
+    Print print, without;
+    slice(print, model, extension_config(1., false));
+    slice(without, model, extension_config(0., false));
+    CHECK(extension_layers(print) == tenths(106, 120));
+    // The visible top surface, around the tower, is the same as without the extension: no notch along the wall.
+    {
+        const Layer *top_with = layer_at(print, 12.0), *top_without = layer_at(without, 12.0), *tower = layer_at(print, 12.2);
+        REQUIRE(top_with != nullptr);
+        REQUIRE(top_without != nullptr);
+        const auto visible_top = [tower](const Layer &layer) {
+            ExPolygons top;
+            for (const LayerRegion *region : layer.regions())
+                for (const Surface &surface : region->fill_surfaces.surfaces)
+                    if (surface.surface_type == stTop)
+                        top.push_back(surface.expolygon);
+            return diff_ex(union_ex(top), tower->lslices);
+        };
+        const ExPolygons with_extension = visible_top(*top_with), without_extension = visible_top(*top_without);
+        REQUIRE(area_mm2(without_extension) > 100.);
+        CHECK(area_mm2(diff_ex(with_extension, without_extension)) + area_mm2(diff_ex(without_extension, with_extension)) < 0.05);
+    }
+    const Layer *top_layer = layer_at(print, 12.0), *tower_layer = layer_at(print, 12.2);
+    REQUIRE(top_layer != nullptr);
+    REQUIRE(tower_layer != nullptr);
+    const Polylines extension = extension_lines(*top_layer);
+    REQUIRE_FALSE(extension.empty());
+    // The middle half of the tower's outer wall bead overlaps the extension bead all along.
+    Polylines wall;
+    for (const LayerRegion *region : tower_layer->regions()) {
+        std::vector<const ExtrusionPath *> paths;
+        collect_paths(region->perimeters, paths);
+        for (const ExtrusionPath *path : paths)
+            if (path->role() == erExternalPerimeter)
+                wall.push_back(path->polyline);
+    }
+    REQUIRE_FALSE(wall.empty());
+    const float width = top_layer->regions().front()->flow(frExternalPerimeter).scaled_width();
+    CHECK(total_length(diff_pl(wall, offset(extension, 0.75f * width))) < width);
+    CHECK(intersection_pl(fill_lines(*top_layer), offset(extension, float(scale_(print.config().resolution.value / 2.)))).empty());
 }
 
 TEST_CASE("The wall extension adds no solid infill besides the bridge it stands on", "[WallExtension][Print]")
@@ -633,8 +842,8 @@ TEST_CASE("With the chamfer off the tower's extension stays under its wall", "[W
     Model model = terrace();
     Print print;
     slice(print, model, extension_config(1., false));
-    // As deep as with the chamfer: down to 1.8 mm below the box's top, whose deepest layer is the bridge.
-    CHECK(extension_layers(print) == tenths(106, 118));
+    // As deep as with the chamfer: from the box's top layer down to 1.8 mm below it, whose deepest layer is the bridge.
+    CHECK(extension_layers(print) == tenths(106, 120));
     const Layer *tower_layer = layer_at(print, 12.2);
     REQUIRE(tower_layer != nullptr);
     // Every line runs right under the tower's wall: inside its outline, within one line width of it.
@@ -650,10 +859,25 @@ TEST_CASE("With the chamfer off the tower's extension stays under its wall", "[W
 TEST_CASE("A one-line fin is extended", "[WallExtension][Print]")
 {
     Model model = boxes({ { { 30., 30., 6. }, { 0., 0., 0. } }, { { 0.6, 20., 5. }, { 14.7, 5., 6. } } });
+    // With a large overlap the top surface reaches the line from both sides almost to its centre.
+    DynamicPrintConfig config = extension_config(1., false);
+    config.set_deserialize_strict({ {"infill_wall_overlap", "75%"} });
     Print print;
-    slice(print, model, extension_config(1.));
-    // Down to 1.8 mm below the box's top, whose deepest layer is the bridge the lines stand on.
-    CHECK(extension_layers(print) == tenths(46, 58));
+    slice(print, model, config);
+    // From the box's top surface down to 1.8 mm below it, whose deepest layer is the bridge the lines stand on.
+    CHECK(extension_layers(print) == tenths(46, 60));
+    // The top surface lies on both sides of the fin's extension line, and stays apart at it.
+    const Layer *top_layer = layer_at(print, 6.0);
+    REQUIRE(top_layer != nullptr);
+    const Polylines extension = extension_lines(*top_layer);
+    REQUIRE_FALSE(extension.empty());
+    const float resolution = float(scale_(print.config().resolution.value));
+    CHECK(intersection_pl(fill_lines(*top_layer), offset(extension, resolution / 2.f)).empty());
+    const Polylines runs = diff_pl(extension, corners(extension, 2.f * top_layer->regions().front()->flow(frExternalPerimeter).scaled_width()));
+    REQUIRE_FALSE(runs.empty());
+    for (const LayerRegion *region : top_layer->regions())
+        for (const Surface &surface : region->fill_surfaces.surfaces)
+            CHECK(intersection_pl(runs, offset_ex(surface.expolygon, -resolution / 2.f)).empty());
 }
 
 TEST_CASE("A rib standing on a sloped skin is extended along its base", "[WallExtension][Print]")
@@ -714,7 +938,7 @@ TEST_CASE("The classic wall generator gets the same extension", "[WallExtension]
     config.set_deserialize_strict({ {"wall_generator", "classic"} });
     Print print;
     slice(print, model, config);
-    CHECK(extension_layers(print) == tenths(106, 118));
+    CHECK(extension_layers(print) == tenths(106, 120));
 }
 
 TEST_CASE("On a thin plate the extension stops above the bed", "[WallExtension][Print]")
@@ -722,8 +946,8 @@ TEST_CASE("On a thin plate the extension stops above the bed", "[WallExtension][
     Model model = boxes({ { { 30., 30., 1. }, { 0., 0., 0. } }, { { 10., 10., 5. }, { 10., 10., 1. } } });
     Print print;
     slice(print, model, extension_config(1.));
-    // The plate's top layer (1.0) keeps its top surface; layer 0.2 is the first layer.
-    CHECK(extension_layers(print) == std::set<int>{ 4, 6, 8 });
+    // From the plate's top layer (1.0) down; layer 0.2 is the first layer.
+    CHECK(extension_layers(print) == std::set<int>{ 4, 6, 8, 10 });
 }
 
 TEST_CASE("Depth is measured in millimetres with variable layer heights", "[WallExtension][Print]")
@@ -732,9 +956,9 @@ TEST_CASE("Depth is measured in millimetres with variable layer heights", "[Wall
     model.objects.front()->layer_config_ranges[{ 9., 12. }].set("layer_height", 0.1);
     Print print;
     slice(print, model, extension_config(1.));
-    // Four 0.1 mm top layers make a 0.4 mm shell; the extension goes through it, but for its top layer, which keeps its
-    // top surface, and 1 mm further, its deepest layer being the bridge it stands on.
-    CHECK(heights_with_extension(print) == Approx(0.4 - 0.1 + 1.0).margin(0.05));
+    // Four 0.1 mm top layers make a 0.4 mm shell; the extension goes through it and 1 mm further, its deepest layer
+    // being the bridge it stands on.
+    CHECK(heights_with_extension(print) == Approx(0.4 + 1.0).margin(0.05));
 }
 
 TEST_CASE("Two close towers print their shared chamfer once", "[WallExtension][Print]")
@@ -897,22 +1121,6 @@ TEST_CASE("A tube through a thin flange keeps the flange's bridge anchors", "[Wa
     CHECK(extension_paths(*bridge_with).empty());
     REQUIRE(surface_area(*bridge_without, stBottomBridge) > 100.);
     CHECK(surface_area(*bridge_with, stBottomBridge) == Approx(surface_area(*bridge_without, stBottomBridge)).epsilon(0.005));
-}
-
-TEST_CASE("The top surface around a tower is the same as without the extension", "[WallExtension][Print]")
-{
-    // The box's top surface runs a little under the tower's wall, as top surfaces do; the extension starts below it.
-    Model model = terrace();
-    Print without, with;
-    slice(without, model, extension_config(0.));
-    slice(with, model, extension_config(1.));
-    const Layer *top_without = layer_at(without, 12.0), *top_with = layer_at(with, 12.0);
-    REQUIRE(top_without != nullptr);
-    REQUIRE(top_with != nullptr);
-    CHECK(extension_paths(*top_with).empty());
-    REQUIRE(surface_area(*top_without, stTop) > 100.);
-    CHECK(surface_area(*top_with, stTop) == Approx(surface_area(*top_without, stTop)).epsilon(0.005));
-    CHECK_FALSE(extension_paths(*layer_at(with, 11.8)).empty());
 }
 
 TEST_CASE("On slope-wall layers the extension lines do not widen top surfaces", "[WallExtension][Print]")
